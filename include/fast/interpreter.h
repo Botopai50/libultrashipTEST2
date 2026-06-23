@@ -22,6 +22,11 @@
 #define SCREEN_WIDTH 320
 #define SCREEN_HEIGHT 240
 
+// SOH [Enhancement] Max floats packed per vertex into the Fast3D VBO. Grew from 32 to 40 when toon
+// lighting added a world-space normal attribute. The interpreter packs from this and every backend
+// sizes its vertex buffers from it, so they stay in lockstep — change it in one place only.
+#define VBO_MAX_FLOATS_PER_VERTEX 40
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -77,6 +82,9 @@ enum class ShaderOpts {
     TEXEL0_BLEND,
     TEXEL1_BLEND,
     USE_SHADER,
+    TOON, // SOH [Enhancement] toon-lighting variant. Bit 17; the loaded-shader id packs ABOVE it
+          // (interpreter.cpp shifts shader.id by 18). Adding an opt here without bumping that shift
+          // would overlap the id and corrupt shader selection.
     MAX
 };
 
@@ -107,6 +115,7 @@ struct CCFeatures {
     bool opt_alpha_threshold;
     bool opt_invisible;
     bool opt_grayscale;
+    bool opt_toon; // SOH [Enhancement] toon lighting
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -209,6 +218,8 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+    // SOH [Enhancement] World-space vertex normal, forwarded to the fragment shader for toon lighting.
+    float nx, ny, nz;
 };
 
 struct RawTexMetadata {
@@ -240,6 +251,19 @@ struct RSP {
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
     uint8_t current_num_lights;        // includes ambient light
     bool lights_changed;
+
+    // SOH [Enhancement] Toon lighting: the single dominant light chosen for the current object,
+    // recomputed when lights change. World-space direction, light color, and ambient color (0..1).
+    float toon_light_dir[3];
+    float toon_light_color[3];
+    float toon_ambient[3];
+
+    // SOH [Enhancement] Toon lighting: a per-object key light supplied by the game (gSPToonKey),
+    // world-space direction + color. When valid it overrides the renderer's own light averaging so
+    // the game can drive a Wind Waker-style sun/torch key with smooth day-night animation.
+    bool toon_key_valid;
+    float toon_key_dir[3];
+    float toon_key_color[3];
 
     uint32_t geometry_mode;
     int16_t fog_mul, fog_offset;
@@ -293,6 +317,7 @@ struct RDP {
     uint32_t other_mode_l, other_mode_h;
     uint64_t combine_mode;
     bool grayscale;
+    bool toon; // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
@@ -409,6 +434,9 @@ class Interpreter {
     void ImportTexture(int i, int tile, bool importReplacement);
     void ImportTextureMask(int i, int tile);
     void CalculateNormalDir(const F3DLight_t*, float coeffs[3]);
+    // SOH [Enhancement] Toon lighting: pick the single dominant light for the current object and
+    // cache its world-space direction / color / ambient in the RSP for the fragment shader.
+    void SelectToonLight();
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);

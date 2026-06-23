@@ -189,6 +189,8 @@
 #define G_DL_INDEX 0x3d
 #define G_READFB 0x3e
 #define G_SETINTENSITY 0x40
+#define G_SETTOON 0x41 // SOH [Enhancement] toon lighting per-draw marker
+#define G_SETTOONKEY 0x4a // SOH [Enhancement] toon lighting per-object key light (dir + color)
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
 #define G_SETTARGETINTERPINDEX 0x45
@@ -2801,6 +2803,29 @@ typedef union Gfx {
 
 #define gsSPGrayscale(state) \
     { (_SHIFTL(G_SETGRAYSCALE, 24, 8)), (state) }
+
+// SOH [Enhancement] Toon lighting per-draw marker (mirrors gSPGrayscale).
+#define gSPToon(pkt, state)                       \
+    {                                             \
+        Gfx* _g = (Gfx*)(pkt);                    \
+                                                  \
+        _g->words.w0 = _SHIFTL(G_SETTOON, 24, 8); \
+        _g->words.w1 = state;                     \
+    }
+
+#define gsSPToon(state) \
+    { (_SHIFTL(G_SETTOON, 24, 8)), (state) }
+
+// SOH [Enhancement] Toon lighting per-object key light. dx/dy/dz are the signed key direction
+// (world space, * 127) and r/g/b the key light color, packed into the two command words.
+#define gSPToonKey(pkt, dx, dy, dz, r, g, b)                                                                     \
+    {                                                                                                            \
+        Gfx* _g = (Gfx*)(pkt);                                                                                   \
+                                                                                                                \
+        _g->words.w0 = _SHIFTL(G_SETTOONKEY, 24, 8) | _SHIFTL((dx) & 0xFF, 16, 8) | _SHIFTL((dy) & 0xFF, 8, 8) | \
+                       _SHIFTL((dz) & 0xFF, 0, 8);                                                              \
+        _g->words.w1 = _SHIFTL((r) & 0xFF, 16, 8) | _SHIFTL((g) & 0xFF, 8, 8) | _SHIFTL((b) & 0xFF, 0, 8);      \
+    }
 
 #define gsSPLoadShader(shader, type) gsDma1p(G_LOAD_SHADER, shader, 0, type)
 #define gsSPUnloadShader() gsDma1p(G_LOAD_SHADER, 0, 0, 0)
