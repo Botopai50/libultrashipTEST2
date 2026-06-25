@@ -238,6 +238,9 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB
                                                                                  : MTL::PixelFormatBGRA8Unorm);
     pipeline_descriptor->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+    // SOH [Enhancement] World light casting: declare the Stencil8 format on every pipeline (parallels the
+    // unconditional depth format above), so pipelines stay consistent with the stencil-bearing render pass.
+    pipeline_descriptor->setStencilAttachmentPixelFormat(MTL::PixelFormatStencil8);
     if (cc_features.opt_alpha) {
         pipeline_descriptor->colorAttachments()->object(0)->setBlendingEnabled(true);
         pipeline_descriptor->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
@@ -424,15 +427,42 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     auto& current_framebuffer = mFramebuffers[mCurrentFramebuffer];
 
     if (current_framebuffer.mLastDepthTest != mCurrentDepthTest ||
-        current_framebuffer.mLastDepthMask != mCurrentDepthMask) {
+        current_framebuffer.mLastDepthMask != mCurrentDepthMask ||
+        current_framebuffer.mLastStencilMode != mStencilMode) { // SOH [Enhancement] world light casting
         current_framebuffer.mLastDepthTest = mCurrentDepthTest;
         current_framebuffer.mLastDepthMask = mCurrentDepthMask;
+        current_framebuffer.mLastStencilMode = mStencilMode; // SOH [Enhancement] world light casting
 
         MTL::DepthStencilDescriptor* depth_descriptor = MTL::DepthStencilDescriptor::alloc()->init();
         depth_descriptor->setDepthWriteEnabled(mCurrentDepthMask);
         depth_descriptor->setDepthCompareFunction(
             mCurrentDepthTest ? (mCurrentZmodeDecal ? MTL::CompareFunctionLessEqual : MTL::CompareFunctionLess)
                               : MTL::CompareFunctionAlways);
+
+        // SOH [Enhancement] World light casting: stencil light-volume ops (see StencilMode). Off leaves
+        // the descriptor stencil-free, so ordinary draws are unchanged. Front == back ops because face
+        // culling is done game-side (each mask pass draws only back or only front faces).
+        if (mStencilMode != (int)StencilMode::Off) {
+            MTL::StencilDescriptor* stencil = MTL::StencilDescriptor::alloc()->init();
+            stencil->setReadMask(0xFF);
+            stencil->setWriteMask(0xFF);
+            if (mStencilMode == (int)StencilMode::Composite) {
+                stencil->setStencilCompareFunction(MTL::CompareFunctionNotEqual); // ref 0: draw where != 0
+                stencil->setStencilFailureOperation(MTL::StencilOperationKeep);
+                stencil->setDepthFailureOperation(MTL::StencilOperationKeep);
+                stencil->setDepthStencilPassOperation(MTL::StencilOperationZero); // self-clear as it composites
+            } else {
+                stencil->setStencilCompareFunction(MTL::CompareFunctionAlways);
+                stencil->setStencilFailureOperation(MTL::StencilOperationKeep);
+                stencil->setDepthFailureOperation(mStencilMode == (int)StencilMode::VolumeIncr
+                                                      ? MTL::StencilOperationIncrementClamp
+                                                      : MTL::StencilOperationDecrementClamp); // z-fail count
+                stencil->setDepthStencilPassOperation(MTL::StencilOperationKeep);
+            }
+            depth_descriptor->setFrontFaceStencil(stencil);
+            depth_descriptor->setBackFaceStencil(stencil);
+            stencil->release();
+        }
 
         MTL::DepthStencilState* depth_stencil_state = mDevice->newDepthStencilState(depth_descriptor);
         current_framebuffer.mCommandEncoder->setDepthStencilState(depth_stencil_state);
@@ -624,6 +654,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         fb.mLastDepthTest = -1;
         fb.mLastDepthMask = -1;
         fb.mLastZmodeDecal = -1;
+        fb.mLastStencilMode = -1; // SOH [Enhancement] world light casting
     }
 
     mFrameAutoreleasePool->release();
@@ -695,12 +726,32 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
         depth_tex_desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
 
         fb.mDepthTexture = mDevice->newTexture(depth_tex_desc);
+
+        // SOH [Enhancement] World light casting: separate Stencil8 plane (depth texture untouched).
+        MTL::TextureDescriptor* stencil_tex_desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatStencil8, width, height, false);
+        stencil_tex_desc->setTextureType(MTL::TextureType2D);
+        stencil_tex_desc->setStorageMode(MTL::StorageModePrivate);
+        stencil_tex_desc->setSampleCount(1);
+        stencil_tex_desc->setUsage(MTL::TextureUsageRenderTarget);
+        if (fb.mStencilTexture != nullptr)
+            fb.mStencilTexture->release();
+        fb.mStencilTexture = mDevice->newTexture(stencil_tex_desc);
+        // NB: texture2DDescriptor returns an autoreleased descriptor (like depth_tex_desc above) — do
+        // NOT release it manually, or the autorelease pool double-frees it (SIGBUS).
     }
 
     render_pass_descriptor->depthAttachment()->setTexture(fb.mDepthTexture);
     render_pass_descriptor->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
     render_pass_descriptor->depthAttachment()->setStoreAction(MTL::StoreActionStore);
     render_pass_descriptor->depthAttachment()->setClearDepth(1);
+
+    // SOH [Enhancement] World light casting: attach the stencil plane (cleared each pass; not stored —
+    // the technique self-clears, so 0 is its correct resting value).
+    render_pass_descriptor->stencilAttachment()->setTexture(fb.mStencilTexture);
+    render_pass_descriptor->stencilAttachment()->setLoadAction(MTL::LoadActionClear);
+    render_pass_descriptor->stencilAttachment()->setStoreAction(MTL::StoreActionDontCare);
+    render_pass_descriptor->stencilAttachment()->setClearStencil(0);
 
     if (fb.mRenderPassDescriptor != nullptr)
         fb.mRenderPassDescriptor->release();
@@ -821,6 +872,28 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
 
             fb.mMsaaDepthTexture = mDevice->newTexture(depth_tex_desc);
         }
+
+        // SOH [Enhancement] World light casting: separate Stencil8 plane(s), matching the depth texture's
+        // size/sample-count. Kept separate so the depth texture + GetPixelDepth are untouched.
+        MTL::TextureDescriptor* stencil_tex_desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatStencil8, width, height, false);
+        stencil_tex_desc->setTextureType(MTL::TextureType2D);
+        stencil_tex_desc->setStorageMode(MTL::StorageModePrivate);
+        stencil_tex_desc->setSampleCount(1);
+        stencil_tex_desc->setUsage(MTL::TextureUsageRenderTarget);
+        if (fb.mStencilTexture != nullptr)
+            fb.mStencilTexture->release();
+        fb.mStencilTexture = mDevice->newTexture(stencil_tex_desc);
+
+        if (msaa_level > 1) {
+            stencil_tex_desc->setTextureType(MTL::TextureType2DMultisample);
+            stencil_tex_desc->setSampleCount(msaa_level);
+            if (fb.mMsaaStencilTexture != nullptr)
+                fb.mMsaaStencilTexture->release();
+            fb.mMsaaStencilTexture = mDevice->newTexture(stencil_tex_desc);
+        }
+        // NB: texture2DDescriptor returns an autoreleased descriptor (like depth_tex_desc above) — do
+        // NOT release it manually, or the autorelease pool double-frees it (SIGBUS).
     }
 
     if (has_depth_buffer) {
@@ -830,14 +903,25 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             fb.mRenderPassDescriptor->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
             fb.mRenderPassDescriptor->depthAttachment()->setStoreAction(MTL::StoreActionMultisampleResolve);
             fb.mRenderPassDescriptor->depthAttachment()->setClearDepth(1);
+            // SOH [Enhancement] World light casting: transient stencil plane (cleared per pass, not stored).
+            fb.mRenderPassDescriptor->stencilAttachment()->setTexture(fb.mMsaaStencilTexture);
+            fb.mRenderPassDescriptor->stencilAttachment()->setLoadAction(MTL::LoadActionClear);
+            fb.mRenderPassDescriptor->stencilAttachment()->setStoreAction(MTL::StoreActionDontCare);
+            fb.mRenderPassDescriptor->stencilAttachment()->setClearStencil(0);
         } else {
             fb.mRenderPassDescriptor->depthAttachment()->setTexture(fb.mDepthTexture);
             fb.mRenderPassDescriptor->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
             fb.mRenderPassDescriptor->depthAttachment()->setStoreAction(MTL::StoreActionStore);
             fb.mRenderPassDescriptor->depthAttachment()->setClearDepth(1);
+            // SOH [Enhancement] World light casting: transient stencil plane (cleared per pass, not stored).
+            fb.mRenderPassDescriptor->stencilAttachment()->setTexture(fb.mStencilTexture);
+            fb.mRenderPassDescriptor->stencilAttachment()->setLoadAction(MTL::LoadActionClear);
+            fb.mRenderPassDescriptor->stencilAttachment()->setStoreAction(MTL::StoreActionDontCare);
+            fb.mRenderPassDescriptor->stencilAttachment()->setClearStencil(0);
         }
     } else {
         fb.mRenderPassDescriptor->setDepthAttachment(nullptr);
+        fb.mRenderPassDescriptor->setStencilAttachment(nullptr); // SOH [Enhancement] world light casting
     }
 
     fb.mRenderTarget = render_target;

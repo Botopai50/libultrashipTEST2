@@ -91,6 +91,10 @@ struct FramebufferMetal {
 
     MTL::Texture* mDepthTexture;
     MTL::Texture* mMsaaDepthTexture;
+    // SOH [Enhancement] World light casting: a separate Stencil8 plane for the stencil light-volume
+    // technique, attached alongside the (unchanged) depth texture so depth + GetPixelDepth are untouched.
+    MTL::Texture* mStencilTexture = nullptr;
+    MTL::Texture* mMsaaStencilTexture = nullptr;
     uint32_t mTextureId;
     bool mHasDepthBuffer;
     uint32_t mMsaaLevel;
@@ -110,6 +114,7 @@ struct FramebufferMetal {
     int8_t mLastDepthTest = -1;
     int8_t mLastDepthMask = -1;
     int8_t mLastZmodeDecal = -1;
+    int mLastStencilMode = -1; // SOH [Enhancement] world light casting
 };
 
 struct FrameUniforms {

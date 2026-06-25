@@ -148,6 +148,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
+    int mLastStencilMode = -1; // SOH [Enhancement] world light casting: cache tracker for mStencilMode
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;

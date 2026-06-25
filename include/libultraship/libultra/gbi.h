@@ -191,6 +191,7 @@
 #define G_SETINTENSITY 0x40
 #define G_SETTOON 0x41 // SOH [Enhancement] toon lighting per-draw marker
 #define G_SETTOONKEY 0x4a // SOH [Enhancement] toon lighting per-object key light (dir + color)
+#define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
 #define G_SETTARGETINTERPINDEX 0x45
@@ -2825,6 +2826,15 @@ typedef union Gfx {
         _g->words.w0 = _SHIFTL(G_SETTOONKEY, 24, 8) | _SHIFTL((dx) & 0xFF, 16, 8) | _SHIFTL((dy) & 0xFF, 8, 8) | \
                        _SHIFTL((dz) & 0xFF, 0, 8);                                                              \
         _g->words.w1 = _SHIFTL((r) & 0xFF, 16, 8) | _SHIFTL((g) & 0xFF, 8, 8) | _SHIFTL((b) & 0xFF, 0, 8);      \
+    }
+
+// SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
+#define gSPStencil(pkt, mode)                        \
+    {                                                \
+        Gfx* _g = (Gfx*)(pkt);                       \
+                                                     \
+        _g->words.w0 = _SHIFTL(G_SETSTENCIL, 24, 8); \
+        _g->words.w1 = (mode);                       \
     }
 
 #define gsSPLoadShader(shader, type) gsDma1p(G_LOAD_SHADER, shader, 0, type)

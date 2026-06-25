@@ -3788,6 +3788,18 @@ bool gfx_set_toon_key_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SOH [Enhancement] World light casting: set the stencil mode for the stencil light-volume technique.
+// Mirrors the toon-key handler's flush-then-set: the mode change must not retroactively apply to already
+// batched geometry, so flush the pending tris (under the previous mode) before switching.
+bool gfx_set_stencil_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->Flush();
+    gfx->mRapi->SetStencilMode((int)cmd->words.w1);
+    return false;
+}
+
 bool gfx_load_block_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -4179,6 +4191,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },                // G_SETTOON (0x41)
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },      // G_SETTOONKEY (0x4a)
+    { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },       // G_SETSTENCIL (0x46)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_LOAD_SHADER, { "G_LOAD_SHADER", gfx_set_shader_custom } },
 };

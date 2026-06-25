@@ -17,6 +17,17 @@ struct GfxClipParameters {
 
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
 
+// SOH [Enhancement] World light casting: per-draw stencil mode for the Wind Waker-style stencil
+// light-volume technique. The interpreter pushes this via SetStencilMode (from a gSPStencil command);
+// backends apply the matching stencil state in their per-draw path. Off (0) is normal rendering, so
+// ordinary draws are unaffected. These values must match the WorldLighting policy module.
+enum class StencilMode {
+    Off = 0,        // no stencil test/write (normal rendering)
+    VolumeIncr = 1, // mask: stencil += 1 where a volume face fails the depth test (z-fail)
+    VolumeDecr = 2, // mask: stencil -= 1 where a volume face fails the depth test (z-fail)
+    Composite = 3,  // draw where stencil != 0, zeroing it as it goes (self-clearing composite)
+};
+
 // A hash function used to hash a: pair<float, float>
 struct hash_pair_ff {
     size_t operator()(const std::pair<float, float>& p) const {
@@ -99,6 +110,13 @@ class GfxRenderingAPI {
         mToonDebug = debug;
     }
 
+    // SOH [Enhancement] World light casting: the interpreter pushes the current stencil mode here when a
+    // gSPStencil command is seen; backends read mStencilMode in their per-draw path to drive the stencil
+    // light-volume technique. Off (0) is normal rendering, so ordinary draws are unaffected.
+    virtual void SetStencilMode(int mode) {
+        mStencilMode = mode;
+    }
+
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -108,6 +126,7 @@ class GfxRenderingAPI {
     float mToonHighlightIntensity = TOON_SHADING_DEFAULT_HIGHLIGHT;
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
+    int mStencilMode = 0; // SOH [Enhancement] world light casting (see StencilMode)
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

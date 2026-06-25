@@ -663,6 +663,24 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
         }
     }
 
+    // SOH [Enhancement] World light casting: stencil light-volume ops (see StencilMode). Off disables the
+    // stencil test, so ordinary draws are unaffected. Applied each draw (the GL state calls are cheap);
+    // face culling is CPU-side, so a single op set covers whichever faces the mask pass draws.
+    if (mStencilMode == (int)StencilMode::Off) {
+        glDisable(GL_STENCIL_TEST);
+    } else {
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        if (mStencilMode == (int)StencilMode::Composite) {
+            glStencilFunc(GL_NOTEQUAL, 0, 0xFF);    // draw where stencil != 0
+            glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO); // self-clear as it composites
+        } else {
+            glStencilFunc(GL_ALWAYS, 0, 0xFF);
+            // z-fail count: increment/decrement where the depth test fails (dpfail)
+            glStencilOp(GL_KEEP, mStencilMode == (int)StencilMode::VolumeIncr ? GL_INCR : GL_DECR, GL_KEEP);
+        }
+    }
+
     if (mCurrentZmodeDecal != mLastZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
         if (mCurrentZmodeDecal) {

@@ -61,8 +61,9 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
     texture_desc.Height = height;
     texture_desc.MipLevels = 1;
     texture_desc.ArraySize = 1;
-    texture_desc.Format =
-        mFeatureLevel >= D3D_FEATURE_LEVEL_10_0 ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
+    // SOH [Enhancement] World light casting: use a combined depth+stencil format on ALL feature levels
+    // (previously FL>=10 was depth-only R32) so the stencil light-volume technique has a stencil plane.
+    texture_desc.Format = DXGI_FORMAT_R24G8_TYPELESS;
     texture_desc.SampleDesc.Count = msaa_count;
     texture_desc.SampleDesc.Quality = 0;
     texture_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -74,7 +75,7 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
     ThrowIfFailed(mDevice->CreateTexture2D(&texture_desc, nullptr, texture.GetAddressOf()));
 
     D3D11_DEPTH_STENCIL_VIEW_DESC view_desc;
-    view_desc.Format = mFeatureLevel >= D3D_FEATURE_LEVEL_10_0 ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D24_UNORM_S8_UINT;
+    view_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; // SOH [Enhancement] world light casting (depth+stencil)
     view_desc.Flags = 0;
     if (msaa_count > 1) {
         view_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
@@ -88,8 +89,9 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
 
     if (srv != nullptr) {
         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
-        srv_desc.Format =
-            mFeatureLevel >= D3D_FEATURE_LEVEL_10_0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        // SOH [Enhancement] World light casting: depth read view matching the R24G8 depth+stencil texture
+        // (the X8 part is the stencil byte, ignored by GetPixelDepth's compute shader).
+        srv_desc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
         srv_desc.ViewDimension = msaa_count > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
         srv_desc.Texture2D.MostDetailedMip = 0;
         srv_desc.Texture2D.MipLevels = -1;
@@ -656,9 +658,12 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
-    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
+    // SOH [Enhancement] World light casting: also rebuild when the stencil mode changes.
+    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask ||
+        mLastStencilMode != mStencilMode) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
+        mLastStencilMode = mStencilMode;
 
         mDepthStencilState.Reset();
 
@@ -671,7 +676,37 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         depth_stencil_desc.DepthFunc = mCurrentDepthTest
                                            ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
                                            : D3D11_COMPARISON_ALWAYS;
-        depth_stencil_desc.StencilEnable = false;
+
+        // SOH [Enhancement] World light casting stencil light-volume state. Off leaves the stencil
+        // disabled (rendering unchanged). The mask modes (z-fail) increment/decrement where a volume face
+        // is occluded by the scene; the composite mode draws where stencil != 0 and zeroes it as it goes
+        // (self-clearing). Front and back ops are identical because face culling is selected game-side, so
+        // only one face type is drawn per pass.
+        if (mStencilMode == (int)StencilMode::Off) {
+            depth_stencil_desc.StencilEnable = false;
+        } else {
+            depth_stencil_desc.StencilEnable = true;
+            depth_stencil_desc.StencilReadMask = 0xFF;
+            depth_stencil_desc.StencilWriteMask = 0xFF;
+
+            D3D11_DEPTH_STENCILOP_DESC op;
+            op.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+            if (mStencilMode == (int)StencilMode::VolumeIncr) {
+                op.StencilDepthFailOp = D3D11_STENCIL_OP_INCR_SAT;
+                op.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+                op.StencilFunc = D3D11_COMPARISON_ALWAYS;
+            } else if (mStencilMode == (int)StencilMode::VolumeDecr) {
+                op.StencilDepthFailOp = D3D11_STENCIL_OP_DECR_SAT;
+                op.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+                op.StencilFunc = D3D11_COMPARISON_ALWAYS;
+            } else { // Composite: draw where stencil != ref(0), zeroing it
+                op.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                op.StencilPassOp = D3D11_STENCIL_OP_ZERO;
+                op.StencilFunc = D3D11_COMPARISON_NOT_EQUAL;
+            }
+            depth_stencil_desc.FrontFace = op;
+            depth_stencil_desc.BackFace = op;
+        }
 
         ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
         mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
