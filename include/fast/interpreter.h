@@ -220,6 +220,9 @@ struct LoadedVertex {
     uint8_t clip_rej;
     // SOH [Enhancement] World-space vertex normal, forwarded to the fragment shader for toon lighting.
     float nx, ny, nz;
+    // SOH [Enhancement] World-space vertex position (object x modelview, camera lives in the projection
+    // matrix). Captured for the actor-shadow pass so geometry can be flattened onto the ground plane.
+    float wx, wy, wz;
 };
 
 struct RawTexMetadata {
@@ -264,6 +267,14 @@ struct RSP {
     bool toon_key_valid;
     float toon_key_dir[3];
     float toon_key_color[3];
+
+    // SOH [Enhancement] Actor shadow: per-object floor plane (the actual tilted floor polygon the object
+    // is flattened onto, as unit normal xyz + plane constant d, world space) supplied by gSPToonShadow,
+    // and the eased key direction snapshotted when the object armed. The snapshot — not the live
+    // toon_key_dir, which the next object overwrites before this object's deferred shadow flush — keeps
+    // the drop shadow on the same light the cel shading uses.
+    float toon_shadow_plane[4]; // nx, ny, nz, d  (N.P + d = 0); a zero normal means "no shadow this object"
+    float toon_shadow_dir[3];   // key direction captured at arm time, used by the deferred shadow flush
 
     uint32_t geometry_mode;
     int16_t fog_mul, fog_offset;
@@ -317,7 +328,8 @@ struct RDP {
     uint32_t other_mode_l, other_mode_h;
     uint64_t combine_mode;
     bool grayscale;
-    bool toon; // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
+    bool toon;        // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
+    bool toon_shadow; // SOH [Enhancement] actor shadow armed for the current object (set by gSPToonShadow)
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
@@ -387,6 +399,16 @@ class Interpreter {
     void Destroy();
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY);
     GfxRenderingAPI* GetCurrentRenderingAPI();
+    // SOH [Enhancement] Actor shadow: global look tuning pushed once per frame by the game. alpha is the
+    // core blend strength; minElevation is the floor the key's height-above-the-floor is remapped into
+    // (higher = the light is forced steeper = shorter shadows); taps is the number of accumulation passes
+    // for the soft penumbra; softness scales the per-tap ground offset.
+    void SetToonShadowParams(float alpha, float minElevation, int taps, float softness) {
+        mToonShadowAlpha = alpha;
+        mToonShadowMinElevation = minElevation;
+        mShadowTaps = taps;
+        mToonShadowSoftness = softness;
+    }
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
@@ -437,6 +459,12 @@ class Interpreter {
     // SOH [Enhancement] Toon lighting: pick the single dominant light for the current object and
     // cache its world-space direction / color / ambient in the RSP for the fragment shader.
     void SelectToonLight();
+
+    // SOH [Enhancement] Actor shadow: project the current object's captured world-space triangles onto
+    // its ground plane along the toon key direction and draw them as flat translucent geometry (reuses
+    // the standard SHADE combine + XLU decal path), accumulated over several offset taps for a soft edge.
+    // Called at each per-object boundary.
+    void FlushToonShadow();
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
@@ -523,6 +551,14 @@ class Interpreter {
     float* mBufVbo; // 3 vertices in a triangle and 32 floats per vtx
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
+    // SOH [Enhancement] Actor shadow: world-space positions of the current object's triangles (9 floats
+    // per tri), accumulated as the object draws and drained by FlushToonShadow at each object boundary.
+    std::vector<float> mShadowVerts;
+    float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
+    float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
+    float mToonShadowSoftness = 0.4f;     // scales the per-tap ground-plane offset (penumbra width)
+    int mShadowTaps = 4;               // accumulation taps for the soft penumbra (1 = hard edge)
+    int mStencilRefCounter = 0;        // cycles 1..255 per shadow tap for single-layer stencil masking
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

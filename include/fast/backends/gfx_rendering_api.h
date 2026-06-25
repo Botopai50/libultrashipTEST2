@@ -26,6 +26,11 @@ enum class StencilMode {
     VolumeIncr = 1, // mask: stencil += 1 where a volume face fails the depth test (z-fail)
     VolumeDecr = 2, // mask: stencil -= 1 where a volume face fails the depth test (z-fail)
     Composite = 3,  // draw where stencil != 0, zeroing it as it goes (self-clearing composite)
+    // SOH [Enhancement] Actor shadows: single-layer "paint once per tap" mask. A fragment passes only
+    // where the stored stencil is below the per-draw ref, then writes the ref. With a fresh, increasing
+    // ref per shadow tap this paints each pixel exactly once per tap (overlapping limbs don't blotch),
+    // while each successive tap (higher ref) re-passes and adds one accumulation layer (soft penumbra).
+    ShadowMask = 4,
 };
 
 // A hash function used to hash a: pair<float, float>
@@ -110,11 +115,14 @@ class GfxRenderingAPI {
         mToonDebug = debug;
     }
 
-    // SOH [Enhancement] World light casting: the interpreter pushes the current stencil mode here when a
-    // gSPStencil command is seen; backends read mStencilMode in their per-draw path to drive the stencil
-    // light-volume technique. Off (0) is normal rendering, so ordinary draws are unaffected.
-    virtual void SetStencilMode(int mode) {
+    // SOH [Enhancement] World light casting / actor shadows: the interpreter pushes the current stencil
+    // mode here when a gSPStencil command is seen, or directly from FlushToonShadow; backends read
+    // mStencilMode in their per-draw path. Off (0) is normal rendering, so ordinary draws are unaffected.
+    // ref is only consumed by the ShadowMask mode (the per-tap reference value); the volume modes compare
+    // against a constant 0 and ignore it, so the default keeps existing call sites unchanged.
+    virtual void SetStencilMode(int mode, int ref = 0) {
         mStencilMode = mode;
+        mStencilRef = ref;
     }
 
   protected:
@@ -127,6 +135,7 @@ class GfxRenderingAPI {
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
     int mStencilMode = 0; // SOH [Enhancement] world light casting (see StencilMode)
+    int mStencilRef = 0;  // SOH [Enhancement] actor shadows: per-tap reference value for ShadowMask
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

@@ -699,6 +699,12 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                 op.StencilDepthFailOp = D3D11_STENCIL_OP_DECR_SAT;
                 op.StencilPassOp = D3D11_STENCIL_OP_KEEP;
                 op.StencilFunc = D3D11_COMPARISON_ALWAYS;
+            } else if (mStencilMode == (int)StencilMode::ShadowMask) {
+                // SOH [Enhancement] Actor shadows: pass where stored < ref, then write ref. The per-tap
+                // ref itself is applied via OMSetDepthStencilState below, every draw (see note).
+                op.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+                op.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+                op.StencilFunc = D3D11_COMPARISON_GREATER;
             } else { // Composite: draw where stencil != ref(0), zeroing it
                 op.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
                 op.StencilPassOp = D3D11_STENCIL_OP_ZERO;
@@ -709,7 +715,14 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         }
 
         ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
-        mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
+        mContext->OMSetDepthStencilState(mDepthStencilState.Get(), mStencilRef);
+    }
+
+    // SOH [Enhancement] Actor shadows: the ShadowMask reference value changes per tap while the mode stays
+    // ShadowMask, so the state-object rebuild guard above does not fire between taps. Re-bind the existing
+    // state with the live ref every draw so each tap masks/accumulates against its own reference.
+    if (mStencilMode == (int)StencilMode::ShadowMask) {
+        mContext->OMSetDepthStencilState(mDepthStencilState.Get(), mStencilRef);
     }
 
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
@@ -985,7 +998,11 @@ void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
         mContext->ClearRenderTargetView(fb.render_target_view.Get(), clearColor);
     }
     if (depth && fb.has_depth_buffer) {
-        mContext->ClearDepthStencilView(fb.depth_stencil_view.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+        // SOH [Enhancement] Actor shadows: also clear the stencil plane (the combined D24S8 format always
+        // has one). The ShadowMask GREATER-compare assumes stencil starts at 0 each frame; the volume
+        // modes self-zero, but the shadow mask does not, so it genuinely needs this.
+        mContext->ClearDepthStencilView(fb.depth_stencil_view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+                                        1.0f, 0);
     }
 }
 

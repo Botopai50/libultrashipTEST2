@@ -1398,14 +1398,23 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // in the same frame as the world-space key, so the single uniform is correct for all limbs.
             // (object->world uses the same row-vector convention as the position transform above; the
             // shader renormalizes, so uniform limb scale is harmless.)
-            if (mRdp->toon) {
+            if (mRdp->toon || mRdp->toon_shadow) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-                d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
-                d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
-                d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
-                d->color.r = 255;
-                d->color.g = 255;
-                d->color.b = 255;
+                // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
+                // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
+                // projection matrix, so world pos x P_matrix later yields clip space. Computed whenever the
+                // shadow is armed, so shadows work even when the cel relight (mRdp->toon) is off.
+                d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+                d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+                d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+                if (mRdp->toon) {
+                    d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
+                    d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
+                    d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
+                    d->color.r = 255;
+                    d->color.g = 255;
+                    d->color.b = 255;
+                }
             }
 
             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
@@ -1508,6 +1517,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
     struct LoadedVertex* v_arr[3] = { v1, v2, v3 };
+
+    // SOH [Enhancement] Actor shadow: while the shadow pass is armed for this object, record its world-space
+    // triangles here (before any culling, so the whole silhouette is captured). FlushToonShadow drains them
+    // at the object boundary. is_rect screen-space quads (UI) have no world position, so skip them. The
+    // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
+    // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
+    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
+        for (int si = 0; si < 3; si++) {
+            mShadowVerts.push_back(v_arr[si]->wx);
+            mShadowVerts.push_back(v_arr[si]->wy);
+            mShadowVerts.push_back(v_arr[si]->wz);
+        }
+    }
 
     // if (rand()%2) return;
 
@@ -2357,6 +2379,194 @@ static inline uint32_t color_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
 
 static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     return (a & 7) | ((b & 7) << 3) | ((c & 7) << 6) | ((d & 7) << 9);
+}
+
+// SOH [Enhancement] Actor shadow: draw the current object's drop shadow. The object's world-space triangles
+// (captured in GfxSpTri1) are projected along the eased toon key direction onto the actor's floor polygon
+// (so it follows slopes), then transformed by the projection matrix (which carries the camera) into clip
+// space and drawn as flat translucent decal geometry. The silhouette is drawn over several taps offset
+// slightly in the ground plane and accumulated, so the edge feathers into a soft penumbra; a per-tap
+// single-layer stencil mask (ShadowMask) makes each tap darken every covered pixel exactly once, so
+// overlapping limbs don't stack into darker seams within a tap. Defined here so color_comb/alpha_comb are
+// in scope.
+void Interpreter::FlushToonShadow() {
+    const size_t floatCount = mShadowVerts.size();
+    const float nx = mRsp->toon_shadow_plane[0];
+    const float ny = mRsp->toon_shadow_plane[1];
+    const float nz = mRsp->toon_shadow_plane[2];
+    const float planeD = mRsp->toon_shadow_plane[3];
+    // No geometry, no floor (zero normal), or fully transparent => nothing to draw.
+    if (floatCount < 9 || mToonShadowAlpha <= 0.0f || ((nx * nx) + (ny * ny) + (nz * nz)) < 0.001f) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    // Direction toward the (snapshotted) key light. Reusing the eased toon key keeps the shadow's azimuth in
+    // lockstep with the cel shading.
+    float lx = mRsp->toon_shadow_dir[0], ly = mRsp->toon_shadow_dir[1], lz = mRsp->toon_shadow_dir[2];
+    const float llen = sqrtf((lx * lx) + (ly * ly) + (lz * lz));
+    if (llen < 0.001f) {
+        mShadowVerts.clear();
+        return;
+    }
+    lx /= llen, ly /= llen, lz /= llen;
+
+    // Raise the light's elevation above the floor before projecting, so a low key can't cast a runaway
+    // shadow. The key's height above the floor plane (L.N: 1 = straight overhead, 0 = at the horizon) is
+    // remapped into [minElevation, 1] with the azimuth preserved. This (a) keeps the shadow short and roughly
+    // under the actor like the vanilla shadow, and (b) bounds the projected length so the shadow eases
+    // smoothly with the key instead of swinging/popping when the light is near-horizontal (the projected
+    // length is hypersensitive to the key's vertical component at low angles, where the s8-quantized key
+    // would otherwise snap visibly even though the cel ramp on the model looks smooth). It is a smooth linear
+    // remap (no threshold), so the easing stays continuous. minElevation comes from the Length slider.
+    const float minElev = std::clamp(mToonShadowMinElevation, 0.05f, 0.99f);
+    float lDotN = (lx * nx) + (ly * ny) + (lz * nz);
+    if (lDotN < 0.0f) {
+        lDotN = 0.0f; // light below the floor: treat as grazing, then raise to minElevation
+    }
+    const float elev = minElev + ((1.0f - minElev) * lDotN); // remapped height above the floor
+    // Horizontal (in-floor) part of the key carries the azimuth; rebuild the cast dir at the new elevation.
+    const float hx = lx - (lDotN * nx), hy = ly - (lDotN * ny), hz = lz - (lDotN * nz);
+    const float hLen = sqrtf((hx * hx) + (hy * hy) + (hz * hz));
+    float dirX, dirY, dirZ;
+    if (hLen < 0.001f) {
+        dirX = -nx, dirY = -ny, dirZ = -nz; // key effectively straight overhead: cast straight down
+    } else {
+        const float hScale = sqrtf(1.0f - (elev * elev)) / hLen; // horizontal magnitude for this elevation
+        dirX = -((elev * nx) + (hScale * hx)); // cast dir = -(elev*N + hScale*H), a unit vector into the floor
+        dirY = -((elev * ny) + (hScale * hy));
+        dirZ = -((elev * nz) + (hScale * hz));
+    }
+    // After the remap the cast dir always descends into the floor at exactly the remapped elevation.
+    const float nDotDir = -elev;
+
+    // Soft edge: N taps composite to the core opacity, so each tap blends a = 1-(1-A)^(1/N). N==1 degrades
+    // to a single hard-edged shadow at full opacity. Taps are offset around a ring in the floor's tangent
+    // plane (radius scaled by the softness control), so the union feathers without shifting the silhouette.
+    const int taps = mShadowTaps < 1 ? 1 : (mShadowTaps > 8 ? 8 : mShadowTaps);
+    const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    const float perTap = (taps <= 1) ? coreAlpha : (1.0f - powf(1.0f - coreAlpha, 1.0f / (float)taps));
+    const uint8_t alpha = (uint8_t)(perTap * 255.0f);
+    const float kShadowSoftnessScale = 8.0f; // world units of penumbra radius at softness 1.0
+    const float ringRadius = std::clamp(mToonShadowSoftness, 0.0f, 1.0f) * kShadowSoftnessScale;
+
+    // Two unit tangents spanning the floor plane (perpendicular to its normal), for the ring offsets.
+    float upx = 0.0f, upy = 1.0f, upz = 0.0f;
+    if (fabsf(ny) > 0.99f) { // floor nearly horizontal: pick a different reference axis for the cross product
+        upx = 1.0f, upy = 0.0f, upz = 0.0f;
+    }
+    float t1x = (upy * nz) - (upz * ny), t1y = (upz * nx) - (upx * nz), t1z = (upx * ny) - (upy * nx);
+    float t1len = sqrtf((t1x * t1x) + (t1y * t1y) + (t1z * t1z));
+    if (t1len < 0.001f) {
+        t1len = 1.0f;
+    }
+    t1x /= t1len, t1y /= t1len, t1z /= t1len;
+    const float t2x = (ny * t1z) - (nz * t1y), t2y = (nz * t1x) - (nx * t1z), t2z = (nx * t1y) - (ny * t1x);
+
+    // Save the render state we override, then set: flat SHADE combine, AA z-buffered translucent DECAL
+    // (depth-tested against the scene, NO depth write — sits on the ground like the vanilla shadow and never
+    // disturbs ground decals/textures), single cycle, no lighting/cull/toon/grayscale.
+    const uint64_t savedCombine = mRdp->combine_mode;
+    const uint32_t savedOtherL = mRdp->other_mode_l;
+    const uint32_t savedOtherH = mRdp->other_mode_h;
+    const uint32_t savedGeo = mRsp->geometry_mode;
+    const bool savedToon = mRdp->toon;
+    const bool savedToonShadow = mRdp->toon_shadow;
+    const bool savedGray = mRdp->grayscale;
+
+    GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_SHADE), alpha_comb(0, 0, 0, G_ACMUX_SHADE), 0, 0);
+    mRdp->other_mode_l = G_RM_AA_ZB_XLU_DECAL | G_RM_AA_ZB_XLU_DECAL2;
+    mRdp->other_mode_h = (savedOtherH & ~(3U << G_MDSFT_CYCLETYPE)) | G_CYC_1CYCLE;
+    mRsp->geometry_mode = G_ZBUFFER; // depth test on, no lighting/cull (ucode-independent value)
+    mRdp->toon = false;
+    mRdp->toon_shadow = false; // so the replayed shadow tris below are not re-captured
+    mRdp->grayscale = false;
+
+    // Project every captured triangle onto the floor plane once (with the below-floor cull), then replay the
+    // projected silhouette per tap with a small ground offset. Projecting once keeps the per-tap work to the
+    // offset + clip transform.
+    static std::vector<float> sProjected; // reused across calls to avoid per-object reallocation
+    sProjected.clear();
+    sProjected.reserve(floatCount);
+    for (size_t base = 0; base + 9 <= floatCount; base += 9) {
+        const float* wp[3] = { &mShadowVerts[base], &mShadowVerts[base + 3], &mShadowVerts[base + 6] };
+        // Signed distance of each vertex to the floor plane (N.P + d).
+        const float nv0 = (nx * wp[0][0]) + (ny * wp[0][1]) + (nz * wp[0][2]) + planeD;
+        const float nv1 = (nx * wp[1][0]) + (ny * wp[1][1]) + (nz * wp[1][2]) + planeD;
+        const float nv2 = (nx * wp[2][0]) + (ny * wp[2][1]) + (nz * wp[2][2]) + planeD;
+        // Whole triangle below the floor (e.g. Link hanging off a ledge, body beneath the floor he grabbed):
+        // projecting it would smear the shadow onto his body, so skip it.
+        if (nv0 < 0.0f && nv1 < 0.0f && nv2 < 0.0f) {
+            continue;
+        }
+        const float nvv[3] = { nv0, nv1, nv2 };
+        for (int vi = 0; vi < 3; vi++) {
+            float nv = nvv[vi];
+            if (nv < 0.0f) {
+                nv = 0.0f; // straddling vertex slightly under the floor: drop it straight down
+            }
+            const float t = -nv / nDotDir; // cast onto the plane: t = -(N.V + d) / (N.dir)
+            sProjected.push_back(wp[vi][0] + (dirX * t));
+            sProjected.push_back(wp[vi][1] + (dirY * t));
+            sProjected.push_back(wp[vi][2] + (dirZ * t));
+        }
+    }
+
+    const size_t projCount = sProjected.size();
+    for (int tap = 0; tap < taps; tap++) {
+        // Ground-plane offset for this tap (none for a single hard tap), a point on the softness ring.
+        float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+        if (taps > 1) {
+            const float ang = 6.2831853f * (float)tap / (float)taps;
+            const float c = cosf(ang) * ringRadius, s = sinf(ang) * ringRadius;
+            ox = (t1x * c) + (t2x * s);
+            oy = (t1y * c) + (t2y * s);
+            oz = (t1z * c) + (t2z * s);
+        }
+        // Fresh, increasing stencil ref per tap: each ground pixel darkens once per tap (single layer), while
+        // each higher-ref tap re-passes and adds one accumulation layer -> a soft penumbra at the edge.
+        mStencilRefCounter = (mStencilRefCounter % 255) + 1;
+        mRapi->SetStencilMode((int)StencilMode::ShadowMask, mStencilRefCounter);
+
+        for (size_t base = 0; base + 9 <= projCount; base += 9) {
+            for (int vi = 0; vi < 3; vi++) {
+                const float px = sProjected[base + vi * 3 + 0] + ox;
+                const float py = sProjected[base + vi * 3 + 1] + oy;
+                const float pz = sProjected[base + vi * 3 + 2] + oz;
+                // World -> clip via the projection matrix (camera is baked into it; see z_view.c).
+                const float cx = (px * mRsp->P_matrix[0][0]) + (py * mRsp->P_matrix[1][0]) +
+                                 (pz * mRsp->P_matrix[2][0]) + mRsp->P_matrix[3][0];
+                const float cy = (px * mRsp->P_matrix[0][1]) + (py * mRsp->P_matrix[1][1]) +
+                                 (pz * mRsp->P_matrix[2][1]) + mRsp->P_matrix[3][1];
+                const float cz = (px * mRsp->P_matrix[0][2]) + (py * mRsp->P_matrix[1][2]) +
+                                 (pz * mRsp->P_matrix[2][2]) + mRsp->P_matrix[3][2];
+                const float cw = (px * mRsp->P_matrix[0][3]) + (py * mRsp->P_matrix[1][3]) +
+                                 (pz * mRsp->P_matrix[2][3]) + mRsp->P_matrix[3][3];
+
+                LoadedVertex* d = &mRsp->loaded_vertices[MAX_VERTICES + vi];
+                d->x = AdjXForAspectRatio(cx); // GfxSpVertex applies this to ordinary verts; match it here
+                d->y = cy;                     // GfxSpTri1 applies invertY at VBO pack time
+                d->z = cz;                     // decal zmode biases this toward the camera for us
+                d->w = cw;
+                d->color.r = d->color.g = d->color.b = 0;
+                d->color.a = alpha;
+                d->clip_rej = 0;
+            }
+            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+        }
+        Flush(); // draw this tap now, while its stencil ref is still bound
+    }
+
+    mRapi->SetStencilMode((int)StencilMode::Off, 0); // back to normal stencil for subsequent geometry
+    mRdp->combine_mode = savedCombine;
+    mRdp->other_mode_l = savedOtherL;
+    mRdp->other_mode_h = savedOtherH;
+    mRsp->geometry_mode = savedGeo;
+    mRdp->toon = savedToon;
+    mRdp->toon_shadow = savedToonShadow;
+    mRdp->grayscale = savedGray;
+
+    mShadowVerts.clear();
 }
 
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -3754,6 +3964,12 @@ bool gfx_set_toon_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
+    // SOH [Enhancement] Actor shadow: draw the last object's drop shadow before the bracket toggles, then
+    // disarm the shadow pass (each object re-arms via gSPToonShadow). Run on both edges so a stale enable
+    // can never leak across the actor-loop boundary.
+    gfx->FlushToonShadow();
+    gfx->mRdp->toon_shadow = false;
+
     gfx->mRdp->toon = cmd->words.w1;
     // A fresh key must be supplied (per object) after each toon-on; clear any stale one.
     gfx->mRsp->toon_key_valid = false;
@@ -3785,6 +4001,38 @@ bool gfx_set_toon_key_handler_custom(F3DGfx** cmd0) {
     gfx->mRsp->toon_key_valid = true;
     // The key changes the effective light, so force a recompute on the next vertex.
     gfx->mRsp->lights_changed = true;
+    return false;
+}
+
+// SOH [Enhancement] Per-object actor shadow marker: the floor-plane unit normal (3x s8 / 127) and the
+// plane constant (32-bit float in w1) the object is flattened onto. The shadow is cast along the per-object
+// toon key direction, so it always agrees with the cel shading. Emitting this per object also bounds each
+// object's captured geometry: the previous object's shadow is drawn here before the plane is re-armed.
+bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+
+    gfx->FlushToonShadow();
+
+    // Floor-plane unit normal as signed bytes / 127; a zero normal disarms the shadow for this object.
+    int8_t nx = (cmd->words.w0 >> 16) & 0xFF;
+    int8_t ny = (cmd->words.w0 >> 8) & 0xFF;
+    int8_t nz = (cmd->words.w0 >> 0) & 0xFF;
+
+    float planeD;
+    uint32_t planeBits = (uint32_t)cmd->words.w1;
+    memcpy(&planeD, &planeBits, sizeof(planeD));
+
+    gfx->mRsp->toon_shadow_plane[0] = nx / 127.0f;
+    gfx->mRsp->toon_shadow_plane[1] = ny / 127.0f;
+    gfx->mRsp->toon_shadow_plane[2] = nz / 127.0f;
+    gfx->mRsp->toon_shadow_plane[3] = planeD;
+    gfx->mRdp->toon_shadow = (nx | ny | nz) != 0;
+    // Snapshot THIS object's key direction (set by the gSPToonKey just before this command) so its
+    // deferred shadow flush uses it, not whatever later object last touched toon_key_dir.
+    gfx->mRsp->toon_shadow_dir[0] = gfx->mRsp->toon_key_dir[0];
+    gfx->mRsp->toon_shadow_dir[1] = gfx->mRsp->toon_key_dir[1];
+    gfx->mRsp->toon_shadow_dir[2] = gfx->mRsp->toon_key_dir[2];
     return false;
 }
 
@@ -4191,7 +4439,9 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },                // G_SETTOON (0x41)
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },      // G_SETTOONKEY (0x4a)
-    { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } },       // G_SETSTENCIL (0x46)
+    { OTR_G_SETTOONSHADOW,
+      { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow
+    { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } }, // G_SETSTENCIL (0x46)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_LOAD_SHADER, { "G_LOAD_SHADER", gfx_set_shader_custom } },
 };
