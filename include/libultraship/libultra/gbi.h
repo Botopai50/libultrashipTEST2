@@ -2847,6 +2847,11 @@ typedef union Gfx {
         _g->words.w1 = _pd.u;                                                                      \
     }
 
+// SOH [Enhancement] Actor shadow: render the frame's accumulated shadow volumes now. Emitted at the pre-actor
+// hook (after the room, before actors) so the shadows land only on the environment. A zero normal + the
+// sentinel planeD (-1e30) tells gfx_set_toon_shadow_handler_custom to call RenderShadowVolumes().
+#define gSPToonShadowFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.0e30f)
+
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \

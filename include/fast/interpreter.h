@@ -403,11 +403,17 @@ class Interpreter {
     // core blend strength; minElevation is the floor the key's height-above-the-floor is remapped into
     // (higher = the light is forced steeper = shorter shadows); taps is the number of accumulation passes
     // for the soft penumbra; softness scales the per-tap ground offset.
-    void SetToonShadowParams(float alpha, float minElevation, int taps, float softness) {
+    void SetToonShadowParams(float alpha, float minElevation, float slabDepth, float slabRise, bool showVolume) {
         mToonShadowAlpha = alpha;
         mToonShadowMinElevation = minElevation;
-        mShadowTaps = taps;
-        mToonShadowSoftness = softness;
+        mShadowSlabDepth = slabDepth;
+        mShadowSlabRise = slabRise;
+        mShadowShowVolume = showVolume;
+    }
+    // SOH [Enhancement] Actor shadow debug: request a one-frame dump (logged from FlushToonShadow) of every
+    // shadow's plane / captured geometry / projected geometry, so the bad cases can be diagnosed off-device.
+    void RequestShadowDump() {
+        mShadowDumpRequest = true;
     }
     void StartFrame();
     void RunGuiOnly();
@@ -463,8 +469,12 @@ class Interpreter {
     // SOH [Enhancement] Actor shadow: project the current object's captured world-space triangles onto
     // its ground plane along the toon key direction and draw them as flat translucent geometry (reuses
     // the standard SHADE combine + XLU decal path), accumulated over several offset taps for a soft edge.
-    // Called at each per-object boundary.
+    // Called at each per-object boundary; builds the object's shadow volume and accumulates it for the frame.
     void FlushToonShadow();
+    // SOH [Enhancement] Actor shadow: draw all volumes accumulated this frame (batched z-fail stencil +
+    // composite), then clear them. Called once per frame at the pre-actor hook so shadows fall only on the
+    // environment (no self-shadow / no shadowing other actors).
+    void RenderShadowVolumes();
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
@@ -554,11 +564,19 @@ class Interpreter {
     // SOH [Enhancement] Actor shadow: world-space positions of the current object's triangles (9 floats
     // per tri), accumulated as the object draws and drained by FlushToonShadow at each object boundary.
     std::vector<float> mShadowVerts;
+    // SOH [Enhancement] Actor shadow: all shadow-volume triangles built this frame (9 floats/tri, outward
+    // wound), drained by RenderShadowVolumes() at the pre-actor hook so shadows fall only on the environment.
+    std::vector<float> mShadowVolumeAccum;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.4f;     // scales the per-tap ground-plane offset (penumbra width)
     int mShadowTaps = 4;               // accumulation taps for the soft penumbra (1 = hard edge)
     int mStencilRefCounter = 0;        // cycles 1..255 per shadow tap for single-layer stencil masking
+    float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
+    float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
+    bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
+    bool mShadowDumpRequest = false;   // debug: set by RequestShadowDump(); armed for one frame in Run()
+    bool mShadowDumpActive = false;    // debug: true for the whole frame after a request; FlushToonShadow logs
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
