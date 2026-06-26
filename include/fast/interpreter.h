@@ -410,11 +410,6 @@ class Interpreter {
         mShadowSlabRise = slabRise;
         mShadowShowVolume = showVolume;
     }
-    // SOH [Enhancement] Actor shadow debug: request a one-frame dump (logged from FlushToonShadow) of every
-    // shadow's plane / captured geometry / projected geometry, so the bad cases can be diagnosed off-device.
-    void RequestShadowDump() {
-        mShadowDumpRequest = true;
-    }
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
@@ -567,6 +562,7 @@ class Interpreter {
     // SOH [Enhancement] Actor shadow: all shadow-volume triangles built this frame (9 floats/tri, outward
     // wound), drained by RenderShadowVolumes() at the pre-actor hook so shadows fall only on the environment.
     std::vector<float> mShadowVolumeAccum;
+    std::vector<uint8_t> mShadowVolumeKind; // per accumulated tri: 0 = cap, 1 = wall (for the debug volume view)
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.4f;     // scales the per-tap ground-plane offset (penumbra width)
@@ -575,8 +571,6 @@ class Interpreter {
     float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
     float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
     bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
-    bool mShadowDumpRequest = false;   // debug: set by RequestShadowDump(); armed for one frame in Run()
-    bool mShadowDumpActive = false;    // debug: true for the whole frame after a request; FlushToonShadow logs
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

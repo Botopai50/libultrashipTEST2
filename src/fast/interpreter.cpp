@@ -2400,11 +2400,23 @@ void Interpreter::FlushToonShadow() {
         return;
     }
 
-    // Feet level = the lowest captured vertex (the real rendered feet, not the unreliable collision floor).
-    float minY = 1e30f;
-    for (size_t i = 1; i < floatCount; i += 3) {
-        minY = std::min(minY, mShadowVerts[i]);
+    // Eased size scale (0..1) the game pushes via the plane constant, so the shadow grows in / shrinks out
+    // instead of popping. At ~0 there's nothing to draw.
+    const float sizeScale = std::clamp(mRsp->toon_shadow_plane[3], 0.0f, 1.0f);
+    if (sizeScale <= 0.01f) {
+        mShadowVerts.clear();
+        return;
     }
+
+    // Feet level = the lowest captured vertex (the real rendered feet, not the unreliable collision floor); the
+    // XZ centroid is the point the footprint shrinks toward when sizeScale < 1.
+    float minY = 1e30f, sumX = 0.0f, sumZ = 0.0f;
+    size_t vertN = 0;
+    for (size_t i = 0; i + 3 <= floatCount; i += 3) {
+        sumX += mShadowVerts[i], minY = std::min(minY, mShadowVerts[i + 1]), sumZ += mShadowVerts[i + 2];
+        vertN++;
+    }
+    const float cenX = sumX / (float)vertN, cenZ = sumZ / (float)vertN;
     const float slabTop = minY + mShadowSlabRise;                     // above the feet (uphill ground)
     const float slabBottom = minY - std::max(5.0f, mShadowSlabDepth); // below the feet (downhill / cliffs)
 
@@ -2439,8 +2451,9 @@ void Interpreter::FlushToonShadow() {
         oz = vz + (dirZ * t);
     };
 
-    // Append outward-wound world-space triangles (8 per prism: 2 caps + 3 walls) to the frame accumulator.
-    auto pushOutward = [&](const float* p0, const float* p1, const float* p2, float ccx, float ccy, float ccz) {
+    // Append one outward-wound world-space triangle to the frame accumulator, tagged cap(0) / wall(1).
+    auto pushTri = [&](const float* p0, const float* p1, const float* p2, float ccx, float ccy, float ccz,
+                       uint8_t kind) {
         const float ux = p1[0] - p0[0], uy = p1[1] - p0[1], uz = p1[2] - p0[2];
         const float vx = p2[0] - p0[0], vy = p2[1] - p0[1], vz = p2[2] - p0[2];
         const float nX = (uy * vz) - (uz * vy), nY = (uz * vx) - (ux * vz), nZ = (ux * vy) - (uy * vx);
@@ -2453,14 +2466,23 @@ void Interpreter::FlushToonShadow() {
         mShadowVolumeAccum.push_back(p0[0]), mShadowVolumeAccum.push_back(p0[1]), mShadowVolumeAccum.push_back(p0[2]);
         mShadowVolumeAccum.push_back(q1[0]), mShadowVolumeAccum.push_back(q1[1]), mShadowVolumeAccum.push_back(q1[2]);
         mShadowVolumeAccum.push_back(q2[0]), mShadowVolumeAccum.push_back(q2[1]), mShadowVolumeAccum.push_back(q2[2]);
+        mShadowVolumeKind.push_back(kind);
     };
 
-    const size_t startTris = mShadowVolumeAccum.size() / 9;
+    // Each captured triangle becomes its OWN closed prism (2 caps + 3 walls = 8 tris). This is robust on OoT's
+    // unwelded "triangle soup" meshes (a silhouette-edge optimization that drops interior walls needs shared
+    // edges, which these meshes don't reliably have, so it shattered the shape). The per-prism z-fail counts
+    // still compose into the union (the footprint).
     for (size_t base = 0; base + 9 <= floatCount; base += 9) {
         float ax, az, bx, bz, cx, cz;
         projectXZ(mShadowVerts[base + 0], mShadowVerts[base + 1], mShadowVerts[base + 2], ax, az);
         projectXZ(mShadowVerts[base + 3], mShadowVerts[base + 4], mShadowVerts[base + 5], bx, bz);
         projectXZ(mShadowVerts[base + 6], mShadowVerts[base + 7], mShadowVerts[base + 8], cx, cz);
+        if (sizeScale < 1.0f) { // shrink the footprint toward its centroid for the size fade
+            ax = cenX + (ax - cenX) * sizeScale, az = cenZ + (az - cenZ) * sizeScale;
+            bx = cenX + (bx - cenX) * sizeScale, bz = cenZ + (bz - cenZ) * sizeScale;
+            cx = cenX + (cx - cenX) * sizeScale, cz = cenZ + (cz - cenZ) * sizeScale;
+        }
         const float area = ((bx - ax) * (cz - az)) - ((cx - ax) * (bz - az));
         if (fabsf(area) < 0.01f) {
             continue;
@@ -2468,23 +2490,16 @@ void Interpreter::FlushToonShadow() {
         const float tA[3] = { ax, slabTop, az }, tB[3] = { bx, slabTop, bz }, tC[3] = { cx, slabTop, cz };
         const float bA[3] = { ax, slabBottom, az }, bB[3] = { bx, slabBottom, bz }, bC[3] = { cx, slabBottom, cz };
         const float ccx = (ax + bx + cx) / 3.0f, ccy = (slabTop + slabBottom) * 0.5f, ccz = (az + bz + cz) / 3.0f;
-        pushOutward(tA, tB, tC, ccx, ccy, ccz);
-        pushOutward(bA, bB, bC, ccx, ccy, ccz);
-        pushOutward(tA, tB, bB, ccx, ccy, ccz), pushOutward(tA, bB, bA, ccx, ccy, ccz);
-        pushOutward(tB, tC, bC, ccx, ccy, ccz), pushOutward(tB, bC, bB, ccx, ccy, ccz);
-        pushOutward(tC, tA, bA, ccx, ccy, ccz), pushOutward(tC, bA, bC, ccx, ccy, ccz);
-    }
-
-    if (mShadowDumpActive) {
-        SPDLOG_ERROR("[SHADOW DUMP] captured tris={} +volume tris={} feetY={:.1f} slab[{:.1f},{:.1f}] "
-                     "dir=({:.2f},{:.2f},{:.2f})",
-                     floatCount / 9, (mShadowVolumeAccum.size() / 9) - startTris, minY, slabBottom, slabTop, dirX,
-                     dirY, dirZ);
+        pushTri(tA, tB, tC, ccx, ccy, ccz, 0); // top cap
+        pushTri(bA, bB, bC, ccx, ccy, ccz, 0); // bottom cap
+        pushTri(tA, tB, bB, ccx, ccy, ccz, 1), pushTri(tA, bB, bA, ccx, ccy, ccz, 1); // wall a-b
+        pushTri(tB, tC, bC, ccx, ccy, ccz, 1), pushTri(tB, bC, bB, ccx, ccy, ccz, 1); // wall b-c
+        pushTri(tC, tA, bA, ccx, ccy, ccz, 1), pushTri(tC, bA, bC, ccx, ccy, ccz, 1); // wall c-a
     }
 
     // Safety cap: if the per-frame render hook somehow isn't draining the accumulator, don't grow unbounded.
     if (mShadowVolumeAccum.size() > 8u * 1024u * 1024u) {
-        mShadowVolumeAccum.clear();
+        mShadowVolumeAccum.clear(), mShadowVolumeKind.clear();
     }
     mShadowVerts.clear();
 }
@@ -2496,7 +2511,7 @@ void Interpreter::RenderShadowVolumes() {
     const std::vector<float>& vol = mShadowVolumeAccum;
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (vol.size() < 9 || coreAlpha <= 0.0f) {
-        mShadowVolumeAccum.clear();
+        mShadowVolumeAccum.clear(), mShadowVolumeKind.clear();
         return;
     }
 
@@ -2518,6 +2533,10 @@ void Interpreter::RenderShadowVolumes() {
     const uint32_t cullFront = get_attr(CULL_FRONT);
     const uint32_t cullBack = get_attr(CULL_BACK);
 
+    // Soft edge: render the volume `samples` times at small ring offsets in the ground plane, compositing each
+    // Hard edge: one z-fail mask pass + one composite. (Softening would mean re-marking the volume at offsets,
+    // which costs a full extra volume render per sample — too expensive, so it was removed.)
+    const uint8_t coreA = (uint8_t)(coreAlpha * 255.0f);
     auto setVert = [&](int s, float wx, float wy, float wz) {
         LoadedVertex* d = &mRsp->loaded_vertices[MAX_VERTICES + s];
         d->x = AdjXForAspectRatio((wx * mRsp->P_matrix[0][0]) + (wy * mRsp->P_matrix[1][0]) +
@@ -2544,20 +2563,18 @@ void Interpreter::RenderShadowVolumes() {
     // z-fail mask: back faces increment, front faces decrement -> stencil != 0 where the ground is inside.
     mRdp->prim_color = { 0, 0, 0, 0 };
     mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2;
-
     mRsp->geometry_mode = G_ZBUFFER | cullFront;
     Flush();
     mRapi->SetStencilMode((int)StencilMode::VolumeIncr);
     drawVolume();
     Flush();
-
     mRsp->geometry_mode = G_ZBUFFER | cullBack;
     mRapi->SetStencilMode((int)StencilMode::VolumeDecr);
     drawVolume();
     Flush();
 
-    // composite: darken the marked ground pixels (self-clearing); full-screen clip-space quad, no depth.
-    mRdp->prim_color = { 0, 0, 0, (uint8_t)(coreAlpha * 255.0f) };
+    // composite (self-clearing); full-screen clip-space quad, no depth test.
+    mRdp->prim_color = { 0, 0, 0, coreA };
     mRdp->other_mode_l = G_RM_AA_XLU_SURF | G_RM_AA_XLU_SURF2;
     mRsp->geometry_mode = 0;
     mRapi->SetStencilMode((int)StencilMode::Composite);
@@ -2584,7 +2601,7 @@ void Interpreter::RenderShadowVolumes() {
             mRdp->prim_color = (batch == 0) ? RGBA{ 0, 0, 0, 128 } : RGBA{ 40, 90, 255, 128 };
             size_t triIdx = 0;
             for (size_t i = 0; i + 9 <= vol.size(); i += 9, triIdx++) {
-                const bool isCap = (triIdx % 8) < 2;
+                const bool isCap = triIdx < mShadowVolumeKind.size() && mShadowVolumeKind[triIdx] == 0;
                 if (isCap != (batch == 0)) {
                     continue;
                 }
@@ -2608,6 +2625,7 @@ void Interpreter::RenderShadowVolumes() {
     mRdp->grayscale = savedGray;
 
     mShadowVolumeAccum.clear();
+    mShadowVolumeKind.clear();
 }
 
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -4869,9 +4887,6 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
-    // SOH [Enhancement] Actor shadow debug: a dump request arms logging for this whole frame, then auto-clears.
-    mShadowDumpActive = mShadowDumpRequest;
-    mShadowDumpRequest = false;
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
