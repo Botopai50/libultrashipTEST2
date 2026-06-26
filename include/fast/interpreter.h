@@ -273,8 +273,8 @@ struct RSP {
     // and the eased key direction snapshotted when the object armed. The snapshot — not the live
     // toon_key_dir, which the next object overwrites before this object's deferred shadow flush — keeps
     // the drop shadow on the same light the cel shading uses.
-    float toon_shadow_plane[4]; // nx, ny, nz, d  (N.P + d = 0); a zero normal means "no shadow this object"
-    float toon_shadow_dir[3];   // key direction captured at arm time, used by the deferred shadow flush
+    float toon_shadow_size;   // eased 0..1 drop-shadow size for this object (carried in the arm command's w1)
+    float toon_shadow_dir[3]; // key direction captured at arm time, used by the deferred shadow flush
 
     uint32_t geometry_mode;
     int16_t fog_mul, fog_offset;
@@ -562,12 +562,12 @@ class Interpreter {
     // SOH [Enhancement] Actor shadow: all shadow-volume triangles built this frame (9 floats/tri, outward
     // wound), drained by RenderShadowVolumes() at the pre-actor hook so shadows fall only on the environment.
     std::vector<float> mShadowVolumeAccum;
-    std::vector<uint8_t> mShadowVolumeKind; // per accumulated tri: 0 = cap, 1 = wall (for the debug volume view)
+    std::vector<uint8_t> mShadowVolumeKind; // per accumulated tri: 0 = cap, 1 = wall (only filled for the debug view)
+    // Clip-space transform of mShadowVolumeAccum, computed once per frame in RenderShadowVolumes so the two
+    // stencil passes (and the debug overlay) reuse it instead of re-running the projection per pass.
+    std::vector<LoadedVertex> mShadowXform;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
-    float mToonShadowSoftness = 0.4f;     // scales the per-tap ground-plane offset (penumbra width)
-    int mShadowTaps = 4;               // accumulation taps for the soft penumbra (1 = hard edge)
-    int mStencilRefCounter = 0;        // cycles 1..255 per shadow tap for single-layer stencil masking
     float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
     float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
     bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
