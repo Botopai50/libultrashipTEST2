@@ -2393,9 +2393,8 @@ static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
 // Each projected triangle becomes its own closed prism with per-face OUTWARD winding (so the z-fail increment
 // hits the right faces despite the clamp-at-0 ops); the per-prism counts compose into the union (the footprint).
 void Interpreter::FlushToonShadow() {
-    const size_t floatCount = mShadowVerts.size();
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
-    if (floatCount < 9 || coreAlpha <= 0.0f) {
+    if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
         mShadowVerts.clear();
         return;
     }
@@ -2407,6 +2406,8 @@ void Interpreter::FlushToonShadow() {
         mShadowVerts.clear();
         return;
     }
+
+    const size_t floatCount = mShadowVerts.size();
 
     // Feet level = the lowest captured vertex (the real rendered feet, not the unreliable collision floor); the
     // XZ centroid is the point the footprint shrinks toward when sizeScale < 1.
@@ -2471,10 +2472,9 @@ void Interpreter::FlushToonShadow() {
         }
     };
 
-    // Each captured triangle becomes its OWN closed prism (2 caps + 3 walls = 8 tris). This is robust on OoT's
-    // unwelded "triangle soup" meshes (a silhouette-edge optimization that drops interior walls needs shared
-    // edges, which these meshes don't reliably have, so it shattered the shape). The per-prism z-fail counts
-    // still compose into the union (the footprint).
+    // Each captured triangle becomes its OWN closed prism (2 caps + 3 walls = 8 tris). Robust on OoT's unwelded
+    // "triangle soup" meshes (a silhouette-edge optimization that drops interior walls needs shared edges, which
+    // these meshes don't reliably have); the per-prism z-fail counts compose into the union (the footprint).
     for (size_t base = 0; base + 9 <= floatCount; base += 9) {
         float ax, az, bx, bz, cx, cz;
         projectXZ(mShadowVerts[base + 0], mShadowVerts[base + 1], mShadowVerts[base + 2], ax, az);
@@ -2558,31 +2558,118 @@ void Interpreter::RenderShadowVolumes() {
         d.u = d.v = 0;
         d.clip_rej = 0;
     }
+
     // Copy triangle t's three cached verts into the scratch slots GfxSpTri1 reads.
     auto loadTri = [&](size_t t) {
         mRsp->loaded_vertices[MAX_VERTICES + 0] = mShadowXform[t * 3 + 0];
         mRsp->loaded_vertices[MAX_VERTICES + 1] = mShadowXform[t * 3 + 1];
         mRsp->loaded_vertices[MAX_VERTICES + 2] = mShadowXform[t * 3 + 2];
     };
-    auto drawVolume = [&]() {
-        for (size_t t = 0; (t * 3) + 3 <= vertCount; t++) {
-            loadTri(t);
-            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+    const size_t triTotal = vertCount / 3;
+    const uint32_t cullBoth = get_attr(CULL_BOTH);
+    const GfxClipParameters clip = mRapi->GetClipParameters();
+
+    // Shared mask render state (both z-fail passes): flat transparent black, depth-tested XLU.
+    mRdp->prim_color = { 0, 0, 0, 0 };
+    mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2;
+
+    // SOH [Enhancement] Actor shadow: batched volume submission. The volume is thousands of identical-state
+    // triangles; routing each through GfxSpTri1 repays the full combiner/shader/mode resolution per triangle —
+    // the measured CPU bottleneck. Instead, resolve+load all render state ONCE (draw a single triangle through
+    // the normal path with culling off, then discard it — nothing is submitted because its state-change Flushes
+    // fire on an empty buffer and we zero the buffer afterward), learn the exact per-vertex VBO layout from what
+    // it wrote, and fill the vertex buffer directly for the rest. We still software-cull per the active
+    // geometry_mode so the two z-fail passes keep the right faces. mBufVbo is backend-agnostic, so this single
+    // interpreter-side change is correct on all three backends.
+    size_t shadowStride = 0;                            // floats per vertex (0 = layout unexpected -> fallback)
+    float shadowColorBlock[VBO_MAX_FLOATS_PER_VERTEX];  // constant non-position vertex data (the flat prim color)
+    {
+        const uint32_t geoSaved = mRsp->geometry_mode;
+        mRsp->geometry_mode = G_ZBUFFER; // no cull -> GfxSpTri1 runs its full setup for this triangle
+        Flush();
+        loadTri(0);
+        GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+        mRsp->geometry_mode = geoSaved;
+        const size_t stride = (mBufVboNumTris > 0) ? (mBufVboLen / 3) : 0;
+        if (stride > 4 && stride <= VBO_MAX_FLOATS_PER_VERTEX) {
+            for (size_t f = 4; f < stride; f++) {
+                shadowColorBlock[f] = mBufVbo[f]; // vertex 0's data past the 4 position floats (x,y,z,w)
+            }
+            shadowStride = stride;
         }
+        mBufVboLen = 0, mBufVboNumTris = 0; // discard the setup triangle (it is re-drawn, culled, in the passes)
+    }
+
+    auto appendShadowVert = [&](const LoadedVertex& v) {
+        float z = v.z;
+        if (clip.z_is_from_0_to_1) {
+            z = (z + v.w) / 2.0f;
+        }
+        mBufVbo[mBufVboLen++] = v.x;
+        mBufVbo[mBufVboLen++] = clip.invertY ? -v.y : v.y;
+        mBufVbo[mBufVboLen++] = z;
+        mBufVbo[mBufVboLen++] = v.w;
+        for (size_t f = 4; f < shadowStride; f++) {
+            mBufVbo[mBufVboLen++] = shadowColorBlock[f];
+        }
+    };
+    // Software backface cull, identical to GfxSpTri1's, so each pass keeps the same faces it did per-triangle.
+    auto faceCulled = [&](const LoadedVertex& v1, const LoadedVertex& v2, const LoadedVertex& v3) -> bool {
+        const uint32_t cullType = mRsp->geometry_mode & cullBoth;
+        if (cullType == 0) {
+            return false;
+        }
+        const float dx1 = (v1.x / v1.w) - (v2.x / v2.w), dy1 = (v1.y / v1.w) - (v2.y / v2.w);
+        const float dx2 = (v3.x / v3.w) - (v2.x / v2.w), dy2 = (v3.y / v3.w) - (v2.y / v2.w);
+        float cross = (dx1 * dy2) - (dy1 * dx2);
+        if ((v1.w < 0) ^ (v2.w < 0) ^ (v3.w < 0)) {
+            cross = -cross;
+        }
+        if (ucode_handler_index == UcodeHandlers::ucode_f3dex2 &&
+            (mRsp->extra_geometry_mode & G_EX_INVERT_CULLING) == 1) {
+            cross = -cross;
+        }
+        if (cullType == cullFront) {
+            return cross <= 0;
+        }
+        if (cullType == cullBack) {
+            return cross >= 0;
+        }
+        return true; // cull_both
+    };
+    // Fill + submit the whole volume for the current pass: fast direct-write path, or the per-triangle GfxSpTri1
+    // fallback if the captured layout was unexpected (shadowStride == 0).
+    auto drawVolume = [&]() {
+        if (shadowStride == 0) {
+            for (size_t t = 0; t < triTotal; t++) {
+                loadTri(t);
+                GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+            }
+        } else {
+            for (size_t t = 0; t < triTotal; t++) {
+                const LoadedVertex& a = mShadowXform[t * 3 + 0];
+                const LoadedVertex& b = mShadowXform[t * 3 + 1];
+                const LoadedVertex& c = mShadowXform[t * 3 + 2];
+                if (faceCulled(a, b, c)) {
+                    continue;
+                }
+                appendShadowVert(a), appendShadowVert(b), appendShadowVert(c);
+                if (++mBufVboNumTris == MAX_TRI_BUFFER) {
+                    Flush();
+                }
+            }
+        }
+        Flush();
     };
 
     // z-fail mask: back faces increment, front faces decrement -> stencil != 0 where the ground is inside.
-    mRdp->prim_color = { 0, 0, 0, 0 };
-    mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2;
     mRsp->geometry_mode = G_ZBUFFER | cullFront;
     Flush();
     mRapi->SetStencilMode((int)StencilMode::VolumeIncr);
     drawVolume();
-    Flush();
     mRsp->geometry_mode = G_ZBUFFER | cullBack;
     mRapi->SetStencilMode((int)StencilMode::VolumeDecr);
     drawVolume();
-    Flush();
 
     // composite (self-clearing); full-screen clip-space quad, no depth test.
     mRdp->prim_color = { 0, 0, 0, coreA };
