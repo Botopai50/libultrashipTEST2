@@ -191,7 +191,9 @@
 #define G_SETINTENSITY 0x40
 #define G_SETTOON 0x41 // SOH [Enhancement] toon lighting per-draw marker
 #define G_SETTOONKEY 0x4a // SOH [Enhancement] toon lighting per-object key light (dir + color)
-#define G_SETTOONSHADOW 0x4b // SOH [Enhancement] actor shadow per-object marker (floor plane)
+#define G_SETTOONSHADOW 0x4b // SOH [Enhancement] actor shadow arm/size marker
+#define G_SETTOONSHADOWID 0x4c // SOH [Enhancement] actor shadow cache id/version
+#define G_SETTOONSHADOWPLANE 0x4d // SOH [Enhancement] actor shadow receiver plane
 #define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
@@ -2829,11 +2831,33 @@ typedef union Gfx {
         _g->words.w1 = _SHIFTL((r) & 0xFF, 16, 8) | _SHIFTL((g) & 0xFF, 8, 8) | _SHIFTL((b) & 0xFF, 0, 8);      \
     }
 
-// SOH [Enhancement] Actor shadow per-object marker (low-level primitive; prefer gSPToonShadowArm to arm).
-// `planeD` carries the eased 0..1 shadow SIZE for this object (raw float bits in w1). The three normal bytes
-// are an arm channel: nz is the arm marker (any nonzero byte arms the shadow; all-zero disarms it), and nx:ny
-// carry an s16 "feet-clamp" world Y (see gSPToonShadowArm). Blend strength + length are global (pushed once
-// per frame, not per object). The shadow direction reuses the object's gSPToonKey, so emit this AFTER the key.
+// SOH [Enhancement] Actor shadow cache identity. The 24-bit id is unique for the lifetime of the game
+// process; the 24-bit version changes whenever the game schedules a new silhouette capture. The high byte
+// of w1 carries cache flags (bit 0 = valid receiver, bit 1 = regenerate mask, bit 2 = wall receiver).
+#define gSPToonShadowId(pkt, actorId, version, flags)                                                      \
+    {                                                                                                      \
+        Gfx* _g = (Gfx*)(pkt);                                                                             \
+        _g->words.w0 = _SHIFTL(G_SETTOONSHADOWID, 24, 8) | ((actorId) & 0x00FFFFFF);                       \
+        _g->words.w1 = ((version) & 0x00FFFFFF) | _SHIFTL((flags) & 0xFF, 24, 8);                         \
+    }
+
+// SOH [Enhancement] Actor shadow receiver plane. The normal is quantized to signed s8; planeD remains a
+// full-precision float so sloped floors and walls do not drift when the mask is reused from cache.
+#define gSPToonShadowPlane(pkt, nx, ny, nz, planeD)                                                \
+    {                                                                                              \
+        Gfx* _g = (Gfx*)(pkt);                                                                     \
+        union {                                                                                    \
+            f32 f;                                                                                 \
+            u32 u;                                                                                 \
+        } _pd;                                                                                     \
+        _pd.f = (f32)(planeD);                                                                     \
+        _g->words.w0 = _SHIFTL(G_SETTOONSHADOWPLANE, 24, 8) | _SHIFTL((nx) & 0xFF, 16, 8) |       \
+                       _SHIFTL((ny) & 0xFF, 8, 8) | _SHIFTL((nz) & 0xFF, 0, 8);                    \
+        _g->words.w1 = _pd.u;                                                                      \
+    }
+
+// SOH [Enhancement] Actor shadow per-object marker. The size is an eased visibility scale; the receiver plane,
+// cache identity, version, and key-light direction are supplied by the commands immediately before it.
 #define gSPToonShadow(pkt, nx, ny, nz, planeD)                                                     \
     {                                                                                              \
         Gfx* _g = (Gfx*)(pkt);                                                                     \
@@ -2853,13 +2877,12 @@ typedef union Gfx {
 // slab below ground and cast no shadow; clamping the feet to the floor Y keeps the slab at ground level. Pass
 // TOON_SHADOW_NO_CLAMP to leave the feet at the captured geometry (the default for normal actors). nz holds
 // the arm marker so the shadow arms even when the clamp bytes are zero.
-#define TOON_SHADOW_NO_CLAMP (-32768)
+#define TOON_SHADOW_NO_CLAMP (-32768) // Legacy payload; CI4 masks use the explicit receiver-plane command.
 #define gSPToonShadowArm(pkt, feetClampY, size)                                                    \
     gSPToonShadow(pkt, ((s32)(feetClampY) >> 8) & 0xFF, (s32)(feetClampY) & 0xFF, 0x7F, (size))
 
-// SOH [Enhancement] Actor shadow: render the frame's accumulated shadow volumes now. Emitted at the pre-actor
-// hook (after the room, before actors) so the shadows land only on the environment. A zero normal + the
-// sentinel planeD (-1e30) tells gfx_set_toon_shadow_handler_custom to call RenderShadowVolumes().
+// SOH [Enhancement] Actor shadow: render all valid cached masks from the previous actor pass now. Emitted at
+// the pre-actor hook so the shadows land only on the environment and receiver actors.
 #define gSPToonShadowFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.0e30f)
 
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).

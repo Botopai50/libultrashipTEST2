@@ -7,6 +7,9 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
+#include <algorithm>
+#include <limits>
+#include <cmath>
 
 #include <any>
 #include <map>
@@ -2381,7 +2384,497 @@ static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
     return (a & 7) | ((b & 7) << 3) | ((c & 7) << 6) | ((d & 7) << 9);
 }
 
-// SOH [Enhancement] Actor shadow: BUILD this object's shadow volume and accumulate it for the frame. It is
+namespace {
+constexpr int kShadowMaskSize = 96;
+constexpr size_t kShadowMaskBytes = (kShadowMaskSize * kShadowMaskSize) / 2;
+constexpr int kShadowTextureBuffers = 3;
+constexpr uint8_t kShadowPaletteIntensity = 28;
+constexpr RGBA kShadowPalette[16] = {
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 0 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 17 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 34 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 51 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 68 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 85 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 102 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 119 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 136 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 153 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 170 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 187 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 204 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 221 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 238 },
+    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 255 },
+};
+constexpr uint8_t kShadowFlagValid = 1 << 0;
+constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
+
+static float ShadowDot(const float a[3], const float b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static float ShadowLength(const float v[3]) {
+    return sqrtf(ShadowDot(v, v));
+}
+
+static bool ShadowNormalize(float v[3]) {
+    const float length = ShadowLength(v);
+    if (length < 0.0001f) {
+        return false;
+    }
+    v[0] /= length;
+    v[1] /= length;
+    v[2] /= length;
+    return true;
+}
+
+static void ShadowCross(const float a[3], const float b[3], float out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static void ShadowBasis(const float normal[3], float basisU[3], float basisV[3]) {
+    const float reference[3] = { 0.0f, 1.0f, 0.0f };
+    if (fabsf(normal[1]) >= 0.85f) {
+        const float alternate[3] = { 1.0f, 0.0f, 0.0f };
+        ShadowCross(alternate, normal, basisU);
+    } else {
+        ShadowCross(reference, normal, basisU);
+    }
+    if (!ShadowNormalize(basisU)) {
+        basisU[0] = 1.0f;
+        basisU[1] = 0.0f;
+        basisU[2] = 0.0f;
+    }
+    ShadowCross(normal, basisU, basisV);
+    ShadowNormalize(basisV);
+}
+
+static bool ShadowPointInTriangle(float px, float py, const float a[2], const float b[2], const float c[2]) {
+    const float e0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+    const float e1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+    const float e2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+    return (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f) || (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
+}
+} // namespace
+
+// SOH [Enhancement] Actor shadow: generate the current actor's cached CI4 silhouette. The expensive work is
+// deliberately isolated from RenderShadowCache(), which draws only the already-uploaded texture each frame.
+void Interpreter::FlushToonShadow() {
+    const uint32_t actorId = mRsp->toon_shadow_actor_id;
+    auto cacheIt = mShadowCaches.find(actorId);
+    if (cacheIt == mShadowCaches.end() || mShadowVerts.size() < 9 ||
+        !mRsp->toon_shadow_update || !(mRsp->toon_shadow_flags & kShadowFlagRegenerate)) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    ShadowMaskCache& cache = cacheIt->second;
+    if (cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    RasterizeShadowMask(cache);
+    if (cache.ci4.empty()) {
+        cache.valid = false;
+    } else {
+        UploadShadowMask(cache);
+        cache.valid = cache.texture_count != 0;
+    }
+    cache.version = mRsp->toon_shadow_version;
+    mShadowVerts.clear();
+}
+
+void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
+    cache.ci4.clear();
+    if (mShadowVerts.size() < 9) {
+        return;
+    }
+
+    float normal[3] = { cache.plane_normal[0], cache.plane_normal[1], cache.plane_normal[2] };
+    if (!ShadowNormalize(normal)) {
+        return;
+    }
+    float planeD = cache.plane_d;
+    float light[3] = { mRsp->toon_shadow_dir[0], mRsp->toon_shadow_dir[1], mRsp->toon_shadow_dir[2] };
+    if (!ShadowNormalize(light)) {
+        return;
+    }
+
+    // Orient the receiver toward the key. This also makes wall projection work when a collision polygon's
+    // winding faces away from the current light source.
+    float lightNormal = ShadowDot(light, normal);
+    if (lightNormal < 0.0f) {
+        normal[0] = -normal[0];
+        normal[1] = -normal[1];
+        normal[2] = -normal[2];
+        planeD = -planeD;
+        lightNormal = -lightNormal;
+    }
+
+    const float minElevation = std::clamp(mToonShadowMinElevation, 0.05f, 0.99f);
+    float tangent[3] = { light[0] - normal[0] * lightNormal, light[1] - normal[1] * lightNormal,
+                         light[2] - normal[2] * lightNormal };
+    const float tangentLength = ShadowLength(tangent);
+    if (tangentLength < 0.001f) {
+        tangent[0] = tangent[1] = tangent[2] = 0.0f;
+    } else {
+        const float elevation = std::max(lightNormal, minElevation);
+        const float tangentScale = sqrtf(std::max(0.0f, 1.0f - elevation * elevation)) / tangentLength;
+        tangent[0] *= tangentScale;
+        tangent[1] *= tangentScale;
+        tangent[2] *= tangentScale;
+        light[0] = normal[0] * elevation + tangent[0];
+        light[1] = normal[1] * elevation + tangent[1];
+        light[2] = normal[2] * elevation + tangent[2];
+    }
+    float castDir[3] = { -light[0], -light[1], -light[2] };
+    const float castDenom = ShadowDot(normal, castDir);
+    if (fabsf(castDenom) < 0.001f) {
+        return;
+    }
+
+    float basisU[3], basisV[3];
+    ShadowBasis(normal, basisU, basisV);
+    float planeOrigin[3] = { -planeD * normal[0], -planeD * normal[1], -planeD * normal[2] };
+
+    struct ProjectedTriangle {
+        float p[3][2];
+    };
+    std::vector<ProjectedTriangle> triangles;
+    triangles.reserve(mShadowVerts.size() / 9);
+    float minU = std::numeric_limits<float>::max();
+    float minV = std::numeric_limits<float>::max();
+    float maxU = -std::numeric_limits<float>::max();
+    float maxV = -std::numeric_limits<float>::max();
+
+    for (size_t base = 0; base + 9 <= mShadowVerts.size(); base += 9) {
+        const float* a = &mShadowVerts[base + 0];
+        const float* b = &mShadowVerts[base + 3];
+        const float* c = &mShadowVerts[base + 6];
+        const float ab[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        const float ac[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+        float areaNormal[3];
+        ShadowCross(ab, ac, areaNormal);
+        if (ShadowLength(areaNormal) < 0.01f) {
+            continue;
+        }
+
+        const float distanceA = ShadowDot(normal, a) + planeD;
+        const float distanceB = ShadowDot(normal, b) + planeD;
+        const float distanceC = ShadowDot(normal, c) + planeD;
+        if (fabsf(distanceA) < 0.05f && fabsf(distanceB) < 0.05f && fabsf(distanceC) < 0.05f) {
+            continue;
+        }
+
+        ProjectedTriangle projected{};
+        const float* points[3] = { a, b, c };
+        bool valid = true;
+        for (int i = 0; i < 3; i++) {
+            const float distance = ShadowDot(normal, points[i]) + planeD;
+            const float t = -distance / castDenom;
+            if (t < -1.0f || t > 8192.0f || !std::isfinite(t)) {
+                valid = false;
+                break;
+            }
+            const float projectedWorld[3] = { points[i][0] + castDir[0] * t, points[i][1] + castDir[1] * t,
+                                               points[i][2] + castDir[2] * t };
+            projected.p[i][0] = ShadowDot(basisU, projectedWorld) - ShadowDot(basisU, planeOrigin);
+            projected.p[i][1] = ShadowDot(basisV, projectedWorld) - ShadowDot(basisV, planeOrigin);
+            minU = std::min(minU, projected.p[i][0]);
+            minV = std::min(minV, projected.p[i][1]);
+            maxU = std::max(maxU, projected.p[i][0]);
+            maxV = std::max(maxV, projected.p[i][1]);
+        }
+        if (valid) {
+            triangles.push_back(projected);
+        }
+    }
+
+    const float width = maxU - minU;
+    const float height = maxV - minV;
+    if (triangles.empty() || width < 0.1f || height < 0.1f || !std::isfinite(width) || !std::isfinite(height)) {
+        return;
+    }
+
+    const float pad = std::max(width, height) / (float)kShadowMaskSize;
+    minU -= pad;
+    maxU += pad;
+    minV -= pad;
+    maxV += pad;
+    const float rasterWidth = maxU - minU;
+    const float rasterHeight = maxV - minV;
+    std::vector<uint8_t> values(kShadowMaskSize * kShadowMaskSize, 0);
+
+    auto toPixel = [&](float u, float v, float out[2]) {
+        out[0] = (u - minU) / rasterWidth * (float)(kShadowMaskSize - 1);
+        out[1] = (v - minV) / rasterHeight * (float)(kShadowMaskSize - 1);
+    };
+
+    for (const ProjectedTriangle& triangle : triangles) {
+        float p[3][2];
+        toPixel(triangle.p[0][0], triangle.p[0][1], p[0]);
+        toPixel(triangle.p[1][0], triangle.p[1][1], p[1]);
+        toPixel(triangle.p[2][0], triangle.p[2][1], p[2]);
+        const int x0 = std::max(0, (int)floorf(std::min({ p[0][0], p[1][0], p[2][0] })));
+        const int x1 = std::min(kShadowMaskSize - 1, (int)ceilf(std::max({ p[0][0], p[1][0], p[2][0] })));
+        const int y0 = std::max(0, (int)floorf(std::min({ p[0][1], p[1][1], p[2][1] })));
+        const int y1 = std::min(kShadowMaskSize - 1, (int)ceilf(std::max({ p[0][1], p[1][1], p[2][1] })));
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                int covered = 0;
+                for (int sy = 0; sy < 2; sy++) {
+                    for (int sx = 0; sx < 2; sx++) {
+                        const float sample[2] = { x + 0.25f + sx * 0.5f, y + 0.25f + sy * 0.5f };
+                        covered += ShadowPointInTriangle(sample[0], sample[1], p[0], p[1], p[2]) ? 1 : 0;
+                    }
+                }
+                const uint8_t coverage = (uint8_t)((covered * 15 + 2) / 4);
+                values[y * kShadowMaskSize + x] = std::max(values[y * kShadowMaskSize + x], coverage);
+            }
+        }
+    }
+
+    // A cheap four-neighbour pass softens only the edge; the interior remains at full CI4 coverage.
+    std::vector<uint8_t> softened(values.size(), 0);
+    for (int y = 0; y < kShadowMaskSize; y++) {
+        for (int x = 0; x < kShadowMaskSize; x++) {
+            const int center = values[y * kShadowMaskSize + x];
+            int sum = center * 4;
+            int maxNeighbour = center;
+            const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+            for (const auto& offset : offsets) {
+                const int nx = x + offset[0];
+                const int ny = y + offset[1];
+                if (nx >= 0 && nx < kShadowMaskSize && ny >= 0 && ny < kShadowMaskSize) {
+                    const int neighbour = values[ny * kShadowMaskSize + nx];
+                    sum += neighbour;
+                    maxNeighbour = std::max(maxNeighbour, neighbour);
+                }
+            }
+            softened[y * kShadowMaskSize + x] = (uint8_t)(center == 0 ? maxNeighbour / 3 : std::min(15, sum / 8));
+        }
+    }
+
+    cache.ci4.assign(kShadowMaskBytes, 0);
+    for (size_t i = 0; i < softened.size(); i++) {
+        const uint8_t value = softened[i] & 0x0F;
+        if ((i & 1) == 0) {
+            cache.ci4[i / 2] = (uint8_t)(value << 4);
+        } else {
+            cache.ci4[i / 2] |= value;
+        }
+    }
+
+    cache.plane_normal[0] = normal[0];
+    cache.plane_normal[1] = normal[1];
+    cache.plane_normal[2] = normal[2];
+    cache.plane_d = planeD;
+    memcpy(cache.plane_origin, planeOrigin, sizeof(cache.plane_origin));
+    memcpy(cache.basis_u, basisU, sizeof(cache.basis_u));
+    memcpy(cache.basis_v, basisV, sizeof(cache.basis_v));
+    cache.min_u = minU;
+    cache.max_u = maxU;
+    cache.min_v = minV;
+    cache.max_v = maxV;
+}
+
+void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
+    if (cache.ci4.size() != kShadowMaskBytes || mRapi == nullptr) {
+        return;
+    }
+
+    while (cache.texture_count < kShadowTextureBuffers) {
+        const uint8_t slot = cache.texture_count++;
+        cache.texture_ids[slot] = mRapi->NewTexture();
+        cache.texture_keys[slot] = mShadowTextureSerial++;
+        TextureCacheKey key{};
+        key.texture_addr = reinterpret_cast<const uint8_t*>(cache.texture_keys[slot]);
+        TextureCacheValue value{};
+        value.texture_id = cache.texture_ids[slot];
+        value.linear_filter = true;
+        mShadowTextureBindings.emplace(key, value);
+    }
+
+    const uint8_t nextSlot = cache.texture_count == 1 ? 0 : (uint8_t)((cache.active_texture + 1) % kShadowTextureBuffers);
+    Flush();
+    TextureCacheNode* previous = mRenderingState.mTextures[0];
+    const bool previousLinear = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    const uint32_t previousCms = mRdp->texture_tile[0].cms;
+    const uint32_t previousCmt = mRdp->texture_tile[0].cmt;
+    mRapi->SelectTexture(0, cache.texture_ids[nextSlot]);
+    mRapi->SetSamplerParameters(0, true, G_TX_CLAMP, G_TX_CLAMP);
+
+    mShadowUploadBuffer.resize(kShadowMaskSize * kShadowMaskSize * 4);
+    const float alphaScale = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    // The renderer API uploads RGBA32, so expand the cached CI4 indices through this fixed palette at the
+    // upload boundary. The cached representation and all coverage decisions remain four-bit.
+    for (size_t i = 0; i < kShadowMaskSize * kShadowMaskSize; i++) {
+        const uint8_t packed = cache.ci4[i / 2];
+        const uint8_t coverage = (i & 1) == 0 ? (packed >> 4) : (packed & 0x0F);
+        const RGBA entry = kShadowPalette[coverage];
+        mShadowUploadBuffer[i * 4 + 0] = entry.r;
+        mShadowUploadBuffer[i * 4 + 1] = entry.g;
+        mShadowUploadBuffer[i * 4 + 2] = entry.b;
+        mShadowUploadBuffer[i * 4 + 3] = (uint8_t)(entry.a * alphaScale);
+    }
+    mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
+
+    cache.active_texture = nextSlot;
+    if (previous != nullptr) {
+        mRapi->SelectTexture(0, previous->second.texture_id);
+        mRapi->SetSamplerParameters(0, previousLinear, previousCms, previousCmt);
+    }
+}
+
+TextureCacheNode* Interpreter::BindShadowTexture(uintptr_t textureKey) {
+    TextureCacheKey key{};
+    key.texture_addr = reinterpret_cast<const uint8_t*>(textureKey);
+    auto it = mShadowTextureBindings.find(key);
+    if (it == mShadowTextureBindings.end()) {
+        return nullptr;
+    }
+    mRapi->SelectTexture(0, it->second.texture_id);
+    return &*it;
+}
+
+void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
+    if (!cache.valid || cache.texture_count == 0 || cache.active_texture >= cache.texture_count || mRapi == nullptr) {
+        return;
+    }
+    TextureCacheNode* shadowTexture = BindShadowTexture(cache.texture_keys[cache.active_texture]);
+    if (shadowTexture == nullptr) {
+        return;
+    }
+
+    Flush();
+    const RenderingState savedRendering = mRenderingState;
+    const uint64_t savedCombine = mRdp->combine_mode;
+    const uint32_t savedOtherL = mRdp->other_mode_l;
+    const uint32_t savedOtherH = mRdp->other_mode_h;
+    const uint32_t savedGeometry = mRsp->geometry_mode;
+    const bool savedToon = mRdp->toon;
+    const bool savedShadow = mRdp->toon_shadow;
+    const bool savedGrayscale = mRdp->grayscale;
+    const uint8_t savedTile = mRdp->first_tile_index;
+    const bool savedTextureChanged0 = mRdp->textures_changed[0];
+    const bool savedTextureChanged1 = mRdp->textures_changed[1];
+    const auto savedTile0 = mRdp->texture_tile[0];
+    const auto savedLoaded0 = mRdp->loaded_texture[0];
+    const RGBA savedPrim = mRdp->prim_color;
+
+    mRenderingState.mTextures[0] = shadowTexture;
+    mRdp->first_tile_index = 0;
+    mRdp->textures_changed[0] = false;
+    mRdp->textures_changed[1] = false;
+    mRdp->texture_tile[0].fmt = G_IM_FMT_RGBA;
+    mRdp->texture_tile[0].siz = G_IM_SIZ_32b;
+    mRdp->texture_tile[0].cms = G_TX_CLAMP;
+    mRdp->texture_tile[0].cmt = G_TX_CLAMP;
+    mRdp->texture_tile[0].shifts = 0;
+    mRdp->texture_tile[0].shiftt = 0;
+    mRdp->texture_tile[0].uls = 0;
+    mRdp->texture_tile[0].ult = 0;
+    mRdp->texture_tile[0].lrs = (kShadowMaskSize - 1) * 4;
+    mRdp->texture_tile[0].lrt = (kShadowMaskSize - 1) * 4;
+    mRdp->texture_tile[0].line_size_bytes = kShadowMaskSize * 2;
+    mRdp->texture_tile[0].tmem_index = 0;
+    mRdp->loaded_texture[0].orig_size_bytes = kShadowMaskSize * kShadowMaskSize * 4;
+    mRdp->loaded_texture[0].size_bytes = mRdp->loaded_texture[0].orig_size_bytes;
+    mRdp->loaded_texture[0].full_image_line_size_bytes = kShadowMaskSize * 2;
+    mRdp->loaded_texture[0].line_size_bytes = kShadowMaskSize * 2;
+    mRdp->loaded_texture[0].masked = false;
+    mRdp->loaded_texture[0].blended = false;
+    mRdp->other_mode_h = (savedOtherH & ~((3U << G_MDSFT_CYCLETYPE) | (3U << G_MDSFT_TEXTFILT))) |
+                          G_CYC_1CYCLE | G_TF_BILERP;
+    mRdp->other_mode_l = G_RM_AA_ZB_XLU_DECAL;
+    GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), alpha_comb(0, 0, 0, G_ACMUX_TEXEL0), 0, 0);
+    mRdp->prim_color = { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 255 };
+    mRdp->toon = false;
+    mRdp->toon_shadow = false;
+    mRdp->grayscale = false;
+    mRsp->geometry_mode = G_ZBUFFER;
+
+    const float centerU = (cache.min_u + cache.max_u) * 0.5f;
+    const float centerV = (cache.min_v + cache.max_v) * 0.5f;
+    const float halfU = (cache.max_u - cache.min_u) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    const float halfV = (cache.max_v - cache.min_v) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
+                                 { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
+    const float uvs[4][2] = { { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f } };
+    for (int i = 0; i < 4; i++) {
+        const float world[3] = { cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] +
+                                     cache.basis_v[0] * coords[i][1] + cache.plane_normal[0] * 0.04f,
+                                 cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] +
+                                     cache.basis_v[1] * coords[i][1] + cache.plane_normal[1] * 0.04f,
+                                 cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] +
+                                     cache.basis_v[2] * coords[i][1] + cache.plane_normal[2] * 0.04f };
+        LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + i];
+        vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
+                                       world[2] * mRsp->P_matrix[2][0] + mRsp->P_matrix[3][0]);
+        vertex->y = world[0] * mRsp->P_matrix[0][1] + world[1] * mRsp->P_matrix[1][1] +
+                    world[2] * mRsp->P_matrix[2][1] + mRsp->P_matrix[3][1];
+        vertex->z = world[0] * mRsp->P_matrix[0][2] + world[1] * mRsp->P_matrix[1][2] +
+                    world[2] * mRsp->P_matrix[2][2] + mRsp->P_matrix[3][2];
+        vertex->w = world[0] * mRsp->P_matrix[0][3] + world[1] * mRsp->P_matrix[1][3] +
+                    world[2] * mRsp->P_matrix[2][3] + mRsp->P_matrix[3][3];
+        vertex->u = (int16_t)(uvs[i][0] * (kShadowMaskSize - 1) * 32.0f);
+        vertex->v = (int16_t)(uvs[i][1] * (kShadowMaskSize - 1) * 32.0f);
+        vertex->clip_rej = 0;
+        vertex->color = { 255, 255, 255, 255 };
+    }
+
+    GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, false);
+    GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, false);
+    Flush();
+
+    mRapi->SetStencilMode((int)StencilMode::Off, 0);
+    if (savedRendering.mTextures[0] != nullptr) {
+        mRapi->SelectTexture(0, savedRendering.mTextures[0]->second.texture_id);
+        const bool linear = (savedOtherH & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+        mRapi->SetSamplerParameters(0, linear, savedTile0.cms, savedTile0.cmt);
+    }
+    mRdp->combine_mode = savedCombine;
+    mRdp->other_mode_l = savedOtherL;
+    mRdp->other_mode_h = savedOtherH;
+    mRsp->geometry_mode = savedGeometry;
+    mRdp->toon = savedToon;
+    mRdp->toon_shadow = savedShadow;
+    mRdp->grayscale = savedGrayscale;
+    mRdp->first_tile_index = savedTile;
+    mRdp->textures_changed[0] = savedTextureChanged0;
+    mRdp->textures_changed[1] = savedTextureChanged1;
+    mRdp->texture_tile[0] = savedTile0;
+    mRdp->loaded_texture[0] = savedLoaded0;
+    mRdp->prim_color = savedPrim;
+    mRenderingState = savedRendering;
+    // The backend currently has the shadow shader bound while the restored RenderingState points at the
+    // previous shader. Force the next normal triangle to reload its real program.
+    mRenderingState.mShaderProgram = nullptr;
+}
+
+void Interpreter::RenderShadowCache() {
+    Flush();
+    mShadowFrame++;
+    const uint32_t visibleFrame = mShadowFrame - 1;
+    for (auto& entry : mShadowCaches) {
+        const ShadowMaskCache& cache = entry.second;
+        if (cache.valid && cache.last_seen_frame == visibleFrame) {
+            DrawShadowQuad(cache);
+        }
+    }
+    mRapi->SetStencilMode((int)StencilMode::Off, 0);
+}
+
+// SOH [Enhancement] Legacy volume implementation retained temporarily for source compatibility with old
+// display-list captures. It is no longer called by the actor-shadow command handlers.
+//
+// The volume is a thin SLAB at the feet: the captured silhouette projected along the cel key-light direction
+// onto the feet level, then extruded from slabTop (above the feet, catches uphill ground) to slabBottom
+// (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // NOT drawn here — all the frame's volumes are rendered together by RenderShadowVolumes() at the pre-actor
 // hook, so the shadow lands only on the environment (the room is in the depth buffer but actors are not yet),
 // exactly like the Wind Waker light pools. That means no self-shadow and no shadowing of other actors, at the
@@ -2392,7 +2885,8 @@ static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
 // (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // Each projected triangle becomes its own closed prism with per-face OUTWARD winding (so the z-fail increment
 // hits the right faces despite the clamp-at-0 ops); the per-prism counts compose into the union (the footprint).
-void Interpreter::FlushToonShadow() {
+#if 0
+void Interpreter::FlushToonShadowLegacy() {
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
         mShadowVerts.clear();
@@ -2516,7 +3010,7 @@ void Interpreter::FlushToonShadow() {
 // SOH [Enhancement] Actor shadow: render every shadow volume accumulated since the last call, as one batched
 // z-fail stencil pass + a single self-clearing composite, then clear the accumulator. Called once per frame at
 // the pre-actor hook (after the room is drawn) so the shadows fall only on the environment.
-void Interpreter::RenderShadowVolumes() {
+void Interpreter::RenderShadowVolumesLegacy() {
     const std::vector<float>& vol = mShadowVolumeAccum;
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (vol.size() < 9 || coreAlpha <= 0.0f) {
@@ -2729,6 +3223,8 @@ void Interpreter::RenderShadowVolumes() {
     mShadowVolumeAccum.clear();
     mShadowVolumeKind.clear();
 }
+
+#endif
 
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mRdp->grayscale_color.r = r;
@@ -4170,13 +4666,42 @@ bool gfx_set_toon_key_handler_custom(F3DGfx** cmd0) {
 // per-object toon key direction, not from a floor plane. w1 carries the eased 0..1 shadow size. Emitting this
 // per object also bounds each object's captured geometry: the previous object's volume is built here before
 // the next one arms.
+bool gfx_set_toon_shadow_id_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    gfx->FlushToonShadow();
+    gfx->mRsp->toon_shadow_actor_id = (uint32_t)cmd->words.w0 & 0x00FFFFFF;
+    gfx->mRsp->toon_shadow_version = (uint32_t)cmd->words.w1 & 0x00FFFFFF;
+    gfx->mRsp->toon_shadow_flags = (uint8_t)(((uint32_t)cmd->words.w1 >> 24) & 0xFF);
+    gfx->mRsp->toon_shadow_update = false;
+    auto& cache = gfx->mShadowCaches[gfx->mRsp->toon_shadow_actor_id];
+    cache.actor_id = gfx->mRsp->toon_shadow_actor_id;
+    cache.last_seen_frame = gfx->mShadowFrame;
+    return false;
+}
+
+bool gfx_set_toon_shadow_plane_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    int8_t nx = (int8_t)((cmd->words.w0 >> 16) & 0xFF);
+    int8_t ny = (int8_t)((cmd->words.w0 >> 8) & 0xFF);
+    int8_t nz = (int8_t)(cmd->words.w0 & 0xFF);
+    uint32_t planeBits = (uint32_t)cmd->words.w1;
+    float planeD;
+    memcpy(&planeD, &planeBits, sizeof(planeD));
+    gfx->mRsp->toon_shadow_plane[0] = nx / 127.0f;
+    gfx->mRsp->toon_shadow_plane[1] = ny / 127.0f;
+    gfx->mRsp->toon_shadow_plane[2] = nz / 127.0f;
+    gfx->mRsp->toon_shadow_plane[3] = planeD;
+    return false;
+}
+
 bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    // Arm flag: any nonzero normal byte arms the shadow for this object; all-zero disarms it. nx:ny carry an
-    // s16 "feet-clamp" world Y (or TOON_SHADOW_NO_CLAMP); nz is the arm marker that keeps the shadow armed even
-    // when the clamp bytes happen to be zero.
+    // Arm flag: the size is carried in w1; the receiver plane and cache identity were supplied immediately
+    // before this marker.
     uint8_t nx = (cmd->words.w0 >> 16) & 0xFF;
     uint8_t ny = (cmd->words.w0 >> 8) & 0xFF;
     uint8_t nz = (cmd->words.w0 >> 0) & 0xFF;
@@ -4185,22 +4710,38 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     uint32_t w1Bits = (uint32_t)cmd->words.w1;
     memcpy(&sizeOrSentinel, &w1Bits, sizeof(sizeOrSentinel));
 
-    // Sentinel (gSPToonShadowFlush): a zero normal with this magic w1 means "render the frame's accumulated
-    // shadow volumes now" (emitted at the pre-actor hook so shadows land only on the environment).
+    // Sentinel (gSPToonShadowFlush): render valid cached masks from the previous actor pass before actors.
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
-        gfx->RenderShadowVolumes();
+        gfx->RenderShadowCache();
         return false;
     }
 
-    gfx->FlushToonShadow(); // build + accumulate the previous object's volume
+    gfx->FlushToonShadow(); // regenerate the previous object's mask only when its version changed
 
+    auto cacheIt = gfx->mShadowCaches.find(gfx->mRsp->toon_shadow_actor_id);
+    if (cacheIt == gfx->mShadowCaches.end()) {
+        return false;
+    }
+    auto& cache = cacheIt->second;
     gfx->mRsp->toon_shadow_size = sizeOrSentinel;
-    gfx->mRdp->toon_shadow = (nx | ny | nz) != 0;
-    // Decode the s16 feet clamp packed in nx:ny (TOON_SHADOW_NO_CLAMP = leave the feet at the captured
-    // geometry). Set alongside toon_shadow_size so the deferred FlushToonShadow reads this object's value.
-    int16_t feetClamp = (int16_t)(((uint16_t)nx << 8) | (uint16_t)ny);
-    gfx->mRsp->toon_shadow_clamp_feet = (feetClamp != -32768);
-    gfx->mRsp->toon_shadow_feet_clamp_y = (float)feetClamp;
+    cache.size = std::clamp(sizeOrSentinel, 0.0f, 1.0f);
+    cache.valid = (gfx->mRsp->toon_shadow_flags & kShadowFlagValid) && cache.size > 0.01f;
+    gfx->mRsp->toon_shadow_update = cache.valid &&
+                                    (gfx->mRsp->toon_shadow_flags & kShadowFlagRegenerate) &&
+                                    cache.version != gfx->mRsp->toon_shadow_version;
+    // Keep the receiver plane paired with the rasterized version. A changing collision plane must not move an
+    // old silhouette until its new mask has been generated.
+    if (gfx->mRsp->toon_shadow_update) {
+        cache.plane_normal[0] = gfx->mRsp->toon_shadow_plane[0];
+        cache.plane_normal[1] = gfx->mRsp->toon_shadow_plane[1];
+        cache.plane_normal[2] = gfx->mRsp->toon_shadow_plane[2];
+        cache.plane_d = gfx->mRsp->toon_shadow_plane[3];
+    }
+    gfx->mRdp->toon_shadow = gfx->mRsp->toon_shadow_update;
+    // The legacy arm payload is retained for display-list compatibility; the CI4 path uses the explicit plane
+    // command above instead of a feet clamp.
+    gfx->mRsp->toon_shadow_clamp_feet = false;
+    gfx->mRsp->toon_shadow_feet_clamp_y = 0.0f;
     // Snapshot THIS object's key direction (set by the gSPToonKey just before this command) so its
     // deferred shadow flush uses it, not whatever later object last touched toon_key_dir.
     gfx->mRsp->toon_shadow_dir[0] = gfx->mRsp->toon_key_dir[0];
@@ -4612,6 +5153,10 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },                // G_SETTOON (0x41)
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },      // G_SETTOONKEY (0x4a)
+    { OTR_G_SETTOONSHADOWID,
+      { "G_SETTOONSHADOWID", gfx_set_toon_shadow_id_handler_custom } }, // G_SETTOONSHADOWID (0x4c)
+    { OTR_G_SETTOONSHADOWPLANE,
+      { "G_SETTOONSHADOWPLANE", gfx_set_toon_shadow_plane_handler_custom } }, // G_SETTOONSHADOWPLANE (0x4d)
     { OTR_G_SETTOONSHADOW,
       { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } }, // G_SETSTENCIL (0x46)

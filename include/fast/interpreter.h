@@ -275,6 +275,11 @@ struct RSP {
     // the drop shadow on the same light the cel shading uses.
     float toon_shadow_size;   // eased 0..1 drop-shadow size for this object (carried in the arm command's w1)
     float toon_shadow_dir[3]; // key direction captured at arm time, used by the deferred shadow flush
+    uint32_t toon_shadow_actor_id;
+    uint32_t toon_shadow_version;
+    uint8_t toon_shadow_flags;
+    bool toon_shadow_update;
+    float toon_shadow_plane[4];
     // Optional per-object feet clamp: when armed, raise the shadow slab's feet UP to this world Y so a model
     // whose geometry dips below the floor (a signpost's buried post) doesn't sink the slab below ground. The
     // flag is false when the object passed TOON_SHADOW_NO_CLAMP (the default — leave the feet at the geometry).
@@ -394,6 +399,28 @@ struct MaskedTextureEntry {
     uint8_t* replacementData;
 };
 
+struct ShadowMaskCache {
+    uint32_t actor_id = 0;
+    uint32_t version = 0;
+    uint32_t last_seen_frame = 0;
+    bool valid = false;
+    uint8_t active_texture = 0;
+    uint8_t texture_count = 0;
+    uint32_t texture_ids[3] = {};
+    uintptr_t texture_keys[3] = {};
+    std::vector<uint8_t> ci4;
+    float plane_normal[3] = { 0.0f, 1.0f, 0.0f };
+    float plane_d = 0.0f;
+    float plane_origin[3] = {};
+    float basis_u[3] = { 1.0f, 0.0f, 0.0f };
+    float basis_v[3] = { 0.0f, 0.0f, 1.0f };
+    float min_u = 0.0f;
+    float max_u = 0.0f;
+    float min_v = 0.0f;
+    float max_v = 0.0f;
+    float size = 1.0f;
+};
+
 class Interpreter {
   public:
     Interpreter();
@@ -405,15 +432,10 @@ class Interpreter {
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY);
     GfxRenderingAPI* GetCurrentRenderingAPI();
     // SOH [Enhancement] Actor shadow: global look tuning pushed once per frame by the game. alpha is the
-    // core blend strength; minElevation is the floor the key's height-above-the-floor is remapped into
-    // (higher = the light is forced steeper = shorter shadows); taps is the number of accumulation passes
-    // for the soft penumbra; softness scales the per-tap ground offset.
-    void SetToonShadowParams(float alpha, float minElevation, float slabDepth, float slabRise, bool showVolume) {
+    // core blend strength; minElevation bounds the projected shadow length.
+    void SetToonShadowParams(float alpha, float minElevation) {
         mToonShadowAlpha = alpha;
         mToonShadowMinElevation = minElevation;
-        mShadowSlabDepth = slabDepth;
-        mShadowSlabRise = slabRise;
-        mShadowShowVolume = showVolume;
     }
     void StartFrame();
     void RunGuiOnly();
@@ -466,15 +488,16 @@ class Interpreter {
     // cache its world-space direction / color / ambient in the RSP for the fragment shader.
     void SelectToonLight();
 
-    // SOH [Enhancement] Actor shadow: project the current object's captured world-space triangles onto
-    // its ground plane along the toon key direction and draw them as flat translucent geometry (reuses
-    // the standard SHADE combine + XLU decal path), accumulated over several offset taps for a soft edge.
-    // Called at each per-object boundary; builds the object's shadow volume and accumulates it for the frame.
+    // SOH [Enhancement] Actor shadow: rasterize the current object's captured world-space triangles into a
+    // cached 96x96 CI4 silhouette. Work is performed only for an actor version scheduled by the game-side
+    // update budget.
     void FlushToonShadow();
-    // SOH [Enhancement] Actor shadow: draw all volumes accumulated this frame (batched z-fail stencil +
-    // composite), then clear them. Called once per frame at the pre-actor hook so shadows fall only on the
-    // environment (no self-shadow / no shadowing other actors).
-    void RenderShadowVolumes();
+    // SOH [Enhancement] Actor shadow: draw every valid cached mask as one textured quad.
+    void RenderShadowCache();
+    void RasterizeShadowMask(ShadowMaskCache& cache);
+    void UploadShadowMask(ShadowMaskCache& cache);
+    void DrawShadowQuad(const ShadowMaskCache& cache);
+    TextureCacheNode* BindShadowTexture(uintptr_t textureKey);
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
@@ -562,20 +585,15 @@ class Interpreter {
     size_t mBufVboLen{};
     size_t mBufVboNumTris{};
     // SOH [Enhancement] Actor shadow: world-space positions of the current object's triangles (9 floats
-    // per tri), accumulated as the object draws and drained by FlushToonShadow at each object boundary.
+    // per tri), captured only when a cached mask is scheduled for regeneration.
     std::vector<float> mShadowVerts;
-    // SOH [Enhancement] Actor shadow: all shadow-volume triangles built this frame (9 floats/tri, outward
-    // wound), drained by RenderShadowVolumes() at the pre-actor hook so shadows fall only on the environment.
-    std::vector<float> mShadowVolumeAccum;
-    std::vector<uint8_t> mShadowVolumeKind; // per accumulated tri: 0 = cap, 1 = wall (only filled for the debug view)
-    // Clip-space transform of mShadowVolumeAccum, computed once per frame in RenderShadowVolumes so the two
-    // stencil passes (and the debug overlay) reuse it instead of re-running the projection per pass.
-    std::vector<LoadedVertex> mShadowXform;
+    std::unordered_map<uint32_t, ShadowMaskCache> mShadowCaches;
+    TextureCacheMap mShadowTextureBindings;
+    uintptr_t mShadowTextureSerial = 1;
+    uint32_t mShadowFrame = 0;
+    std::vector<uint8_t> mShadowUploadBuffer;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
-    float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
-    float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
-    bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
