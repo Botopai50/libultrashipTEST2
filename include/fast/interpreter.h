@@ -423,6 +423,11 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
+    // Link supplies an interpolated root matrix. Keeping the anchor used by the cached mask lets the
+    // renderer derive a full-precision live offset on every presentation frame instead of following the
+    // lower-rate game tick.
+    bool anchor_valid = false;
+    float mask_anchor[3] = {};
     float world_offset[3] = {};
     float size = 1.0f;
 };
