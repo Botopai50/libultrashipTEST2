@@ -404,11 +404,13 @@ struct ShadowMaskCache {
     uint32_t version = 0;
     uint32_t last_seen_frame = 0;
     bool valid = false;
+    bool visible = false;
     uint8_t active_texture = 0;
     uint8_t texture_count = 0;
     uint32_t texture_ids[3] = {};
     uintptr_t texture_keys[3] = {};
     std::vector<uint8_t> ci4;
+    // Raster plane and bounds belong to the cached mask version.
     float plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float plane_d = 0.0f;
     float plane_origin[3] = {};
@@ -418,6 +420,10 @@ struct ShadowMaskCache {
     float max_u = 0.0f;
     float min_v = 0.0f;
     float max_v = 0.0f;
+    // Live placement is updated every actor pass even when the 96x96 mask is reused.
+    float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
+    float draw_plane_d = 0.0f;
+    float world_offset[3] = {};
     float size = 1.0f;
 };
 
