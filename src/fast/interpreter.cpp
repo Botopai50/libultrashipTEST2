@@ -2410,6 +2410,8 @@ constexpr RGBA kShadowPalette[16] = {
 constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
+constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
+constexpr float kShadowSurfaceBias = 0.35f;
 
 static int ShadowSignExtend7(uint32_t value) {
     return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
@@ -2888,9 +2890,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
         const float planeDistance = ShadowDot(drawNormal, world) + drawPlaneD;
-        world[0] += drawNormal[0] * (0.04f - planeDistance);
-        world[1] += drawNormal[1] * (0.04f - planeDistance);
-        world[2] += drawNormal[2] * (0.04f - planeDistance);
+        world[0] += drawNormal[0] * (kShadowSurfaceBias - planeDistance);
+        world[1] += drawNormal[1] * (kShadowSurfaceBias - planeDistance);
+        world[2] += drawNormal[2] * (kShadowSurfaceBias - planeDistance);
         LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + i];
         vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
                                        world[2] * mRsp->P_matrix[2][0] + mRsp->P_matrix[3][0]);
@@ -4791,6 +4793,9 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
 
     // Sentinel (gSPToonShadowFlush): render valid cached masks from the previous actor pass before actors.
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
+        // Finish the final actor from the preceding pass before drawing the cache. Ordinarily the next
+        // actor-id command closes an object, but the last actor has no following id command.
+        gfx->FlushToonShadow();
         gfx->RenderShadowCache();
         return false;
     }
@@ -4812,7 +4817,23 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
                                     (gfx->mRsp->toon_shadow_flags & kShadowFlagRegenerate) &&
                                     cache.version != gfx->mRsp->toon_shadow_version;
 
-    if ((gfx->mRsp->toon_shadow_flags & kShadowFlagHasOffset) != 0) {
+    if ((gfx->mRsp->toon_shadow_flags & kShadowFlagUsesModelAnchor) != 0) {
+        // Link's root matrix is registered with frame interpolation by the game. Reading its translation
+        // here makes placement update at presentation rate with full float precision, independently from
+        // the deliberately throttled 96x96 silhouette regeneration.
+        float(*modelView)[4] =
+            gfx->mRsp->modelview_matrix_stack[gfx->mRsp->modelview_matrix_stack_size - 1];
+        const float liveAnchor[3] = { modelView[3][0], modelView[3][1], modelView[3][2] };
+        if (gfx->mRsp->toon_shadow_update || !cache.anchor_valid) {
+            cache.mask_anchor[0] = liveAnchor[0];
+            cache.mask_anchor[1] = liveAnchor[1];
+            cache.mask_anchor[2] = liveAnchor[2];
+            cache.anchor_valid = true;
+        }
+        cache.world_offset[0] = liveAnchor[0] - cache.mask_anchor[0];
+        cache.world_offset[1] = liveAnchor[1] - cache.mask_anchor[1];
+        cache.world_offset[2] = liveAnchor[2] - cache.mask_anchor[2];
+    } else if ((gfx->mRsp->toon_shadow_flags & kShadowFlagHasOffset) != 0) {
         const uint32_t packedOffset = ((uint32_t)nx << 16) | ((uint32_t)ny << 8) | (uint32_t)nz;
         ShadowDecodeOffset(packedOffset, cache.world_offset);
     } else {
