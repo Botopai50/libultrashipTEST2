@@ -1526,7 +1526,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // at the object boundary. is_rect screen-space quads (UI) have no world position, so skip them. The
     // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
     // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
-    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
+    if (mRdp->toon_shadow && !is_rect &&
+        ((mRsp->geometry_mode & G_LIGHTING) || (mRsp->toon_shadow_flags & kShadowFlagCaptureUnlit))) {
         for (int si = 0; si < 3; si++) {
             mShadowVerts.push_back(v_arr[si]->wx);
             mShadowVerts.push_back(v_arr[si]->wy);
@@ -2411,7 +2412,8 @@ constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
-constexpr float kShadowSurfaceBias = 0.35f;
+constexpr uint8_t kShadowFlagCaptureUnlit = 1 << 5;
+constexpr float kShadowSurfaceBias = 0.75f;
 
 static int ShadowSignExtend7(uint32_t value) {
     return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
@@ -2687,7 +2689,34 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Softness controls the number of cheap four-neighbour passes. The interior stays near full CI4 coverage,
+    // Projected N64 meshes are frequently unwelded triangle soup. Close only isolated one-pixel cracks and
+    // normalize strong interior samples before softening; this removes CI4 speckle without filling real gaps
+    // between limbs or increasing the 96x96 mask/update cost.
+    std::vector<uint8_t> cleaned = values;
+    for (int y = 1; y < kShadowMaskSize - 1; y++) {
+        for (int x = 1; x < kShadowMaskSize - 1; x++) {
+            const size_t index = (size_t)y * kShadowMaskSize + x;
+            const uint8_t center = values[index];
+            int strongNeighbours = 0;
+            for (int oy = -1; oy <= 1; oy++) {
+                for (int ox = -1; ox <= 1; ox++) {
+                    if ((ox != 0 || oy != 0) &&
+                        values[(size_t)(y + oy) * kShadowMaskSize + (x + ox)] >= 12) {
+                        strongNeighbours++;
+                    }
+                }
+            }
+            const bool bridged =
+                (values[index - 1] >= 12 && values[index + 1] >= 12) ||
+                (values[index - kShadowMaskSize] >= 12 && values[index + kShadowMaskSize] >= 12);
+            if (center >= 12 || strongNeighbours >= 5 || bridged) {
+                cleaned[index] = 15;
+            }
+        }
+    }
+    values.swap(cleaned);
+
+    // Softness controls the number of cheap four-neighbour passes. The interior stays at full CI4 coverage,
     // while zero-valued edge pixels receive only a small fraction of their strongest neighbour.
     const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
     const int smoothingPasses = std::clamp((int)(softness * 3.0f + 0.5f), 0, 3);
@@ -2861,7 +2890,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->loaded_texture[0].blended = false;
     mRdp->other_mode_h = (savedOtherH & ~((3U << G_MDSFT_CYCLETYPE) | (3U << G_MDSFT_TEXTFILT))) |
                           G_CYC_1CYCLE | G_TF_BILERP;
-    mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF;
+    mRdp->other_mode_l = G_RM_AA_ZB_XLU_DECAL;
     GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), alpha_comb(0, 0, 0, G_ACMUX_TEXEL0), 0, 0);
     mRdp->prim_color = { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 255 };
     mRdp->toon = false;
@@ -2873,6 +2902,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     const float centerV = (cache.min_v + cache.max_v) * 0.5f;
     const float halfU = (cache.max_u - cache.min_u) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
     const float halfV = (cache.max_v - cache.min_v) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    // Normal quantization error grows across a large footprint. Add a small size-aware lift and use the
+    // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
+    const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
+    const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
@@ -2890,9 +2923,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
         const float planeDistance = ShadowDot(drawNormal, world) + drawPlaneD;
-        world[0] += drawNormal[0] * (kShadowSurfaceBias - planeDistance);
-        world[1] += drawNormal[1] * (kShadowSurfaceBias - planeDistance);
-        world[2] += drawNormal[2] * (kShadowSurfaceBias - planeDistance);
+        world[0] += drawNormal[0] * (surfaceBias - planeDistance);
+        world[1] += drawNormal[1] * (surfaceBias - planeDistance);
+        world[2] += drawNormal[2] * (surfaceBias - planeDistance);
         LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + i];
         vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
                                        world[2] * mRsp->P_matrix[2][0] + mRsp->P_matrix[3][0]);
@@ -2913,6 +2946,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     Flush();
 
     mRapi->SetStencilMode((int)StencilMode::Off, 0);
+    mRapi->SetZmodeDecal(savedRendering.decal_mode);
     if (savedRendering.mTextures[0] != nullptr) {
         mRapi->SelectTexture(0, savedRendering.mTextures[0]->second.texture_id);
         const bool linear = (savedOtherH & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
