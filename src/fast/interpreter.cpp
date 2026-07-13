@@ -2409,6 +2409,19 @@ constexpr RGBA kShadowPalette[16] = {
 };
 constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
+constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
+
+static int ShadowSignExtend7(uint32_t value) {
+    return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
+}
+
+static void ShadowDecodeOffset(uint32_t packed, float out[3]) {
+    const int exponent = (int)((packed >> 21) & 0x07U);
+    const float scale = ldexpf(1.0f / 16.0f, exponent);
+    out[0] = ShadowSignExtend7((packed >> 14) & 0x7FU) * scale;
+    out[1] = ShadowSignExtend7((packed >> 7) & 0x7FU) * scale;
+    out[2] = ShadowSignExtend7(packed & 0x7FU) * scale;
+}
 
 static float ShadowDot(const float a[3], const float b[3]) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -2426,6 +2439,18 @@ static bool ShadowNormalize(float v[3]) {
     v[0] /= length;
     v[1] /= length;
     v[2] /= length;
+    return true;
+}
+
+static bool ShadowNormalizePlane(float normal[3], float& planeD) {
+    const float length = ShadowLength(normal);
+    if (length < 0.0001f || !std::isfinite(length) || !std::isfinite(planeD)) {
+        return false;
+    }
+    normal[0] /= length;
+    normal[1] /= length;
+    normal[2] /= length;
+    planeD /= length;
     return true;
 }
 
@@ -2495,10 +2520,10 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     }
 
     float normal[3] = { cache.plane_normal[0], cache.plane_normal[1], cache.plane_normal[2] };
-    if (!ShadowNormalize(normal)) {
+    float planeD = cache.plane_d;
+    if (!ShadowNormalizePlane(normal, planeD)) {
         return;
     }
-    float planeD = cache.plane_d;
     float light[3] = { mRsp->toon_shadow_dir[0], mRsp->toon_shadow_dir[1], mRsp->toon_shadow_dir[2] };
     if (!ShadowNormalize(light)) {
         return;
@@ -2772,7 +2797,8 @@ TextureCacheNode* Interpreter::BindShadowTexture(uintptr_t textureKey) {
 }
 
 void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
-    if (!cache.valid || cache.texture_count == 0 || cache.active_texture >= cache.texture_count || mRapi == nullptr) {
+    if (!cache.valid || !cache.visible || cache.texture_count == 0 ||
+        cache.active_texture >= cache.texture_count || mRapi == nullptr) {
         return;
     }
     TextureCacheNode* shadowTexture = BindShadowTexture(cache.texture_keys[cache.active_texture]);
@@ -2828,6 +2854,19 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->grayscale = false;
     mRsp->geometry_mode = G_ZBUFFER;
 
+    float drawNormal[3] = { cache.draw_plane_normal[0], cache.draw_plane_normal[1],
+                            cache.draw_plane_normal[2] };
+    float drawPlaneD = cache.draw_plane_d;
+    if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+        drawNormal[0] = cache.plane_normal[0];
+        drawNormal[1] = cache.plane_normal[1];
+        drawNormal[2] = cache.plane_normal[2];
+        drawPlaneD = cache.plane_d;
+        if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+            return;
+        }
+    }
+
     const float centerU = (cache.min_u + cache.max_u) * 0.5f;
     const float centerV = (cache.min_v + cache.max_v) * 0.5f;
     const float halfU = (cache.max_u - cache.min_u) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
@@ -2838,12 +2877,18 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     // vertical flip put the actor's feet at the far end of the projected shadow.
     const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
     for (int i = 0; i < 4; i++) {
-        const float world[3] = { cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] +
-                                     cache.basis_v[0] * coords[i][1] + cache.plane_normal[0] * 0.04f,
-                                 cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] +
-                                     cache.basis_v[1] * coords[i][1] + cache.plane_normal[1] * 0.04f,
-                                 cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] +
-                                     cache.basis_v[2] * coords[i][1] + cache.plane_normal[2] * 0.04f };
+        float world[3] = { cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] +
+                                 cache.basis_v[0] * coords[i][1] + cache.world_offset[0],
+                             cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] +
+                                 cache.basis_v[1] * coords[i][1] + cache.world_offset[1],
+                             cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] +
+                                 cache.basis_v[2] * coords[i][1] + cache.world_offset[2] };
+        // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
+        // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
+        const float planeDistance = ShadowDot(drawNormal, world) + drawPlaneD;
+        world[0] += drawNormal[0] * (0.04f - planeDistance);
+        world[1] += drawNormal[1] * (0.04f - planeDistance);
+        world[2] += drawNormal[2] * (0.04f - planeDistance);
         LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + i];
         vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
                                        world[2] * mRsp->P_matrix[2][0] + mRsp->P_matrix[3][0]);
@@ -2894,7 +2939,7 @@ void Interpreter::RenderShadowCache() {
     const uint32_t visibleFrame = mShadowFrame - 1;
     for (auto& entry : mShadowCaches) {
         const ShadowMaskCache& cache = entry.second;
-        if (cache.valid && cache.last_seen_frame == visibleFrame) {
+        if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
             DrawShadowQuad(cache);
         }
     }
@@ -4757,12 +4802,29 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     auto& cache = cacheIt->second;
     gfx->mRsp->toon_shadow_size = sizeOrSentinel;
     cache.size = std::clamp(sizeOrSentinel, 0.0f, 1.0f);
-    cache.valid = (gfx->mRsp->toon_shadow_flags & kShadowFlagValid) && cache.size > 0.01f;
-    gfx->mRsp->toon_shadow_update = cache.valid &&
+    // Texture validity is independent from receiver visibility. Keeping the uploaded mask alive lets the
+    // game-side size easing fade through brief floor misses instead of deleting the shadow for one frame.
+    cache.visible = cache.size > 0.01f;
+    const bool receiverValid = (gfx->mRsp->toon_shadow_flags & kShadowFlagValid) != 0;
+    gfx->mRsp->toon_shadow_update = receiverValid &&
                                     (gfx->mRsp->toon_shadow_flags & kShadowFlagRegenerate) &&
                                     cache.version != gfx->mRsp->toon_shadow_version;
-    // Keep the receiver plane paired with the rasterized version. A changing collision plane must not move an
-    // old silhouette until its new mask has been generated.
+
+    if ((gfx->mRsp->toon_shadow_flags & kShadowFlagHasOffset) != 0) {
+        const uint32_t packedOffset = ((uint32_t)nx << 16) | ((uint32_t)ny << 8) | (uint32_t)nz;
+        ShadowDecodeOffset(packedOffset, cache.world_offset);
+    } else {
+        cache.world_offset[0] = cache.world_offset[1] = cache.world_offset[2] = 0.0f;
+    }
+
+    // Placement follows the latest valid collision plane every actor pass. The expensive CI4 mask and its
+    // source plane change only when the scheduler grants a regeneration.
+    if (receiverValid) {
+        cache.draw_plane_normal[0] = gfx->mRsp->toon_shadow_plane[0];
+        cache.draw_plane_normal[1] = gfx->mRsp->toon_shadow_plane[1];
+        cache.draw_plane_normal[2] = gfx->mRsp->toon_shadow_plane[2];
+        cache.draw_plane_d = gfx->mRsp->toon_shadow_plane[3];
+    }
     if (gfx->mRsp->toon_shadow_update) {
         cache.plane_normal[0] = gfx->mRsp->toon_shadow_plane[0];
         cache.plane_normal[1] = gfx->mRsp->toon_shadow_plane[1];
