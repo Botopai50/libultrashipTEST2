@@ -70,6 +70,7 @@ std::stack<std::string> currentDir;
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
+static constexpr uint8_t kShadowFlagCaptureUnlit = 1 << 5;
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -2412,7 +2413,6 @@ constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
-constexpr uint8_t kShadowFlagCaptureUnlit = 1 << 5;
 constexpr float kShadowSurfaceBias = 0.75f;
 
 static int ShadowSignExtend7(uint32_t value) {
