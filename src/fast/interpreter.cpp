@@ -2801,6 +2801,19 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
         cache.active_texture >= cache.texture_count || mRapi == nullptr) {
         return;
     }
+    float drawNormal[3] = { cache.draw_plane_normal[0], cache.draw_plane_normal[1],
+                            cache.draw_plane_normal[2] };
+    float drawPlaneD = cache.draw_plane_d;
+    if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+        drawNormal[0] = cache.plane_normal[0];
+        drawNormal[1] = cache.plane_normal[1];
+        drawNormal[2] = cache.plane_normal[2];
+        drawPlaneD = cache.plane_d;
+        if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+            return;
+        }
+    }
+
     TextureCacheNode* shadowTexture = BindShadowTexture(cache.texture_keys[cache.active_texture]);
     if (shadowTexture == nullptr) {
         return;
@@ -2854,19 +2867,6 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->grayscale = false;
     mRsp->geometry_mode = G_ZBUFFER;
 
-    float drawNormal[3] = { cache.draw_plane_normal[0], cache.draw_plane_normal[1],
-                            cache.draw_plane_normal[2] };
-    float drawPlaneD = cache.draw_plane_d;
-    if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
-        drawNormal[0] = cache.plane_normal[0];
-        drawNormal[1] = cache.plane_normal[1];
-        drawNormal[2] = cache.plane_normal[2];
-        drawPlaneD = cache.plane_d;
-        if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
-            return;
-        }
-    }
-
     const float centerU = (cache.min_u + cache.max_u) * 0.5f;
     const float centerV = (cache.min_v + cache.max_v) * 0.5f;
     const float halfU = (cache.max_u - cache.min_u) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
@@ -2877,12 +2877,14 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     // vertical flip put the actor's feet at the far end of the projected shadow.
     const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
     for (int i = 0; i < 4; i++) {
-        float world[3] = { cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] +
-                                 cache.basis_v[0] * coords[i][1] + cache.world_offset[0],
-                             cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] +
-                                 cache.basis_v[1] * coords[i][1] + cache.world_offset[1],
-                             cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] +
-                                 cache.basis_v[2] * coords[i][1] + cache.world_offset[2] };
+        float world[3] = {
+            cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] + cache.basis_v[0] * coords[i][1] +
+                cache.world_offset[0],
+            cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] + cache.basis_v[1] * coords[i][1] +
+                cache.world_offset[1],
+            cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] + cache.basis_v[2] * coords[i][1] +
+                cache.world_offset[2],
+        };
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
         const float planeDistance = ShadowDot(drawNormal, world) + drawPlaneD;
