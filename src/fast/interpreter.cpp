@@ -2388,7 +2388,7 @@ namespace {
 constexpr int kShadowMaskSize = 96;
 constexpr size_t kShadowMaskBytes = (kShadowMaskSize * kShadowMaskSize) / 2;
 constexpr int kShadowTextureBuffers = 3;
-constexpr uint8_t kShadowPaletteIntensity = 28;
+constexpr uint8_t kShadowPaletteIntensity = 0;
 constexpr RGBA kShadowPalette[16] = {
     { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 0 },
     { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 17 },
@@ -2638,25 +2638,33 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // A cheap four-neighbour pass softens only the edge; the interior remains at full CI4 coverage.
-    std::vector<uint8_t> softened(values.size(), 0);
-    for (int y = 0; y < kShadowMaskSize; y++) {
-        for (int x = 0; x < kShadowMaskSize; x++) {
-            const int center = values[y * kShadowMaskSize + x];
-            int sum = center * 4;
-            int maxNeighbour = center;
-            const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
-            for (const auto& offset : offsets) {
-                const int nx = x + offset[0];
-                const int ny = y + offset[1];
-                if (nx >= 0 && nx < kShadowMaskSize && ny >= 0 && ny < kShadowMaskSize) {
-                    const int neighbour = values[ny * kShadowMaskSize + nx];
-                    sum += neighbour;
-                    maxNeighbour = std::max(maxNeighbour, neighbour);
+    // Softness controls the number of cheap four-neighbour passes. The interior stays near full CI4 coverage,
+    // while zero-valued edge pixels receive only a small fraction of their strongest neighbour.
+    const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
+    const int smoothingPasses = std::clamp((int)(softness * 3.0f + 0.5f), 0, 3);
+    std::vector<uint8_t> softened = values;
+    for (int pass = 0; pass < smoothingPasses; pass++) {
+        std::vector<uint8_t> next(softened.size(), 0);
+        for (int y = 0; y < kShadowMaskSize; y++) {
+            for (int x = 0; x < kShadowMaskSize; x++) {
+                const int center = softened[y * kShadowMaskSize + x];
+                int sum = center * 4;
+                int maxNeighbour = center;
+                const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+                for (const auto& offset : offsets) {
+                    const int nx = x + offset[0];
+                    const int ny = y + offset[1];
+                    if (nx >= 0 && nx < kShadowMaskSize && ny >= 0 && ny < kShadowMaskSize) {
+                        const int neighbour = softened[ny * kShadowMaskSize + nx];
+                        sum += neighbour;
+                        maxNeighbour = std::max(maxNeighbour, neighbour);
+                    }
                 }
+                next[y * kShadowMaskSize + x] =
+                    (uint8_t)(center == 0 ? maxNeighbour / 3 : std::min(15, sum / 8));
             }
-            softened[y * kShadowMaskSize + x] = (uint8_t)(center == 0 ? maxNeighbour / 3 : std::min(15, sum / 8));
         }
+        softened.swap(next);
     }
 
     cache.ci4.assign(kShadowMaskBytes, 0);
@@ -2804,7 +2812,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     const float halfV = (cache.max_v - cache.min_v) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
-    const float uvs[4][2] = { { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f } };
+    // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
+    // vertical flip put the actor's feet at the far end of the projected shadow.
+    const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
     for (int i = 0; i < 4; i++) {
         const float world[3] = { cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] +
                                      cache.basis_v[0] * coords[i][1] + cache.plane_normal[0] * 0.04f,
