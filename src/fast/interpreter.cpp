@@ -2414,6 +2414,7 @@ constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr float kShadowSurfaceBias = 0.75f;
+constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
     return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
@@ -2599,26 +2600,101 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        ProjectedTriangle projected{};
-        const float* points[3] = { a, b, c };
+        // Clip the actor triangle against the receiving plane before projection. Previously a single vertex
+        // below the floor discarded the entire triangle, cutting off deep-rooted geometry such as sign posts.
+        constexpr float clipBoundary = -1.0f;
+        const float input[3][3] = {
+            { a[0], a[1], a[2] },
+            { b[0], b[1], b[2] },
+            { c[0], c[1], c[2] },
+        };
+        float clipped[4][3]{};
+        int clippedCount = 0;
+
+        for (int currentIndex = 0; currentIndex < 3; currentIndex++) {
+            const float* previous = input[(currentIndex + 2) % 3];
+            const float* current = input[currentIndex];
+            const float previousDistance = ShadowDot(normal, previous) + planeD;
+            const float currentDistance = ShadowDot(normal, current) + planeD;
+            const bool previousInside = previousDistance >= clipBoundary;
+            const bool currentInside = currentDistance >= clipBoundary;
+
+            auto appendIntersection = [&]() {
+                const float denominator = currentDistance - previousDistance;
+                if (fabsf(denominator) < 0.000001f || clippedCount >= 4) {
+                    return;
+                }
+                const float amount =
+                    std::clamp((clipBoundary - previousDistance) / denominator, 0.0f, 1.0f);
+                for (int axis = 0; axis < 3; axis++) {
+                    clipped[clippedCount][axis] =
+                        previous[axis] + (current[axis] - previous[axis]) * amount;
+                }
+                clippedCount++;
+            };
+
+            if (currentInside) {
+                if (!previousInside) {
+                    appendIntersection();
+                }
+                if (clippedCount < 4) {
+                    for (int axis = 0; axis < 3; axis++) {
+                        clipped[clippedCount][axis] = current[axis];
+                    }
+                    clippedCount++;
+                }
+            } else if (previousInside) {
+                appendIntersection();
+            }
+        }
+
+        if (clippedCount < 3) {
+            continue;
+        }
+
+        float projectedVertices[4][2]{};
         bool valid = true;
-        for (int i = 0; i < 3; i++) {
-            const float distance = ShadowDot(normal, points[i]) + planeD;
+        for (int i = 0; i < clippedCount; i++) {
+            // Vertices within the one-unit clip tolerance are snapped onto the receiver instead of being
+            // projected behind it. This keeps the bottom of an actor from vanishing inside the floor.
+            const float distance = std::max(0.0f, ShadowDot(normal, clipped[i]) + planeD);
             const float t = -distance / castDenom;
-            if (t < -1.0f || t > 8192.0f || !std::isfinite(t)) {
+            if (t > 8192.0f || !std::isfinite(t)) {
                 valid = false;
                 break;
             }
-            const float projectedWorld[3] = { points[i][0] + castDir[0] * t, points[i][1] + castDir[1] * t,
-                                               points[i][2] + castDir[2] * t };
-            projected.p[i][0] = ShadowDot(basisU, projectedWorld) - ShadowDot(basisU, planeOrigin);
-            projected.p[i][1] = ShadowDot(basisV, projectedWorld) - ShadowDot(basisV, planeOrigin);
-            minU = std::min(minU, projected.p[i][0]);
-            minV = std::min(minV, projected.p[i][1]);
-            maxU = std::max(maxU, projected.p[i][0]);
-            maxV = std::max(maxV, projected.p[i][1]);
+            const float projectedWorld[3] = {
+                clipped[i][0] + castDir[0] * t,
+                clipped[i][1] + castDir[1] * t,
+                clipped[i][2] + castDir[2] * t,
+            };
+            projectedVertices[i][0] =
+                ShadowDot(basisU, projectedWorld) - ShadowDot(basisU, planeOrigin);
+            projectedVertices[i][1] =
+                ShadowDot(basisV, projectedWorld) - ShadowDot(basisV, planeOrigin);
+            if (!std::isfinite(projectedVertices[i][0]) ||
+                !std::isfinite(projectedVertices[i][1])) {
+                valid = false;
+                break;
+            }
         }
-        if (valid) {
+        if (!valid) {
+            continue;
+        }
+
+        // A clipped triangle is either a triangle or a quad. Rasterize a fan and update the mask bounds only
+        // after every projected vertex is known to be valid; invalid triangles used to corrupt these bounds.
+        for (int fan = 1; fan + 1 < clippedCount; fan++) {
+            ProjectedTriangle projected{};
+            const int indices[3] = { 0, fan, fan + 1 };
+            for (int i = 0; i < 3; i++) {
+                projected.p[i][0] = projectedVertices[indices[i]][0];
+                projected.p[i][1] = projectedVertices[indices[i]][1];
+                minU = std::min(minU, projected.p[i][0]);
+                minV = std::min(minV, projected.p[i][1]);
+                maxU = std::max(maxU, projected.p[i][0]);
+                maxV = std::max(maxV, projected.p[i][1]);
+            }
             triangles.push_back(projected);
         }
     }
@@ -2689,32 +2765,49 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Projected N64 meshes are frequently unwelded triangle soup. Close only isolated one-pixel cracks and
-    // normalize strong interior samples before softening; this removes CI4 speckle without filling real gaps
-    // between limbs or increasing the 96x96 mask/update cost.
-    std::vector<uint8_t> cleaned = values;
-    for (int y = 1; y < kShadowMaskSize - 1; y++) {
-        for (int x = 1; x < kShadowMaskSize - 1; x++) {
-            const size_t index = (size_t)y * kShadowMaskSize + x;
-            const uint8_t center = values[index];
-            int strongNeighbours = 0;
-            for (int oy = -1; oy <= 1; oy++) {
-                for (int ox = -1; ox <= 1; ox++) {
-                    if ((ox != 0 || oy != 0) &&
-                        values[(size_t)(y + oy) * kShadowMaskSize + (x + ox)] >= 12) {
-                        strongNeighbours++;
-                    }
-                }
-            }
-            const bool bridged =
-                (values[index - 1] >= 12 && values[index + 1] >= 12) ||
-                (values[index - kShadowMaskSize] >= 12 && values[index + kShadowMaskSize] >= 12);
-            if (center >= 12 || strongNeighbours >= 5 || bridged) {
-                cleaned[index] = 15;
-            }
+    // Mark the low-coverage background connected to the mask edge, then fill every enclosed gap. This keeps
+    // antialiasing on the outer contour while making the projected actor interior fully solid and noise-free.
+    std::vector<uint8_t> exterior(values.size(), 0);
+    std::vector<int> flood;
+    flood.reserve(values.size());
+
+    auto seedExterior = [&](int x, int y) {
+        const int index = y * kShadowMaskSize + x;
+        if (exterior[index] == 0 && values[index] < 12) {
+            exterior[index] = 1;
+            flood.push_back(index);
+        }
+    };
+    for (int coordinate = 0; coordinate < kShadowMaskSize; coordinate++) {
+        seedExterior(coordinate, 0);
+        seedExterior(coordinate, kShadowMaskSize - 1);
+        seedExterior(0, coordinate);
+        seedExterior(kShadowMaskSize - 1, coordinate);
+    }
+
+    for (size_t cursor = 0; cursor < flood.size(); cursor++) {
+        const int index = flood[cursor];
+        const int x = index % kShadowMaskSize;
+        const int y = index / kShadowMaskSize;
+        if (x > 0) {
+            seedExterior(x - 1, y);
+        }
+        if (x + 1 < kShadowMaskSize) {
+            seedExterior(x + 1, y);
+        }
+        if (y > 0) {
+            seedExterior(x, y - 1);
+        }
+        if (y + 1 < kShadowMaskSize) {
+            seedExterior(x, y + 1);
         }
     }
-    values.swap(cleaned);
+
+    for (size_t index = 0; index < values.size(); index++) {
+        if (values[index] >= 12 || exterior[index] == 0) {
+            values[index] = 15;
+        }
+    }
 
     // Softness controls the number of cheap four-neighbour passes. The interior stays at full CI4 coverage,
     // while zero-valued edge pixels receive only a small fraction of their strongest neighbour.
@@ -2935,6 +3028,11 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
                     world[2] * mRsp->P_matrix[2][2] + mRsp->P_matrix[3][2];
         vertex->w = world[0] * mRsp->P_matrix[0][3] + world[1] * mRsp->P_matrix[1][3] +
                     world[2] * mRsp->P_matrix[2][3] + mRsp->P_matrix[3][3];
+        if (vertex->w > 0.0f) {
+            // Pull the decal slightly toward the camera in clip space. This is stable on GLES and prevents
+            // depth quantization from producing grain or letting the shadow fall behind the receiving surface.
+            vertex->z -= vertex->w * kShadowClipDepthBias;
+        }
         vertex->u = (int16_t)(uvs[i][0] * (kShadowMaskSize - 1) * 32.0f);
         vertex->v = (int16_t)(uvs[i][1] * (kShadowMaskSize - 1) * 32.0f);
         vertex->clip_rej = 0;
