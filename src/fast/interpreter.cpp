@@ -2605,8 +2605,30 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     maxU += pad;
     minV -= pad;
     maxV += pad;
-    const float rasterWidth = maxU - minU;
-    const float rasterHeight = maxV - minV;
+    float rasterWidth = maxU - minU;
+    float rasterHeight = maxV - minV;
+
+    // Keep the 96x96 world-to-texel mapping stable while an actor animates. Recomputing a tight box for every
+    // pose makes the quad scale and slide by sub-texel amounts, which reads as shimmer on a running Link. Reuse
+    // the previous footprint size, follow the current silhouette center, and snap that center to a half-texel
+    // grid. A genuinely larger pose can still expand the footprint; it is never clipped by the stabilizer.
+    const float previousWidth = cache.max_u - cache.min_u;
+    const float previousHeight = cache.max_v - cache.min_v;
+    if (cache.version != 0 && cache.texture_count != 0 && std::isfinite(previousWidth) &&
+        std::isfinite(previousHeight) && previousWidth > 0.1f && previousHeight > 0.1f) {
+        rasterWidth = std::max(rasterWidth, previousWidth);
+        rasterHeight = std::max(rasterHeight, previousHeight);
+        const float centerU = (minU + maxU) * 0.5f;
+        const float centerV = (minV + maxV) * 0.5f;
+        const float quantumU = rasterWidth / (float)(kShadowMaskSize - 1) * 0.5f;
+        const float quantumV = rasterHeight / (float)(kShadowMaskSize - 1) * 0.5f;
+        const float stableCenterU = quantumU > 0.0001f ? roundf(centerU / quantumU) * quantumU : centerU;
+        const float stableCenterV = quantumV > 0.0001f ? roundf(centerV / quantumV) * quantumV : centerV;
+        minU = stableCenterU - rasterWidth * 0.5f;
+        maxU = stableCenterU + rasterWidth * 0.5f;
+        minV = stableCenterV - rasterHeight * 0.5f;
+        maxV = stableCenterV + rasterHeight * 0.5f;
+    }
     std::vector<uint8_t> values(kShadowMaskSize * kShadowMaskSize, 0);
 
     auto toPixel = [&](float u, float v, float out[2]) {
@@ -2798,7 +2820,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->loaded_texture[0].blended = false;
     mRdp->other_mode_h = (savedOtherH & ~((3U << G_MDSFT_CYCLETYPE) | (3U << G_MDSFT_TEXTFILT))) |
                           G_CYC_1CYCLE | G_TF_BILERP;
-    mRdp->other_mode_l = G_RM_AA_ZB_XLU_DECAL;
+    mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF;
     GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), alpha_comb(0, 0, 0, G_ACMUX_TEXEL0), 0, 0);
     mRdp->prim_color = { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 255 };
     mRdp->toon = false;
