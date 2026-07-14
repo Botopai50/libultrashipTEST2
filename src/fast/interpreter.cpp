@@ -2403,6 +2403,7 @@ constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
+constexpr uint8_t kShadowFlagEdgeVolume = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
@@ -2493,8 +2494,19 @@ void Interpreter::FlushToonShadow() {
     }
 
     ShadowMaskCache& cache = cacheIt->second;
-    if (cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
+    const bool edgeVolume = (mRsp->toon_shadow_flags & kShadowFlagEdgeVolume) != 0;
+    if (!edgeVolume && cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
         mShadowVerts.clear();
+        return;
+    }
+
+    // A hard drop is rendered by the edge-aware stencil volume below. Keep the cached planar mask intact so it
+    // remains a safe fallback on throttled frames, and only suppress the quad when a volume was actually built.
+    if (edgeVolume) {
+        const size_t volumeBefore = mShadowVolumeAccum.size();
+        FlushToonShadowLegacy();
+        cache.edge_volume_this_frame = mShadowVolumeAccum.size() > volumeBefore;
+        cache.version = mRsp->toon_shadow_version;
         return;
     }
 
@@ -3073,17 +3085,19 @@ void Interpreter::RenderShadowCache() {
     Flush();
     mShadowFrame++;
     const uint32_t visibleFrame = mShadowFrame - 1;
+    RenderShadowVolumesLegacy();
     for (auto& entry : mShadowCaches) {
-        const ShadowMaskCache& cache = entry.second;
-        if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
+        ShadowMaskCache& cache = entry.second;
+        if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame && !cache.edge_volume_this_frame) {
             DrawShadowQuad(cache);
         }
+        cache.edge_volume_this_frame = false;
     }
     mRapi->SetStencilMode((int)StencilMode::Off, 0);
 }
 
-// SOH [Enhancement] Legacy volume implementation retained temporarily for source compatibility with old
-// display-list captures. It is no longer called by the actor-shadow command handlers.
+// SOH [Enhancement] Edge-aware actor-shadow volume. It is enabled only for a game-side hard-drop probe; normal
+// receivers continue to use the cached 96x96 mask and never pay this stencil cost.
 //
 // The volume is a thin SLAB at the feet: the captured silhouette projected along the cel key-light direction
 // onto the feet level, then extruded from slabTop (above the feet, catches uphill ground) to slabBottom
@@ -3098,7 +3112,6 @@ void Interpreter::RenderShadowCache() {
 // (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // Each projected triangle becomes its own closed prism with per-face OUTWARD winding (so the z-fail increment
 // hits the right faces despite the clamp-at-0 ops); the per-prism counts compose into the union (the footprint).
-#if 0
 void Interpreter::FlushToonShadowLegacy() {
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
@@ -3239,6 +3252,8 @@ void Interpreter::RenderShadowVolumesLegacy() {
     const bool savedToonShadow = mRdp->toon_shadow;
     const bool savedGray = mRdp->grayscale;
     const struct RGBA savedPrim = mRdp->prim_color;
+    const RenderingState savedRendering = mRenderingState;
+    const bool savedTextureChanged1 = mRdp->textures_changed[1];
 
     mRdp->toon = false;
     mRdp->toon_shadow = false; // the volume geometry must not be re-captured
@@ -3433,11 +3448,24 @@ void Interpreter::RenderShadowVolumesLegacy() {
     mRdp->toon_shadow = savedToonShadow;
     mRdp->grayscale = savedGray;
 
+    // The volume path uses the normal triangle setup to batch its stencil geometry, so restore every backend
+    // state that the setup may have changed before the next ordinary display-list draw is submitted.
+    mRapi->SetDepthTestAndMask((savedRendering.depth_test_and_mask & 1) != 0,
+                               (savedRendering.depth_test_and_mask & 2) != 0);
+    mRapi->SetZmodeDecal(savedRendering.decal_mode);
+    mRapi->SetUseAlpha(savedRendering.alpha_blend);
+    // Unit 0 was touched by the volume's state-resolution triangle. Force normal geometry to bind its own
+    // texture instead of trusting the state that was active during the stencil pass.
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = savedTextureChanged1;
+    mRenderingState = savedRendering;
+    mRapi->SelectTexture(0, 0);
+    mRenderingState.mTextures[0] = nullptr;
+    mRenderingState.mShaderProgram = nullptr;
+
     mShadowVolumeAccum.clear();
     mShadowVolumeKind.clear();
 }
-
-#endif
 
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mRdp->grayscale_color.r = r;

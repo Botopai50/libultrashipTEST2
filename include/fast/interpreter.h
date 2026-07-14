@@ -407,6 +407,9 @@ struct ShadowMaskCache {
     uint32_t last_seen_frame = 0;
     bool valid = false;
     bool visible = false;
+    // True only for the current frame when an edge-aware stencil volume was built for this actor. The cached
+    // planar mask remains available as a fallback on frames where regeneration is throttled.
+    bool edge_volume_this_frame = false;
     uint8_t active_texture = 0;
     uint8_t texture_count = 0;
     uint32_t texture_ids[3] = {};
@@ -508,6 +511,9 @@ class Interpreter {
     // cached 96x96 8-bit coverage silhouette. Work is performed only for an actor version scheduled by the game-side
     // update budget.
     void FlushToonShadow();
+    // SOH [Enhancement] Actor shadow: build and render a depth-conforming volume for a detected hard drop.
+    void FlushToonShadowLegacy();
+    void RenderShadowVolumesLegacy();
     // SOH [Enhancement] Actor shadow: draw every valid cached mask as one textured quad.
     void RenderShadowCache();
     void RasterizeShadowMask(ShadowMaskCache& cache);
@@ -603,6 +609,9 @@ class Interpreter {
     // SOH [Enhancement] Actor shadow: world-space positions of the current object's triangles (9 floats
     // per tri), captured only when a cached mask is scheduled for regeneration.
     std::vector<float> mShadowVerts;
+    std::vector<float> mShadowVolumeAccum;
+    std::vector<uint8_t> mShadowVolumeKind;
+    std::vector<LoadedVertex> mShadowXform;
     std::unordered_map<uint32_t, ShadowMaskCache> mShadowCaches;
     TextureCacheMap mShadowTextureBindings;
     uintptr_t mShadowTextureSerial = 1;
@@ -612,6 +621,10 @@ class Interpreter {
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
+    // Edge-volume fallback only; the normal path remains the cached 96x96 mask.
+    float mShadowSlabDepth = 80.0f;
+    float mShadowSlabRise = 10.0f;
+    bool mShadowShowVolume = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
