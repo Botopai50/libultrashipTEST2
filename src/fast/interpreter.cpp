@@ -2763,21 +2763,24 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Build the crisp base mask first. The optional smoothing below is applied only when the user requests a
-    // soft edge; crisp mode stays binary and the shadow shader thresholds the bilinear sample.
-    for (uint8_t& value : values) {
-        value = value >= 128 ? 255 : 0;
+    // Keep the 4x4 coverage values for the contour. Crisp mode thresholds them in the shader, after bilinear
+    // filtering, so the final solid edge uses the sub-texel coverage instead of a prematurely quantized mask.
+    // Soft mode also benefits from the same coverage values instead of blurring an already-binary silhouette.
+    std::vector<uint8_t> solid(values.size(), 0);
+    for (size_t index = 0; index < values.size(); index++) {
+        solid[index] = values[index] >= 128 ? 255 : 0;
     }
 
-    // Mark the low-coverage background connected to the mask edge, then fill every enclosed gap. This keeps
-    // the projected actor interior fully solid and noise-free without leaving pinholes between unwelded faces.
+    // Mark the background connected to the mask edge using the solid occupancy mask, then fill every enclosed
+    // gap in the coverage. This keeps the projected actor interior fully solid without destroying fractional
+    // coverage at the outer contour.
     std::vector<uint8_t> exterior(values.size(), 0);
     std::vector<int> flood;
     flood.reserve(values.size());
 
     auto seedExterior = [&](int x, int y) {
         const int index = y * kShadowMaskSize + x;
-        if (exterior[index] == 0 && values[index] == 0) {
+        if (exterior[index] == 0 && solid[index] == 0) {
             exterior[index] = 1;
             flood.push_back(index);
         }
@@ -2871,10 +2874,6 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
         mShadowTextureBindings.emplace(key, value);
     }
 
-    TextureCacheNode* previous = mRenderingState.mTextures[0];
-    const bool previousLinear = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
-    const uint32_t previousCms = mRdp->texture_tile[0].cms;
-    const uint32_t previousCmt = mRdp->texture_tile[0].cmt;
     const uint8_t nextSlot = cache.texture_count == 1 ? 0 : (uint8_t)((cache.active_texture + 1) % kShadowTextureBuffers);
     // Finish any normal geometry before changing texture unit 0. Otherwise the pending batch is submitted with
     // the shadow texture bound, which corrupts unrelated scene textures and can stretch them across the screen.
@@ -2895,15 +2894,11 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
     mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
 
     cache.active_texture = nextSlot;
-    if (previous != nullptr) {
-        mRapi->SelectTexture(0, previous->second.texture_id);
-        mRapi->SetSamplerParameters(0, previousLinear, previousCms, previousCmt);
-    } else {
-        // No normal texture was active when the mask was uploaded. Do not leave the shadow texture bound for
-        // the next display-list draw; force that draw to import/select its real texture.
-        mRapi->SelectTexture(0, 0);
-        mRdp->textures_changed[0] = true;
-    }
+    // The mask upload temporarily owns texture unit 0. Do not try to restore a possibly stale cache entry: clear
+    // the binding and force the next normal draw to import/select its real texture and sampler state.
+    mRapi->SelectTexture(0, 0);
+    mRenderingState.mTextures[0] = nullptr;
+    mRdp->textures_changed[0] = true;
 }
 
 TextureCacheNode* Interpreter::BindShadowTexture(uintptr_t textureKey) {
@@ -2952,8 +2947,6 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     const bool savedShadow = mRdp->toon_shadow;
     const bool savedGrayscale = mRdp->grayscale;
     const uint8_t savedTile = mRdp->first_tile_index;
-    const bool savedTextureChanged0 = mRdp->textures_changed[0];
-    const bool forceTextureReload0 = savedRendering.mTextures[0] == nullptr;
     const bool savedTextureChanged1 = mRdp->textures_changed[1];
     const auto savedTile0 = mRdp->texture_tile[0];
     const auto savedLoaded0 = mRdp->loaded_texture[0];
@@ -3053,15 +3046,6 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
                                (savedRendering.depth_test_and_mask & 2) != 0);
     mRapi->SetZmodeDecal(savedRendering.decal_mode);
     mRapi->SetUseAlpha(savedRendering.alpha_blend);
-    if (savedRendering.mTextures[0] != nullptr) {
-        mRapi->SelectTexture(0, savedRendering.mTextures[0]->second.texture_id);
-        const bool linear = (savedOtherH & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
-        mRapi->SetSamplerParameters(0, linear, savedTile0.cms, savedTile0.cmt);
-    } else {
-        // The shadow pass owns texture unit 0 temporarily. If there was no prior texture, unbind it; the
-        // invalidation below forces the next textured draw through ImportTexture instead of reusing the shadow binding.
-        mRapi->SelectTexture(0, 0);
-    }
     mRdp->combine_mode = savedCombine;
     mRdp->other_mode_l = savedOtherL;
     mRdp->other_mode_h = savedOtherH;
@@ -3070,12 +3054,16 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->toon_shadow = savedShadow;
     mRdp->grayscale = savedGrayscale;
     mRdp->first_tile_index = savedTile;
-    mRdp->textures_changed[0] = savedTextureChanged0 || forceTextureReload0;
+    // The shadow pass changed texture unit 0 and its sampler state. Invalidate that unit so the next normal
+    // display-list draw cannot reuse a shadow binding or a stale texture-cache entry.
+    mRdp->textures_changed[0] = true;
     mRdp->textures_changed[1] = savedTextureChanged1;
     mRdp->texture_tile[0] = savedTile0;
     mRdp->loaded_texture[0] = savedLoaded0;
     mRdp->prim_color = savedPrim;
     mRenderingState = savedRendering;
+    mRapi->SelectTexture(0, 0);
+    mRenderingState.mTextures[0] = nullptr;
     // The backend currently has the shadow shader bound while the restored RenderingState points at the
     // previous shader. Force the next normal triangle to reload its real program.
     mRenderingState.mShaderProgram = nullptr;
