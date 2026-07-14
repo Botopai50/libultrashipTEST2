@@ -18,6 +18,7 @@
 #include <vector>
 #include <list>
 #include <stack>
+#include <utility>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -2388,27 +2389,10 @@ static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
 
 namespace {
 constexpr int kShadowMaskSize = 96;
-constexpr size_t kShadowMaskBytes = (kShadowMaskSize * kShadowMaskSize) / 2;
+constexpr int kShadowCoverageSamples = 4;
+constexpr size_t kShadowMaskBytes = kShadowMaskSize * kShadowMaskSize;
 constexpr int kShadowTextureBuffers = 3;
 constexpr uint8_t kShadowPaletteIntensity = 0;
-constexpr RGBA kShadowPalette[16] = {
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 0 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 17 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 34 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 51 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 68 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 85 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 102 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 119 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 136 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 153 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 170 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 187 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 204 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 221 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 238 },
-    { kShadowPaletteIntensity, kShadowPaletteIntensity, kShadowPaletteIntensity, 255 },
-};
 constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
@@ -2488,9 +2472,10 @@ static bool ShadowPointInTriangle(float px, float py, const float a[2], const fl
     const float e2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
     return (e0 >= 0.0f && e1 >= 0.0f && e2 >= 0.0f) || (e0 <= 0.0f && e1 <= 0.0f && e2 <= 0.0f);
 }
+
 } // namespace
 
-// SOH [Enhancement] Actor shadow: generate the current actor's cached CI4 silhouette. The expensive work is
+// SOH [Enhancement] Actor shadow: generate the current actor's cached 8-bit coverage silhouette. The expensive work is
 // deliberately isolated from RenderShadowCache(), which draws only the already-uploaded texture each frame.
 void Interpreter::FlushToonShadow() {
     const uint32_t actorId = mRsp->toon_shadow_actor_id;
@@ -2508,7 +2493,7 @@ void Interpreter::FlushToonShadow() {
     }
 
     RasterizeShadowMask(cache);
-    if (cache.ci4.empty()) {
+    if (cache.coverage.empty()) {
         cache.valid = false;
     } else {
         UploadShadowMask(cache);
@@ -2519,7 +2504,7 @@ void Interpreter::FlushToonShadow() {
 }
 
 void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
-    cache.ci4.clear();
+    cache.coverage.clear();
     if (mShadowVerts.size() < 9) {
         return;
     }
@@ -2677,6 +2662,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 valid = false;
                 break;
             }
+
         }
         if (!valid) {
             continue;
@@ -2752,28 +2738,40 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         const int y1 = std::min(kShadowMaskSize - 1, (int)ceilf(std::max({ p[0][1], p[1][1], p[2][1] })));
         for (int y = y0; y <= y1; y++) {
             for (int x = x0; x <= x1; x++) {
+                // Supersample the contour instead of relying on a 2x2 mask, whose five possible coverage
+                // values made a solid shadow edge break into visible chalk-like steps.
                 int covered = 0;
-                for (int sy = 0; sy < 2; sy++) {
-                    for (int sx = 0; sx < 2; sx++) {
-                        const float sample[2] = { x + 0.25f + sx * 0.5f, y + 0.25f + sy * 0.5f };
+                for (int sy = 0; sy < kShadowCoverageSamples; sy++) {
+                    for (int sx = 0; sx < kShadowCoverageSamples; sx++) {
+                        const float sample[2] = {
+                            x + (sx + 0.5f) / kShadowCoverageSamples,
+                            y + (sy + 0.5f) / kShadowCoverageSamples,
+                        };
                         covered += ShadowPointInTriangle(sample[0], sample[1], p[0], p[1], p[2]) ? 1 : 0;
                     }
                 }
-                const uint8_t coverage = (uint8_t)((covered * 15 + 2) / 4);
+                const int sampleCount = kShadowCoverageSamples * kShadowCoverageSamples;
+                const uint8_t coverage = (uint8_t)((covered * 255 + sampleCount / 2) / sampleCount);
                 values[y * kShadowMaskSize + x] = std::max(values[y * kShadowMaskSize + x], coverage);
             }
         }
     }
 
+    // Keep the shadow solid. The GPU's bilinear sampler still gives the contour a clean one-texel transition,
+    // but storing fractional alpha here creates the chalk-like fringe against textured floors.
+    for (uint8_t& value : values) {
+        value = value >= 128 ? 255 : 0;
+    }
+
     // Mark the low-coverage background connected to the mask edge, then fill every enclosed gap. This keeps
-    // antialiasing on the outer contour while making the projected actor interior fully solid and noise-free.
+    // the projected actor interior fully solid and noise-free without leaving pinholes between unwelded faces.
     std::vector<uint8_t> exterior(values.size(), 0);
     std::vector<int> flood;
     flood.reserve(values.size());
 
     auto seedExterior = [&](int x, int y) {
         const int index = y * kShadowMaskSize + x;
-        if (exterior[index] == 0 && values[index] < 12) {
+        if (exterior[index] == 0 && values[index] == 0) {
             exterior[index] = 1;
             flood.push_back(index);
         }
@@ -2804,13 +2802,13 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     }
 
     for (size_t index = 0; index < values.size(); index++) {
-        if (values[index] >= 12 || exterior[index] == 0) {
-            values[index] = 15;
+        if (exterior[index] == 0) {
+            values[index] = 255;
         }
     }
 
-    // Softness controls the number of cheap four-neighbour passes. The interior stays at full CI4 coverage,
-    // while zero-valued edge pixels receive only a small fraction of their strongest neighbour.
+    // Softness controls the number of cheap four-neighbour passes. Keep this as an 8-bit blur so the outer
+    // contour does not collapse back into the 16 alpha levels of the old CI4 path.
     const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
     const int smoothingPasses = std::clamp((int)(softness * 3.0f + 0.5f), 0, 3);
     std::vector<uint8_t> softened = values;
@@ -2820,7 +2818,6 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             for (int x = 0; x < kShadowMaskSize; x++) {
                 const int center = softened[y * kShadowMaskSize + x];
                 int sum = center * 4;
-                int maxNeighbour = center;
                 const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
                 for (const auto& offset : offsets) {
                     const int nx = x + offset[0];
@@ -2828,25 +2825,15 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                     if (nx >= 0 && nx < kShadowMaskSize && ny >= 0 && ny < kShadowMaskSize) {
                         const int neighbour = softened[ny * kShadowMaskSize + nx];
                         sum += neighbour;
-                        maxNeighbour = std::max(maxNeighbour, neighbour);
                     }
                 }
-                next[y * kShadowMaskSize + x] =
-                    (uint8_t)(center == 0 ? maxNeighbour / 3 : std::min(15, sum / 8));
+                next[y * kShadowMaskSize + x] = (uint8_t)(sum / 8);
             }
         }
         softened.swap(next);
     }
 
-    cache.ci4.assign(kShadowMaskBytes, 0);
-    for (size_t i = 0; i < softened.size(); i++) {
-        const uint8_t value = softened[i] & 0x0F;
-        if ((i & 1) == 0) {
-            cache.ci4[i / 2] = (uint8_t)(value << 4);
-        } else {
-            cache.ci4[i / 2] |= value;
-        }
-    }
+    cache.coverage = std::move(softened);
 
     cache.plane_normal[0] = normal[0];
     cache.plane_normal[1] = normal[1];
@@ -2862,7 +2849,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
 }
 
 void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
-    if (cache.ci4.size() != kShadowMaskBytes || mRapi == nullptr) {
+    if (cache.coverage.size() != kShadowMaskBytes || mRapi == nullptr) {
         return;
     }
 
@@ -2889,16 +2876,13 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
 
     mShadowUploadBuffer.resize(kShadowMaskSize * kShadowMaskSize * 4);
     const float alphaScale = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
-    // The renderer API uploads RGBA32, so expand the cached CI4 indices through this fixed palette at the
-    // upload boundary. The cached representation and all coverage decisions remain four-bit.
+    // The renderer API uploads RGBA32. Keep the high-resolution alpha coverage generated by the rasterizer
+    // instead of expanding quantized CI4 indices through a 16-entry palette.
     for (size_t i = 0; i < kShadowMaskSize * kShadowMaskSize; i++) {
-        const uint8_t packed = cache.ci4[i / 2];
-        const uint8_t coverage = (i & 1) == 0 ? (packed >> 4) : (packed & 0x0F);
-        const RGBA entry = kShadowPalette[coverage];
-        mShadowUploadBuffer[i * 4 + 0] = entry.r;
-        mShadowUploadBuffer[i * 4 + 1] = entry.g;
-        mShadowUploadBuffer[i * 4 + 2] = entry.b;
-        mShadowUploadBuffer[i * 4 + 3] = (uint8_t)(entry.a * alphaScale);
+        mShadowUploadBuffer[i * 4 + 0] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 1] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 2] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 3] = (uint8_t)(cache.coverage[i] * alphaScale);
     }
     mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
 
@@ -4972,7 +4956,7 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         cache.world_offset[0] = cache.world_offset[1] = cache.world_offset[2] = 0.0f;
     }
 
-    // Placement follows the latest valid collision plane every actor pass. The expensive CI4 mask and its
+    // Placement follows the latest valid collision plane every actor pass. The expensive 8-bit mask and its
     // source plane change only when the scheduler grants a regeneration.
     if (receiverValid) {
         cache.draw_plane_normal[0] = gfx->mRsp->toon_shadow_plane[0];
@@ -4987,7 +4971,7 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         cache.plane_d = gfx->mRsp->toon_shadow_plane[3];
     }
     gfx->mRdp->toon_shadow = gfx->mRsp->toon_shadow_update;
-    // The legacy arm payload is retained for display-list compatibility; the CI4 path uses the explicit plane
+    // The legacy arm payload is retained for display-list compatibility; the coverage path uses the explicit plane
     // command above instead of a feet clamp.
     gfx->mRsp->toon_shadow_clamp_feet = false;
     gfx->mRsp->toon_shadow_feet_clamp_y = 0.0f;

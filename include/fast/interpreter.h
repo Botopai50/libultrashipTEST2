@@ -409,7 +409,9 @@ struct ShadowMaskCache {
     uint8_t texture_count = 0;
     uint32_t texture_ids[3] = {};
     uintptr_t texture_keys[3] = {};
-    std::vector<uint8_t> ci4;
+    // Keep the rasterized coverage at 8 bits until the texture upload. Quantizing the edge to CI4 before
+    // filtering produces visible alpha steps around the projected silhouette.
+    std::vector<uint8_t> coverage;
     // Raster plane and bounds belong to the cached mask version.
     float plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float plane_d = 0.0f;
@@ -501,7 +503,7 @@ class Interpreter {
     void SelectToonLight();
 
     // SOH [Enhancement] Actor shadow: rasterize the current object's captured world-space triangles into a
-    // cached 96x96 CI4 silhouette. Work is performed only for an actor version scheduled by the game-side
+    // cached 96x96 8-bit coverage silhouette. Work is performed only for an actor version scheduled by the game-side
     // update budget.
     void FlushToonShadow();
     // SOH [Enhancement] Actor shadow: draw every valid cached mask as one textured quad.
@@ -606,7 +608,7 @@ class Interpreter {
     std::vector<uint8_t> mShadowUploadBuffer;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
-    float mToonShadowSoftness = 0.35f;    // CI4 edge smoothing passes, 0 = crisp, 1 = broad
+    float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
