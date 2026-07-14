@@ -1666,9 +1666,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_toon) {
         cc_options |= SHADER_OPT(TOON);
     }
-    if (mShadowComposite) {
-        // Threshold the sampled coverage in the fragment shader after bilinear filtering. This removes the
-        // low-alpha fringe without applying the threshold to ordinary alpha-tested game textures.
+    if (mShadowComposite && mToonShadowSoftness <= 0.001f) {
+        // In crisp mode, threshold the sampled coverage after bilinear filtering. This removes the low-alpha
+        // fringe without applying the threshold to ordinary alpha-tested game textures. Positive softness
+        // intentionally leaves the filtered alpha intact so the user can choose a smooth edge.
         cc_options |= SHADER_OPT(SHADOW_SOLID);
     }
     if (mRdp->loaded_texture[0].masked) {
@@ -2762,8 +2763,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Keep the shadow solid. The GPU's bilinear sampler still gives the contour a clean one-texel transition,
-    // but storing fractional alpha here creates the chalk-like fringe against textured floors.
+    // Build the crisp base mask first. The optional smoothing below is applied only when the user requests a
+    // soft edge; crisp mode stays binary and the shadow shader thresholds the bilinear sample.
     for (uint8_t& value : values) {
         value = value >= 128 ? 255 : 0;
     }
@@ -2812,8 +2813,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Softness controls the number of cheap four-neighbour passes. Keep this as an 8-bit blur so the outer
-    // contour does not collapse back into the 16 alpha levels of the old CI4 path.
+    // Softness controls the number of optional four-neighbour passes. With softness at zero this loop is
+    // skipped, preserving a solid binary mask; higher values retain the smooth-edge option.
     const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
     const int smoothingPasses = std::clamp((int)(softness * 3.0f + 0.5f), 0, 3);
     std::vector<uint8_t> softened = values;
@@ -2897,6 +2898,11 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
     if (previous != nullptr) {
         mRapi->SelectTexture(0, previous->second.texture_id);
         mRapi->SetSamplerParameters(0, previousLinear, previousCms, previousCmt);
+    } else {
+        // No normal texture was active when the mask was uploaded. Do not leave the shadow texture bound for
+        // the next display-list draw; force that draw to import/select its real texture.
+        mRapi->SelectTexture(0, 0);
+        mRdp->textures_changed[0] = true;
     }
 }
 
@@ -2947,6 +2953,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     const bool savedGrayscale = mRdp->grayscale;
     const uint8_t savedTile = mRdp->first_tile_index;
     const bool savedTextureChanged0 = mRdp->textures_changed[0];
+    const bool forceTextureReload0 = savedRendering.mTextures[0] == nullptr;
     const bool savedTextureChanged1 = mRdp->textures_changed[1];
     const auto savedTile0 = mRdp->texture_tile[0];
     const auto savedLoaded0 = mRdp->loaded_texture[0];
@@ -3050,6 +3057,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
         mRapi->SelectTexture(0, savedRendering.mTextures[0]->second.texture_id);
         const bool linear = (savedOtherH & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
         mRapi->SetSamplerParameters(0, linear, savedTile0.cms, savedTile0.cmt);
+    } else {
+        // The shadow pass owns texture unit 0 temporarily. If there was no prior texture, unbind it; the
+        // invalidation below forces the next textured draw through ImportTexture instead of reusing the shadow binding.
+        mRapi->SelectTexture(0, 0);
     }
     mRdp->combine_mode = savedCombine;
     mRdp->other_mode_l = savedOtherL;
@@ -3059,7 +3070,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->toon_shadow = savedShadow;
     mRdp->grayscale = savedGrayscale;
     mRdp->first_tile_index = savedTile;
-    mRdp->textures_changed[0] = savedTextureChanged0;
+    mRdp->textures_changed[0] = savedTextureChanged0 || forceTextureReload0;
     mRdp->textures_changed[1] = savedTextureChanged1;
     mRdp->texture_tile[0] = savedTile0;
     mRdp->loaded_texture[0] = savedLoaded0;
