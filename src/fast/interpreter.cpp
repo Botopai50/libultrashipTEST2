@@ -2870,12 +2870,14 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
         mShadowTextureBindings.emplace(key, value);
     }
 
-    const uint8_t nextSlot = cache.texture_count == 1 ? 0 : (uint8_t)((cache.active_texture + 1) % kShadowTextureBuffers);
-    Flush();
     TextureCacheNode* previous = mRenderingState.mTextures[0];
     const bool previousLinear = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
     const uint32_t previousCms = mRdp->texture_tile[0].cms;
     const uint32_t previousCmt = mRdp->texture_tile[0].cmt;
+    const uint8_t nextSlot = cache.texture_count == 1 ? 0 : (uint8_t)((cache.active_texture + 1) % kShadowTextureBuffers);
+    // Finish any normal geometry before changing texture unit 0. Otherwise the pending batch is submitted with
+    // the shadow texture bound, which corrupts unrelated scene textures and can stretch them across the screen.
+    Flush();
     mRapi->SelectTexture(0, cache.texture_ids[nextSlot]);
     mRapi->SetSamplerParameters(0, true, G_TX_CLAMP, G_TX_CLAMP);
 
@@ -2927,12 +2929,14 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
         }
     }
 
+    // Flush before binding the shadow texture so normal geometry already queued for this batch keeps its own
+    // texture and sampler state.
+    Flush();
     TextureCacheNode* shadowTexture = BindShadowTexture(cache.texture_keys[cache.active_texture]);
     if (shadowTexture == nullptr) {
         return;
     }
 
-    Flush();
     const RenderingState savedRendering = mRenderingState;
     const uint64_t savedCombine = mRdp->combine_mode;
     const uint32_t savedOtherL = mRdp->other_mode_l;
@@ -3038,7 +3042,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mShadowComposite = savedShadowComposite;
 
     mRapi->SetStencilMode((int)StencilMode::Off, 0);
+    mRapi->SetDepthTestAndMask((savedRendering.depth_test_and_mask & 1) != 0,
+                               (savedRendering.depth_test_and_mask & 2) != 0);
     mRapi->SetZmodeDecal(savedRendering.decal_mode);
+    mRapi->SetUseAlpha(savedRendering.alpha_blend);
     if (savedRendering.mTextures[0] != nullptr) {
         mRapi->SelectTexture(0, savedRendering.mTextures[0]->second.texture_id);
         const bool linear = (savedOtherH & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
