@@ -269,6 +269,12 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         @end
     @end
 
+    @if(o_shadow_solid)
+        // Threshold actor-shadow coverage after bilinear filtering so the silhouette stays solid.
+        if (texVal0.a < 0.5) discard;
+        texVal0.a = 1.0;
+    @end
+
     @if(o_alpha) 
         float4 texel;
     @else

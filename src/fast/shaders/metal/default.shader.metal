@@ -228,6 +228,12 @@ fragment float4 fragmentShader(
         @end
     @end
     
+    @if(o_shadow_solid)
+        // Threshold actor-shadow coverage after bilinear filtering so the silhouette stays solid.
+        if (texVal0.w < 0.5) discard_fragment();
+        texVal0.w = 1.0;
+    @end
+
     @if(o_alpha)
         float4 texel;
     @else

@@ -83,8 +83,9 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     USE_SHADER,
     TOON, // SOH [Enhancement] toon-lighting variant. Bit 17; the loaded-shader id packs ABOVE it
-          // (interpreter.cpp shifts shader.id by 18). Adding an opt here without bumping that shift
+          // (interpreter.cpp shifts shader.id by 19). Adding an opt here without bumping that shift
           // would overlap the id and corrupt shader selection.
+    SHADOW_SOLID, // SOH [Enhancement] actor-shadow alpha threshold. Bit 18; loaded-shader ids start at bit 19.
     MAX
 };
 
@@ -126,6 +127,7 @@ struct CCFeatures {
     bool do_mix[2][2];
     bool color_alpha_same[2];
     int16_t shader_id;
+    bool opt_shadow_solid;
 };
 
 void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeatures* cc_features);
@@ -605,6 +607,7 @@ class Interpreter {
     TextureCacheMap mShadowTextureBindings;
     uintptr_t mShadowTextureSerial = 1;
     uint32_t mShadowFrame = 0;
+    bool mShadowComposite = false;
     std::vector<uint8_t> mShadowUploadBuffer;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)

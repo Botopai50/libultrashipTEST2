@@ -138,6 +138,13 @@ void main() {
         @end
     @end
 
+    @if(o_shadow_solid)
+        // Actor-shadow coverage is deliberately thresholded after bilinear filtering. The texture itself is
+        // binary, but bilinear sampling otherwise reintroduces a noisy low-alpha fringe at the silhouette.
+        if (texVal0.a < 0.5) discard;
+        texVal0.a = 1.0;
+    @end
+
     @if(o_alpha) 
         vec4 texel;
     @else 
