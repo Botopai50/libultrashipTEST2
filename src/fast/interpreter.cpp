@@ -3155,7 +3155,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
     const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 1.5f) : surfaceBias;
+    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 2.5f) : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
