@@ -407,9 +407,6 @@ struct ShadowMaskCache {
     uint32_t last_seen_frame = 0;
     bool valid = false;
     bool visible = false;
-    // True only for the current frame when an edge-aware stencil volume was built for this actor. The cached
-    // planar mask remains available as a fallback on frames where regeneration is throttled.
-    bool edge_volume_this_frame = false;
     uint8_t active_texture = 0;
     uint8_t texture_count = 0;
     uint32_t texture_ids[3] = {};
@@ -623,7 +620,7 @@ class Interpreter {
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
     // Edge-volume fallback only; the normal path remains the cached 96x96 mask.
     float mShadowSlabDepth = 80.0f;
-    float mShadowSlabRise = 10.0f;
+    float mShadowSlabRise = 0.75f;
     bool mShadowShowVolume = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;

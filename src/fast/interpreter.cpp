@@ -2500,12 +2500,10 @@ void Interpreter::FlushToonShadow() {
         return;
     }
 
-    // A hard drop is rendered by the edge-aware stencil volume below. Keep the cached planar mask intact so it
-    // remains a safe fallback on throttled frames, and only suppress the quad when a volume was actually built.
+    // A hard drop is rendered by the edge-aware stencil volume below. Keep the cached planar mask intact; the
+    // hybrid pass uses it for the upper receiver and lets the volume continue only below the edge.
     if (edgeVolume) {
-        const size_t volumeBefore = mShadowVolumeAccum.size();
         FlushToonShadowLegacy();
-        cache.edge_volume_this_frame = mShadowVolumeAccum.size() > volumeBefore;
         cache.version = mRsp->toon_shadow_version;
         return;
     }
@@ -3087,11 +3085,10 @@ void Interpreter::RenderShadowCache() {
     const uint32_t visibleFrame = mShadowFrame - 1;
     RenderShadowVolumesLegacy();
     for (auto& entry : mShadowCaches) {
-        ShadowMaskCache& cache = entry.second;
-        if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame && !cache.edge_volume_this_frame) {
+        const ShadowMaskCache& cache = entry.second;
+        if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
             DrawShadowQuad(cache);
         }
-        cache.edge_volume_this_frame = false;
     }
     mRapi->SetStencilMode((int)StencilMode::Off, 0);
 }
@@ -3100,7 +3097,7 @@ void Interpreter::RenderShadowCache() {
 // receivers continue to use the cached 96x96 mask and never pay this stencil cost.
 //
 // The volume is a thin SLAB at the feet: the captured silhouette projected along the cel key-light direction
-// onto the feet level, then extruded from slabTop (above the feet, catches uphill ground) to slabBottom
+// onto the feet level, then extruded from slabTop (just below the upper floor) to slabBottom
 // (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // NOT drawn here — all the frame's volumes are rendered together by RenderShadowVolumes() at the pre-actor
 // hook, so the shadow lands only on the environment (the room is in the depth buffer but actors are not yet),
@@ -3108,7 +3105,7 @@ void Interpreter::RenderShadowCache() {
 // cost of one frame of lag in the shadow's position (imperceptible for a ground shadow).
 //
 // The volume is a thin SLAB at the feet: the captured silhouette projected along the cel key-light direction
-// onto the feet level, then extruded from slabTop (above the feet, catches uphill ground) to slabBottom
+// onto the feet level, then extruded from slabTop (just below the upper floor) to slabBottom
 // (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // Each projected triangle becomes its own closed prism with per-face OUTWARD winding (so the z-fail increment
 // hits the right faces despite the clamp-at-0 ops); the per-prism counts compose into the union (the footprint).
@@ -3145,7 +3142,10 @@ void Interpreter::FlushToonShadowLegacy() {
     if (mRsp->toon_shadow_clamp_feet) {
         feetY = std::max(minY, mRsp->toon_shadow_feet_clamp_y);
     }
-    const float slabTop = feetY + mShadowSlabRise;                     // above the feet (uphill ground)
+    // Keep the top cap just below the upper floor. This is the important hybrid detail: the normal 96x96 decal
+    // owns the ground above the ledge, while the volume can only mark receivers below it instead of replacing the
+    // decal with a large full-model silhouette on the top surface.
+    const float slabTop = feetY - std::max(0.25f, mShadowSlabRise);
     const float slabBottom = feetY - std::max(5.0f, mShadowSlabDepth); // below the feet (downhill / cliffs)
 
     // Cast direction from the cel key light (toward-light dir snapshotted at arm time), elevation-remapped
