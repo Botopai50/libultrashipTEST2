@@ -282,6 +282,8 @@ struct RSP {
     uint8_t toon_shadow_flags;
     bool toon_shadow_update;
     float toon_shadow_plane[4];
+    bool toon_shadow_edge_valid;
+    float toon_shadow_edge_plane[4];
     // Optional per-object feet clamp: when armed, raise the shadow slab's feet UP to this world Y so a model
     // whose geometry dips below the floor (a signpost's buried post) doesn't sink the slab below ground. The
     // flag is false when the object passed TOON_SHADOW_NO_CLAMP (the default — leave the feet at the geometry).
@@ -401,6 +403,23 @@ struct MaskedTextureEntry {
     uint8_t* replacementData;
 };
 
+struct ShadowMaskProjection {
+    bool valid = false;
+    uint32_t version = 0;
+    uint32_t texture_id = 0;
+    uintptr_t texture_key = 0;
+    std::vector<uint8_t> coverage;
+    float plane_normal[3] = { 0.0f, 1.0f, 0.0f };
+    float plane_d = 0.0f;
+    float plane_origin[3] = {};
+    float basis_u[3] = { 1.0f, 0.0f, 0.0f };
+    float basis_v[3] = { 0.0f, 0.0f, 1.0f };
+    float min_u = 0.0f;
+    float max_u = 0.0f;
+    float min_v = 0.0f;
+    float max_v = 0.0f;
+};
+
 struct ShadowMaskCache {
     uint32_t actor_id = 0;
     uint32_t version = 0;
@@ -427,6 +446,13 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
+    // Edge projections are clipped to the lower half-space of the live floor plane. This leaves the normal
+    // floor mask responsible for the upper surface and makes the second projection continue through the edge.
+    bool clip_to_lower_receiver = false;
+    float lower_receiver_normal[3] = { 0.0f, 1.0f, 0.0f };
+    float lower_receiver_d = 0.0f;
+    bool edge_receiver_valid = false;
+    ShadowMaskProjection edge;
     // Link supplies an interpolated root matrix. Keeping the anchor used by the cached mask lets the
     // renderer derive a full-precision live offset on every presentation frame instead of following the
     // lower-rate game tick.
@@ -512,7 +538,8 @@ class Interpreter {
     void RenderShadowCache();
     void RasterizeShadowMask(ShadowMaskCache& cache);
     void UploadShadowMask(ShadowMaskCache& cache);
-    void DrawShadowQuad(const ShadowMaskCache& cache);
+    void UploadShadowProjection(ShadowMaskProjection& projection);
+    void DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjection = false);
     TextureCacheNode* BindShadowTexture(uintptr_t textureKey);
 
     void GfxSpMatrix(uint8_t params, const int32_t* addr);

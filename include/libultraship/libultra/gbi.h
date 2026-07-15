@@ -194,6 +194,7 @@
 #define G_SETTOONSHADOW 0x4b // SOH [Enhancement] actor shadow arm/size marker
 #define G_SETTOONSHADOWID 0x4c // SOH [Enhancement] actor shadow cache id/version
 #define G_SETTOONSHADOWPLANE 0x4d // SOH [Enhancement] actor shadow receiver plane
+#define G_SETTOONSHADOWEDGEPLANE 0x4e // SOH [Enhancement] actor shadow edge receiver plane
 #define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
@@ -2856,8 +2857,22 @@ typedef union Gfx {
         _g->words.w1 = _pd.u;                                                                      \
     }
 
+// SOH [Enhancement] Optional second receiver plane used only when an actor's shadow reaches a detected wall/drop.
+#define gSPToonShadowEdgePlane(pkt, nx, ny, nz, planeD)                                             \
+    {                                                                                               \
+        Gfx* _g = (Gfx*)(pkt);                                                                      \
+        union {                                                                                     \
+            f32 f;                                                                                  \
+            u32 u;                                                                                  \
+        } _pd;                                                                                      \
+        _pd.f = (f32)(planeD);                                                                      \
+        _g->words.w0 = _SHIFTL(G_SETTOONSHADOWEDGEPLANE, 24, 8) | _SHIFTL((nx) & 0xFF, 16, 8) |     \
+                       _SHIFTL((ny) & 0xFF, 8, 8) | _SHIFTL((nz) & 0xFF, 0, 8);                     \
+        _g->words.w1 = _pd.u;                                                                       \
+    }
+
 // SOH [Enhancement] Actor shadow per-object marker. The size is an eased visibility scale; the receiver plane,
-// cache identity, version, and key-light direction are supplied by the commands immediately before it.
+// cache identity, version, key-light direction, and optional edge receiver are supplied by the commands immediately before it.
 #define gSPToonShadow(pkt, nx, ny, nz, planeD)                                                     \
     {                                                                                              \
         Gfx* _g = (Gfx*)(pkt);                                                                     \

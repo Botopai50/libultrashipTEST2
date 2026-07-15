@@ -2403,6 +2403,7 @@ constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
+constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
@@ -2504,6 +2505,46 @@ void Interpreter::FlushToonShadow() {
     } else {
         UploadShadowMask(cache);
         cache.valid = cache.texture_count != 0;
+    }
+
+    // An edge receiver gets its own projection and texture. The ordinary mask remains untouched, so the shadow
+    // keeps contact on the upper floor while the second quad can continue onto a detected wall below it.
+    if (cache.edge_receiver_valid && (mRsp->toon_shadow_flags & kShadowFlagEdgeProjection) != 0 &&
+        mRsp->toon_shadow_edge_valid) {
+        ShadowMaskCache edgeCache;
+        edgeCache.version = cache.edge.version;
+        edgeCache.texture_count = cache.edge.texture_id != 0 ? 1 : 0;
+        memcpy(edgeCache.plane_normal, cache.edge.plane_normal, sizeof(edgeCache.plane_normal));
+        edgeCache.plane_d = cache.edge.plane_d;
+        memcpy(edgeCache.plane_origin, cache.edge.plane_origin, sizeof(edgeCache.plane_origin));
+        memcpy(edgeCache.basis_u, cache.edge.basis_u, sizeof(edgeCache.basis_u));
+        memcpy(edgeCache.basis_v, cache.edge.basis_v, sizeof(edgeCache.basis_v));
+        edgeCache.min_u = cache.edge.min_u;
+        edgeCache.max_u = cache.edge.max_u;
+        edgeCache.min_v = cache.edge.min_v;
+        edgeCache.max_v = cache.edge.max_v;
+        edgeCache.clip_to_lower_receiver = true;
+        memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
+        edgeCache.lower_receiver_d = cache.draw_plane_d;
+
+        RasterizeShadowMask(edgeCache);
+        if (edgeCache.coverage.empty()) {
+            cache.edge.valid = false;
+        } else {
+            memcpy(cache.edge.plane_normal, edgeCache.plane_normal, sizeof(cache.edge.plane_normal));
+            cache.edge.plane_d = edgeCache.plane_d;
+            memcpy(cache.edge.plane_origin, edgeCache.plane_origin, sizeof(cache.edge.plane_origin));
+            memcpy(cache.edge.basis_u, edgeCache.basis_u, sizeof(cache.edge.basis_u));
+            memcpy(cache.edge.basis_v, edgeCache.basis_v, sizeof(cache.edge.basis_v));
+            cache.edge.min_u = edgeCache.min_u;
+            cache.edge.max_u = edgeCache.max_u;
+            cache.edge.min_v = edgeCache.min_v;
+            cache.edge.max_v = edgeCache.max_v;
+            cache.edge.coverage = std::move(edgeCache.coverage);
+            UploadShadowProjection(cache.edge);
+            cache.edge.valid = cache.edge.texture_id != 0;
+        }
+        cache.edge.version = mRsp->toon_shadow_version;
     }
     cache.version = mRsp->toon_shadow_version;
     mShadowVerts.clear();
@@ -2643,7 +2684,11 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        float projectedVertices[4][2]{};
+        struct ProjectedPoint {
+            float p[2];
+            float lowerDistance;
+        };
+        ProjectedPoint projectedVertices[4]{};
         bool valid = true;
         for (int i = 0; i < clippedCount; i++) {
             // Vertices within the one-unit clip tolerance are snapped onto the receiver instead of being
@@ -2659,12 +2704,17 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 clipped[i][1] + castDir[1] * t,
                 clipped[i][2] + castDir[2] * t,
             };
-            projectedVertices[i][0] =
+            projectedVertices[i].p[0] =
                 ShadowDot(basisU, projectedWorld) - ShadowDot(basisU, planeOrigin);
-            projectedVertices[i][1] =
+            projectedVertices[i].p[1] =
                 ShadowDot(basisV, projectedWorld) - ShadowDot(basisV, planeOrigin);
-            if (!std::isfinite(projectedVertices[i][0]) ||
-                !std::isfinite(projectedVertices[i][1])) {
+            projectedVertices[i].lowerDistance = cache.clip_to_lower_receiver
+                                                     ? ShadowDot(cache.lower_receiver_normal, projectedWorld) +
+                                                           cache.lower_receiver_d
+                                                     : 0.0f;
+            if (!std::isfinite(projectedVertices[i].p[0]) ||
+                !std::isfinite(projectedVertices[i].p[1]) ||
+                !std::isfinite(projectedVertices[i].lowerDistance)) {
                 valid = false;
                 break;
             }
@@ -2674,14 +2724,59 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        // A clipped triangle is either a triangle or a quad. Rasterize a fan and update the mask bounds only
-        // after every projected vertex is known to be valid; invalid triangles used to corrupt these bounds.
-        for (int fan = 1; fan + 1 < clippedCount; fan++) {
+        // A clipped triangle is either a triangle or a quad. For a wall receiver, keep only the portion below
+        // the upper floor plane. Sutherland-Hodgman clipping in projected coordinates preserves the actual
+        // silhouette at the ledge instead of drawing a second, detached rectangle above it.
+        ProjectedPoint lowerClipped[8]{};
+        int lowerClippedCount = clippedCount;
+        for (int i = 0; i < clippedCount; i++) {
+            lowerClipped[i] = projectedVertices[i];
+        }
+        if (cache.clip_to_lower_receiver) {
+            lowerClippedCount = 0;
+            for (int currentIndex = 0; currentIndex < clippedCount; currentIndex++) {
+                const ProjectedPoint& previous = projectedVertices[(currentIndex + clippedCount - 1) % clippedCount];
+                const ProjectedPoint& current = projectedVertices[currentIndex];
+                const bool previousInside = previous.lowerDistance <= 0.0f;
+                const bool currentInside = current.lowerDistance <= 0.0f;
+                auto appendLowerIntersection = [&]() {
+                    const float denominator = current.lowerDistance - previous.lowerDistance;
+                    if (fabsf(denominator) < 0.000001f || lowerClippedCount >= 8) {
+                        return;
+                    }
+                    const float amount = std::clamp(-previous.lowerDistance / denominator, 0.0f, 1.0f);
+                    ProjectedPoint intersection{};
+                    intersection.p[0] = previous.p[0] + (current.p[0] - previous.p[0]) * amount;
+                    intersection.p[1] = previous.p[1] + (current.p[1] - previous.p[1]) * amount;
+                    intersection.lowerDistance = 0.0f;
+                    lowerClipped[lowerClippedCount++] = intersection;
+                };
+
+                if (currentInside) {
+                    if (!previousInside) {
+                        appendLowerIntersection();
+                    }
+                    if (lowerClippedCount < 8) {
+                        lowerClipped[lowerClippedCount++] = current;
+                    }
+                } else if (previousInside) {
+                    appendLowerIntersection();
+                }
+            }
+        }
+
+        if (lowerClippedCount < 3) {
+            continue;
+        }
+
+        // Update the mask bounds only after every projected/clipped vertex is known to be valid; invalid
+        // triangles used to corrupt these bounds and produce a shadow that slid away from Link.
+        for (int fan = 1; fan + 1 < lowerClippedCount; fan++) {
             ProjectedTriangle projected{};
             const int indices[3] = { 0, fan, fan + 1 };
             for (int i = 0; i < 3; i++) {
-                projected.p[i][0] = projectedVertices[indices[i]][0];
-                projected.p[i][1] = projectedVertices[indices[i]][1];
+                projected.p[i][0] = lowerClipped[indices[i]].p[0];
+                projected.p[i][1] = lowerClipped[indices[i]].p[1];
                 minU = std::min(minU, projected.p[i][0]);
                 minV = std::min(minV, projected.p[i][1]);
                 maxU = std::max(maxU, projected.p[i][0]);
@@ -2901,6 +2996,39 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
     mRdp->textures_changed[0] = true;
 }
 
+void Interpreter::UploadShadowProjection(ShadowMaskProjection& projection) {
+    if (projection.coverage.size() != kShadowMaskBytes || mRapi == nullptr) {
+        return;
+    }
+
+    if (projection.texture_id == 0) {
+        projection.texture_id = mRapi->NewTexture();
+        projection.texture_key = mShadowTextureSerial++;
+        TextureCacheKey key{};
+        key.texture_addr = reinterpret_cast<const uint8_t*>(projection.texture_key);
+        TextureCacheValue value{};
+        value.texture_id = projection.texture_id;
+        value.linear_filter = true;
+        mShadowTextureBindings.emplace(key, value);
+    }
+
+    Flush();
+    mRapi->SelectTexture(0, projection.texture_id);
+    mRapi->SetSamplerParameters(0, true, G_TX_CLAMP, G_TX_CLAMP);
+    mShadowUploadBuffer.resize(kShadowMaskSize * kShadowMaskSize * 4);
+    for (size_t i = 0; i < kShadowMaskSize * kShadowMaskSize; i++) {
+        mShadowUploadBuffer[i * 4 + 0] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 1] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 2] = kShadowPaletteIntensity;
+        mShadowUploadBuffer[i * 4 + 3] = projection.coverage[i];
+    }
+    mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
+    projection.coverage.clear();
+    mRapi->SelectTexture(0, 0);
+    mRenderingState.mTextures[0] = nullptr;
+    mRdp->textures_changed[0] = true;
+}
+
 TextureCacheNode* Interpreter::BindShadowTexture(uintptr_t textureKey) {
     TextureCacheKey key{};
     key.texture_addr = reinterpret_cast<const uint8_t*>(textureKey);
@@ -2912,28 +3040,46 @@ TextureCacheNode* Interpreter::BindShadowTexture(uintptr_t textureKey) {
     return &*it;
 }
 
-void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
-    if (!cache.valid || !cache.visible || cache.texture_count == 0 ||
-        cache.active_texture >= cache.texture_count || mRapi == nullptr) {
+void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjection) {
+    const ShadowMaskProjection* projection = edgeProjection ? &cache.edge : nullptr;
+    if (!cache.visible || mRapi == nullptr) {
         return;
     }
-    float drawNormal[3] = { cache.draw_plane_normal[0], cache.draw_plane_normal[1],
-                            cache.draw_plane_normal[2] };
-    float drawPlaneD = cache.draw_plane_d;
-    if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
-        drawNormal[0] = cache.plane_normal[0];
-        drawNormal[1] = cache.plane_normal[1];
-        drawNormal[2] = cache.plane_normal[2];
-        drawPlaneD = cache.plane_d;
-        if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+    if (projection != nullptr) {
+        if (!cache.edge_receiver_valid || !projection->valid || projection->texture_id == 0) {
             return;
         }
+    } else if (!cache.valid || cache.texture_count == 0 || cache.active_texture >= cache.texture_count) {
+        return;
+    }
+    float drawNormal[3];
+    float drawPlaneD;
+    if (projection != nullptr) {
+        drawNormal[0] = projection->plane_normal[0];
+        drawNormal[1] = projection->plane_normal[1];
+        drawNormal[2] = projection->plane_normal[2];
+        drawPlaneD = projection->plane_d;
+    } else {
+        drawNormal[0] = cache.draw_plane_normal[0];
+        drawNormal[1] = cache.draw_plane_normal[1];
+        drawNormal[2] = cache.draw_plane_normal[2];
+        drawPlaneD = cache.draw_plane_d;
+        if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+            drawNormal[0] = cache.plane_normal[0];
+            drawNormal[1] = cache.plane_normal[1];
+            drawNormal[2] = cache.plane_normal[2];
+            drawPlaneD = cache.plane_d;
+        }
+    }
+    if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
+        return;
     }
 
     // Flush before binding the shadow texture so normal geometry already queued for this batch keeps its own
     // texture and sampler state.
     Flush();
-    TextureCacheNode* shadowTexture = BindShadowTexture(cache.texture_keys[cache.active_texture]);
+    const uintptr_t textureKey = projection != nullptr ? projection->texture_key : cache.texture_keys[cache.active_texture];
+    TextureCacheNode* shadowTexture = BindShadowTexture(textureKey);
     if (shadowTexture == nullptr) {
         return;
     }
@@ -2986,10 +3132,14 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     mRdp->grayscale = false;
     mRsp->geometry_mode = G_ZBUFFER;
 
-    const float centerU = (cache.min_u + cache.max_u) * 0.5f;
-    const float centerV = (cache.min_v + cache.max_v) * 0.5f;
-    const float halfU = (cache.max_u - cache.min_u) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
-    const float halfV = (cache.max_v - cache.min_v) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    const float minU = projection != nullptr ? projection->min_u : cache.min_u;
+    const float maxU = projection != nullptr ? projection->max_u : cache.max_u;
+    const float minV = projection != nullptr ? projection->min_v : cache.min_v;
+    const float maxV = projection != nullptr ? projection->max_v : cache.max_v;
+    const float centerU = (minU + maxU) * 0.5f;
+    const float centerV = (minV + maxV) * 0.5f;
+    const float halfU = (maxU - minU) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    const float halfV = (maxV - minV) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
     // Normal quantization error grows across a large footprint. Add a small size-aware lift and use the
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
@@ -2999,14 +3149,14 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache) {
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
     // vertical flip put the actor's feet at the far end of the projected shadow.
     const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
+    const float* planeOrigin = projection != nullptr ? projection->plane_origin : cache.plane_origin;
+    const float* basisU = projection != nullptr ? projection->basis_u : cache.basis_u;
+    const float* basisV = projection != nullptr ? projection->basis_v : cache.basis_v;
     for (int i = 0; i < 4; i++) {
         float world[3] = {
-            cache.plane_origin[0] + cache.basis_u[0] * coords[i][0] + cache.basis_v[0] * coords[i][1] +
-                cache.world_offset[0],
-            cache.plane_origin[1] + cache.basis_u[1] * coords[i][0] + cache.basis_v[1] * coords[i][1] +
-                cache.world_offset[1],
-            cache.plane_origin[2] + cache.basis_u[2] * coords[i][0] + cache.basis_v[2] * coords[i][1] +
-                cache.world_offset[2],
+            planeOrigin[0] + basisU[0] * coords[i][0] + basisV[0] * coords[i][1] + cache.world_offset[0],
+            planeOrigin[1] + basisU[1] * coords[i][0] + basisV[1] * coords[i][1] + cache.world_offset[1],
+            planeOrigin[2] + basisU[2] * coords[i][0] + basisV[2] * coords[i][1] + cache.world_offset[2],
         };
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
@@ -3077,6 +3227,9 @@ void Interpreter::RenderShadowCache() {
         const ShadowMaskCache& cache = entry.second;
         if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
             DrawShadowQuad(cache);
+        }
+        if (cache.edge_receiver_valid && cache.edge.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
+            DrawShadowQuad(cache, true);
         }
     }
     mRapi->SetStencilMode((int)StencilMode::Off, 0);
@@ -4906,6 +5059,7 @@ bool gfx_set_toon_shadow_id_handler_custom(F3DGfx** cmd0) {
     gfx->mRsp->toon_shadow_actor_id = (uint32_t)cmd->words.w0 & 0x00FFFFFF;
     gfx->mRsp->toon_shadow_version = (uint32_t)cmd->words.w1 & 0x00FFFFFF;
     gfx->mRsp->toon_shadow_flags = (uint8_t)(((uint32_t)cmd->words.w1 >> 24) & 0xFF);
+    gfx->mRsp->toon_shadow_edge_valid = false;
     gfx->mRsp->toon_shadow_update = false;
     auto& cache = gfx->mShadowCaches[gfx->mRsp->toon_shadow_actor_id];
     cache.actor_id = gfx->mRsp->toon_shadow_actor_id;
@@ -4926,6 +5080,23 @@ bool gfx_set_toon_shadow_plane_handler_custom(F3DGfx** cmd0) {
     gfx->mRsp->toon_shadow_plane[1] = ny / 127.0f;
     gfx->mRsp->toon_shadow_plane[2] = nz / 127.0f;
     gfx->mRsp->toon_shadow_plane[3] = planeD;
+    return false;
+}
+
+bool gfx_set_toon_shadow_edge_plane_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    int8_t nx = (int8_t)((cmd->words.w0 >> 16) & 0xFF);
+    int8_t ny = (int8_t)((cmd->words.w0 >> 8) & 0xFF);
+    int8_t nz = (int8_t)(cmd->words.w0 & 0xFF);
+    uint32_t planeBits = (uint32_t)cmd->words.w1;
+    float planeD;
+    memcpy(&planeD, &planeBits, sizeof(planeD));
+    gfx->mRsp->toon_shadow_edge_plane[0] = nx / 127.0f;
+    gfx->mRsp->toon_shadow_edge_plane[1] = ny / 127.0f;
+    gfx->mRsp->toon_shadow_edge_plane[2] = nz / 127.0f;
+    gfx->mRsp->toon_shadow_edge_plane[3] = planeD;
+    gfx->mRsp->toon_shadow_edge_valid = true;
     return false;
 }
 
@@ -4999,6 +5170,15 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         cache.draw_plane_normal[1] = gfx->mRsp->toon_shadow_plane[1];
         cache.draw_plane_normal[2] = gfx->mRsp->toon_shadow_plane[2];
         cache.draw_plane_d = gfx->mRsp->toon_shadow_plane[3];
+    }
+    cache.edge_receiver_valid = receiverValid &&
+                                (gfx->mRsp->toon_shadow_flags & kShadowFlagEdgeProjection) != 0 &&
+                                gfx->mRsp->toon_shadow_edge_valid;
+    if (cache.edge_receiver_valid) {
+        cache.edge.plane_normal[0] = gfx->mRsp->toon_shadow_edge_plane[0];
+        cache.edge.plane_normal[1] = gfx->mRsp->toon_shadow_edge_plane[1];
+        cache.edge.plane_normal[2] = gfx->mRsp->toon_shadow_edge_plane[2];
+        cache.edge.plane_d = gfx->mRsp->toon_shadow_edge_plane[3];
     }
     if (gfx->mRsp->toon_shadow_update) {
         cache.plane_normal[0] = gfx->mRsp->toon_shadow_plane[0];
@@ -5426,6 +5606,8 @@ static constexpr UcodeHandler otrHandlers = {
       { "G_SETTOONSHADOWID", gfx_set_toon_shadow_id_handler_custom } }, // G_SETTOONSHADOWID (0x4c)
     { OTR_G_SETTOONSHADOWPLANE,
       { "G_SETTOONSHADOWPLANE", gfx_set_toon_shadow_plane_handler_custom } }, // G_SETTOONSHADOWPLANE (0x4d)
+    { OTR_G_SETTOONSHADOWEDGEPLANE,
+      { "G_SETTOONSHADOWEDGEPLANE", gfx_set_toon_shadow_edge_plane_handler_custom } }, // G_SETTOONSHADOWEDGEPLANE (0x4e)
     { OTR_G_SETTOONSHADOW,
       { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } }, // G_SETSTENCIL (0x46)
