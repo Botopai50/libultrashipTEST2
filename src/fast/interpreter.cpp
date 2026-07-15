@@ -2531,8 +2531,6 @@ void Interpreter::FlushToonShadow() {
         if (edgeCache.coverage.empty()) {
             cache.edge.valid = false;
         } else {
-            memcpy(cache.edge.plane_normal, edgeCache.plane_normal, sizeof(cache.edge.plane_normal));
-            cache.edge.plane_d = edgeCache.plane_d;
             memcpy(cache.edge.plane_origin, edgeCache.plane_origin, sizeof(cache.edge.plane_origin));
             memcpy(cache.edge.basis_u, edgeCache.basis_u, sizeof(cache.edge.basis_u));
             memcpy(cache.edge.basis_v, edgeCache.basis_v, sizeof(cache.edge.basis_v));
@@ -3152,19 +3150,33 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float* planeOrigin = projection != nullptr ? projection->plane_origin : cache.plane_origin;
     const float* basisU = projection != nullptr ? projection->basis_u : cache.basis_u;
     const float* basisV = projection != nullptr ? projection->basis_v : cache.basis_v;
+    struct ShadowQuadPoint {
+        float world[3];
+        float uv[2];
+    };
+    ShadowQuadPoint quad[4]{};
     for (int i = 0; i < 4; i++) {
-        float world[3] = {
-            planeOrigin[0] + basisU[0] * coords[i][0] + basisV[0] * coords[i][1] + cache.world_offset[0],
-            planeOrigin[1] + basisU[1] * coords[i][0] + basisV[1] * coords[i][1] + cache.world_offset[1],
-            planeOrigin[2] + basisU[2] * coords[i][0] + basisV[2] * coords[i][1] + cache.world_offset[2],
-        };
+        quad[i].world[0] =
+            planeOrigin[0] + basisU[0] * coords[i][0] + basisV[0] * coords[i][1] + cache.world_offset[0];
+        quad[i].world[1] =
+            planeOrigin[1] + basisU[1] * coords[i][0] + basisV[1] * coords[i][1] + cache.world_offset[1];
+        quad[i].world[2] =
+            planeOrigin[2] + basisU[2] * coords[i][0] + basisV[2] * coords[i][1] + cache.world_offset[2];
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
-        const float planeDistance = ShadowDot(drawNormal, world) + drawPlaneD;
-        world[0] += drawNormal[0] * (surfaceBias - planeDistance);
-        world[1] += drawNormal[1] * (surfaceBias - planeDistance);
-        world[2] += drawNormal[2] * (surfaceBias - planeDistance);
-        LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + i];
+        const float planeDistance = ShadowDot(drawNormal, quad[i].world) + drawPlaneD;
+        quad[i].world[0] += drawNormal[0] * (surfaceBias - planeDistance);
+        quad[i].world[1] += drawNormal[1] * (surfaceBias - planeDistance);
+        quad[i].world[2] += drawNormal[2] * (surfaceBias - planeDistance);
+        quad[i].uv[0] = uvs[i][0];
+        quad[i].uv[1] = uvs[i][1];
+    }
+
+    const bool savedShadowComposite = mShadowComposite;
+    mShadowComposite = true;
+    auto writeShadowVertex = [&](int slot, const ShadowQuadPoint& point) {
+        const float* world = point.world;
+        LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + slot];
         vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
                                        world[2] * mRsp->P_matrix[2][0] + mRsp->P_matrix[3][0]);
         vertex->y = world[0] * mRsp->P_matrix[0][1] + world[1] * mRsp->P_matrix[1][1] +
@@ -3178,16 +3190,61 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             // depth quantization from producing grain or letting the shadow fall behind the receiving surface.
             vertex->z -= vertex->w * kShadowClipDepthBias;
         }
-        vertex->u = (int16_t)(uvs[i][0] * (kShadowMaskSize - 1) * 32.0f);
-        vertex->v = (int16_t)(uvs[i][1] * (kShadowMaskSize - 1) * 32.0f);
+        vertex->u = (int16_t)(point.uv[0] * (kShadowMaskSize - 1) * 32.0f);
+        vertex->v = (int16_t)(point.uv[1] * (kShadowMaskSize - 1) * 32.0f);
         vertex->clip_rej = 0;
         vertex->color = { 255, 255, 255, 255 };
-    }
+    };
 
-    const bool savedShadowComposite = mShadowComposite;
-    mShadowComposite = true;
-    GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, false);
-    GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, false);
+    const bool clipFloorShadow = projection == nullptr && cache.edge_receiver_valid;
+    float edgeNormal[3] = { cache.edge.plane_normal[0], cache.edge.plane_normal[1], cache.edge.plane_normal[2] };
+    float edgePlaneD = cache.edge.plane_d;
+    const bool validEdgeClip = clipFloorShadow && ShadowNormalizePlane(edgeNormal, edgePlaneD);
+    const int triangleIndices[2][3] = { { 0, 1, 3 }, { 1, 2, 3 } };
+    for (const auto& triangle : triangleIndices) {
+        ShadowQuadPoint clipped[4]{};
+        int clippedCount = 0;
+        for (int currentIndex = 0; currentIndex < 3; currentIndex++) {
+            const ShadowQuadPoint& previous = quad[triangle[(currentIndex + 2) % 3]];
+            const ShadowQuadPoint& current = quad[triangle[currentIndex]];
+            const float previousDistance = validEdgeClip ? ShadowDot(edgeNormal, previous.world) + edgePlaneD : 1.0f;
+            const float currentDistance = validEdgeClip ? ShadowDot(edgeNormal, current.world) + edgePlaneD : 1.0f;
+            const bool previousInside = previousDistance >= 0.0f;
+            const bool currentInside = currentDistance >= 0.0f;
+            auto appendIntersection = [&]() {
+                const float denominator = currentDistance - previousDistance;
+                if (fabsf(denominator) < 0.000001f || clippedCount >= 4) {
+                    return;
+                }
+                const float amount = std::clamp(-previousDistance / denominator, 0.0f, 1.0f);
+                ShadowQuadPoint intersection{};
+                for (int axis = 0; axis < 3; axis++) {
+                    intersection.world[axis] = previous.world[axis] +
+                                               (current.world[axis] - previous.world[axis]) * amount;
+                }
+                intersection.uv[0] = previous.uv[0] + (current.uv[0] - previous.uv[0]) * amount;
+                intersection.uv[1] = previous.uv[1] + (current.uv[1] - previous.uv[1]) * amount;
+                clipped[clippedCount++] = intersection;
+            };
+
+            if (currentInside) {
+                if (!previousInside) {
+                    appendIntersection();
+                }
+                if (clippedCount < 4) {
+                    clipped[clippedCount++] = current;
+                }
+            } else if (previousInside) {
+                appendIntersection();
+            }
+        }
+        for (int fan = 1; fan + 1 < clippedCount; fan++) {
+            writeShadowVertex(0, clipped[0]);
+            writeShadowVertex(1, clipped[fan]);
+            writeShadowVertex(2, clipped[fan + 1]);
+            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+        }
+    }
     Flush();
     mShadowComposite = savedShadowComposite;
 

@@ -300,7 +300,9 @@ struct RSP {
         uint16_t s, t;
     } texture_scaling_factor;
 
-    struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
+    // Four scratch vertices are used by rectangles; the shadow pass can use up to eight vertices when it clips
+    // the floor quad against a detected ledge plane.
+    struct LoadedVertex loaded_vertices[MAX_VERTICES + 8];
     ShaderMod current_shader;
 };
 
