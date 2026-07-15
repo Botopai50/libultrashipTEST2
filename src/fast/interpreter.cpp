@@ -2403,7 +2403,6 @@ constexpr uint8_t kShadowFlagValid = 1 << 0;
 constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
-constexpr uint8_t kShadowFlagEdgeVolume = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
@@ -2494,17 +2493,8 @@ void Interpreter::FlushToonShadow() {
     }
 
     ShadowMaskCache& cache = cacheIt->second;
-    const bool edgeVolume = (mRsp->toon_shadow_flags & kShadowFlagEdgeVolume) != 0;
-    if (!edgeVolume && cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
+    if (cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
         mShadowVerts.clear();
-        return;
-    }
-
-    // A hard drop is rendered by the edge-aware stencil volume below. Keep the cached planar mask intact; the
-    // hybrid pass uses it for the upper receiver and lets the volume continue only below the edge.
-    if (edgeVolume) {
-        FlushToonShadowLegacy();
-        cache.version = mRsp->toon_shadow_version;
         return;
     }
 
@@ -3083,7 +3073,6 @@ void Interpreter::RenderShadowCache() {
     Flush();
     mShadowFrame++;
     const uint32_t visibleFrame = mShadowFrame - 1;
-    RenderShadowVolumesLegacy();
     for (auto& entry : mShadowCaches) {
         const ShadowMaskCache& cache = entry.second;
         if (cache.valid && cache.visible && cache.last_seen_frame == visibleFrame) {
@@ -3109,6 +3098,7 @@ void Interpreter::RenderShadowCache() {
 // (below the feet, catches downhill ground / cliffs). The stencil z-fail pass conforms it to the real ground.
 // Each projected triangle becomes its own closed prism with per-face OUTWARD winding (so the z-fail increment
 // hits the right faces despite the clamp-at-0 ops); the per-prism counts compose into the union (the footprint).
+#if 0
 void Interpreter::FlushToonShadowLegacy() {
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
@@ -3466,6 +3456,8 @@ void Interpreter::RenderShadowVolumesLegacy() {
     mShadowVolumeAccum.clear();
     mShadowVolumeKind.clear();
 }
+
+#endif
 
 void Interpreter::GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mRdp->grayscale_color.r = r;
