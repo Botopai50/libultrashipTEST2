@@ -2527,6 +2527,7 @@ void Interpreter::FlushToonShadow() {
         // their cast rays land above the lip; the normal floor quad is clipped separately at the edge.
         edgeCache.clip_to_lower_receiver = false;
         edgeCache.project_full_source = true;
+        edgeCache.translate_to_lower_receiver = true;
         memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
         edgeCache.lower_receiver_d = cache.draw_plane_d;
 
@@ -2603,6 +2604,14 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     float basisU[3], basisV[3];
     ShadowBasis(normal, basisU, basisV);
     float planeOrigin[3] = { -planeD * normal[0], -planeD * normal[1], -planeD * normal[2] };
+
+    float lowerNormal[3] = { cache.lower_receiver_normal[0], cache.lower_receiver_normal[1],
+                              cache.lower_receiver_normal[2] };
+    float lowerPlaneD = cache.lower_receiver_d;
+    const bool hasLowerReceiver =
+        (cache.clip_to_lower_receiver || cache.translate_to_lower_receiver) &&
+        ShadowNormalizePlane(lowerNormal, lowerPlaneD);
+    float maxLowerDistance = -std::numeric_limits<float>::max();
 
     struct ProjectedTriangle {
         float p[3][2];
@@ -2710,10 +2719,12 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 ShadowDot(basisU, projectedWorld) - ShadowDot(basisU, planeOrigin);
             projectedVertices[i].p[1] =
                 ShadowDot(basisV, projectedWorld) - ShadowDot(basisV, planeOrigin);
-            projectedVertices[i].lowerDistance = cache.clip_to_lower_receiver
-                                                     ? ShadowDot(cache.lower_receiver_normal, projectedWorld) +
-                                                           cache.lower_receiver_d
+            projectedVertices[i].lowerDistance = hasLowerReceiver
+                                                     ? ShadowDot(lowerNormal, projectedWorld) + lowerPlaneD
                                                      : 0.0f;
+            if (hasLowerReceiver && cache.translate_to_lower_receiver) {
+                maxLowerDistance = std::max(maxLowerDistance, projectedVertices[i].lowerDistance);
+            }
             if (!std::isfinite(projectedVertices[i].p[0]) ||
                 !std::isfinite(projectedVertices[i].p[1]) ||
                 !std::isfinite(projectedVertices[i].lowerDistance)) {
@@ -2726,9 +2737,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        // A clipped triangle is either a triangle or a quad. For a wall receiver, keep only the portion below
-        // the upper floor plane. Sutherland-Hodgman clipping in projected coordinates preserves the actual
-        // silhouette at the ledge instead of drawing a second, detached rectangle above it.
+        // A clipped triangle is either a triangle or a quad. Optional lower-receiver clipping is retained for
+        // experiments, but the wall projection uses translation below so the complete silhouette is preserved.
         ProjectedPoint lowerClipped[8]{};
         int lowerClippedCount = clippedCount;
         for (int i = 0; i < clippedCount; i++) {
@@ -2785,6 +2795,35 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 maxV = std::max(maxV, projected.p[i][1]);
             }
             triangles.push_back(projected);
+        }
+    }
+
+    // The complete wall silhouette is captured from Link's original projection. Without this translation its
+    // highest point remains at the actor's original height, so it appears to float above the ledge and can be
+    // visibly embedded in the wall. Translate the whole mask down along the wall plane until that point meets
+    // the upper floor plane; unlike clipping, this keeps Link's head and torso in the projected shadow.
+    if (cache.translate_to_lower_receiver && hasLowerReceiver && maxLowerDistance > 0.0f) {
+        const float floorAlongU = ShadowDot(lowerNormal, basisU);
+        const float floorAlongV = ShadowDot(lowerNormal, basisV);
+        const float denominator = floorAlongU * floorAlongU + floorAlongV * floorAlongV;
+        if (denominator > 0.0001f) {
+            const float scale = maxLowerDistance / denominator;
+            const float shiftU = -floorAlongU * scale;
+            const float shiftV = -floorAlongV * scale;
+            minU = std::numeric_limits<float>::max();
+            minV = std::numeric_limits<float>::max();
+            maxU = -std::numeric_limits<float>::max();
+            maxV = -std::numeric_limits<float>::max();
+            for (ProjectedTriangle& triangle : triangles) {
+                for (int i = 0; i < 3; i++) {
+                    triangle.p[i][0] += shiftU;
+                    triangle.p[i][1] += shiftV;
+                    minU = std::min(minU, triangle.p[i][0]);
+                    minV = std::min(minV, triangle.p[i][1]);
+                    maxU = std::max(maxU, triangle.p[i][0]);
+                    maxV = std::max(maxV, triangle.p[i][1]);
+                }
+            }
         }
     }
 

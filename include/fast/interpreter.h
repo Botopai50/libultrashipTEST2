@@ -454,6 +454,9 @@ struct ShadowMaskCache {
     // A wall/drop projection uses the complete captured silhouette. Clipping the source triangles against the
     // wall plane removes Link's upper body when the actor overlaps the lip; only the projected result is clipped.
     bool project_full_source = false;
+    // Move a complete wall projection along the receiver until its highest point meets the upper floor plane.
+    // This preserves the silhouette while preventing the shadow from floating above the ledge.
+    bool translate_to_lower_receiver = false;
     float lower_receiver_normal[3] = { 0.0f, 1.0f, 0.0f };
     float lower_receiver_d = 0.0f;
     bool edge_receiver_valid = false;
