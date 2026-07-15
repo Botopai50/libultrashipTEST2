@@ -2523,7 +2523,9 @@ void Interpreter::FlushToonShadow() {
         edgeCache.max_u = cache.edge.max_u;
         edgeCache.min_v = cache.edge.min_v;
         edgeCache.max_v = cache.edge.max_v;
-        edgeCache.clip_to_lower_receiver = true;
+        // Do not clip the wall mask by the upper-floor plane. That removes the head and torso projection when
+        // their cast rays land above the lip; the normal floor quad is clipped separately at the edge.
+        edgeCache.clip_to_lower_receiver = false;
         edgeCache.project_full_source = true;
         memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
         edgeCache.lower_receiver_d = cache.draw_plane_d;

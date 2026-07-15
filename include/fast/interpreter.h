@@ -448,8 +448,8 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
-    // Edge projections are clipped to the lower half-space of the live floor plane. This leaves the normal
-    // floor mask responsible for the upper surface and makes the second projection continue through the edge.
+    // Optional lower-receiver clipping is retained for other receiver experiments; the wall projection itself is
+    // kept complete so Link's head and torso are not removed at the ledge.
     bool clip_to_lower_receiver = false;
     // A wall/drop projection uses the complete captured silhouette. Clipping the source triangles against the
     // wall plane removes Link's upper body when the actor overlaps the lip; only the projected result is clipped.
