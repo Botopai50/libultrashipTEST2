@@ -3072,6 +3072,19 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
         return;
     }
+    // Collision winding can differ between room meshes. For the wall projection, orient the bias toward Link's
+    // live anchor so the decal is always placed on the visible side of the receiver instead of inside it.
+    if (projection != nullptr && cache.anchor_valid) {
+        const float actorPoint[3] = { cache.mask_anchor[0] + cache.world_offset[0],
+                                      cache.mask_anchor[1] + cache.world_offset[1],
+                                      cache.mask_anchor[2] + cache.world_offset[2] };
+        if (ShadowDot(drawNormal, actorPoint) + drawPlaneD < 0.0f) {
+            drawNormal[0] = -drawNormal[0];
+            drawNormal[1] = -drawNormal[1];
+            drawNormal[2] = -drawNormal[2];
+            drawPlaneD = -drawPlaneD;
+        }
+    }
 
     // Flush before binding the shadow texture so normal geometry already queued for this batch keeps its own
     // texture and sampler state.
@@ -3142,6 +3155,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
     const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
+    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 1.5f) : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
@@ -3165,9 +3179,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         // Reproject the translated cached footprint onto the latest receiver plane. Moving an actor therefore
         // moves its cheap cached quad every frame, while ramps and floor-height changes do not require a new mask.
         const float planeDistance = ShadowDot(drawNormal, quad[i].world) + drawPlaneD;
-        quad[i].world[0] += drawNormal[0] * (surfaceBias - planeDistance);
-        quad[i].world[1] += drawNormal[1] * (surfaceBias - planeDistance);
-        quad[i].world[2] += drawNormal[2] * (surfaceBias - planeDistance);
+        quad[i].world[0] += drawNormal[0] * (receiverBias - planeDistance);
+        quad[i].world[1] += drawNormal[1] * (receiverBias - planeDistance);
+        quad[i].world[2] += drawNormal[2] * (receiverBias - planeDistance);
         quad[i].uv[0] = uvs[i][0];
         quad[i].uv[1] = uvs[i][1];
     }
@@ -3199,7 +3213,18 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const bool clipFloorShadow = projection == nullptr && cache.edge_receiver_valid;
     float edgeNormal[3] = { cache.edge.plane_normal[0], cache.edge.plane_normal[1], cache.edge.plane_normal[2] };
     float edgePlaneD = cache.edge.plane_d;
-    const bool validEdgeClip = clipFloorShadow && ShadowNormalizePlane(edgeNormal, edgePlaneD);
+    bool validEdgeClip = clipFloorShadow && ShadowNormalizePlane(edgeNormal, edgePlaneD);
+    if (validEdgeClip && cache.anchor_valid) {
+        const float actorPoint[3] = { cache.mask_anchor[0] + cache.world_offset[0],
+                                      cache.mask_anchor[1] + cache.world_offset[1],
+                                      cache.mask_anchor[2] + cache.world_offset[2] };
+        if (ShadowDot(edgeNormal, actorPoint) + edgePlaneD < 0.0f) {
+            edgeNormal[0] = -edgeNormal[0];
+            edgeNormal[1] = -edgeNormal[1];
+            edgeNormal[2] = -edgeNormal[2];
+            edgePlaneD = -edgePlaneD;
+        }
+    }
     const int triangleIndices[2][3] = { { 0, 1, 3 }, { 1, 2, 3 } };
     for (const auto& triangle : triangleIndices) {
         ShadowQuadPoint clipped[4]{};
