@@ -2524,6 +2524,7 @@ void Interpreter::FlushToonShadow() {
         edgeCache.min_v = cache.edge.min_v;
         edgeCache.max_v = cache.edge.max_v;
         edgeCache.clip_to_lower_receiver = true;
+        edgeCache.project_full_source = true;
         memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
         edgeCache.lower_receiver_d = cache.draw_plane_d;
 
@@ -2626,13 +2627,14 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         const float distanceA = ShadowDot(normal, a) + planeD;
         const float distanceB = ShadowDot(normal, b) + planeD;
         const float distanceC = ShadowDot(normal, c) + planeD;
-        if (fabsf(distanceA) < 0.05f && fabsf(distanceB) < 0.05f && fabsf(distanceC) < 0.05f) {
+        if (!cache.project_full_source && fabsf(distanceA) < 0.05f && fabsf(distanceB) < 0.05f &&
+            fabsf(distanceC) < 0.05f) {
             continue;
         }
 
         // Clip the actor triangle against the receiving plane before projection. Previously a single vertex
         // below the floor discarded the entire triangle, cutting off deep-rooted geometry such as sign posts.
-        constexpr float clipBoundary = -1.0f;
+        const float clipBoundary = cache.project_full_source ? -8192.0f : -1.0f;
         const float input[3][3] = {
             { a[0], a[1], a[2] },
             { b[0], b[1], b[2] },
@@ -3155,7 +3157,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
     const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 2.5f) : surfaceBias;
+    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 4.0f) : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
