@@ -25,7 +25,7 @@
 // SOH [Enhancement] Max floats packed per vertex into the Fast3D VBO. Grew from 32 to 40 when toon
 // lighting added a world-space normal attribute. The interpreter packs from this and every backend
 // sizes its vertex buffers from it, so they stay in lockstep — change it in one place only.
-#define VBO_MAX_FLOATS_PER_VERTEX 40
+#define VBO_MAX_FLOATS_PER_VERTEX 48
 
 #include <stdint.h>
 #include <stdbool.h>
