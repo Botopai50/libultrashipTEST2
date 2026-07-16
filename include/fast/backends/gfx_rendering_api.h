@@ -115,6 +115,21 @@ class GfxRenderingAPI {
         mToonDebug = debug;
     }
 
+    // SOH [Enhancement] Stylized actor rim lighting. The application supplies the camera-facing direction
+    // once per frame together with look controls. The toon shader already owns the interpolated normal and
+    // dominant key light, so the effect needs no texture, light, geometry or extra pass.
+    virtual void SetToonRim(const float viewDir[3], float enabled, float intensity, float width, float softness,
+                            float directionInfluence) {
+        for (int i = 0; i < 3; i++) {
+            mToonViewDir[i] = viewDir[i];
+        }
+        mToonRimEnabled = enabled;
+        mToonRimIntensity = intensity;
+        mToonRimWidth = width;
+        mToonRimSoftness = softness;
+        mToonRimDirectionInfluence = directionInfluence;
+    }
+
     // SOH [Enhancement] World light casting / actor shadows: the interpreter pushes the current stencil
     // mode here when a gSPStencil command is seen, or directly from FlushToonShadow; backends read
     // mStencilMode in their per-draw path. Off (0) is normal rendering, so ordinary draws are unaffected.
@@ -134,6 +149,12 @@ class GfxRenderingAPI {
     float mToonHighlightIntensity = TOON_SHADING_DEFAULT_HIGHLIGHT;
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
+    float mToonViewDir[3] = { 0.0f, 0.0f, 1.0f };
+    float mToonRimEnabled = 0.0f;
+    float mToonRimIntensity = 1.0f;
+    float mToonRimWidth = 0.28f;      // threshold = 1 - width = 0.72
+    float mToonRimSoftness = 0.035f;  // low-resolution stability floor
+    float mToonRimDirectionInfluence = 1.0f;
     int mStencilMode = 0; // SOH [Enhancement] world light casting (see StencilMode)
     int mStencilRef = 0;  // SOH [Enhancement] actor shadows: per-tap reference value for ShadowMask
     int8_t mCurrentDepthTest = 0;
