@@ -2405,9 +2405,9 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-// Collision wall planes can sit several world units behind the visible room mesh. Keep an edge projection
-// decisively on the upper-platform side so the depth test cannot bury it in the wall.
-constexpr float kShadowWallSurfaceBias = 12.0f;
+// The wall plane is rebuilt through the actual collision hit, so only a small decal offset is needed. A large
+// world-space push makes the projection visibly cross the ledge and appear to enter the surrounding geometry.
+constexpr float kShadowWallSurfaceBias = 1.5f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
