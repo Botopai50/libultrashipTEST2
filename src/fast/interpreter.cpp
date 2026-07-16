@@ -2405,6 +2405,9 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
+// Collision wall planes can sit several world units behind the visible room mesh. Keep an edge projection
+// decisively on the camera-facing side so the depth test cannot bury it in the wall.
+constexpr float kShadowWallSurfaceBias = 12.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -3115,19 +3118,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
         return;
     }
-    // Collision winding can differ between room meshes. For the wall projection, orient the bias toward Link's
-    // live anchor so the decal is always placed on the visible side of the receiver instead of inside it.
-    if (projection != nullptr && cache.anchor_valid) {
-        const float actorPoint[3] = { cache.mask_anchor[0] + cache.world_offset[0],
-                                      cache.mask_anchor[1] + cache.world_offset[1],
-                                      cache.mask_anchor[2] + cache.world_offset[2] };
-        if (ShadowDot(drawNormal, actorPoint) + drawPlaneD < 0.0f) {
-            drawNormal[0] = -drawNormal[0];
-            drawNormal[1] = -drawNormal[1];
-            drawNormal[2] = -drawNormal[2];
-            drawPlaneD = -drawPlaneD;
-        }
-    }
+    // Edge planes are oriented toward the current camera by the game-side collision query. Do not replace that
+    // orientation with Link's side: when the camera crosses the wall, Link-facing bias can put the decal inside
+    // the wall from the new view.
 
     // Flush before binding the shadow texture so normal geometry already queued for this batch keeps its own
     // texture and sampler state.
@@ -3198,7 +3191,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
     const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? std::max(surfaceBias, 4.0f) : surfaceBias;
+    const float receiverBias = projection != nullptr ? std::max(surfaceBias, kShadowWallSurfaceBias) : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
