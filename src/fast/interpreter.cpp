@@ -1629,6 +1629,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool use_grayscale = mRdp->grayscale;
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
     bool use_toon = mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
+    // OpenGL's rim-light shader also consumes the world position that GfxSpVertex already calculated for
+    // toon actors. Resolve this once per triangle so the per-vertex packing has no repeated virtual call.
+    bool use_toon_world_position = use_toon && mRapi->UsesToonWorldPosition();
     auto shader = mRdp->current_shader;
 
     if (texture_edge) {
@@ -1888,6 +1891,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBufVbo[mBufVboLen++] = v_arr[i]->nx;
             mBufVbo[mBufVboLen++] = v_arr[i]->ny;
             mBufVbo[mBufVboLen++] = v_arr[i]->nz;
+            if (use_toon_world_position) {
+                mBufVbo[mBufVboLen++] = v_arr[i]->wx;
+                mBufVbo[mBufVboLen++] = v_arr[i]->wy;
+                mBufVbo[mBufVboLen++] = v_arr[i]->wz;
+            }
         }
 
         for (int j = 0; j < numInputs; j++) {
