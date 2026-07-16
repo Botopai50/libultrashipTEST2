@@ -84,7 +84,7 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1f(mCurrentShaderProgram->toon_highlight_intensity_location, mToonHighlightIntensity);
         glUniform1f(mCurrentShaderProgram->toon_shadow_intensity_location, mToonShadowIntensity);
         glUniform1f(mCurrentShaderProgram->toon_debug_location, mToonDebug);
-        glUniform3fv(mCurrentShaderProgram->toon_view_dir_location, 1, mToonViewDir);
+        glUniform3fv(mCurrentShaderProgram->toon_camera_pos_location, 1, mToonCameraPos);
         glUniform1f(mCurrentShaderProgram->toon_rim_enabled_location, mToonRimEnabled);
         glUniform1f(mCurrentShaderProgram->toon_rim_intensity_location, mToonRimIntensity);
         glUniform1f(mCurrentShaderProgram->toon_rim_width_location, mToonRimWidth);
@@ -487,6 +487,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aNormal");
         prg->attribSizes[cnt] = 3;
         ++cnt;
+        prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aWorldPos");
+        prg->attribSizes[cnt] = 3;
+        ++cnt;
     }
 
     for (int i = 0; i < cc_features.numInputs; i++) {
@@ -524,7 +527,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->toon_highlight_intensity_location = glGetUniformLocation(shader_program, "toon_highlight_intensity");
     prg->toon_shadow_intensity_location = glGetUniformLocation(shader_program, "toon_shadow_intensity");
     prg->toon_debug_location = glGetUniformLocation(shader_program, "toon_debug");
-    prg->toon_view_dir_location = glGetUniformLocation(shader_program, "toon_view_dir");
+    prg->toon_camera_pos_location = glGetUniformLocation(shader_program, "toon_camera_pos");
     prg->toon_rim_enabled_location = glGetUniformLocation(shader_program, "toon_rim_enabled");
     prg->toon_rim_intensity_location = glGetUniformLocation(shader_program, "toon_rim_intensity");
     prg->toon_rim_width_location = glGetUniformLocation(shader_program, "toon_rim_width");
