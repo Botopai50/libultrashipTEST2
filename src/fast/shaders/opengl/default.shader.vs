@@ -39,7 +39,9 @@
 @if(o_toon)
     @{attr} vec3 aNormal;
     @{out} vec3 vNormal;
-    @{update_floats(3)}
+    @{attr} vec3 aWorldPos;
+    @{out} vec3 vWorldPos;
+    @{update_floats(6)}
 @end
 
 @for(i in 0..o_inputs)
@@ -77,6 +79,7 @@ void main() {
     @end
     @if(o_toon)
         vNormal = aNormal;
+        vWorldPos = aWorldPos;
     @end
     @for(i in 0..o_inputs)
         vInput@{i + 1} = aInput@{i + 1};
