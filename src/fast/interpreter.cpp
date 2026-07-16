@@ -2406,7 +2406,7 @@ constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 // Collision wall planes can sit several world units behind the visible room mesh. Keep an edge projection
-// decisively on the camera-facing side so the depth test cannot bury it in the wall.
+// decisively on the upper-platform side so the depth test cannot bury it in the wall.
 constexpr float kShadowWallSurfaceBias = 12.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
@@ -3118,9 +3118,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     if (!ShadowNormalizePlane(drawNormal, drawPlaneD)) {
         return;
     }
-    // Edge planes are oriented toward the current camera by the game-side collision query. Do not replace that
-    // orientation with Link's side: when the camera crosses the wall, Link-facing bias can put the decal inside
-    // the wall from the new view.
+    // Edge planes are oriented toward the upper platform by the game-side collision query. Do not replace that
+    // geometric orientation with Link or camera state; both can move independently of the wall.
 
     // Flush before binding the shadow texture so normal geometry already queued for this batch keeps its own
     // texture and sampler state.
