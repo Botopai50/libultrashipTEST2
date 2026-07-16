@@ -84,6 +84,12 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1f(mCurrentShaderProgram->toon_highlight_intensity_location, mToonHighlightIntensity);
         glUniform1f(mCurrentShaderProgram->toon_shadow_intensity_location, mToonShadowIntensity);
         glUniform1f(mCurrentShaderProgram->toon_debug_location, mToonDebug);
+        glUniform3fv(mCurrentShaderProgram->toon_view_dir_location, 1, mToonViewDir);
+        glUniform1f(mCurrentShaderProgram->toon_rim_enabled_location, mToonRimEnabled);
+        glUniform1f(mCurrentShaderProgram->toon_rim_intensity_location, mToonRimIntensity);
+        glUniform1f(mCurrentShaderProgram->toon_rim_width_location, mToonRimWidth);
+        glUniform1f(mCurrentShaderProgram->toon_rim_softness_location, mToonRimSoftness);
+        glUniform1f(mCurrentShaderProgram->toon_rim_direction_influence_location, mToonRimDirectionInfluence);
     }
 }
 
@@ -518,6 +524,13 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->toon_highlight_intensity_location = glGetUniformLocation(shader_program, "toon_highlight_intensity");
     prg->toon_shadow_intensity_location = glGetUniformLocation(shader_program, "toon_shadow_intensity");
     prg->toon_debug_location = glGetUniformLocation(shader_program, "toon_debug");
+    prg->toon_view_dir_location = glGetUniformLocation(shader_program, "toon_view_dir");
+    prg->toon_rim_enabled_location = glGetUniformLocation(shader_program, "toon_rim_enabled");
+    prg->toon_rim_intensity_location = glGetUniformLocation(shader_program, "toon_rim_intensity");
+    prg->toon_rim_width_location = glGetUniformLocation(shader_program, "toon_rim_width");
+    prg->toon_rim_softness_location = glGetUniformLocation(shader_program, "toon_rim_softness");
+    prg->toon_rim_direction_influence_location =
+        glGetUniformLocation(shader_program, "toon_rim_direction_influence");
 
     LoadShader(prg);
 
