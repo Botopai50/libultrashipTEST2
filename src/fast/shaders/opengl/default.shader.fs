@@ -24,6 +24,7 @@ out vec4 vOutColor;
 @if(o_fog) @{attr} vec4 vFog;
 @if(o_grayscale) @{attr} vec4 vGrayscaleColor;
 @if(o_toon) @{attr} vec3 vNormal;
+@if(o_toon) @{attr} vec3 vWorldPos;
 
 @for(i in 0..o_inputs)
     @if(o_alpha)
@@ -55,7 +56,7 @@ uniform float toon_ramp_softness;
 uniform float toon_highlight_intensity;
 uniform float toon_shadow_intensity;
 uniform float toon_debug;
-uniform vec3 toon_view_dir;
+uniform vec3 toon_camera_pos;
 uniform float toon_rim_enabled;
 uniform float toon_rim_intensity;
 uniform float toon_rim_width;
@@ -220,7 +221,8 @@ void main() {
             // particle-like draws. Sky, water, UI and ordinary scenery never compile this path.
             @if(!o_alpha)
                 if (toon_rim_enabled > 0.5) {
-                    vec3 V = normalize(toon_view_dir);
+                    vec3 viewDelta = toon_camera_pos - vWorldPos;
+                    vec3 V = viewDelta * inversesqrt(max(dot(viewDelta, viewDelta), 0.000001));
                     float edge = 1.0 - clamp(dot(toonN, V), 0.0, 1.0);
                     float feather = max(max(toon_rim_softness, 0.035), fwidth(edge) * 1.5);
                     float threshold = clamp(1.0 - toon_rim_width, 0.0, 1.0);
