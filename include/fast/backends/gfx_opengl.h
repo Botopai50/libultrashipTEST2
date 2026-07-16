@@ -48,6 +48,12 @@ struct ShaderProgram {
     GLint toon_highlight_intensity_location;
     GLint toon_shadow_intensity_location;
     GLint toon_debug_location;
+    GLint toon_view_dir_location;
+    GLint toon_rim_enabled_location;
+    GLint toon_rim_intensity_location;
+    GLint toon_rim_width_location;
+    GLint toon_rim_softness_location;
+    GLint toon_rim_direction_influence_location;
 };
 
 struct FramebufferOGL {
