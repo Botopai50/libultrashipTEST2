@@ -2405,9 +2405,9 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-// The wall plane is rebuilt through the actual collision hit, so only a small decal offset is needed. A large
-// world-space push makes the projection visibly cross the ledge and appear to enter the surrounding geometry.
-constexpr float kShadowWallSurfaceBias = 1.5f;
+// Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
+// floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
+constexpr float kShadowWallSurfaceBias = -12.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -3190,7 +3190,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
     const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
     const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? std::max(surfaceBias, kShadowWallSurfaceBias) : surfaceBias;
+    const float receiverBias = projection != nullptr ? kShadowWallSurfaceBias : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
