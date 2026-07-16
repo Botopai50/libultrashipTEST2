@@ -2807,7 +2807,11 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     // visibly embedded in the wall. Translate the whole mask down along the wall plane until that point slightly
     // overlaps the upper floor plane; unlike clipping, this keeps Link's head and torso in the projected shadow
     // and connects the wall shadow to the end of the floor shadow.
-    if (cache.translate_to_lower_receiver && hasLowerReceiver && maxLowerDistance > 0.0f) {
+    // The projected silhouette is normally below the upper floor, so maxLowerDistance is often negative. The
+    // previous positive-only guard skipped the translation in exactly that case and left the wall shadow starting
+    // at the actor's feet instead of at the ledge.
+    if (cache.translate_to_lower_receiver && hasLowerReceiver && !triangles.empty() &&
+        std::isfinite(maxLowerDistance)) {
         const float floorAlongU = ShadowDot(lowerNormal, basisU);
         const float floorAlongV = ShadowDot(lowerNormal, basisV);
         const float denominator = floorAlongU * floorAlongU + floorAlongV * floorAlongV;
