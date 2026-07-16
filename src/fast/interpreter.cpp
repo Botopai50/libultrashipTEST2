@@ -2407,7 +2407,7 @@ constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 // Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
 // floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
-constexpr float kShadowWallSurfaceBias = -12.0f;
+constexpr float kShadowWallSurfaceBias = -2.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -3193,9 +3193,15 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float receiverBias = projection != nullptr ? kShadowWallSurfaceBias : surfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
-    // Raster row 0 is minV, so keep the texture orientation aligned with the plane bounds. The previous
-    // vertical flip put the actor's feet at the far end of the projected shadow.
-    const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
+    // Raster row 0 is minV. The wall projection uses the opposite V orientation because its vertical receiver
+    // basis is traversed from the ledge down toward the lower surface; the ordinary floor shadow keeps its prior
+    // orientation.
+    float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
+    if (projection != nullptr) {
+        for (auto& uv : uvs) {
+            uv[1] = 1.0f - uv[1];
+        }
+    }
     const float* planeOrigin = projection != nullptr ? projection->plane_origin : cache.plane_origin;
     const float* basisU = projection != nullptr ? projection->basis_u : cache.basis_u;
     const float* basisV = projection != nullptr ? projection->basis_v : cache.basis_v;
