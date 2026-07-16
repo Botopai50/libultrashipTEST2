@@ -2407,7 +2407,8 @@ constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
 // Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
 // floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
-constexpr float kShadowWallSurfaceBias = -2.0f;
+constexpr float kShadowWallSurfaceBias = -0.5f;
+constexpr float kShadowWallEdgeOverlap = 1.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -2803,14 +2804,15 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
 
     // The complete wall silhouette is captured from Link's original projection. Without this translation its
     // highest point remains at the actor's original height, so it appears to float above the ledge and can be
-    // visibly embedded in the wall. Translate the whole mask down along the wall plane until that point meets
-    // the upper floor plane; unlike clipping, this keeps Link's head and torso in the projected shadow.
+    // visibly embedded in the wall. Translate the whole mask down along the wall plane until that point slightly
+    // overlaps the upper floor plane; unlike clipping, this keeps Link's head and torso in the projected shadow
+    // and connects the wall shadow to the end of the floor shadow.
     if (cache.translate_to_lower_receiver && hasLowerReceiver && maxLowerDistance > 0.0f) {
         const float floorAlongU = ShadowDot(lowerNormal, basisU);
         const float floorAlongV = ShadowDot(lowerNormal, basisV);
         const float denominator = floorAlongU * floorAlongU + floorAlongV * floorAlongV;
         if (denominator > 0.0001f) {
-            const float scale = maxLowerDistance / denominator;
+            const float scale = (maxLowerDistance - kShadowWallEdgeOverlap) / denominator;
             const float shiftU = -floorAlongU * scale;
             const float shiftV = -floorAlongV * scale;
             minU = std::numeric_limits<float>::max();
