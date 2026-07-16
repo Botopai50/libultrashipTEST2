@@ -30,8 +30,8 @@ struct ShaderProgram {
     uint8_t numInputs;
     bool usedTextures[SHADER_MAX_TEXTURES];
     uint8_t numFloats;
-    GLint attribLocations[16];
-    uint8_t attribSizes[16];
+    GLint attribLocations[20];
+    uint8_t attribSizes[20];
     uint8_t numAttribs;
     GLint frameCountLocation;
     GLint noiseScaleLocation;
@@ -48,7 +48,7 @@ struct ShaderProgram {
     GLint toon_highlight_intensity_location;
     GLint toon_shadow_intensity_location;
     GLint toon_debug_location;
-    GLint toon_view_dir_location;
+    GLint toon_camera_pos_location;
     GLint toon_rim_enabled_location;
     GLint toon_rim_intensity_location;
     GLint toon_rim_width_location;
@@ -116,6 +116,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool UsesToonWorldPosition() const override {
+        return true;
+    }
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
