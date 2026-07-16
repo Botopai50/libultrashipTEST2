@@ -118,16 +118,22 @@ class GfxRenderingAPI {
     // SOH [Enhancement] Stylized actor rim lighting. The application supplies the camera-facing direction
     // once per frame together with look controls. The toon shader already owns the interpolated normal and
     // dominant key light, so the effect needs no texture, light, geometry or extra pass.
-    virtual void SetToonRim(const float viewDir[3], float enabled, float intensity, float width, float softness,
+    virtual void SetToonRim(const float cameraPos[3], float enabled, float intensity, float width, float softness,
                             float directionInfluence) {
         for (int i = 0; i < 3; i++) {
-            mToonViewDir[i] = viewDir[i];
+            mToonCameraPos[i] = cameraPos[i];
         }
         mToonRimEnabled = enabled;
         mToonRimIntensity = intensity;
         mToonRimWidth = width;
         mToonRimSoftness = softness;
         mToonRimDirectionInfluence = directionInfluence;
+    }
+
+    // OpenGL's toon shader consumes the already-computed world position to form an exact fragment-to-camera
+    // direction. Other backends keep their existing vertex layout until they implement the same shader path.
+    virtual bool UsesToonWorldPosition() const {
+        return false;
     }
 
     // SOH [Enhancement] World light casting / actor shadows: the interpreter pushes the current stencil
@@ -149,7 +155,7 @@ class GfxRenderingAPI {
     float mToonHighlightIntensity = TOON_SHADING_DEFAULT_HIGHLIGHT;
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
-    float mToonViewDir[3] = { 0.0f, 0.0f, 1.0f };
+    float mToonCameraPos[3] = { 0.0f, 0.0f, 0.0f };
     float mToonRimEnabled = 0.0f;
     float mToonRimIntensity = 1.0f;
     float mToonRimWidth = 0.28f;      // threshold = 1 - width = 0.72
