@@ -55,6 +55,12 @@ uniform float toon_ramp_softness;
 uniform float toon_highlight_intensity;
 uniform float toon_shadow_intensity;
 uniform float toon_debug;
+uniform vec3 toon_view_dir;
+uniform float toon_rim_enabled;
+uniform float toon_rim_intensity;
+uniform float toon_rim_width;
+uniform float toon_rim_softness;
+uniform float toon_rim_direction_influence;
 @end
 
 uniform int texture_width[2];
@@ -195,18 +201,48 @@ void main() {
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single
     // dominant light through a soft half-Lambert ramp. Wind Waker-style two-tone.
     @if(o_toon)
+        vec3 albedoColor = texel.rgb;
         vec3 toonN = normalize(vNormal);
-        float toonNL = dot(toonN, normalize(toon_light_dir)) * 0.5 + 0.5;
+        vec3 toonL = normalize(toon_light_dir);
+        float toonNL = dot(toonN, toonL) * 0.5 + 0.5;
         float toonRamp = smoothstep(toon_ramp_center - toon_ramp_softness,
                                     toon_ramp_center + toon_ramp_softness, toonNL);
         vec3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
         vec3 toonShadow = mix(toonLit, toon_ambient, toon_shadow_intensity);
         if (toon_debug > 0.5) {
             // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
-            // discarded — makes it obvious which draws are receiving toon lighting.
+            // discarded â makes it obvious which draws are receiving toon lighting.
             texel.rgb = vec3(toonRamp);
         } else {
             texel.rgb = clamp(texel.rgb * mix(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            // Stylized, light-directed inner silhouette band for opaque lit actor materials only. The
+            // opt_toon variant is armed around actors and requires G_LIGHTING; !o_alpha rejects translucent,
+            // particle-like draws. Sky, water, UI and ordinary scenery never compile this path.
+            @if(!o_alpha)
+                if (toon_rim_enabled > 0.5) {
+                    vec3 V = normalize(toon_view_dir);
+                    float edge = 1.0 - clamp(dot(toonN, V), 0.0, 1.0);
+                    float feather = max(max(toon_rim_softness, 0.035), fwidth(edge) * 1.5);
+                    float threshold = clamp(1.0 - toon_rim_width, 0.0, 1.0);
+                    float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
+
+                    float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
+                    float backLighting = smoothstep(0.0, 0.65, dot(-V, toonL));
+                    float directionalMask = lightSide * mix(0.25, 1.0, backLighting);
+                    // Keep a directional component even at the lowest user setting: the effect must never
+                    // collapse into a uniform Fresnel halo around the whole actor.
+                    float directionInfluence = clamp(toon_rim_direction_influence, 0.25, 1.0);
+                    directionalMask = mix(1.0, directionalMask, directionInfluence);
+
+                    // This shader variant itself is the material mask: opaque + lit + actor-toon eligible.
+                    // Emissive/unlit and transparent materials never reach this branch.
+                    float materialRimMask = 1.0;
+                    float rimMask = clamp(rimBand * directionalMask * materialRimMask * 0.45 *
+                                          max(toon_rim_intensity, 0.0), 0.0, 1.0);
+                    vec3 rimColor = mix(albedoColor, toon_light_color, 0.65);
+                    texel.rgb = mix(texel.rgb, rimColor, rimMask);
+                }
+            @end
         }
     @end
 
