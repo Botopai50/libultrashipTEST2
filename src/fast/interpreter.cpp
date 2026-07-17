@@ -2416,9 +2416,9 @@ constexpr float kShadowSurfaceBias = 0.75f;
 // The renderer's folded-wall basis places the visible receiver on the negative side of the collision normal.
 // Keep a minimum separation there and increase only its magnitude for larger footprints; never cross zero,
 // which would make the decal coplanar and reintroduce z-fighting.
-constexpr float kShadowWallSurfaceBias = -0.60f;
-constexpr float kShadowWallSurfaceBiasRange = 0.65f;
-constexpr float kShadowWallSurfaceBiasScale = 0.005f;
+constexpr float kShadowWallSurfaceBias = -1.25f;
+constexpr float kShadowWallSurfaceBiasRange = 1.75f;
+constexpr float kShadowWallSurfaceBiasScale = 0.015f;
 // Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
 // two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
 constexpr float kShadowWallSeamOverlap = 4.0f;
