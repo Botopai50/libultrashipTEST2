@@ -2418,7 +2418,9 @@ constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowWallSurfaceBias = -0.5f;
 // Cover the transparent one-texel mask border and the receiver decal biases at the fold without moving the
 // silhouette itself. This narrow band is hidden by the two receiving surfaces except directly at their seam.
-constexpr float kShadowWallSeamOverlap = 2.0f;
+constexpr float kShadowWallSeamOverlap = 4.0f;
+constexpr float kShadowWallMinimumSplit = 1.0f;
+constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -2694,7 +2696,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             wallDown[2] = -wallDown[2];
         }
         edgeAlongFloor = ShadowDot(normal, floorOut);
-        if (edgeAlongFloor > -0.001f) {
+        if (edgeAlongFloor > -kShadowWallMinimumFoldSine) {
             return;
         }
     }
@@ -2910,7 +2912,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     // A fold is valid only when the floor silhouette genuinely crosses the ledge. If every projected point lies
     // on one side, drawing a wall mask would either put the complete shadow on the edge or remove it entirely.
     // Returning an empty edge mask lets DrawShadowQuad keep the ordinary floor shadow as the safe fallback.
-    if (cache.fold_over_edge && !(minFoldEdgeDistance < -0.01f && maxFoldEdgeDistance > 0.01f)) {
+    if (cache.fold_over_edge && !(minFoldEdgeDistance < -kShadowWallMinimumSplit &&
+                                  maxFoldEdgeDistance > kShadowWallMinimumSplit)) {
         return;
     }
 
@@ -3297,13 +3300,16 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float maxV = projection != nullptr ? projection->max_v : cache.max_v;
     const float centerU = (minU + maxU) * 0.5f;
     const float centerV = (minV + maxV) * 0.5f;
-    const float halfU = (maxU - minU) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
-    const float halfV = (maxV - minV) * 0.5f * std::clamp(cache.size, 0.0f, 1.0f);
+    const float sizeScale = std::clamp(cache.size, 0.0f, 1.0f);
+    const float halfU = (maxU - minU) * 0.5f * sizeScale;
+    const float halfV = (maxV - minV) * 0.5f * sizeScale;
     // Normal quantization error grows across a large footprint. Add a small size-aware lift and use the
     // backend's decal depth mode so the quad remains above ramps and polygon seams without a visible float.
-    const float footprintRadius = sqrtf(halfU * halfU + halfV * halfV);
-    const float surfaceBias = kShadowSurfaceBias + std::min(2.0f, footprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? kShadowWallSurfaceBias : surfaceBias;
+    const float floorHalfU = (cache.max_u - cache.min_u) * 0.5f * sizeScale;
+    const float floorHalfV = (cache.max_v - cache.min_v) * 0.5f * sizeScale;
+    const float floorFootprintRadius = sqrtf(floorHalfU * floorHalfU + floorHalfV * floorHalfV);
+    const float floorSurfaceBias = kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f);
+    const float receiverBias = projection != nullptr ? kShadowWallSurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 always corresponds to minV. Keeping that mapping on the folded wall mask is what makes the
@@ -3374,6 +3380,11 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     }
     bool validReceiverClip =
         (clipFloorShadow || clipWallShadow) && ShadowNormalizePlane(receiverClipNormal, receiverClipPlaneD);
+    if (validReceiverClip) {
+        // Cut both quads at the intersection of their rendered, biased planes. Cutting at the raw collision planes
+        // leaves different endpoints (especially on slopes), which is the geometric gap visible between masks.
+        receiverClipPlaneD -= clipFloorShadow ? kShadowWallSurfaceBias : floorSurfaceBias;
+    }
     if (validReceiverClip && clipFloorShadow) {
         // The platform is opposite the shadow cast direction. Use that fixed geometric relation to select the
         // floor side of the wall plane; Link and camera movement cannot reverse it.
@@ -3388,7 +3399,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     }
     if (validReceiverClip && clipWallShadow) {
         // Game-side floor planes are normalized upward. Flip that plane so the generic >= 0 clip retains only the
-        // wall below it. The mask extends above this line by two units, making its edge opaque at the seam.
+        // wall below it. The mask overlap above this line keeps its filtered edge opaque at the seam.
         if (receiverClipNormal[1] < 0.0f) {
             receiverClipNormal[0] = -receiverClipNormal[0];
             receiverClipNormal[1] = -receiverClipNormal[1];
