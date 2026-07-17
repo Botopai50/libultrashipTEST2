@@ -2413,9 +2413,12 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-// Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
-// floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
-constexpr float kShadowWallSurfaceBias = -0.5f;
+// The edge receiver normal points toward the upper-platform/open side. Keep the wall decal slightly in front
+// of the collision plane instead of pushing it behind the wall. Larger projected footprints receive a small
+// additional lift below, capped to avoid a visibly floating decal.
+constexpr float kShadowWallSurfaceBias = 0.60f;
+constexpr float kShadowWallSurfaceBiasRange = 0.65f;
+constexpr float kShadowWallSurfaceBiasScale = 0.005f;
 // Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
 // two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
 constexpr float kShadowWallSeamOverlap = 4.0f;
@@ -3307,7 +3310,12 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float floorHalfV = (cache.max_v - cache.min_v) * 0.5f * sizeScale;
     const float floorFootprintRadius = sqrtf(floorHalfU * floorHalfU + floorHalfV * floorHalfV);
     const float floorSurfaceBias = kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f);
-    const float receiverBias = projection != nullptr ? kShadowWallSurfaceBias : floorSurfaceBias;
+    // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
+    // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
+    const float wallSurfaceBias =
+        kShadowWallSurfaceBias +
+        std::min(kShadowWallSurfaceBiasRange, floorFootprintRadius * kShadowWallSurfaceBiasScale);
+    const float receiverBias = projection != nullptr ? wallSurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 always corresponds to minV. Keeping that mapping on the folded wall mask is what makes the
@@ -3381,7 +3389,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     if (validReceiverClip) {
         // Cut both quads at the intersection of their rendered, biased planes. Cutting at the raw collision planes
         // leaves different endpoints (especially on slopes), which is the geometric gap visible between masks.
-        receiverClipPlaneD -= clipFloorShadow ? kShadowWallSurfaceBias : floorSurfaceBias;
+        receiverClipPlaneD -= clipFloorShadow ? wallSurfaceBias : floorSurfaceBias;
     }
     // The edge query orients this plane toward its actual upper-floor probe point. Keep that side directly; using
     // Link, camera, or light direction here can reverse the clip when any of them moves relative to a sloped wall.
