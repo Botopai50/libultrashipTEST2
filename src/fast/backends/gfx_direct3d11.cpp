@@ -429,7 +429,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     // Input Layout
 
-    D3D11_INPUT_ELEMENT_DESC ied[16];
+    D3D11_INPUT_ELEMENT_DESC ied[20];
     uint8_t ied_index = 0;
     ied[ied_index++] = {
         "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
@@ -473,10 +473,14 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              D3D11_INPUT_PER_VERTEX_DATA,
                              0 };
     }
-    // SOH [Enhancement] Toon lighting world-space normal (order must match the vbo packing).
+    // SOH [Enhancement] Toon lighting world-space normal and position (order must match the VBO packing).
+    // The position lets the pixel shader form the exact fragment-to-camera direction for rim lighting.
     if (cc_features.opt_toon) {
         ied[ied_index++] = {
             "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
+        };
+        ied[ied_index++] = {
+            "WORLDPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
     }
     for (unsigned int i = 0; i < cc_features.numInputs; i++) {
@@ -806,12 +810,18 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
             mPerToonCbData.toon_light_dir[j] = mToonLightDir[j];
             mPerToonCbData.toon_light_color[j] = mToonLightColor[j];
             mPerToonCbData.toon_ambient[j] = mToonAmbient[j];
+            mPerToonCbData.toon_camera_pos[j] = mToonCameraPos[j];
         }
         mPerToonCbData.toon_ramp_center = mToonRampCenter;
         mPerToonCbData.toon_ramp_softness = mToonRampSoftness;
         mPerToonCbData.toon_highlight_intensity = mToonHighlightIntensity;
         mPerToonCbData.toon_shadow_intensity = mToonShadowIntensity;
         mPerToonCbData.toon_debug = mToonDebug;
+        mPerToonCbData.toon_rim_enabled = mToonRimEnabled;
+        mPerToonCbData.toon_rim_intensity = mToonRimIntensity;
+        mPerToonCbData.toon_rim_width = mToonRimWidth;
+        mPerToonCbData.toon_rim_softness = mToonRimSoftness;
+        mPerToonCbData.toon_rim_direction_influence = mToonRimDirectionInfluence;
         D3D11_MAPPED_SUBRESOURCE toon_ms;
         ZeroMemory(&toon_ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
         mContext->Map(mPerToonCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &toon_ms);
