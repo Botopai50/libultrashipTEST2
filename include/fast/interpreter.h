@@ -448,6 +448,9 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
+    // Fold the part of the ordinary floor projection that crosses an edge onto the wall receiver. This preserves
+    // the exact silhouette cut at the ledge instead of projecting the actor onto the wall a second time.
+    bool fold_over_edge = false;
     // Optional lower-receiver clipping keeps only the portion of a projection below the upper receiver plane.
     bool clip_to_lower_receiver = false;
     // A wall/drop projection uses the complete captured silhouette. Clipping the source triangles against the
