@@ -2416,7 +2416,6 @@ constexpr float kShadowSurfaceBias = 0.75f;
 // Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
 // floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
 constexpr float kShadowWallSurfaceBias = -0.5f;
-constexpr float kShadowWallEdgeOverlap = 1.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -2535,13 +2534,17 @@ void Interpreter::FlushToonShadow() {
         edgeCache.max_u = cache.edge.max_u;
         edgeCache.min_v = cache.edge.min_v;
         edgeCache.max_v = cache.edge.max_v;
-        // Do not clip the wall mask by the upper-floor plane. That removes the head and torso projection when
-        // their cast rays land above the lip; the normal floor quad is clipped separately at the edge.
-        edgeCache.clip_to_lower_receiver = false;
+        // Clip the wall mask by the same upper-floor plane that clips the floor quad. The shared light-ray
+        // projection then makes the wall shadow continue from the exact actor part that reaches the ledge: if the
+        // floor shadow is cut at Link's waist, the wall shadow starts at Link's waist instead of at his feet.
+        edgeCache.clip_to_lower_receiver = true;
         edgeCache.project_full_source = true;
-        edgeCache.translate_to_lower_receiver = true;
+        edgeCache.translate_to_lower_receiver = false;
         memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
         edgeCache.lower_receiver_d = cache.draw_plane_d;
+        edgeCache.reuse_cast_direction = true;
+        edgeCache.cast_direction_valid = cache.cast_direction_valid;
+        memcpy(edgeCache.cast_direction, cache.cast_direction, sizeof(edgeCache.cast_direction));
 
         RasterizeShadowMask(edgeCache);
         if (edgeCache.coverage.empty()) {
@@ -2566,6 +2569,9 @@ void Interpreter::FlushToonShadow() {
 
 void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     cache.coverage.clear();
+    if (!cache.reuse_cast_direction) {
+        cache.cast_direction_valid = false;
+    }
     if (mShadowVerts.size() < 9) {
         return;
     }
@@ -2575,9 +2581,28 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     if (!ShadowNormalizePlane(normal, planeD)) {
         return;
     }
-    float light[3] = { mRsp->toon_shadow_dir[0], mRsp->toon_shadow_dir[1], mRsp->toon_shadow_dir[2] };
-    if (!ShadowNormalize(light)) {
-        return;
+    float light[3] = {};
+    float castDir[3] = {};
+    if (cache.reuse_cast_direction) {
+        if (!cache.cast_direction_valid) {
+            return;
+        }
+        castDir[0] = cache.cast_direction[0];
+        castDir[1] = cache.cast_direction[1];
+        castDir[2] = cache.cast_direction[2];
+        if (!ShadowNormalize(castDir)) {
+            return;
+        }
+        light[0] = -castDir[0];
+        light[1] = -castDir[1];
+        light[2] = -castDir[2];
+    } else {
+        light[0] = mRsp->toon_shadow_dir[0];
+        light[1] = mRsp->toon_shadow_dir[1];
+        light[2] = mRsp->toon_shadow_dir[2];
+        if (!ShadowNormalize(light)) {
+            return;
+        }
     }
 
     // Orient the receiver toward the key. This also makes wall projection work when a collision polygon's
@@ -2591,23 +2616,29 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         lightNormal = -lightNormal;
     }
 
-    const float minElevation = std::clamp(mToonShadowMinElevation, 0.05f, 0.99f);
-    float tangent[3] = { light[0] - normal[0] * lightNormal, light[1] - normal[1] * lightNormal,
-                         light[2] - normal[2] * lightNormal };
-    const float tangentLength = ShadowLength(tangent);
-    if (tangentLength < 0.001f) {
-        tangent[0] = tangent[1] = tangent[2] = 0.0f;
-    } else {
-        const float elevation = std::max(lightNormal, minElevation);
-        const float tangentScale = sqrtf(std::max(0.0f, 1.0f - elevation * elevation)) / tangentLength;
-        tangent[0] *= tangentScale;
-        tangent[1] *= tangentScale;
-        tangent[2] *= tangentScale;
-        light[0] = normal[0] * elevation + tangent[0];
-        light[1] = normal[1] * elevation + tangent[1];
-        light[2] = normal[2] * elevation + tangent[2];
+    if (!cache.reuse_cast_direction) {
+        const float minElevation = std::clamp(mToonShadowMinElevation, 0.05f, 0.99f);
+        float tangent[3] = { light[0] - normal[0] * lightNormal, light[1] - normal[1] * lightNormal,
+                             light[2] - normal[2] * lightNormal };
+        const float tangentLength = ShadowLength(tangent);
+        if (tangentLength < 0.001f) {
+            tangent[0] = tangent[1] = tangent[2] = 0.0f;
+        } else {
+            const float elevation = std::max(lightNormal, minElevation);
+            const float tangentScale = sqrtf(std::max(0.0f, 1.0f - elevation * elevation)) / tangentLength;
+            tangent[0] *= tangentScale;
+            tangent[1] *= tangentScale;
+            tangent[2] *= tangentScale;
+            light[0] = normal[0] * elevation + tangent[0];
+            light[1] = normal[1] * elevation + tangent[1];
+            light[2] = normal[2] * elevation + tangent[2];
+        }
+        castDir[0] = -light[0];
+        castDir[1] = -light[1];
+        castDir[2] = -light[2];
+        memcpy(cache.cast_direction, castDir, sizeof(cache.cast_direction));
+        cache.cast_direction_valid = true;
     }
-    float castDir[3] = { -light[0], -light[1], -light[2] };
     const float castDenom = ShadowDot(normal, castDir);
     if (fabsf(castDenom) < 0.001f) {
         return;
@@ -2810,21 +2841,16 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // The complete wall silhouette is captured from Link's original projection. Without this translation its
-    // highest point remains at the actor's original height, so it appears to float above the ledge and can be
-    // visibly embedded in the wall. Translate the whole mask down along the wall plane until that point slightly
-    // overlaps the upper floor plane; unlike clipping, this keeps Link's head and torso in the projected shadow
-    // and connects the wall shadow to the end of the floor shadow.
-    // The projected silhouette is normally below the upper floor, so maxLowerDistance is often negative. The
-    // previous positive-only guard skipped the translation in exactly that case and left the wall shadow starting
-    // at the actor's feet instead of at the ledge.
+    // Translation is reserved for receivers that need an explicit alignment. The edge projection uses clipping
+    // instead: its boundary is the actual intersection between the wall and upper floor, preserving the exact
+    // source silhouette part that reaches the ledge.
     if (cache.translate_to_lower_receiver && hasLowerReceiver && !triangles.empty() &&
         std::isfinite(maxLowerDistance)) {
         const float floorAlongU = ShadowDot(lowerNormal, basisU);
         const float floorAlongV = ShadowDot(lowerNormal, basisV);
         const float denominator = floorAlongU * floorAlongU + floorAlongV * floorAlongV;
         if (denominator > 0.0001f) {
-            const float scale = (maxLowerDistance - kShadowWallEdgeOverlap) / denominator;
+            const float scale = maxLowerDistance / denominator;
             const float shiftU = -floorAlongU * scale;
             const float shiftV = -floorAlongV * scale;
             minU = std::numeric_limits<float>::max();

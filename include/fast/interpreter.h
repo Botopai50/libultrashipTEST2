@@ -448,17 +448,21 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
-    // Optional lower-receiver clipping is retained for other receiver experiments; the wall projection itself is
-    // kept complete so Link's head and torso are not removed at the ledge.
+    // Optional lower-receiver clipping keeps only the portion of a projection below the upper receiver plane.
     bool clip_to_lower_receiver = false;
     // A wall/drop projection uses the complete captured silhouette. Clipping the source triangles against the
     // wall plane removes Link's upper body when the actor overlaps the lip; only the projected result is clipped.
     bool project_full_source = false;
-    // Move a complete wall projection along the receiver until its highest point meets the upper floor plane.
-    // This preserves the silhouette while preventing the shadow from floating above the ledge.
+    // Move a projected mask along the receiver until its highest point meets the lower receiver plane. Edge shadows
+    // use clipping instead, so this remains available only for other receiver experiments.
     bool translate_to_lower_receiver = false;
     float lower_receiver_normal[3] = { 0.0f, 1.0f, 0.0f };
     float lower_receiver_d = 0.0f;
+    // Both sides of an edge must use the same adjusted key direction. Recomputing the minimum-elevation remap for
+    // the wall changes which actor part reaches the ledge and breaks the floor-to-wall silhouette continuity.
+    bool reuse_cast_direction = false;
+    bool cast_direction_valid = false;
+    float cast_direction[3] = {};
     bool edge_receiver_valid = false;
     ShadowMaskProjection edge;
     // Link supplies an interpolated root matrix. Keeping the anchor used by the cached mask lets the
