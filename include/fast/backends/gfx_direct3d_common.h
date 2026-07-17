@@ -21,7 +21,7 @@ struct PerFrameCB {
 // SOH [Enhancement] Toon lighting: the per-object dominant light + frame-global ramp shape. Kept in
 // its own constant buffer (register b3) rather than PerFrameCB so that buffer stays purely frame-global;
 // this one is re-uploaded per toon draw. The padding keeps each float3 on a 16-byte boundary so the
-// layout matches the HLSL cbuffer packing rules. Total size 64 bytes (multiple of 16).
+// layout matches the HLSL cbuffer packing rules. Total size 96 bytes (multiple of 16).
 struct PerToonCB {
     float toon_light_dir[3];
     float toon_ramp_center;
@@ -32,6 +32,12 @@ struct PerToonCB {
     float toon_shadow_intensity;
     float toon_debug;
     float _toon_pad[2];
+    float toon_camera_pos[3];
+    float toon_rim_enabled;
+    float toon_rim_intensity;
+    float toon_rim_width;
+    float toon_rim_softness;
+    float toon_rim_direction_influence;
 };
 
 struct PerDrawCB {
@@ -128,6 +134,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    bool UsesToonWorldPosition() const override {
+        return true;
+    }
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
