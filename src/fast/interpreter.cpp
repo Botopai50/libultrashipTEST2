@@ -2419,7 +2419,7 @@ constexpr float kShadowWallSurfaceBias = -0.5f;
 // The floor and wall quads are clipped at the intersection of their rendered planes, so only a narrow overlap is
 // needed for bilinear filtering. A larger strip becomes a visible solid bar when only a small part crosses the edge.
 constexpr float kShadowWallSeamOverlap = 1.0f;
-constexpr float kShadowWallMinimumSplit = 1.0f;
+constexpr float kShadowWallMinimumFoldDepth = 0.5f;
 constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
@@ -2713,7 +2713,6 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     float maxU = -std::numeric_limits<float>::max();
     float maxV = -std::numeric_limits<float>::max();
     float minFoldEdgeDistance = std::numeric_limits<float>::max();
-    float maxFoldEdgeDistance = -std::numeric_limits<float>::max();
 
     for (size_t base = 0; base + 9 <= mShadowVerts.size(); base += 9) {
         const float* a = &mShadowVerts[base + 0];
@@ -2815,7 +2814,6 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 // the point on the shared edge fixed.
                 const float edgeDistance = ShadowDot(normal, projectedWorld) + planeD;
                 minFoldEdgeDistance = std::min(minFoldEdgeDistance, edgeDistance);
-                maxFoldEdgeDistance = std::max(maxFoldEdgeDistance, edgeDistance);
                 const float distancePastEdge = edgeDistance / edgeAlongFloor;
                 const float edgePoint[3] = {
                     projectedWorld[0] - floorOut[0] * distancePastEdge,
@@ -2910,11 +2908,10 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // A fold is valid only when the floor silhouette genuinely crosses the ledge. If every projected point lies
-    // on one side, drawing a wall mask would either put the complete shadow on the edge or remove it entirely.
-    // Returning an empty edge mask lets DrawShadowQuad keep the ordinary floor shadow as the safe fallback.
-    if (cache.fold_over_edge && !(minFoldEdgeDistance < -kShadowWallMinimumSplit &&
-                                  maxFoldEdgeDistance > kShadowWallMinimumSplit)) {
+    // Any meaningful portion beyond the ledge needs the folded receiver. Requiring silhouette points on both sides
+    // made the edge mask invalid when Link stood very close and most (or all) of his projected shadow crossed the
+    // plane; DrawShadowQuad then kept the complete floor quad floating over the drop.
+    if (cache.fold_over_edge && !(minFoldEdgeDistance < -kShadowWallMinimumFoldDepth)) {
         return;
     }
 
