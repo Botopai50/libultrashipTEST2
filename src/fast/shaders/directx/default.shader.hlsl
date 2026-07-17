@@ -38,7 +38,8 @@ float4 grayscale : GRAYSCALE;
 @end
 @if(o_toon)
 float3 normal : NORMAL;
-@{update_floats(3)}
+float3 worldPos : WORLDPOS;
+@{update_floats(6)}
 @end
 
 @for(i in 0..o_inputs)
@@ -86,6 +87,12 @@ cbuffer PerToonCB : register(b2) {
     float toon_shadow_intensity;
     float toon_debug;
     float2 _toon_pad;
+    float3 toon_camera_pos;
+    float toon_rim_enabled;
+    float toon_rim_intensity;
+    float toon_rim_width;
+    float toon_rim_softness;
+    float toon_rim_direction_influence;
 }
 @end
 
@@ -143,6 +150,7 @@ PSInput VSMain(
 @end
 @if(o_toon)
     , float3 normal : NORMAL
+    , float3 worldPos : WORLDPOS
 @end
 @for(i in 0..o_inputs)
     @if(o_alpha)
@@ -179,6 +187,7 @@ PSInput VSMain(
 
     @if(o_toon)
         result.normal = normal;
+        result.worldPos = worldPos;
     @end
 
     @for(i in 0..o_inputs)
@@ -329,8 +338,10 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.
     @if(o_toon)
+        float3 albedoColor = texel.rgb;
         float3 toonN = normalize(input.normal);
-        float toonNL = dot(toonN, normalize(toon_light_dir)) * 0.5 + 0.5;
+        float3 toonL = normalize(toon_light_dir);
+        float toonNL = dot(toonN, toonL) * 0.5 + 0.5;
         float toonRamp = smoothstep(toon_ramp_center - toon_ramp_softness, toon_ramp_center + toon_ramp_softness, toonNL);
         float3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
         float3 toonShadow = lerp(toonLit, toon_ambient, toon_shadow_intensity);
@@ -340,6 +351,30 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             texel.rgb = float3(toonRamp, toonRamp, toonRamp);
         } else {
             texel.rgb = clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            // Same low-cost, directional inner silhouette band as the OpenGL path. The toon shader
+            // variant identifies lit actor materials; !o_alpha excludes translucent/particle draws.
+            @if(!o_alpha)
+                if (toon_rim_enabled > 0.5) {
+                    float3 viewDelta = toon_camera_pos - input.worldPos;
+                    float3 V = viewDelta * rsqrt(max(dot(viewDelta, viewDelta), 0.000001));
+                    float edge = 1.0 - saturate(dot(toonN, V));
+                    float feather = max(max(toon_rim_softness, 0.035), fwidth(edge) * 1.5);
+                    float threshold = saturate(1.0 - toon_rim_width);
+                    float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
+
+                    float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
+                    float backLighting = smoothstep(0.0, 0.65, dot(-V, toonL));
+                    float directionalMask = lightSide * lerp(0.25, 1.0, backLighting);
+                    float directionInfluence = clamp(toon_rim_direction_influence, 0.25, 1.0);
+                    directionalMask = lerp(1.0, directionalMask, directionInfluence);
+
+                    float materialRimMask = 1.0;
+                    float rimMask = saturate(rimBand * directionalMask * materialRimMask * 0.45 *
+                                             max(toon_rim_intensity, 0.0));
+                    float3 rimColor = lerp(albedoColor, toon_light_color, 0.65);
+                    texel.rgb = lerp(texel.rgb, rimColor, rimMask);
+                }
+            @end
         }
     @end
 
