@@ -2416,9 +2416,9 @@ constexpr float kShadowSurfaceBias = 0.75f;
 // Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
 // floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
 constexpr float kShadowWallSurfaceBias = -0.5f;
-// The floor and wall quads are clipped at the intersection of their rendered planes, so only a narrow overlap is
-// needed for bilinear filtering. A larger strip becomes a visible solid bar when only a small part crosses the edge.
-constexpr float kShadowWallSeamOverlap = 1.0f;
+// Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
+// two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
+constexpr float kShadowWallSeamOverlap = 4.0f;
 constexpr float kShadowWallMinimumFoldDepth = 0.5f;
 constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
