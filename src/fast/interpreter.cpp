@@ -2416,9 +2416,9 @@ constexpr float kShadowSurfaceBias = 0.75f;
 // Keep this signed for testing both sides of the collision plane. The wall projection must not pass through the
 // floor-shadow bias clamp below, otherwise a negative value would silently become positive again.
 constexpr float kShadowWallSurfaceBias = -0.5f;
-// Cover the transparent one-texel mask border and the receiver decal biases at the fold without moving the
-// silhouette itself. This narrow band is hidden by the two receiving surfaces except directly at their seam.
-constexpr float kShadowWallSeamOverlap = 4.0f;
+// The floor and wall quads are clipped at the intersection of their rendered planes, so only a narrow overlap is
+// needed for bilinear filtering. A larger strip becomes a visible solid bar when only a small part crosses the edge.
+constexpr float kShadowWallSeamOverlap = 1.0f;
 constexpr float kShadowWallMinimumSplit = 1.0f;
 constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
@@ -2611,10 +2611,11 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Orient every receiver toward the key. For a folded edge this is also the geometric platform side: the wall
-    // was found along the opposite cast direction. This remains independent of Link and camera position.
+    // Ordinary receivers face the key. A folded edge already arrives oriented toward the actual upper-floor probe
+    // point; preserving that geometric half-space prevents an inclined wall from being flipped by the light vector.
     float lightNormal = ShadowDot(light, normal);
-    if (lightNormal < 0.0f) {
+    const bool preserveFoldReceiverSide = cache.fold_over_edge && cache.reuse_cast_direction;
+    if (!preserveFoldReceiverSide && lightNormal < 0.0f) {
         normal[0] = -normal[0];
         normal[1] = -normal[1];
         normal[2] = -normal[2];
@@ -3385,18 +3386,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         // leaves different endpoints (especially on slopes), which is the geometric gap visible between masks.
         receiverClipPlaneD -= clipFloorShadow ? kShadowWallSurfaceBias : floorSurfaceBias;
     }
-    if (validReceiverClip && clipFloorShadow) {
-        // The platform is opposite the shadow cast direction. Use that fixed geometric relation to select the
-        // floor side of the wall plane; Link and camera movement cannot reverse it.
-        float cachedCastDir[3] = { cache.cast_direction[0], cache.cast_direction[1], cache.cast_direction[2] };
-        if (cache.cast_direction_valid && ShadowNormalize(cachedCastDir) &&
-            ShadowDot(receiverClipNormal, cachedCastDir) > 0.0f) {
-            receiverClipNormal[0] = -receiverClipNormal[0];
-            receiverClipNormal[1] = -receiverClipNormal[1];
-            receiverClipNormal[2] = -receiverClipNormal[2];
-            receiverClipPlaneD = -receiverClipPlaneD;
-        }
-    }
+    // The edge query orients this plane toward its actual upper-floor probe point. Keep that side directly; using
+    // Link, camera, or light direction here can reverse the clip when any of them moves relative to a sloped wall.
     if (validReceiverClip && clipWallShadow) {
         // Game-side floor planes are normalized upward. Flip that plane so the generic >= 0 clip retains only the
         // wall below it. The mask overlap above this line keeps its filtered edge opaque at the seam.
