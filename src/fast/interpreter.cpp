@@ -2415,17 +2415,9 @@ constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr uint8_t kShadowFlagSecondaryAboveFloor = 1 << 7;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowDirectWallSurfaceBias = 1.0f;
-// The folded-wall basis uses the negative side of the receiver plane. Increase the separation more quickly for
-// ordinary footprints while retaining the five-unit cap for large projections.
-constexpr float kShadowWallSurfaceBias = -1.25f;
-constexpr float kShadowWallSurfaceBiasRange = 3.75f;
-constexpr float kShadowWallSurfaceBiasScale = 0.030f;
-// Preserve enough source silhouette around the raw fold to reach the intersection of the rendered biased planes.
-// On a ramp the +2.75 floor bias and up-to -5.0 wall bias can move that intersection by more than four units.
-// Geometry clipping hides this reserve; the extra margin also covers the bilinear mask border.
+constexpr float kShadowDropSurfaceBias = -0.5f;
+// Preserve enough source silhouette around the raw floor/wall intersection to cover receiver bias and filtering.
 constexpr float kShadowWallSeamOverlap = 10.0f;
-constexpr float kShadowWallMinimumFoldDepth = 0.5f;
-constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -2544,10 +2536,9 @@ void Interpreter::FlushToonShadow() {
         edgeCache.max_u = cache.edge.max_u;
         edgeCache.min_v = cache.edge.min_v;
         edgeCache.max_v = cache.edge.max_v;
-        // Drop faces retain the light-weight fold around the ledge. A wall that rises from the floor receives a
-        // direct light-ray projection, so the same path now handles ordinary walls without changing drop behavior.
-        edgeCache.fold_over_edge = !cache.edge.above_floor;
-        edgeCache.direct_secondary_projection = cache.edge.above_floor;
+        // Every secondary surface receives a true light-ray projection. The floor half-space decides whether the
+        // visible result belongs above the floor (wall) or below it (drop), without an artificial fold transform.
+        edgeCache.direct_secondary_projection = true;
         edgeCache.clip_to_lower_receiver = true;
         edgeCache.keep_above_lower_receiver = cache.edge.above_floor;
         edgeCache.project_full_source = true;
@@ -2617,12 +2608,11 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
     }
 
-    // Ordinary receivers face the key. A folded edge already arrives oriented toward the actual upper-floor probe
-    // point; preserving that geometric half-space prevents an inclined wall from being flipped by the light vector.
+    // Ordinary receivers face the key. A secondary receiver already arrives oriented against the cast ray;
+    // preserving that geometric half-space prevents an inclined wall from being flipped by the light vector.
     float lightNormal = ShadowDot(light, normal);
-    const bool preserveFoldReceiverSide =
-        (cache.fold_over_edge || cache.direct_secondary_projection) && cache.reuse_cast_direction;
-    if (!preserveFoldReceiverSide && lightNormal < 0.0f) {
+    const bool preserveSecondaryReceiverSide = cache.direct_secondary_projection && cache.reuse_cast_direction;
+    if (!preserveSecondaryReceiverSide && lightNormal < 0.0f) {
         normal[0] = -normal[0];
         normal[1] = -normal[1];
         normal[2] = -normal[2];
@@ -2660,54 +2650,15 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     float lowerNormal[3] = { cache.lower_receiver_normal[0], cache.lower_receiver_normal[1],
                               cache.lower_receiver_normal[2] };
     float lowerPlaneD = cache.lower_receiver_d;
-    const bool hasLowerReceiver =
-        (cache.fold_over_edge || cache.clip_to_lower_receiver || cache.translate_to_lower_receiver) &&
-        ShadowNormalizePlane(lowerNormal, lowerPlaneD);
+    const bool hasLowerReceiver = (cache.clip_to_lower_receiver || cache.translate_to_lower_receiver) &&
+                                  ShadowNormalizePlane(lowerNormal, lowerPlaneD);
     float projectionNormal[3] = { normal[0], normal[1], normal[2] };
     float projectionPlaneD = planeD;
-    if (cache.fold_over_edge) {
-        if (!hasLowerReceiver) {
-            return;
-        }
-        memcpy(projectionNormal, lowerNormal, sizeof(projectionNormal));
-        projectionPlaneD = lowerPlaneD;
-    }
     const float castDenom = ShadowDot(projectionNormal, castDir);
     if (fabsf(castDenom) < 0.001f) {
         return;
     }
 
-    // Folding is a rigid 90-ish-degree bend around the intersection of the floor and wall planes. floorOut points
-    // from the upper platform across the ledge; wallDown follows the receiving face away from the upper floor.
-    float floorOut[3] = {};
-    float wallDown[3] = {};
-    float edgeAlongFloor = 0.0f;
-    if (cache.fold_over_edge) {
-        const float receiverDot = ShadowDot(normal, lowerNormal);
-        floorOut[0] = -normal[0] + lowerNormal[0] * receiverDot;
-        floorOut[1] = -normal[1] + lowerNormal[1] * receiverDot;
-        floorOut[2] = -normal[2] + lowerNormal[2] * receiverDot;
-        wallDown[0] = -lowerNormal[0] + normal[0] * receiverDot;
-        wallDown[1] = -lowerNormal[1] + normal[1] * receiverDot;
-        wallDown[2] = -lowerNormal[2] + normal[2] * receiverDot;
-        if (!ShadowNormalize(floorOut) || !ShadowNormalize(wallDown)) {
-            return;
-        }
-        if (ShadowDot(normal, floorOut) > 0.0f) {
-            floorOut[0] = -floorOut[0];
-            floorOut[1] = -floorOut[1];
-            floorOut[2] = -floorOut[2];
-        }
-        if (ShadowDot(lowerNormal, wallDown) > 0.0f) {
-            wallDown[0] = -wallDown[0];
-            wallDown[1] = -wallDown[1];
-            wallDown[2] = -wallDown[2];
-        }
-        edgeAlongFloor = ShadowDot(normal, floorOut);
-        if (edgeAlongFloor > -kShadowWallMinimumFoldSine) {
-            return;
-        }
-    }
     float maxLowerDistance = -std::numeric_limits<float>::max();
 
     struct ProjectedTriangle {
@@ -2719,7 +2670,6 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     float minV = std::numeric_limits<float>::max();
     float maxU = -std::numeric_limits<float>::max();
     float maxV = -std::numeric_limits<float>::max();
-    float minFoldEdgeDistance = std::numeric_limits<float>::max();
 
     for (size_t base = 0; base + 9 <= mShadowVerts.size(); base += 9) {
         const float* a = &mShadowVerts[base + 0];
@@ -2741,8 +2691,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        // Clip the actor triangle against the plane it is first projected onto. For an edge fold this is the upper
-        // floor; ordinary shadows project directly onto their final receiver.
+        // Ordinary receivers reject source geometry behind their plane. Secondary receivers keep the complete
+        // silhouette here and clip the projected result against the floor farther below.
         const float clipBoundary = cache.project_full_source ? -8192.0f : -1.0f;
         const float input[3][3] = {
             { a[0], a[1], a[2] },
@@ -2813,30 +2763,13 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 clipped[i][1] + castDir[1] * t,
                 clipped[i][2] + castDir[2] * t,
             };
-            float receiverWorld[3] = { projectedWorld[0], projectedWorld[1], projectedWorld[2] };
+            const float receiverWorld[3] = { projectedWorld[0], projectedWorld[1], projectedWorld[2] };
             float clipDistance = hasLowerReceiver ? ShadowDot(lowerNormal, projectedWorld) + lowerPlaneD : 0.0f;
-            if (cache.fold_over_edge) {
-                // projectedWorld is the ordinary floor-shadow point. Its signed wall-plane distance identifies the
-                // exact silhouette section past the ledge. Rotate that excess distance onto the wall while keeping
-                // the point on the shared edge fixed.
-                const float edgeDistance = ShadowDot(normal, projectedWorld) + planeD;
-                minFoldEdgeDistance = std::min(minFoldEdgeDistance, edgeDistance);
-                const float distancePastEdge = edgeDistance / edgeAlongFloor;
-                const float edgePoint[3] = {
-                    projectedWorld[0] - floorOut[0] * distancePastEdge,
-                    projectedWorld[1] - floorOut[1] * distancePastEdge,
-                    projectedWorld[2] - floorOut[2] * distancePastEdge,
-                };
-                receiverWorld[0] = edgePoint[0] + wallDown[0] * distancePastEdge;
-                receiverWorld[1] = edgePoint[1] + wallDown[1] * distancePastEdge;
-                receiverWorld[2] = edgePoint[2] + wallDown[2] * distancePastEdge;
-                // Keep a narrow strip from the platform side. After folding it overlaps the floor shadow only at
-                // the seam, covering the transparent raster padding and the small offsets of both receiver quads.
-                clipDistance = edgeDistance - kShadowWallSeamOverlap;
-            } else if (cache.direct_secondary_projection && cache.keep_above_lower_receiver) {
-                // A wall rising from the floor keeps the projection above the floor plane. Preserve a narrow strip
-                // below the raw intersection so filtering and receiver biases cannot open a seam at the base.
-                clipDistance += kShadowWallSeamOverlap;
+            if (cache.direct_secondary_projection) {
+                // Keep a narrow strip across the raw intersection on either side. Geometry clipping hides the
+                // reserve while filtering and the two receiver biases cannot open a seam between the decals.
+                clipDistance += cache.keep_above_lower_receiver ? kShadowWallSeamOverlap
+                                                                : -kShadowWallSeamOverlap;
             }
             projectedVertices[i].p[0] =
                 ShadowDot(basisU, receiverWorld) - ShadowDot(basisU, planeOrigin);
@@ -2858,8 +2791,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             continue;
         }
 
-        // A clipped triangle is either a triangle or a quad. For a folded edge, lowerDistance is the signed
-        // wall-plane distance of the original floor-shadow point minus the narrow seam overlap.
+        // A clipped triangle is either a triangle or a quad. For a secondary receiver, lowerDistance selects the
+        // side of the floor intersection that belongs to the wall or drop face.
         ProjectedPoint lowerClipped[8]{};
         int lowerClippedCount = clippedCount;
         for (int i = 0; i < clippedCount; i++) {
@@ -2920,13 +2853,6 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             }
             triangles.push_back(projected);
         }
-    }
-
-    // Any meaningful portion beyond the ledge needs the folded receiver. Requiring silhouette points on both sides
-    // made the edge mask invalid when Link stood very close and most (or all) of his projected shadow crossed the
-    // plane; DrawShadowQuad then kept the complete floor quad floating over the drop.
-    if (cache.fold_over_edge && !(minFoldEdgeDistance < -kShadowWallMinimumFoldDepth)) {
-        return;
     }
 
     // Translation is reserved for receivers that need an explicit alignment. The edge projection uses clipping
@@ -3321,19 +3247,18 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float floorHalfV = (cache.max_v - cache.min_v) * 0.5f * sizeScale;
     const float floorFootprintRadius = sqrtf(floorHalfU * floorHalfU + floorHalfV * floorHalfV);
     const float floorSurfaceBias = kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f);
-    // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
+    // Use the floor footprint for both draw calls so the floor and secondary quads share the exact same biased
     // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
-    const float wallSurfaceBias =
-        kShadowWallSurfaceBias -
-        std::min(kShadowWallSurfaceBiasRange, floorFootprintRadius * kShadowWallSurfaceBiasScale);
     const float directWallSurfaceBias =
         kShadowDirectWallSurfaceBias + std::min(1.5f, floorFootprintRadius * 0.015f);
-    const float secondarySurfaceBias = cache.edge.above_floor ? directWallSurfaceBias : wallSurfaceBias;
+    // The game reports which side of the floor owns the receiver. An upper wall faces the incoming ray and uses a
+    // positive lift; a cliff face is reached from its solid side, so -0.5 places the decal on the open side.
+    const float secondarySurfaceBias = cache.edge.above_floor ? directWallSurfaceBias : kShadowDropSurfaceBias;
     const float receiverBias = projection != nullptr ? secondarySurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
-    // Raster row 0 always corresponds to minV. Keeping that mapping on the folded wall mask is what makes the
-    // texels at the ledge remain attached to the same silhouette cut as the floor mask.
+    // Raster row 0 always corresponds to minV. Keeping that mapping on the secondary mask prevents a texture flip
+    // when the receiver switches between an upper wall and a drop face.
     const float uvs[4][2] = { { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f } };
     const float* planeOrigin = projection != nullptr ? projection->plane_origin : cache.plane_origin;
     const float* basisU = projection != nullptr ? projection->basis_u : cache.basis_u;
@@ -3426,8 +3351,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // The edge query orients this plane toward its actual upper-floor probe point. Keep that side directly; using
     // Link, camera, or light direction here can reverse the clip when any of them moves relative to a sloped wall.
     if (validReceiverClip && clipWallShadow) {
-        // Game-side floor planes are normalized upward. Direct walls retain the part above the floor; drop faces
-        // invert it and retain the folded part below. Both use the generic >= 0 polygon clip.
+        // Game-side floor planes are normalized upward. Walls retain the part above the floor; drop faces invert it
+        // and retain the directly projected part below. Both use the generic >= 0 polygon clip.
         if (receiverClipNormal[1] < 0.0f) {
             receiverClipNormal[0] = -receiverClipNormal[0];
             receiverClipNormal[1] = -receiverClipNormal[1];

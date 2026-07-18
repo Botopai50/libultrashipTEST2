@@ -407,7 +407,7 @@ struct MaskedTextureEntry {
 
 struct ShadowMaskProjection {
     bool valid = false;
-    // False folds down a drop face; true projects directly onto a wall rising from the floor.
+    // False keeps the portion below the floor on a drop face; true keeps the portion on a wall above the floor.
     bool above_floor = false;
     uint32_t version = 0;
     uint32_t texture_id = 0;
@@ -450,10 +450,8 @@ struct ShadowMaskCache {
     // Live placement is updated every actor pass even when the 96x96 mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
-    // Fold the part of the ordinary floor projection that crosses an edge onto the wall receiver. This preserves
-    // the exact silhouette cut at the ledge instead of projecting the actor onto the wall a second time.
-    bool fold_over_edge = false;
-    // Direct secondary receivers use light-ray projection instead of the drop-fold transform.
+    // Secondary receivers use the same light-ray projection for walls above the floor and faces below a drop.
+    // This avoids guessing a fold direction from plane signs.
     bool direct_secondary_projection = false;
     // Optional lower-receiver clipping keeps only the portion of a projection below the upper receiver plane.
     bool clip_to_lower_receiver = false;
