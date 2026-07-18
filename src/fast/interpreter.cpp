@@ -2413,6 +2413,8 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
+constexpr float kShadowSlopeSurfaceBiasRange = 2.5f;
+constexpr float kShadowSlopeSurfaceBiasScale = 0.08f;
 // The folded-wall basis uses the negative side of the receiver plane. Increase the separation more quickly for
 // ordinary footprints while retaining the five-unit cap for large projections.
 constexpr float kShadowWallSurfaceBias = -1.25f;
@@ -3309,7 +3311,15 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float floorHalfU = (cache.max_u - cache.min_u) * 0.5f * sizeScale;
     const float floorHalfV = (cache.max_v - cache.min_v) * 0.5f * sizeScale;
     const float floorFootprintRadius = sqrtf(floorHalfU * floorHalfU + floorHalfV * floorHalfV);
-    const float floorSurfaceBias = kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f);
+    // A single floor quad can overlap neighbouring collision triangles on a ramp. Size-only bias leaves the far
+    // part behind those triangles, so the shadow appears to vanish while a small strip remains at Link's feet.
+    // Add a bounded slope-aware lift; flat floors keep the previous placement and steep ground gains at most 2.5
+    // world units, avoiding the visibly floating result of a large unconditional offset.
+    const float floorSlope = sqrtf(std::max(0.0f, 1.0f - drawNormal[1] * drawNormal[1]));
+    const float floorSlopeSurfaceBias =
+        std::min(kShadowSlopeSurfaceBiasRange, floorFootprintRadius * floorSlope * kShadowSlopeSurfaceBiasScale);
+    const float floorSurfaceBias =
+        kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f) + floorSlopeSurfaceBias;
     // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
     // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
     const float wallSurfaceBias =
