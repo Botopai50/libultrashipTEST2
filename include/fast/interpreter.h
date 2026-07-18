@@ -469,6 +469,10 @@ struct ShadowMaskCache {
     bool reuse_cast_direction = false;
     bool cast_direction_valid = false;
     float cast_direction[3] = {};
+    // Link supplies only collision triangles touched by a sparse receiver probe. Drawing the cached mask directly
+    // on these polygons prevents an infinite floor/wall plane from projecting into empty space.
+    uint8_t receiver_triangle_count = 0;
+    float receiver_triangles[TOON_SHADOW_RECEIVER_MAX_TRIANGLES][3][3] = {};
     bool edge_receiver_valid = false;
     ShadowMaskProjection edge;
     // Link supplies an interpolated root matrix. Keeping the anchor used by the cached mask lets the

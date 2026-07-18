@@ -195,6 +195,7 @@
 #define G_SETTOONSHADOWID 0x4c // SOH [Enhancement] actor shadow cache id/version
 #define G_SETTOONSHADOWPLANE 0x4d // SOH [Enhancement] actor shadow receiver plane
 #define G_SETTOONSHADOWEDGEPLANE 0x4e // SOH [Enhancement] actor shadow edge receiver plane
+#define G_SETTOONSHADOWRECEIVERMESH 0x4f // SOH [Enhancement] actor shadow collision receiver triangles
 #define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
@@ -2855,6 +2856,23 @@ typedef union Gfx {
         _g->words.w0 = _SHIFTL(G_SETTOONSHADOWPLANE, 24, 8) | _SHIFTL((nx) & 0xFF, 16, 8) |       \
                        _SHIFTL((ny) & 0xFF, 8, 8) | _SHIFTL((nz) & 0xFF, 0, 8);                    \
         _g->words.w1 = _pd.u;                                                                      \
+    }
+
+// A small frame-local set of real collision triangles that may receive Link's projected mask. The interpreter
+// copies the payload immediately, so the pointer only needs to remain valid for this display-list execution.
+#define TOON_SHADOW_RECEIVER_MAX_TRIANGLES 16
+typedef struct {
+    u8 triangleCount;
+    u8 pad[3];
+    f32 vertices[TOON_SHADOW_RECEIVER_MAX_TRIANGLES][3][3];
+} ToonShadowReceiverMesh;
+
+#define gSPToonShadowReceiverMesh(pkt, mesh)                                   \
+    {                                                                          \
+        Gfx* _g = (Gfx*)(pkt);                                                 \
+                                                                               \
+        _g->words.w0 = _SHIFTL(G_SETTOONSHADOWRECEIVERMESH, 24, 8);           \
+        _g->words.w1 = (uintptr_t)(mesh);                                      \
     }
 
 // SOH [Enhancement] Optional second receiver plane used only when an actor's shadow reaches a detected wall/drop.

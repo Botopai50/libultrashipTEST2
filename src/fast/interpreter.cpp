@@ -3309,6 +3309,106 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         vertex->color = { 255, 255, 255, 255 };
     };
 
+    float meshBaseNormal[3] = { cache.plane_normal[0], cache.plane_normal[1], cache.plane_normal[2] };
+    float meshBasePlaneD = cache.plane_d;
+    float meshCastDirection[3] = { cache.cast_direction[0], cache.cast_direction[1], cache.cast_direction[2] };
+    const bool useReceiverMesh = projection == nullptr && cache.receiver_triangle_count > 0 &&
+                                 cache.cast_direction_valid && ShadowNormalizePlane(meshBaseNormal, meshBasePlaneD) &&
+                                 ShadowNormalize(meshCastDirection) && halfU > 0.001f && halfV > 0.001f &&
+                                 fabsf(ShadowDot(meshBaseNormal, meshCastDirection)) > 0.001f;
+    if (useReceiverMesh) {
+        // The mask was rasterized on the cached base floor. Map each real collision vertex back to that floor along
+        // the inverse shadow ray; the resulting base-plane coordinate is its UV. Adjacent floor, ramp and wall
+        // triangles therefore share the same mapping at their common edge without a second decal or fold transform.
+        const float castDenom = ShadowDot(meshBaseNormal, meshCastDirection);
+        const float effectiveMinU = centerU - halfU;
+        const float effectiveMinV = centerV - halfV;
+        const float effectiveWidth = halfU * 2.0f;
+        const float effectiveHeight = halfV * 2.0f;
+        auto clipUvBoundary = [](const ShadowQuadPoint* input, int inputCount, ShadowQuadPoint* output, int axis,
+                                 float boundary, bool keepGreater) {
+            int outputCount = 0;
+            for (int currentIndex = 0; currentIndex < inputCount; currentIndex++) {
+                const ShadowQuadPoint& previous = input[(currentIndex + inputCount - 1) % inputCount];
+                const ShadowQuadPoint& current = input[currentIndex];
+                const float previousDistance = keepGreater ? previous.uv[axis] - boundary
+                                                           : boundary - previous.uv[axis];
+                const float currentDistance = keepGreater ? current.uv[axis] - boundary
+                                                          : boundary - current.uv[axis];
+                const bool previousInside = previousDistance >= 0.0f;
+                const bool currentInside = currentDistance >= 0.0f;
+                auto appendIntersection = [&]() {
+                    const float denominator = previousDistance - currentDistance;
+                    if (fabsf(denominator) < 0.000001f || outputCount >= 8) {
+                        return;
+                    }
+                    const float amount = std::clamp(previousDistance / denominator, 0.0f, 1.0f);
+                    ShadowQuadPoint intersection{};
+                    for (int worldAxis = 0; worldAxis < 3; worldAxis++) {
+                        intersection.world[worldAxis] =
+                            previous.world[worldAxis] + (current.world[worldAxis] - previous.world[worldAxis]) * amount;
+                    }
+                    intersection.uv[0] = previous.uv[0] + (current.uv[0] - previous.uv[0]) * amount;
+                    intersection.uv[1] = previous.uv[1] + (current.uv[1] - previous.uv[1]) * amount;
+                    output[outputCount++] = intersection;
+                };
+                if (currentInside) {
+                    if (!previousInside) {
+                        appendIntersection();
+                    }
+                    if (outputCount < 8) {
+                        output[outputCount++] = current;
+                    }
+                } else if (previousInside) {
+                    appendIntersection();
+                }
+            }
+            return outputCount;
+        };
+
+        for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count; triangle++) {
+            ShadowQuadPoint polygonA[8]{};
+            ShadowQuadPoint polygonB[8]{};
+            bool valid = true;
+            for (int vertex = 0; vertex < 3; vertex++) {
+                float cachedWorld[3] = {};
+                for (int axis = 0; axis < 3; axis++) {
+                    polygonA[vertex].world[axis] = cache.receiver_triangles[triangle][vertex][axis];
+                    cachedWorld[axis] = polygonA[vertex].world[axis] - cache.world_offset[axis];
+                }
+                const float t = -(ShadowDot(meshBaseNormal, cachedWorld) + meshBasePlaneD) / castDenom;
+                const float basePoint[3] = { cachedWorld[0] + meshCastDirection[0] * t,
+                                             cachedWorld[1] + meshCastDirection[1] * t,
+                                             cachedWorld[2] + meshCastDirection[2] * t };
+                const float relative[3] = { basePoint[0] - planeOrigin[0], basePoint[1] - planeOrigin[1],
+                                            basePoint[2] - planeOrigin[2] };
+                polygonA[vertex].uv[0] = (ShadowDot(basisU, relative) - effectiveMinU) / effectiveWidth;
+                polygonA[vertex].uv[1] = (ShadowDot(basisV, relative) - effectiveMinV) / effectiveHeight;
+                valid = valid && std::isfinite(polygonA[vertex].uv[0]) && std::isfinite(polygonA[vertex].uv[1]);
+            }
+            if (!valid) {
+                continue;
+            }
+
+            ShadowQuadPoint* input = polygonA;
+            ShadowQuadPoint* output = polygonB;
+            int count = 3;
+            const int axes[4] = { 0, 0, 1, 1 };
+            const float boundaries[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+            const bool keepGreater[4] = { true, false, true, false };
+            for (int boundary = 0; boundary < 4 && count >= 3; boundary++) {
+                count = clipUvBoundary(input, count, output, axes[boundary], boundaries[boundary],
+                                       keepGreater[boundary]);
+                std::swap(input, output);
+            }
+            for (int fan = 1; fan + 1 < count; fan++) {
+                writeShadowVertex(0, input[0]);
+                writeShadowVertex(1, input[fan]);
+                writeShadowVertex(2, input[fan + 1]);
+                GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+            }
+        }
+    } else {
     // Clip the floor only when its matching wall mask is ready. If wall-mask generation fails, preserving the
     // ordinary floor shadow is preferable to cutting it away and making the complete shadow disappear.
     const bool clipFloorShadow = projection == nullptr && cache.edge_receiver_valid && cache.edge.valid &&
@@ -3414,6 +3514,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             writeShadowVertex(2, clipped[fan + 1]);
             GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
         }
+    }
     }
     Flush();
     mShadowComposite = savedShadowComposite;
@@ -5291,6 +5392,7 @@ bool gfx_set_toon_shadow_id_handler_custom(F3DGfx** cmd0) {
     auto& cache = gfx->mShadowCaches[gfx->mRsp->toon_shadow_actor_id];
     cache.actor_id = gfx->mRsp->toon_shadow_actor_id;
     cache.last_seen_frame = gfx->mShadowFrame;
+    cache.receiver_triangle_count = 0;
     return false;
 }
 
@@ -5324,6 +5426,33 @@ bool gfx_set_toon_shadow_edge_plane_handler_custom(F3DGfx** cmd0) {
     gfx->mRsp->toon_shadow_edge_plane[2] = nz / 127.0f;
     gfx->mRsp->toon_shadow_edge_plane[3] = planeD;
     gfx->mRsp->toon_shadow_edge_valid = true;
+    return false;
+}
+
+bool gfx_set_toon_shadow_receiver_mesh_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const auto* mesh = static_cast<const ToonShadowReceiverMesh*>(gfx->SegAddr(cmd->words.w1));
+    auto& cache = gfx->mShadowCaches[gfx->mRsp->toon_shadow_actor_id];
+    cache.receiver_triangle_count = 0;
+    if (mesh == nullptr) {
+        return false;
+    }
+
+    const uint8_t count = std::min<uint8_t>(mesh->triangleCount, TOON_SHADOW_RECEIVER_MAX_TRIANGLES);
+    for (uint8_t triangle = 0; triangle < count; triangle++) {
+        bool finite = true;
+        for (int vertex = 0; vertex < 3; vertex++) {
+            for (int axis = 0; axis < 3; axis++) {
+                const float value = mesh->vertices[triangle][vertex][axis];
+                finite = finite && std::isfinite(value);
+                cache.receiver_triangles[cache.receiver_triangle_count][vertex][axis] = value;
+            }
+        }
+        if (finite) {
+            cache.receiver_triangle_count++;
+        }
+    }
     return false;
 }
 
@@ -5837,6 +5966,8 @@ static constexpr UcodeHandler otrHandlers = {
       { "G_SETTOONSHADOWPLANE", gfx_set_toon_shadow_plane_handler_custom } }, // G_SETTOONSHADOWPLANE (0x4d)
     { OTR_G_SETTOONSHADOWEDGEPLANE,
       { "G_SETTOONSHADOWEDGEPLANE", gfx_set_toon_shadow_edge_plane_handler_custom } }, // G_SETTOONSHADOWEDGEPLANE (0x4e)
+    { OTR_G_SETTOONSHADOWRECEIVERMESH,
+      { "G_SETTOONSHADOWRECEIVERMESH", gfx_set_toon_shadow_receiver_mesh_handler_custom } }, // 0x4f
     { OTR_G_SETTOONSHADOW,
       { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } }, // G_SETSTENCIL (0x46)
