@@ -2673,7 +2673,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     }
 
     // Folding is a rigid 90-ish-degree bend around the intersection of the floor and wall planes. floorOut points
-    // from the upper platform across the ledge; wallDown follows the receiving face away from the upper floor.
+    // from the upper platform across the ledge; wallDown follows the receiving face toward world down.
     float floorOut[3] = {};
     float wallDown[3] = {};
     float edgeAlongFloor = 0.0f;
@@ -2693,7 +2693,9 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             floorOut[1] = -floorOut[1];
             floorOut[2] = -floorOut[2];
         }
-        if (ShadowDot(lowerNormal, wallDown) > 0.0f) {
+        // Comparing against the floor normal works only on level ground. On a ramp its horizontal component can
+        // select the upward wall tangent; the below-floor clip then removes the complete folded shadow.
+        if (wallDown[1] > 0.0f) {
             wallDown[0] = -wallDown[0];
             wallDown[1] = -wallDown[1];
             wallDown[2] = -wallDown[2];
@@ -5381,8 +5383,7 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     uint32_t w1Bits = (uint32_t)cmd->words.w1;
     memcpy(&sizeOrSentinel, &w1Bits, sizeof(sizeOrSentinel));
 
-    // Sentinel (gSPToonShadowFlush): finish the current opaque captures, then composite cached masks at this point
-    // in the translucent list (after room water and before actor translucency).
+    // Sentinel (gSPToonShadowFlush): render valid cached masks from the previous actor pass before actors.
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
         // Finish the final actor from the preceding pass before drawing the cache. Ordinarily the next
         // actor-id command closes an object, but the last actor has no following id command.
