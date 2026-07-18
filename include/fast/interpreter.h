@@ -14,6 +14,7 @@
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
+#include "libultraship/libultra/toon_shadow.h"
 
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"

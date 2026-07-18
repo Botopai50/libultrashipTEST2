@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mbi.h"
+#include "toon_shadow.h"
 
 #ifdef _MSC_VER
 #ifndef u8
@@ -2857,15 +2858,6 @@ typedef union Gfx {
                        _SHIFTL((ny) & 0xFF, 8, 8) | _SHIFTL((nz) & 0xFF, 0, 8);                    \
         _g->words.w1 = _pd.u;                                                                      \
     }
-
-// A small frame-local set of real collision triangles that may receive Link's projected mask. The interpreter
-// copies the payload immediately, so the pointer only needs to remain valid for this display-list execution.
-#define TOON_SHADOW_RECEIVER_MAX_TRIANGLES 16
-typedef struct {
-    u8 triangleCount;
-    u8 pad[3];
-    f32 vertices[TOON_SHADOW_RECEIVER_MAX_TRIANGLES][3][3];
-} ToonShadowReceiverMesh;
 
 #define gSPToonShadowReceiverMesh(pkt, mesh)                                   \
     {                                                                          \
