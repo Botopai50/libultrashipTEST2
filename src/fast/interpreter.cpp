@@ -2413,10 +2413,9 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-// The renderer's folded-wall basis places the visible receiver on the negative side of the collision normal.
-// Keep a minimum separation there and increase only its magnitude for larger footprints; never cross zero,
-// which would make the decal coplanar and reintroduce z-fighting.
-constexpr float kShadowWallSurfaceBias = -1.25f;
+// The game orients every edge normal toward the verified upper-floor/open side. Keep the folded decal on that
+// positive half-space and increase its separation for larger footprints; a negative bias enters the wall.
+constexpr float kShadowWallSurfaceBias = 1.25f;
 // Preserve the existing separation for ordinary footprints, but let large projections continue adapting up to
 // five total world units instead of saturating at three and entering coarse or strongly sloped wall geometry.
 constexpr float kShadowWallSurfaceBiasRange = 3.75f;
@@ -3315,7 +3314,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
     // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
     const float wallSurfaceBias =
-        kShadowWallSurfaceBias -
+        kShadowWallSurfaceBias +
         std::min(kShadowWallSurfaceBiasRange, floorFootprintRadius * kShadowWallSurfaceBiasScale);
     const float receiverBias = projection != nullptr ? wallSurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
