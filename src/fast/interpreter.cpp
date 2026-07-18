@@ -3374,7 +3374,11 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // ordinary floor shadow is preferable to cutting it away and making the complete shadow disappear.
     const bool clipFloorShadow = projection == nullptr && cache.edge_receiver_valid && cache.edge.valid &&
                                  cache.edge.version == cache.version && cache.edge.texture_id != 0;
-    const bool clipWallShadow = projection != nullptr;
+    // The folded mask was already clipped from the source silhouette against the ledge plane in
+    // RasterizeShadowMask(). Clipping its receiver quad a second time against a live sloped floor can discard the
+    // complete opaque part of the texture even though the quad itself still crosses the plane. Keep only the floor
+    // clip here; depth testing and the source-clipped wall mask constrain the continuation to the receiving face.
+    const bool clipWallShadow = false;
     float receiverClipNormal[3] = {};
     float receiverClipPlaneD = 0.0f;
     if (clipFloorShadow) {
