@@ -5381,7 +5381,8 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     uint32_t w1Bits = (uint32_t)cmd->words.w1;
     memcpy(&sizeOrSentinel, &w1Bits, sizeof(sizeOrSentinel));
 
-    // Sentinel (gSPToonShadowFlush): render valid cached masks from the previous actor pass before actors.
+    // Sentinel (gSPToonShadowFlush): finish the current opaque captures, then composite cached masks at this point
+    // in the translucent list (after room water and before actor translucency).
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
         // Finish the final actor from the preceding pass before drawing the cache. Ordinarily the next
         // actor-id command closes an object, but the last actor has no following id command.

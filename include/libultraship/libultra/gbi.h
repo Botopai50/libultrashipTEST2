@@ -2896,8 +2896,8 @@ typedef union Gfx {
 #define gSPToonShadowArm(pkt, feetClampY, size)                                                    \
     gSPToonShadow(pkt, ((s32)(feetClampY) >> 8) & 0xFF, (s32)(feetClampY) & 0xFF, 0x7F, (size))
 
-// SOH [Enhancement] Actor shadow: render all valid cached masks from the previous actor pass now. Emitted at
-// the pre-actor hook so the shadows land only on the environment and receiver actors.
+// SOH [Enhancement] Actor shadow: render all valid cached masks now. Emitted after room water and before actor
+// translucency; opaque actor depth already exists when the XLU list executes and prevents self-shadowing.
 #define gSPToonShadowFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.0e30f)
 
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
