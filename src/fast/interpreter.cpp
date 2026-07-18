@@ -2418,9 +2418,10 @@ constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowWallSurfaceBias = -1.25f;
 constexpr float kShadowWallSurfaceBiasRange = 3.75f;
 constexpr float kShadowWallSurfaceBiasScale = 0.030f;
-// Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
-// two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
-constexpr float kShadowWallSeamOverlap = 4.0f;
+// Preserve enough source silhouette around the raw fold to reach the intersection of the rendered biased planes.
+// On a ramp the +2.75 floor bias and up-to -5.0 wall bias can move that intersection by more than four units.
+// Geometry clipping hides this reserve; the extra margin also covers the bilinear mask border.
+constexpr float kShadowWallSeamOverlap = 10.0f;
 constexpr float kShadowWallMinimumFoldDepth = 0.5f;
 constexpr float kShadowWallMinimumFoldSine = 0.35f;
 constexpr float kShadowClipDepthBias = 0.0015f;
@@ -2673,7 +2674,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     }
 
     // Folding is a rigid 90-ish-degree bend around the intersection of the floor and wall planes. floorOut points
-    // from the upper platform across the ledge; wallDown follows the receiving face toward world down.
+    // from the upper platform across the ledge; wallDown follows the receiving face away from the upper floor.
     float floorOut[3] = {};
     float wallDown[3] = {};
     float edgeAlongFloor = 0.0f;
@@ -2693,9 +2694,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
             floorOut[1] = -floorOut[1];
             floorOut[2] = -floorOut[2];
         }
-        // Comparing against the floor normal works only on level ground. On a ramp its horizontal component can
-        // select the upward wall tangent; the below-floor clip then removes the complete folded shadow.
-        if (wallDown[1] > 0.0f) {
+        if (ShadowDot(lowerNormal, wallDown) > 0.0f) {
             wallDown[0] = -wallDown[0];
             wallDown[1] = -wallDown[1];
             wallDown[2] = -wallDown[2];
