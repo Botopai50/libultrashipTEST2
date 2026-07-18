@@ -2417,7 +2417,9 @@ constexpr float kShadowSurfaceBias = 0.75f;
 // Keep a minimum separation there and increase only its magnitude for larger footprints; never cross zero,
 // which would make the decal coplanar and reintroduce z-fighting.
 constexpr float kShadowWallSurfaceBias = -1.25f;
-constexpr float kShadowWallSurfaceBiasRange = 1.75f;
+// Preserve the existing separation for ordinary footprints, but let large projections continue adapting up to
+// five total world units instead of saturating at three and entering coarse or strongly sloped wall geometry.
+constexpr float kShadowWallSurfaceBiasRange = 3.75f;
 constexpr float kShadowWallSurfaceBiasScale = 0.015f;
 // Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
 // two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
