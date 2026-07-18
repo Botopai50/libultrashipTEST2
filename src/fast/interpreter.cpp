@@ -2413,13 +2413,11 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-// The game orients every edge normal toward the verified upper-floor/open side. Keep the folded decal on that
-// positive half-space and increase its separation for larger footprints; a negative bias enters the wall.
-constexpr float kShadowWallSurfaceBias = 1.25f;
-// Preserve the existing separation for ordinary footprints, but let large projections continue adapting up to
-// five total world units instead of saturating at three and entering coarse or strongly sloped wall geometry.
+// The folded-wall basis uses the negative side of the receiver plane. Increase the separation more quickly for
+// ordinary footprints while retaining the five-unit cap for large projections.
+constexpr float kShadowWallSurfaceBias = -1.25f;
 constexpr float kShadowWallSurfaceBiasRange = 3.75f;
-constexpr float kShadowWallSurfaceBiasScale = 0.015f;
+constexpr float kShadowWallSurfaceBiasScale = 0.030f;
 // Cover the transparent mask border and receiver decal offsets at the fold. The geometry clips this strip to the
 // two receiving surfaces, while four world units keep bilinear filtering from opening a visible seam between them.
 constexpr float kShadowWallSeamOverlap = 4.0f;
@@ -3314,7 +3312,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
     // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
     const float wallSurfaceBias =
-        kShadowWallSurfaceBias +
+        kShadowWallSurfaceBias -
         std::min(kShadowWallSurfaceBiasRange, floorFootprintRadius * kShadowWallSurfaceBiasScale);
     const float receiverBias = projection != nullptr ? wallSurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
