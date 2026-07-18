@@ -2413,8 +2413,6 @@ constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
 constexpr float kShadowSurfaceBias = 0.75f;
-constexpr float kShadowSlopeSurfaceBiasRange = 2.5f;
-constexpr float kShadowSlopeSurfaceBiasScale = 0.08f;
 // The folded-wall basis uses the negative side of the receiver plane. Increase the separation more quickly for
 // ordinary footprints while retaining the five-unit cap for large projections.
 constexpr float kShadowWallSurfaceBias = -1.25f;
@@ -3311,15 +3309,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float floorHalfU = (cache.max_u - cache.min_u) * 0.5f * sizeScale;
     const float floorHalfV = (cache.max_v - cache.min_v) * 0.5f * sizeScale;
     const float floorFootprintRadius = sqrtf(floorHalfU * floorHalfU + floorHalfV * floorHalfV);
-    // A single floor quad can overlap neighbouring collision triangles on a ramp. Size-only bias leaves the far
-    // part behind those triangles, so the shadow appears to vanish while a small strip remains at Link's feet.
-    // Add a bounded slope-aware lift; flat floors keep the previous placement and steep ground gains at most 2.5
-    // world units, avoiding the visibly floating result of a large unconditional offset.
-    const float floorSlope = sqrtf(std::max(0.0f, 1.0f - drawNormal[1] * drawNormal[1]));
-    const float floorSlopeSurfaceBias =
-        std::min(kShadowSlopeSurfaceBiasRange, floorFootprintRadius * floorSlope * kShadowSlopeSurfaceBiasScale);
-    const float floorSurfaceBias =
-        kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f) + floorSlopeSurfaceBias;
+    const float floorSurfaceBias = kShadowSurfaceBias + std::min(2.0f, floorFootprintRadius * 0.015f);
     // Use the floor footprint for both draw calls so the floor and folded-wall quads share the exact same biased
     // intersection. This keeps the seam closed while preventing the wall decal from entering the receiver mesh.
     const float wallSurfaceBias =
@@ -3384,11 +3374,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     // ordinary floor shadow is preferable to cutting it away and making the complete shadow disappear.
     const bool clipFloorShadow = projection == nullptr && cache.edge_receiver_valid && cache.edge.valid &&
                                  cache.edge.version == cache.version && cache.edge.texture_id != 0;
-    // The folded mask was already clipped from the source silhouette against the ledge plane in
-    // RasterizeShadowMask(). Clipping its receiver quad a second time against a live sloped floor can discard the
-    // complete opaque part of the texture even though the quad itself still crosses the plane. Keep only the floor
-    // clip here; depth testing and the source-clipped wall mask constrain the continuation to the receiving face.
-    const bool clipWallShadow = false;
+    const bool clipWallShadow = projection != nullptr;
     float receiverClipNormal[3] = {};
     float receiverClipPlaneD = 0.0f;
     if (clipFloorShadow) {
@@ -3400,6 +3386,24 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     }
     bool validReceiverClip =
         (clipFloorShadow || clipWallShadow) && ShadowNormalizePlane(receiverClipNormal, receiverClipPlaneD);
+    if (validReceiverClip && clipFloorShadow && cache.anchor_valid) {
+        // The collision winding of an edge is not reliable on ramps. The ground shadow must retain the half-plane
+        // containing Link's live root/feet; otherwise the clip keeps the drop side and removes almost the complete
+        // floor silhouette. This reference selects only the clip half-space and never changes the wall bias.
+        const float liveAnchor[3] = { cache.mask_anchor[0] + cache.world_offset[0],
+                                      cache.mask_anchor[1] + cache.world_offset[1],
+                                      cache.mask_anchor[2] + cache.world_offset[2] };
+        const float anchorFloorDistance = ShadowDot(drawNormal, liveAnchor) + drawPlaneD;
+        const float feetOnFloor[3] = { liveAnchor[0] - drawNormal[0] * anchorFloorDistance,
+                                       liveAnchor[1] - drawNormal[1] * anchorFloorDistance,
+                                       liveAnchor[2] - drawNormal[2] * anchorFloorDistance };
+        if (ShadowDot(receiverClipNormal, feetOnFloor) + receiverClipPlaneD < 0.0f) {
+            receiverClipNormal[0] = -receiverClipNormal[0];
+            receiverClipNormal[1] = -receiverClipNormal[1];
+            receiverClipNormal[2] = -receiverClipNormal[2];
+            receiverClipPlaneD = -receiverClipPlaneD;
+        }
+    }
     if (validReceiverClip) {
         // Cut both quads at the intersection of their rendered, biased planes. Cutting at the raw collision planes
         // leaves different endpoints (especially on slopes), which is the geometric gap visible between masks.
