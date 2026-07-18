@@ -407,6 +407,8 @@ struct MaskedTextureEntry {
 
 struct ShadowMaskProjection {
     bool valid = false;
+    // False folds down a drop face; true projects directly onto a wall rising from the floor.
+    bool above_floor = false;
     uint32_t version = 0;
     uint32_t texture_id = 0;
     uintptr_t texture_key = 0;
@@ -451,8 +453,11 @@ struct ShadowMaskCache {
     // Fold the part of the ordinary floor projection that crosses an edge onto the wall receiver. This preserves
     // the exact silhouette cut at the ledge instead of projecting the actor onto the wall a second time.
     bool fold_over_edge = false;
+    // Direct secondary receivers use light-ray projection instead of the drop-fold transform.
+    bool direct_secondary_projection = false;
     // Optional lower-receiver clipping keeps only the portion of a projection below the upper receiver plane.
     bool clip_to_lower_receiver = false;
+    bool keep_above_lower_receiver = false;
     // A wall/drop projection uses the complete captured silhouette. Clipping the source triangles against the
     // wall plane removes Link's upper body when the actor overlaps the lip; only the projected result is clipped.
     bool project_full_source = false;

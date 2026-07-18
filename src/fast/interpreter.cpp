@@ -2412,7 +2412,9 @@ constexpr uint8_t kShadowFlagRegenerate = 1 << 1;
 constexpr uint8_t kShadowFlagHasOffset = 1 << 3;
 constexpr uint8_t kShadowFlagUsesModelAnchor = 1 << 4;
 constexpr uint8_t kShadowFlagEdgeProjection = 1 << 6;
+constexpr uint8_t kShadowFlagSecondaryAboveFloor = 1 << 7;
 constexpr float kShadowSurfaceBias = 0.75f;
+constexpr float kShadowDirectWallSurfaceBias = 1.0f;
 // The folded-wall basis uses the negative side of the receiver plane. Increase the separation more quickly for
 // ordinary footprints while retaining the five-unit cap for large projections.
 constexpr float kShadowWallSurfaceBias = -1.25f;
@@ -2542,11 +2544,12 @@ void Interpreter::FlushToonShadow() {
         edgeCache.max_u = cache.edge.max_u;
         edgeCache.min_v = cache.edge.min_v;
         edgeCache.max_v = cache.edge.max_v;
-        // Clip the wall mask by the same upper-floor plane that clips the floor quad. The shared light-ray
-        // projection then makes the wall shadow continue from the exact actor part that reaches the ledge: if the
-        // floor shadow is cut at Link's waist, the wall shadow starts at Link's waist instead of at his feet.
-        edgeCache.fold_over_edge = true;
+        // Drop faces retain the light-weight fold around the ledge. A wall that rises from the floor receives a
+        // direct light-ray projection, so the same path now handles ordinary walls without changing drop behavior.
+        edgeCache.fold_over_edge = !cache.edge.above_floor;
+        edgeCache.direct_secondary_projection = cache.edge.above_floor;
         edgeCache.clip_to_lower_receiver = true;
+        edgeCache.keep_above_lower_receiver = cache.edge.above_floor;
         edgeCache.project_full_source = true;
         edgeCache.translate_to_lower_receiver = false;
         memcpy(edgeCache.lower_receiver_normal, cache.draw_plane_normal, sizeof(edgeCache.lower_receiver_normal));
@@ -2617,7 +2620,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     // Ordinary receivers face the key. A folded edge already arrives oriented toward the actual upper-floor probe
     // point; preserving that geometric half-space prevents an inclined wall from being flipped by the light vector.
     float lightNormal = ShadowDot(light, normal);
-    const bool preserveFoldReceiverSide = cache.fold_over_edge && cache.reuse_cast_direction;
+    const bool preserveFoldReceiverSide =
+        (cache.fold_over_edge || cache.direct_secondary_projection) && cache.reuse_cast_direction;
     if (!preserveFoldReceiverSide && lightNormal < 0.0f) {
         normal[0] = -normal[0];
         normal[1] = -normal[1];
@@ -2829,6 +2833,10 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 // Keep a narrow strip from the platform side. After folding it overlaps the floor shadow only at
                 // the seam, covering the transparent raster padding and the small offsets of both receiver quads.
                 clipDistance = edgeDistance - kShadowWallSeamOverlap;
+            } else if (cache.direct_secondary_projection && cache.keep_above_lower_receiver) {
+                // A wall rising from the floor keeps the projection above the floor plane. Preserve a narrow strip
+                // below the raw intersection so filtering and receiver biases cannot open a seam at the base.
+                clipDistance += kShadowWallSeamOverlap;
             }
             projectedVertices[i].p[0] =
                 ShadowDot(basisU, receiverWorld) - ShadowDot(basisU, planeOrigin);
@@ -2859,11 +2867,14 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         }
         if (cache.clip_to_lower_receiver) {
             lowerClippedCount = 0;
+            auto lowerInside = [&](float distance) {
+                return cache.keep_above_lower_receiver ? distance >= 0.0f : distance <= 0.0f;
+            };
             for (int currentIndex = 0; currentIndex < clippedCount; currentIndex++) {
                 const ProjectedPoint& previous = projectedVertices[(currentIndex + clippedCount - 1) % clippedCount];
                 const ProjectedPoint& current = projectedVertices[currentIndex];
-                const bool previousInside = previous.lowerDistance <= 0.0f;
-                const bool currentInside = current.lowerDistance <= 0.0f;
+                const bool previousInside = lowerInside(previous.lowerDistance);
+                const bool currentInside = lowerInside(current.lowerDistance);
                 auto appendLowerIntersection = [&]() {
                     const float denominator = current.lowerDistance - previous.lowerDistance;
                     if (fabsf(denominator) < 0.000001f || lowerClippedCount >= 8) {
@@ -3315,7 +3326,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     const float wallSurfaceBias =
         kShadowWallSurfaceBias -
         std::min(kShadowWallSurfaceBiasRange, floorFootprintRadius * kShadowWallSurfaceBiasScale);
-    const float receiverBias = projection != nullptr ? wallSurfaceBias : floorSurfaceBias;
+    const float directWallSurfaceBias =
+        kShadowDirectWallSurfaceBias + std::min(1.5f, floorFootprintRadius * 0.015f);
+    const float secondarySurfaceBias = cache.edge.above_floor ? directWallSurfaceBias : wallSurfaceBias;
+    const float receiverBias = projection != nullptr ? secondarySurfaceBias : floorSurfaceBias;
     const float coords[4][2] = { { centerU - halfU, centerV - halfV }, { centerU + halfU, centerV - halfV },
                                  { centerU + halfU, centerV + halfV }, { centerU - halfU, centerV + halfV } };
     // Raster row 0 always corresponds to minV. Keeping that mapping on the folded wall mask is what makes the
@@ -3407,23 +3421,25 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     if (validReceiverClip) {
         // Cut both quads at the intersection of their rendered, biased planes. Cutting at the raw collision planes
         // leaves different endpoints (especially on slopes), which is the geometric gap visible between masks.
-        receiverClipPlaneD -= clipFloorShadow ? wallSurfaceBias : floorSurfaceBias;
+        receiverClipPlaneD -= clipFloorShadow ? secondarySurfaceBias : floorSurfaceBias;
     }
     // The edge query orients this plane toward its actual upper-floor probe point. Keep that side directly; using
     // Link, camera, or light direction here can reverse the clip when any of them moves relative to a sloped wall.
     if (validReceiverClip && clipWallShadow) {
-        // Game-side floor planes are normalized upward. Flip that plane so the generic >= 0 clip retains only the
-        // wall below it. The mask overlap above this line keeps its filtered edge opaque at the seam.
+        // Game-side floor planes are normalized upward. Direct walls retain the part above the floor; drop faces
+        // invert it and retain the folded part below. Both use the generic >= 0 polygon clip.
         if (receiverClipNormal[1] < 0.0f) {
             receiverClipNormal[0] = -receiverClipNormal[0];
             receiverClipNormal[1] = -receiverClipNormal[1];
             receiverClipNormal[2] = -receiverClipNormal[2];
             receiverClipPlaneD = -receiverClipPlaneD;
         }
-        receiverClipNormal[0] = -receiverClipNormal[0];
-        receiverClipNormal[1] = -receiverClipNormal[1];
-        receiverClipNormal[2] = -receiverClipNormal[2];
-        receiverClipPlaneD = -receiverClipPlaneD;
+        if (!projection->above_floor) {
+            receiverClipNormal[0] = -receiverClipNormal[0];
+            receiverClipNormal[1] = -receiverClipNormal[1];
+            receiverClipNormal[2] = -receiverClipNormal[2];
+            receiverClipPlaneD = -receiverClipPlaneD;
+        }
     }
     const int triangleIndices[2][3] = { { 0, 1, 3 }, { 1, 2, 3 } };
     for (const auto& triangle : triangleIndices) {
@@ -5460,6 +5476,8 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     cache.edge_receiver_valid = receiverValid &&
                                 (gfx->mRsp->toon_shadow_flags & kShadowFlagEdgeProjection) != 0 &&
                                 gfx->mRsp->toon_shadow_edge_valid;
+    cache.edge.above_floor =
+        cache.edge_receiver_valid && (gfx->mRsp->toon_shadow_flags & kShadowFlagSecondaryAboveFloor) != 0;
     if (cache.edge_receiver_valid) {
         cache.edge.plane_normal[0] = gfx->mRsp->toon_shadow_edge_plane[0];
         cache.edge.plane_normal[1] = gfx->mRsp->toon_shadow_edge_plane[1];
