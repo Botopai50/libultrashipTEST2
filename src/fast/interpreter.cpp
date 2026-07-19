@@ -3371,8 +3371,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             return outputCount;
         };
 
-        // Lower floors are parameterized after the selected wall in one unfolded path: upper floor, wall height,
-        // then lower floor. Precompute that wall family once so every continuation triangle shares the exact seam.
+        // A floor reached after the selected wall is parameterized in one unfolded path: base floor, wall height,
+        // then the next floor. This works for both raised platforms and drops while preserving the exact seam.
         float foldWallNormal[3]{};
         float foldWallPlaneD = 0.0f;
         float foldReceiverDown[3]{};
@@ -3452,8 +3452,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             float receiverDownFloorRate = 0.0f;
             const bool receiverIsWall =
                 (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) != 0;
-            const bool receiverIsLowerFloor =
-                (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_LOWER_FLOOR) != 0;
+            const bool receiverIsAfterWallFloor =
+                (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_AFTER_WALL_FLOOR) != 0;
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
                 receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
@@ -3476,8 +3476,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
 
             float lowerOut[3]{};
             float lowerOutWallRate = 0.0f;
-            bool unfoldLowerFloor = false;
-            if (receiverIsLowerFloor && foldWallValid && ShadowNormalize(receiverNormal)) {
+            bool unfoldAfterWallFloor = false;
+            if (receiverIsAfterWallFloor && foldWallValid && ShadowNormalize(receiverNormal)) {
                 if (ShadowDot(receiverNormal, meshBaseNormal) < 0.0f) {
                     for (float& axis : receiverNormal) {
                         axis = -axis;
@@ -3494,10 +3494,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                         }
                     }
                     lowerOutWallRate = ShadowDot(foldWallNormal, lowerOut);
-                    unfoldLowerFloor = fabsf(lowerOutWallRate) > 0.1f;
+                    unfoldAfterWallFloor = fabsf(lowerOutWallRate) > 0.1f;
                 }
             }
-            if (receiverIsLowerFloor && !unfoldLowerFloor) {
+            if (receiverIsAfterWallFloor && !unfoldAfterWallFloor) {
                 continue;
             }
 
@@ -3507,7 +3507,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     polygonA[vertex].world[axis] = cache.receiver_triangles[triangle][vertex][axis];
                 }
                 float basePoint[3]{};
-                if (unfoldLowerFloor) {
+                if (unfoldAfterWallFloor) {
                     const float lowerDistance =
                         (ShadowDot(foldWallNormal, cachedTriangle[vertex]) + foldWallPlaneD) /
                         lowerOutWallRate;
@@ -3553,9 +3553,9 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             ShadowQuadPoint* input = polygonA;
             ShadowQuadPoint* output = polygonB;
             int count = 3;
-            if (unfoldLowerFloor) {
-                // Collision floors sometimes extend underneath a platform. Keep only the side reached after
-                // crossing the wall so hidden geometry cannot resurrect a duplicate copy of the silhouette.
+            if (unfoldAfterWallFloor) {
+                // Collision floors may extend through a platform. Keep only the side reached after crossing the
+                // wall so hidden geometry cannot resurrect a duplicate copy of the silhouette.
                 int outputCount = 0;
                 for (int currentIndex = 0; currentIndex < count; currentIndex++) {
                     const ShadowQuadPoint& previous = input[(currentIndex + count - 1) % count];
