@@ -422,7 +422,10 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        const char* err = error_blob != nullptr ? static_cast<const char*>(error_blob->GetBufferPointer())
+                                                : "D3DCompile returned no diagnostic text";
+        SPDLOG_ERROR("DX11 vertex shader compilation failed (id0={:#018x}, id1={:#010x}): {}", shader_id0,
+                     shader_id1, err);
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
@@ -431,7 +434,10 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                      error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        const char* err = error_blob != nullptr ? static_cast<const char*>(error_blob->GetBufferPointer())
+                                                : "D3DCompile returned no diagnostic text";
+        SPDLOG_ERROR("DX11 pixel shader compilation failed (id0={:#018x}, id1={:#010x}): {}", shader_id0,
+                     shader_id1, err);
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
