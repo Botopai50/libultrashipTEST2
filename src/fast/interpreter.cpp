@@ -3371,6 +3371,58 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             return outputCount;
         };
 
+        // Lower floors are parameterized after the selected wall in one unfolded path: upper floor, wall height,
+        // then lower floor. Precompute that wall family once so every continuation triangle shares the exact seam.
+        float foldWallNormal[3]{};
+        float foldWallPlaneD = 0.0f;
+        float foldReceiverDown[3]{};
+        float foldFloorOut[3]{};
+        float foldReceiverDownFloorRate = 0.0f;
+        bool foldWallValid = false;
+        if (hasCastAlongBase) {
+            for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count && !foldWallValid; triangle++) {
+                if ((cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) == 0) {
+                    continue;
+                }
+                float wallTriangle[3][3]{};
+                for (int vertex = 0; vertex < 3; vertex++) {
+                    for (int axis = 0; axis < 3; axis++) {
+                        wallTriangle[vertex][axis] =
+                            cache.receiver_triangles[triangle][vertex][axis] - cache.world_offset[axis];
+                    }
+                }
+                const float wallEdgeA[3] = { wallTriangle[1][0] - wallTriangle[0][0],
+                                             wallTriangle[1][1] - wallTriangle[0][1],
+                                             wallTriangle[1][2] - wallTriangle[0][2] };
+                const float wallEdgeB[3] = { wallTriangle[2][0] - wallTriangle[0][0],
+                                             wallTriangle[2][1] - wallTriangle[0][1],
+                                             wallTriangle[2][2] - wallTriangle[0][2] };
+                ShadowCross(wallEdgeA, wallEdgeB, foldWallNormal);
+                if (!ShadowNormalize(foldWallNormal)) {
+                    continue;
+                }
+                foldWallPlaneD = -ShadowDot(foldWallNormal, wallTriangle[0]);
+                const float receiverAlignment = ShadowDot(meshBaseNormal, foldWallNormal);
+                for (int axis = 0; axis < 3; axis++) {
+                    foldReceiverDown[axis] =
+                        -meshBaseNormal[axis] + foldWallNormal[axis] * receiverAlignment;
+                    foldFloorOut[axis] =
+                        -foldWallNormal[axis] + meshBaseNormal[axis] * receiverAlignment;
+                }
+                if (!ShadowNormalize(foldReceiverDown) || !ShadowNormalize(foldFloorOut)) {
+                    continue;
+                }
+                if (ShadowDot(foldFloorOut, castAlongBase) < 0.0f) {
+                    for (float& axis : foldFloorOut) {
+                        axis = -axis;
+                    }
+                }
+                foldReceiverDownFloorRate = ShadowDot(meshBaseNormal, foldReceiverDown);
+                foldWallValid = foldReceiverDownFloorRate < -0.1f &&
+                                ShadowDot(foldFloorOut, castAlongBase) > 0.1f;
+            }
+        }
+
         for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count; triangle++) {
             ShadowQuadPoint polygonA[8]{};
             ShadowQuadPoint polygonB[8]{};
@@ -3400,6 +3452,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             float receiverDownFloorRate = 0.0f;
             const bool receiverIsWall =
                 (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) != 0;
+            const bool receiverIsLowerFloor =
+                (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_LOWER_FLOOR) != 0;
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
                 receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
@@ -3420,13 +3474,57 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 }
             }
 
+            float lowerOut[3]{};
+            float lowerOutWallRate = 0.0f;
+            bool unfoldLowerFloor = false;
+            if (receiverIsLowerFloor && foldWallValid && ShadowNormalize(receiverNormal)) {
+                if (ShadowDot(receiverNormal, meshBaseNormal) < 0.0f) {
+                    for (float& axis : receiverNormal) {
+                        axis = -axis;
+                    }
+                }
+                const float floorOutAlignment = ShadowDot(receiverNormal, foldFloorOut);
+                for (int axis = 0; axis < 3; axis++) {
+                    lowerOut[axis] = foldFloorOut[axis] - receiverNormal[axis] * floorOutAlignment;
+                }
+                if (ShadowNormalize(lowerOut)) {
+                    if (ShadowDot(lowerOut, castAlongBase) < 0.0f) {
+                        for (float& axis : lowerOut) {
+                            axis = -axis;
+                        }
+                    }
+                    lowerOutWallRate = ShadowDot(foldWallNormal, lowerOut);
+                    unfoldLowerFloor = fabsf(lowerOutWallRate) > 0.1f;
+                }
+            }
+            if (receiverIsLowerFloor && !unfoldLowerFloor) {
+                continue;
+            }
+
             bool valid = true;
             for (int vertex = 0; vertex < 3; vertex++) {
                 for (int axis = 0; axis < 3; axis++) {
                     polygonA[vertex].world[axis] = cache.receiver_triangles[triangle][vertex][axis];
                 }
                 float basePoint[3]{};
-                if (unfoldReceiver) {
+                if (unfoldLowerFloor) {
+                    const float lowerDistance =
+                        (ShadowDot(foldWallNormal, cachedTriangle[vertex]) + foldWallPlaneD) /
+                        lowerOutWallRate;
+                    float lowerEdge[3]{};
+                    for (int axis = 0; axis < 3; axis++) {
+                        lowerEdge[axis] = cachedTriangle[vertex][axis] - lowerOut[axis] * lowerDistance;
+                    }
+                    const float floorDistance = ShadowDot(meshBaseNormal, lowerEdge) + meshBasePlaneD;
+                    const float signedWallDistance = floorDistance / foldReceiverDownFloorRate;
+                    const float wallDistance = fabsf(signedWallDistance);
+                    for (int axis = 0; axis < 3; axis++) {
+                        const float topEdge = lowerEdge[axis] -
+                                              foldReceiverDown[axis] * signedWallDistance;
+                        basePoint[axis] = topEdge + foldFloorOut[axis] * (wallDistance + lowerDistance);
+                    }
+                    valid = valid && std::isfinite(lowerDistance) && std::isfinite(signedWallDistance);
+                } else if (unfoldReceiver) {
                     const float floorDistance =
                         ShadowDot(meshBaseNormal, cachedTriangle[vertex]) + meshBasePlaneD;
                     const float signedWallDistance = floorDistance / receiverDownFloorRate;
@@ -3455,6 +3553,55 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             ShadowQuadPoint* input = polygonA;
             ShadowQuadPoint* output = polygonB;
             int count = 3;
+            if (unfoldLowerFloor) {
+                // Collision floors sometimes extend underneath a platform. Keep only the side reached after
+                // crossing the wall so hidden geometry cannot resurrect a duplicate copy of the silhouette.
+                int outputCount = 0;
+                for (int currentIndex = 0; currentIndex < count; currentIndex++) {
+                    const ShadowQuadPoint& previous = input[(currentIndex + count - 1) % count];
+                    const ShadowQuadPoint& current = input[currentIndex];
+                    auto wallDistance = [&](const ShadowQuadPoint& point) {
+                        const float cachedPoint[3] = { point.world[0] - cache.world_offset[0],
+                                                       point.world[1] - cache.world_offset[1],
+                                                       point.world[2] - cache.world_offset[2] };
+                        return (ShadowDot(foldWallNormal, cachedPoint) + foldWallPlaneD) /
+                               lowerOutWallRate;
+                    };
+                    const float previousDistance = wallDistance(previous);
+                    const float currentDistance = wallDistance(current);
+                    const bool previousInside = previousDistance >= -0.5f;
+                    const bool currentInside = currentDistance >= -0.5f;
+                    auto appendIntersection = [&]() {
+                        const float denominator = previousDistance - currentDistance;
+                        if (fabsf(denominator) < 0.000001f || outputCount >= 8) {
+                            return;
+                        }
+                        const float amount = std::clamp((previousDistance + 0.5f) / denominator, 0.0f, 1.0f);
+                        ShadowQuadPoint intersection{};
+                        for (int axis = 0; axis < 3; axis++) {
+                            intersection.world[axis] =
+                                previous.world[axis] + (current.world[axis] - previous.world[axis]) * amount;
+                        }
+                        for (int axis = 0; axis < 2; axis++) {
+                            intersection.uv[axis] =
+                                previous.uv[axis] + (current.uv[axis] - previous.uv[axis]) * amount;
+                        }
+                        output[outputCount++] = intersection;
+                    };
+                    if (currentInside) {
+                        if (!previousInside) {
+                            appendIntersection();
+                        }
+                        if (outputCount < 8) {
+                            output[outputCount++] = current;
+                        }
+                    } else if (previousInside) {
+                        appendIntersection();
+                    }
+                }
+                count = outputCount;
+                std::swap(input, output);
+            }
             const int axes[4] = { 0, 0, 1, 1 };
             const float boundaries[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
             const bool keepGreater[4] = { true, false, true, false };
