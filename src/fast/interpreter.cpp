@@ -2416,6 +2416,9 @@ constexpr uint8_t kShadowFlagSecondaryAboveFloor = 1 << 7;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowDirectWallSurfaceBias = 1.0f;
 constexpr float kShadowDropSurfaceBias = -0.5f;
+// Receiver-mesh floors use exact collision vertices. Keep the small offset negative to match the decal depth
+// convention used by this shadow path and avoid a visibly floating surface.
+constexpr float kShadowMeshFloorSurfaceBias = -0.5f;
 // Preserve enough source silhouette around the raw floor/wall intersection to cover receiver bias and filtering.
 constexpr float kShadowWallSeamOverlap = 10.0f;
 constexpr float kShadowClipDepthBias = 0.0015f;
@@ -3423,6 +3426,85 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             }
         }
 
+        // Geometry alone can find a valid wall in a side lane while the opaque silhouette never reaches its seam.
+        // Require actual 96x96 mask coverage along the real floor/wall intersection before drawing that wall family.
+        bool wallTouchesMask = true;
+        if (foldWallValid && cache.coverage.size() == kShadowMaskBytes) {
+            wallTouchesMask = false;
+            auto maskCoveredAt = [&](float u, float v) {
+                const float pixelX = u * (kShadowMaskSize - 1);
+                const float pixelY = v * (kShadowMaskSize - 1);
+                const int centerX = (int)roundf(pixelX);
+                const int centerY = (int)roundf(pixelY);
+                for (int offsetY = -2; offsetY <= 2; offsetY++) {
+                    const int y = centerY + offsetY;
+                    if (y < 0 || y >= kShadowMaskSize) {
+                        continue;
+                    }
+                    for (int offsetX = -2; offsetX <= 2; offsetX++) {
+                        const int x = centerX + offsetX;
+                        if (x >= 0 && x < kShadowMaskSize &&
+                            cache.coverage[y * kShadowMaskSize + x] >= 32) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+            for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count && !wallTouchesMask; triangle++) {
+                if ((cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) == 0) {
+                    continue;
+                }
+                float seamUv[3][2]{};
+                bool validSeam = true;
+                for (int vertex = 0; vertex < 3; vertex++) {
+                    float cachedPoint[3]{};
+                    for (int axis = 0; axis < 3; axis++) {
+                        cachedPoint[axis] =
+                            cache.receiver_triangles[triangle][vertex][axis] - cache.world_offset[axis];
+                    }
+                    const float floorDistance = ShadowDot(meshBaseNormal, cachedPoint) + meshBasePlaneD;
+                    const float signedWallDistance = floorDistance / foldReceiverDownFloorRate;
+                    float seamPoint[3]{};
+                    for (int axis = 0; axis < 3; axis++) {
+                        seamPoint[axis] = cachedPoint[axis] -
+                                          foldReceiverDown[axis] * signedWallDistance;
+                    }
+                    const float relative[3] = { seamPoint[0] - planeOrigin[0], seamPoint[1] - planeOrigin[1],
+                                                seamPoint[2] - planeOrigin[2] };
+                    seamUv[vertex][0] = (ShadowDot(basisU, relative) - effectiveMinU) / effectiveWidth;
+                    seamUv[vertex][1] = (ShadowDot(basisV, relative) - effectiveMinV) / effectiveHeight;
+                    validSeam = validSeam && std::isfinite(seamUv[vertex][0]) &&
+                                std::isfinite(seamUv[vertex][1]);
+                }
+                if (!validSeam) {
+                    continue;
+                }
+                int first = 0;
+                int second = 1;
+                float longestPixelsSquared = -1.0f;
+                for (int a = 0; a < 3; a++) {
+                    for (int b = a + 1; b < 3; b++) {
+                        const float dx = (seamUv[b][0] - seamUv[a][0]) * (kShadowMaskSize - 1);
+                        const float dy = (seamUv[b][1] - seamUv[a][1]) * (kShadowMaskSize - 1);
+                        const float lengthSquared = dx * dx + dy * dy;
+                        if (lengthSquared > longestPixelsSquared) {
+                            longestPixelsSquared = lengthSquared;
+                            first = a;
+                            second = b;
+                        }
+                    }
+                }
+                const int samples = std::clamp((int)ceilf(sqrtf(std::max(0.0f, longestPixelsSquared))), 1, 128);
+                for (int sample = 0; sample <= samples && !wallTouchesMask; sample++) {
+                    const float amount = (float)sample / samples;
+                    const float u = seamUv[first][0] + (seamUv[second][0] - seamUv[first][0]) * amount;
+                    const float v = seamUv[first][1] + (seamUv[second][1] - seamUv[first][1]) * amount;
+                    wallTouchesMask = maskCoveredAt(u, v);
+                }
+            }
+        }
+
         for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count; triangle++) {
             ShadowQuadPoint polygonA[8]{};
             ShadowQuadPoint polygonB[8]{};
@@ -3454,6 +3536,16 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) != 0;
             const bool receiverIsAfterWallFloor =
                 (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_AFTER_WALL_FLOOR) != 0;
+            if ((receiverIsWall || receiverIsAfterWallFloor) && !wallTouchesMask) {
+                continue;
+            }
+            float floorBiasNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
+            const bool biasReceiverFloor = !receiverIsWall && ShadowNormalize(floorBiasNormal);
+            if (biasReceiverFloor && ShadowDot(floorBiasNormal, meshBaseNormal) < 0.0f) {
+                for (float& axis : floorBiasNormal) {
+                    axis = -axis;
+                }
+            }
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
                 receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
@@ -3609,6 +3701,13 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 count = clipUvBoundary(input, count, output, axes[boundary], boundaries[boundary],
                                        keepGreater[boundary]);
                 std::swap(input, output);
+            }
+            if (biasReceiverFloor) {
+                for (int vertex = 0; vertex < count; vertex++) {
+                    for (int axis = 0; axis < 3; axis++) {
+                        input[vertex].world[axis] += floorBiasNormal[axis] * kShadowMeshFloorSurfaceBias;
+                    }
+                }
             }
             for (int fan = 1; fan + 1 < count; fan++) {
                 writeShadowVertex(0, input[0]);
