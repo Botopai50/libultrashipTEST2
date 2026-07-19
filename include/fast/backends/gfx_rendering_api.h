@@ -140,16 +140,18 @@ class GfxRenderingAPI {
     // every tunable once per frame; the renderer only transports it to explicitly marked water draws.
     // Colors arrive as normalized RGBA values in the same working color space as the legacy combiner.
     virtual void SetStylizedWaterParams(const float shallowColor[4], const float deepColor[4],
-                                        const float foamColor[4], float fadeDistance, float foamThickness,
-                                        const float uvSpeed1[2], const float uvSpeed2[2], float normalScale,
-                                        float normalStrength, float reflectionIntensity, float reflectionDistortion,
-                                        float fresnelPower, float specularThreshold, float specularIntensity,
-                                        const float cameraPos[3], const float lightDir[3], const float lightColor[3],
-                                        float nearPlane, float farPlane, float timeSeconds) {
+                                        const float foamColor[4], const float causticColor[4], float fadeDistance,
+                                        float foamThickness, const float uvSpeed1[2], const float uvSpeed2[2],
+                                        float normalScale, float normalStrength, float reflectionIntensity,
+                                        float reflectionDistortion, float fresnelPower, float specularThreshold,
+                                        float specularIntensity, float causticScale, float causticStrength,
+                                        float causticThickness, const float cameraPos[3], const float lightDir[3],
+                                        const float lightColor[3], float nearPlane, float farPlane, float timeSeconds) {
         for (int i = 0; i < 4; i++) {
             mWaterShallowColor[i] = shallowColor[i];
             mWaterDeepColor[i] = deepColor[i];
             mWaterFoamColor[i] = foamColor[i];
+            mWaterCausticColor[i] = causticColor[i];
         }
         for (int i = 0; i < 3; i++) {
             mWaterCameraPos[i] = cameraPos[i];
@@ -169,6 +171,9 @@ class GfxRenderingAPI {
         mWaterFresnelPower = fresnelPower;
         mWaterSpecularThreshold = specularThreshold;
         mWaterSpecularIntensity = specularIntensity;
+        mWaterCausticScale = causticScale;
+        mWaterCausticStrength = causticStrength;
+        mWaterCausticThickness = causticThickness;
         mWaterNearPlane = nearPlane;
         mWaterFarPlane = farPlane;
         mWaterTimeSeconds = timeSeconds;
@@ -204,9 +209,11 @@ class GfxRenderingAPI {
     float mToonRimWidth = 0.28f;      // perceptual thin-line width control
     float mToonRimSoftness = 0.035f;  // screen-space contour antialiasing control
     float mToonRimDirectionInfluence = 1.0f;
-    float mWaterShallowColor[4] = { 0.08f, 0.72f, 0.72f, 0.28f };
-    float mWaterDeepColor[4] = { 0.0f, 0.20f, 0.62f, 0.86f };
-    float mWaterFoamColor[4] = { 0.82f, 0.98f, 0.94f, 1.0f };
+    // RGB is a multiplicative tint. White preserves the original Fast3D water material color.
+    float mWaterShallowColor[4] = { 1.0f, 1.0f, 1.0f, 0.45f };
+    float mWaterDeepColor[4] = { 1.0f, 1.0f, 1.0f, 0.86f };
+    float mWaterFoamColor[4] = { 0.92f, 0.98f, 1.0f, 1.0f };
+    float mWaterCausticColor[4] = { 0.95f, 0.99f, 1.0f, 0.96f };
     float mWaterCameraPos[3] = { 0.0f, 0.0f, 0.0f };
     float mWaterLightDir[3] = { 0.0f, 1.0f, 0.0f };
     float mWaterLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -221,6 +228,9 @@ class GfxRenderingAPI {
     float mWaterFresnelPower = 4.0f;
     float mWaterSpecularThreshold = 0.78f;
     float mWaterSpecularIntensity = 0.85f;
+    float mWaterCausticScale = 0.018f;
+    float mWaterCausticStrength = 0.88f;
+    float mWaterCausticThickness = 0.08f;
     float mWaterNearPlane = 10.0f;
     float mWaterFarPlane = 12800.0f;
     float mWaterTimeSeconds = 0.0f;

@@ -74,6 +74,7 @@ uniform sampler2D water_scene_depth;
 uniform vec4 water_shallow_color;
 uniform vec4 water_deep_color;
 uniform vec4 water_foam_color;
+uniform vec4 water_caustic_color;
 uniform vec3 water_camera_pos;
 uniform vec3 water_light_dir;
 uniform vec3 water_light_color;
@@ -88,6 +89,9 @@ uniform float water_reflection_distortion;
 uniform float water_fresnel_power;
 uniform float water_specular_threshold;
 uniform float water_specular_intensity;
+uniform float water_caustic_scale;
+uniform float water_caustic_strength;
+uniform float water_caustic_thickness;
 uniform float water_near_plane;
 uniform float water_far_plane;
 uniform vec2 water_viewport_size;
@@ -100,20 +104,30 @@ vec2 waterHash22(vec2 p) {
     return fract((p3.xx + p3.yz) * p3.zy);
 }
 
-// Four-cell Worley approximation: enough irregularity for a narrow intersection stripe without the
-// nine-cell cost of a general-purpose cellular-noise function.
-float waterCellular(vec2 p) {
+// One antialiased Worley edge field supplies both the bright surface web and shoreline breakup.
+// Reusing it keeps the reference-style caustics to one lightweight 3x3 search and no extra texture pass.
+float waterCausticWeb(vec2 p, float thickness) {
     vec2 cell = floor(p);
     vec2 local = fract(p);
-    float nearest = 2.0;
-    for (int y = 0; y <= 1; ++y) {
-        for (int x = 0; x <= 1; ++x) {
-            vec2 corner = vec2(float(x), float(y));
-            vec2 feature = corner + waterHash22(cell + corner);
-            nearest = min(nearest, length(feature - local));
+    float nearest = 8.0;
+    float secondNearest = 8.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 neighbor = vec2(float(x), float(y));
+            vec2 delta = neighbor + waterHash22(cell + neighbor) - local;
+            float distanceSquared = dot(delta, delta);
+            if (distanceSquared < nearest) {
+                secondNearest = nearest;
+                nearest = distanceSquared;
+            } else {
+                secondNearest = min(secondNearest, distanceSquared);
+            }
         }
     }
-    return nearest;
+    float edgeDistance = max(sqrt(secondNearest) - sqrt(nearest), 0.0);
+    float edgeWidth = clamp(thickness, 0.005, 0.3);
+    float antialias = max(fwidth(edgeDistance) * 0.75, 0.002);
+    return 1.0 - smoothstep(max(edgeWidth - antialias, 0.0), edgeWidth + antialias, edgeDistance);
 }
 
 float waterLinearDepth(float depth01) {
@@ -316,17 +330,35 @@ void main() {
             waterDepthGap = max(waterLinearDepth(waterSceneZ) - waterLinearDepth(gl_FragCoord.z), 0.0);
         }
         float waterDeepFactor = smoothstep(0.0, max(water_fade_distance, 1.0), waterDepthGap);
-        vec4 waterBaseColor = mix(water_shallow_color, water_deep_color, waterDeepFactor);
-        float legacyDetail = clamp(dot(texel.rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
-        waterBaseColor.rgb *= mix(0.88, 1.12, legacyDetail);
+        vec4 waterDepthTint = mix(water_shallow_color, water_deep_color, waterDeepFactor);
+        vec4 waterBaseColor = texel;
+        waterBaseColor.rgb *= waterDepthTint.rgb;
+        waterBaseColor.a = waterDepthTint.a;
+
+        vec2 waterCausticUv = vWorldPos.xz * max(water_caustic_scale, 0.00001);
+        vec2 waterCausticWarp = vec2(
+            sin(waterCausticUv.y * 1.71 + waterTime * 0.73) +
+                sin(waterCausticUv.x * 0.67 - waterTime * 0.41),
+            cos(waterCausticUv.x * 1.43 - waterTime * 0.61) +
+                cos(waterCausticUv.y * 0.79 + waterTime * 0.53)) * 0.16;
+        waterCausticUv += waterCausticWarp + water_uv_speed1 * waterTime * 8.0;
+        float waterCaustic = waterCausticWeb(waterCausticUv, water_caustic_thickness);
 
         float waterFresnel = pow(1.0 - clamp(dot(waterN, waterV), 0.0, 1.0),
                                  max(water_fresnel_power, 0.01));
-        vec2 waterReflectUv = clamp(waterScreenUv + waterN.xz * water_reflection_distortion,
+        vec2 waterMirrorUv = vec2(waterScreenUv.x, 1.0 - waterScreenUv.y);
+        vec2 waterReflectUv = clamp(waterMirrorUv + vec2(waterN.x, -waterN.z) * water_reflection_distortion,
                                     vec2(0.002), vec2(0.998));
         vec3 waterSceneReflection = @{texture}(water_scene_color, waterReflectUv).rgb;
+        float waterReflectionAmount = clamp(mix(0.20, 1.0, waterFresnel) * water_reflection_intensity,
+                                            0.0, 1.0);
         waterBaseColor.rgb = mix(waterBaseColor.rgb, waterSceneReflection,
-                                 clamp(waterFresnel * water_reflection_intensity, 0.0, 1.0));
+                                 waterReflectionAmount);
+
+        float waterCausticFacing = mix(1.0, 0.65, waterFresnel);
+        float waterCausticAmount = clamp(waterCaustic * water_caustic_strength *
+                                         water_caustic_color.a * waterCausticFacing, 0.0, 1.0);
+        waterBaseColor = mix(waterBaseColor, water_caustic_color, waterCausticAmount);
 
         vec3 waterL = normalize(water_light_dir);
         vec3 waterH = normalize(waterL + waterV);
@@ -338,8 +370,7 @@ void main() {
         float waterFoam = 0.0;
         if (water_depth_available > 0.5) {
             float waterContact = 1.0 - smoothstep(0.0, max(water_foam_thickness, 0.001), waterDepthGap);
-            float waterCells = waterCellular(waterBaseUv * 10.0 + water_uv_speed1 * waterTime * 2.7);
-            float waterIrregular = smoothstep(0.15, 0.72, 1.0 - waterCells);
+            float waterIrregular = 1.0 - waterCaustic;
             waterFoam = clamp(waterContact * mix(0.45, 1.0, waterIrregular), 0.0, 1.0);
         }
         waterBaseColor = mix(waterBaseColor, water_foam_color, waterFoam * water_foam_color.a);

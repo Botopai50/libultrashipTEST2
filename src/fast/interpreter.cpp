@@ -78,35 +78,6 @@ static constexpr uint8_t kStylizedWaterOff = 0;
 static constexpr uint8_t kStylizedWaterForce = 1;
 static constexpr uint8_t kStylizedWaterAuto = 2;
 
-static constexpr uint32_t PackColorCombiner(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    return (a & 0xf) | ((b & 0xf) << 4) | ((c & 0x1f) << 8) | ((d & 7) << 13);
-}
-
-static constexpr uint32_t PackAlphaCombiner(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
-    return (a & 7) | ((b & 7) << 3) | ((c & 7) << 6) | ((d & 7) << 9);
-}
-
-static constexpr uint64_t BuildStaticWaterCombiner(bool texture0, bool texture1) {
-    uint32_t rgb;
-    uint32_t alpha;
-    if (texture0 && texture1) {
-        // Multiplying both sources keeps the two original maps available to the dual-panning normal path.
-        rgb = PackColorCombiner(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_TEXEL1, G_CCMUX_0);
-        alpha = PackAlphaCombiner(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_TEXEL1, G_ACMUX_0);
-    } else if (texture0) {
-        rgb = PackColorCombiner(G_CCMUX_0, G_CCMUX_0, G_CCMUX_0, G_CCMUX_TEXEL0);
-        alpha = PackAlphaCombiner(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL0);
-    } else if (texture1) {
-        rgb = PackColorCombiner(G_CCMUX_0, G_CCMUX_0, G_CCMUX_0, G_CCMUX_TEXEL1);
-        alpha = PackAlphaCombiner(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_TEXEL1);
-    } else {
-        // Textureless room water still receives the two cheap analytic panning waves in the material shader.
-        rgb = PackColorCombiner(G_CCMUX_0, G_CCMUX_0, G_CCMUX_0, G_CCMUX_SHADE);
-        alpha = PackAlphaCombiner(G_ACMUX_0, G_ACMUX_0, G_ACMUX_0, G_ACMUX_SHADE);
-    }
-    return rgb | (static_cast<uint64_t>(alpha) << 16);
-}
-
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
     F3DEX2_G_CULL_FRONT,     F3DEX2_G_CULL_BACK, F3DEX2_G_CULL_BOTH,
@@ -1725,34 +1696,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool use_world_position = use_stylized_water || use_toon_world_position;
     auto shader = mRdp->current_shader;
 
-    bool staticWaterTexture0 = false;
-    bool staticWaterTexture1 = false;
-    if (use_static_stylized_water) {
-        // Room XLU lists can carry arbitrary fog, two-cycle, alpha-test and custom-shader combinations. Combining
-        // all of those with the water material creates invalid/oversized HLSL variants on DX11. We only need to
-        // preserve which legacy textures are present; the water shader owns color, opacity and lighting.
-        ColorCombinerKey sourceKey = { mRdp->combine_mode, use_2cyc ? SHADER_OPT(_2CYC) : 0ULL };
-        if (!mStaticWaterSourceCached || mStaticWaterSourceKey != sourceKey) {
-            ColorCombiner sourceCombiner{};
-            GenerateCC(&sourceCombiner, sourceKey);
-            mStaticWaterSourceKey = sourceKey;
-            mStaticWaterTexture0 = sourceCombiner.usedTextures[0];
-            mStaticWaterTexture1 = sourceCombiner.usedTextures[1];
-            mStaticWaterSourceCached = true;
-        }
-        staticWaterTexture0 = mStaticWaterTexture0;
-        staticWaterTexture1 = mStaticWaterTexture1;
-
-        use_fog = false;
-        texture_edge = false;
-        use_noise = false;
-        use_2cyc = false;
-        alpha_threshold = false;
-        invisible = false;
-        use_grayscale = false;
-        shader.enabled = false;
-    }
-
     if (texture_edge) {
         if (use_alpha) {
             alpha_threshold = true;
@@ -1796,22 +1739,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_stylized_water) {
         cc_options |= SHADER_OPT(STYLIZED_WATER);
     }
-    if (!use_static_stylized_water && mShadowComposite && mToonShadowSoftness <= 0.001f) {
+    if (mShadowComposite && mToonShadowSoftness <= 0.001f) {
         // In crisp mode, threshold the sampled coverage after bilinear filtering. This removes the low-alpha
         // fringe without applying the threshold to ordinary alpha-tested game textures. Positive softness
         // intentionally leaves the filtered alpha intact so the user can choose a smooth edge.
         cc_options |= SHADER_OPT(SHADOW_SOLID);
     }
-    if (!use_static_stylized_water && mRdp->loaded_texture[0].masked) {
+    if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
-    if (!use_static_stylized_water && mRdp->loaded_texture[1].masked) {
+    if (mRdp->loaded_texture[1].masked) {
         cc_options |= SHADER_OPT(TEXEL1_MASK);
     }
-    if (!use_static_stylized_water && mRdp->loaded_texture[0].blended) {
+    if (mRdp->loaded_texture[0].blended) {
         cc_options |= SHADER_OPT(TEXEL0_BLEND);
     }
-    if (!use_static_stylized_water && mRdp->loaded_texture[1].blended) {
+    if (mRdp->loaded_texture[1].blended) {
         cc_options |= SHADER_OPT(TEXEL1_BLEND);
     }
     if (shader.enabled) {
@@ -1822,8 +1765,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     ColorCombinerKey key;
-    key.combine_mode = use_static_stylized_water ? BuildStaticWaterCombiner(staticWaterTexture0, staticWaterTexture1)
-                                                  : mRdp->combine_mode;
+    key.combine_mode = mRdp->combine_mode;
     key.options = cc_options;
 
     // If we are not using alpha, clear the alpha components of the combiner as they have no effect
@@ -1842,10 +1784,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (mRdp->textures_changed[i]) {
                 Flush();
                 ImportTexture(i, tile, false);
-                if (!use_static_stylized_water && mRdp->loaded_texture[i].masked) {
+                if (mRdp->loaded_texture[i].masked) {
                     ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
                 }
-                if (!use_static_stylized_water && mRdp->loaded_texture[i].blended) {
+                if (mRdp->loaded_texture[i].blended) {
                     ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
                 }
                 mRdp->textures_changed[i] = false;
@@ -1854,7 +1796,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uint8_t cms = mRdp->texture_tile[tile].cms;
             uint8_t cmt = mRdp->texture_tile[tile].cmt;
             if (use_static_stylized_water) {
-                // World-space panning must repeat instead of pinning every sample to a texture edge.
+                // World-space dual panning must repeat rather than pinning every sample to a texture edge.
                 cms = G_TX_WRAP;
                 cmt = G_TX_WRAP;
             }

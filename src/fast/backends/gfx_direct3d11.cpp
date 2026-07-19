@@ -869,6 +869,7 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
             mPerWaterCbData.shallow_color[j] = mWaterShallowColor[j];
             mPerWaterCbData.deep_color[j] = mWaterDeepColor[j];
             mPerWaterCbData.foam_color[j] = mWaterFoamColor[j];
+            mPerWaterCbData.caustic_color[j] = mWaterCausticColor[j];
         }
         for (int j = 0; j < 3; j++) {
             mPerWaterCbData.camera_pos[j] = mWaterCameraPos[j];
@@ -888,6 +889,9 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mPerWaterCbData.fresnel_power = mWaterFresnelPower;
         mPerWaterCbData.specular_threshold = mWaterSpecularThreshold;
         mPerWaterCbData.specular_intensity = mWaterSpecularIntensity;
+        mPerWaterCbData.caustic_scale = mWaterCausticScale;
+        mPerWaterCbData.caustic_strength = mWaterCausticStrength;
+        mPerWaterCbData.caustic_thickness = mWaterCausticThickness;
         mPerWaterCbData.near_plane = mWaterNearPlane;
         mPerWaterCbData.far_plane = mWaterFarPlane;
         mPerWaterCbData.viewport_size[0] = static_cast<float>(mWaterSceneWidth);

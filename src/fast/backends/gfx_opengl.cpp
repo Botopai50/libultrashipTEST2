@@ -98,6 +98,7 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform4fv(mCurrentShaderProgram->water_shallow_color_location, 1, mWaterShallowColor);
         glUniform4fv(mCurrentShaderProgram->water_deep_color_location, 1, mWaterDeepColor);
         glUniform4fv(mCurrentShaderProgram->water_foam_color_location, 1, mWaterFoamColor);
+        glUniform4fv(mCurrentShaderProgram->water_caustic_color_location, 1, mWaterCausticColor);
         glUniform3fv(mCurrentShaderProgram->water_camera_pos_location, 1, mWaterCameraPos);
         glUniform3fv(mCurrentShaderProgram->water_light_dir_location, 1, mWaterLightDir);
         glUniform3fv(mCurrentShaderProgram->water_light_color_location, 1, mWaterLightColor);
@@ -112,6 +113,9 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1f(mCurrentShaderProgram->water_fresnel_power_location, mWaterFresnelPower);
         glUniform1f(mCurrentShaderProgram->water_specular_threshold_location, mWaterSpecularThreshold);
         glUniform1f(mCurrentShaderProgram->water_specular_intensity_location, mWaterSpecularIntensity);
+        glUniform1f(mCurrentShaderProgram->water_caustic_scale_location, mWaterCausticScale);
+        glUniform1f(mCurrentShaderProgram->water_caustic_strength_location, mWaterCausticStrength);
+        glUniform1f(mCurrentShaderProgram->water_caustic_thickness_location, mWaterCausticThickness);
         glUniform1f(mCurrentShaderProgram->water_near_plane_location, mWaterNearPlane);
         glUniform1f(mCurrentShaderProgram->water_far_plane_location, mWaterFarPlane);
         glUniform2fv(mCurrentShaderProgram->water_viewport_size_location, 1, viewport);
@@ -578,6 +582,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->water_shallow_color_location = glGetUniformLocation(shader_program, "water_shallow_color");
     prg->water_deep_color_location = glGetUniformLocation(shader_program, "water_deep_color");
     prg->water_foam_color_location = glGetUniformLocation(shader_program, "water_foam_color");
+    prg->water_caustic_color_location = glGetUniformLocation(shader_program, "water_caustic_color");
     prg->water_camera_pos_location = glGetUniformLocation(shader_program, "water_camera_pos");
     prg->water_light_dir_location = glGetUniformLocation(shader_program, "water_light_dir");
     prg->water_light_color_location = glGetUniformLocation(shader_program, "water_light_color");
@@ -593,6 +598,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->water_fresnel_power_location = glGetUniformLocation(shader_program, "water_fresnel_power");
     prg->water_specular_threshold_location = glGetUniformLocation(shader_program, "water_specular_threshold");
     prg->water_specular_intensity_location = glGetUniformLocation(shader_program, "water_specular_intensity");
+    prg->water_caustic_scale_location = glGetUniformLocation(shader_program, "water_caustic_scale");
+    prg->water_caustic_strength_location = glGetUniformLocation(shader_program, "water_caustic_strength");
+    prg->water_caustic_thickness_location = glGetUniformLocation(shader_program, "water_caustic_thickness");
     prg->water_near_plane_location = glGetUniformLocation(shader_program, "water_near_plane");
     prg->water_far_plane_location = glGetUniformLocation(shader_program, "water_far_plane");
     prg->water_viewport_size_location = glGetUniformLocation(shader_program, "water_viewport_size");

@@ -26,6 +26,7 @@ struct DrawUniforms {
     float4 waterShallowColor;
     float4 waterDeepColor;
     float4 waterFoamColor;
+    float4 waterCausticColor;
     packed_float3 waterCameraPos;
     float waterFadeDistance;
     packed_float3 waterLightDir;
@@ -40,8 +41,12 @@ struct DrawUniforms {
     float waterFresnelPower;
     float waterSpecularThreshold;
     float waterSpecularIntensity;
+    float waterCausticScale;
+    float waterCausticStrength;
+    float waterCausticThickness;
     float waterNearPlane;
     float waterFarPlane;
+    float waterMaterialPadding;
     float waterTimeSeconds;
     packed_float3 waterPadding;
 };
@@ -203,6 +208,36 @@ float random(float3 value) {
     return fract(sin(random) * 143758.5453);
 }
 
+float2 waterHash22(float2 p) {
+    float3 p3 = fract(float3(p.x, p.y, p.x) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+float waterCausticWeb(float2 p, float thickness) {
+    float2 cell = floor(p);
+    float2 local = fract(p);
+    float nearest = 8.0;
+    float secondNearest = 8.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 neighbor = float2(float(x), float(y));
+            float2 delta = neighbor + waterHash22(cell + neighbor) - local;
+            float distanceSquared = dot(delta, delta);
+            if (distanceSquared < nearest) {
+                secondNearest = nearest;
+                nearest = distanceSquared;
+            } else {
+                secondNearest = min(secondNearest, distanceSquared);
+            }
+        }
+    }
+    float edgeDistance = max(sqrt(secondNearest) - sqrt(nearest), 0.0);
+    float edgeWidth = clamp(thickness, 0.005, 0.3);
+    float antialias = max((abs(dfdx(edgeDistance)) + abs(dfdy(edgeDistance))) * 0.75, 0.002);
+    return 1.0 - smoothstep(max(edgeWidth - antialias, 0.0), edgeWidth + antialias, edgeDistance);
+}
+
 fragment float4 fragmentShader(
     ProjectedVertex in [[stage_in]],
     constant FrameUniforms &frameUniforms [[buffer(0)]],
@@ -357,13 +392,32 @@ fragment float4 fragmentShader(
         float3 waterN = normalize(waterGeometricN - waterTangent * waterSlope.x - waterBitangent * waterSlope.y);
 
         float legacyDepthHint = clamp(texel.w, 0.0, 1.0);
-        float4 waterBaseColor = mix(drawUniforms.waterShallowColor, drawUniforms.waterDeepColor, legacyDepthHint);
+        float4 waterDepthTint = mix(drawUniforms.waterShallowColor, drawUniforms.waterDeepColor,
+                                    legacyDepthHint);
+        float4 waterBaseColor = texel;
+        waterBaseColor.xyz *= waterDepthTint.xyz;
+        waterBaseColor.w = waterDepthTint.w;
+
+        float2 waterCausticUv = in.worldPos.xz * max(drawUniforms.waterCausticScale, 0.00001);
+        float2 waterCausticWarp = float2(
+            sin(waterCausticUv.y * 1.71 + drawUniforms.waterTimeSeconds * 0.73) +
+                sin(waterCausticUv.x * 0.67 - drawUniforms.waterTimeSeconds * 0.41),
+            cos(waterCausticUv.x * 1.43 - drawUniforms.waterTimeSeconds * 0.61) +
+                cos(waterCausticUv.y * 0.79 + drawUniforms.waterTimeSeconds * 0.53)) * 0.16;
+        waterCausticUv += waterCausticWarp +
+                           float2(drawUniforms.waterUvSpeed1) * drawUniforms.waterTimeSeconds * 8.0;
+        float waterCaustic = waterCausticWeb(waterCausticUv, drawUniforms.waterCausticThickness);
         float waterFresnel = pow(1.0 - clamp(dot(waterN, waterV), 0.0, 1.0),
                                  max(drawUniforms.waterFresnelPower, 0.01));
         float3 waterSkyTint = mix(float3(drawUniforms.waterDeepColor.xyz),
                                   float3(drawUniforms.waterLightColor), 0.35);
-        waterBaseColor.xyz = mix(waterBaseColor.xyz, waterSkyTint,
-                                 clamp(waterFresnel * drawUniforms.waterReflectionIntensity, 0.0, 1.0));
+        float waterReflectionAmount = clamp(mix(0.20, 1.0, waterFresnel) *
+                                            drawUniforms.waterReflectionIntensity, 0.0, 1.0);
+        waterBaseColor.xyz = mix(waterBaseColor.xyz, waterSkyTint, waterReflectionAmount);
+        float waterCausticFacing = mix(1.0, 0.65, waterFresnel);
+        float waterCausticAmount = clamp(waterCaustic * drawUniforms.waterCausticStrength *
+                                         drawUniforms.waterCausticColor.w * waterCausticFacing, 0.0, 1.0);
+        waterBaseColor = mix(waterBaseColor, drawUniforms.waterCausticColor, waterCausticAmount);
         float3 waterL = normalize(float3(drawUniforms.waterLightDir));
         float3 waterH = normalize(waterL + waterV);
         float waterSpecular = step(clamp(drawUniforms.waterSpecularThreshold, 0.0, 1.0),

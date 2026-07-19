@@ -581,6 +581,7 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
             mDrawUniforms.waterShallowColor[j] = mWaterShallowColor[j];
             mDrawUniforms.waterDeepColor[j] = mWaterDeepColor[j];
             mDrawUniforms.waterFoamColor[j] = mWaterFoamColor[j];
+            mDrawUniforms.waterCausticColor[j] = mWaterCausticColor[j];
         }
         for (int j = 0; j < 3; j++) {
             mDrawUniforms.waterCameraPos[j] = mWaterCameraPos[j];
@@ -600,6 +601,9 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         mDrawUniforms.waterFresnelPower = mWaterFresnelPower;
         mDrawUniforms.waterSpecularThreshold = mWaterSpecularThreshold;
         mDrawUniforms.waterSpecularIntensity = mWaterSpecularIntensity;
+        mDrawUniforms.waterCausticScale = mWaterCausticScale;
+        mDrawUniforms.waterCausticStrength = mWaterCausticStrength;
+        mDrawUniforms.waterCausticThickness = mWaterCausticThickness;
         mDrawUniforms.waterNearPlane = mWaterNearPlane;
         mDrawUniforms.waterFarPlane = mWaterFarPlane;
         mDrawUniforms.waterTimeSeconds = mWaterTimeSeconds;

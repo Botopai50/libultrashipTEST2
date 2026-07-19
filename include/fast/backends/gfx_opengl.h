@@ -59,6 +59,7 @@ struct ShaderProgram {
     GLint water_shallow_color_location;
     GLint water_deep_color_location;
     GLint water_foam_color_location;
+    GLint water_caustic_color_location;
     GLint water_camera_pos_location;
     GLint water_light_dir_location;
     GLint water_light_color_location;
@@ -73,6 +74,9 @@ struct ShaderProgram {
     GLint water_fresnel_power_location;
     GLint water_specular_threshold_location;
     GLint water_specular_intensity_location;
+    GLint water_caustic_scale_location;
+    GLint water_caustic_strength_location;
+    GLint water_caustic_thickness_location;
     GLint water_near_plane_location;
     GLint water_far_plane_location;
     GLint water_viewport_size_location;

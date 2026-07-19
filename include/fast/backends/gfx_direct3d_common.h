@@ -46,6 +46,7 @@ struct PerWaterCB {
     float shallow_color[4];
     float deep_color[4];
     float foam_color[4];
+    float caustic_color[4];
     float camera_pos[3];
     float fade_distance;
     float light_dir[3];
@@ -60,14 +61,19 @@ struct PerWaterCB {
     float fresnel_power;
     float specular_threshold;
     float specular_intensity;
+    float caustic_scale;
+    float caustic_strength;
+    float caustic_thickness;
     float near_plane;
     float far_plane;
+    float _water_material_pad;
     float viewport_size[2];
     float depth_available;
     float msaa_samples;
     float time_seconds;
     float _water_pad[3];
 };
+static_assert(sizeof(PerWaterCB) == 208, "PerWaterCB must match the HLSL b3 layout");
 
 struct PerDrawCB {
     struct Texture {

@@ -687,12 +687,6 @@ class Interpreter {
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
     int mToonShadowResolution = 96;       // fixed silhouette-mask size; edge quality is reconstructed in the shader
     std::vector<StylizedWaterBox> mStylizedWaterBoxes;
-    // Static room water inherits a legacy combiner before switching to the canonical water material. Cache only
-    // which source textures that combiner actually uses so this classification never flushes the renderer per tri.
-    bool mStaticWaterSourceCached = false;
-    ColorCombinerKey mStaticWaterSourceKey{};
-    bool mStaticWaterTexture0 = false;
-    bool mStaticWaterTexture1 = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

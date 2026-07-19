@@ -138,6 +138,7 @@ struct DrawUniforms {
     simd::float1 waterShallowColor[4];
     simd::float1 waterDeepColor[4];
     simd::float1 waterFoamColor[4];
+    simd::float1 waterCausticColor[4];
     simd::float1 waterCameraPos[3];
     simd::float1 waterFadeDistance;
     simd::float1 waterLightDir[3];
@@ -152,8 +153,12 @@ struct DrawUniforms {
     simd::float1 waterFresnelPower;
     simd::float1 waterSpecularThreshold;
     simd::float1 waterSpecularIntensity;
+    simd::float1 waterCausticScale;
+    simd::float1 waterCausticStrength;
+    simd::float1 waterCausticThickness;
     simd::float1 waterNearPlane;
     simd::float1 waterFarPlane;
+    simd::float1 waterMaterialPadding;
     simd::float1 waterTimeSeconds;
     simd::float1 waterPadding[3];
 };
