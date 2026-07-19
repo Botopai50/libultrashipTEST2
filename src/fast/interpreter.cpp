@@ -2416,12 +2416,12 @@ constexpr uint8_t kShadowFlagSecondaryAboveFloor = 1 << 7;
 constexpr float kShadowSurfaceBias = 0.75f;
 constexpr float kShadowDirectWallSurfaceBias = 1.0f;
 constexpr float kShadowDropSurfaceBias = -0.5f;
-// Receiver-mesh floors use exact collision vertices. Keep the small offset negative to match the decal depth
-// convention used by this shadow path and avoid a visibly floating surface.
-constexpr float kShadowMeshFloorSurfaceBias = -0.5f;
 // Preserve enough source silhouette around the raw floor/wall intersection to cover receiver bias and filtering.
 constexpr float kShadowWallSeamOverlap = 10.0f;
-constexpr float kShadowClipDepthBias = 0.0015f;
+constexpr float kShadowClipDepthBias = -0.0015f;
+// Exact collision floors need a little more depth separation than walls. Keep this negative in clip space: unlike a
+// world-normal offset it cannot bury the decal when the camera approaches the receiving plane.
+constexpr float kShadowMeshFloorClipDepthBias = -0.0025f;
 
 static int ShadowSignExtend7(uint32_t value) {
     return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
@@ -3290,7 +3290,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
 
     const bool savedShadowComposite = mShadowComposite;
     mShadowComposite = true;
-    auto writeShadowVertex = [&](int slot, const ShadowQuadPoint& point) {
+    auto writeShadowVertex = [&](int slot, const ShadowQuadPoint& point,
+                                 float clipDepthBias = kShadowClipDepthBias) {
         const float* world = point.world;
         LoadedVertex* vertex = &mRsp->loaded_vertices[MAX_VERTICES + slot];
         vertex->x = AdjXForAspectRatio(world[0] * mRsp->P_matrix[0][0] + world[1] * mRsp->P_matrix[1][0] +
@@ -3304,7 +3305,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         if (vertex->w > 0.0f) {
             // Pull the decal slightly toward the camera in clip space. This is stable on GLES and prevents
             // depth quantization from producing grain or letting the shadow fall behind the receiving surface.
-            vertex->z -= vertex->w * kShadowClipDepthBias;
+            vertex->z += vertex->w * clipDepthBias;
         }
         vertex->u = (int16_t)(point.uv[0] * (kShadowMaskSize - 1) * 32.0f);
         vertex->v = (int16_t)(point.uv[1] * (kShadowMaskSize - 1) * 32.0f);
@@ -3539,13 +3540,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             if ((receiverIsWall || receiverIsAfterWallFloor) && !wallTouchesMask) {
                 continue;
             }
-            float floorBiasNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
-            const bool biasReceiverFloor = !receiverIsWall && ShadowNormalize(floorBiasNormal);
-            if (biasReceiverFloor && ShadowDot(floorBiasNormal, meshBaseNormal) < 0.0f) {
-                for (float& axis : floorBiasNormal) {
-                    axis = -axis;
-                }
-            }
+            const float receiverClipDepthBias =
+                receiverIsWall ? kShadowClipDepthBias : kShadowMeshFloorClipDepthBias;
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
                 receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
@@ -3702,17 +3698,10 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                                        keepGreater[boundary]);
                 std::swap(input, output);
             }
-            if (biasReceiverFloor) {
-                for (int vertex = 0; vertex < count; vertex++) {
-                    for (int axis = 0; axis < 3; axis++) {
-                        input[vertex].world[axis] += floorBiasNormal[axis] * kShadowMeshFloorSurfaceBias;
-                    }
-                }
-            }
             for (int fan = 1; fan + 1 < count; fan++) {
-                writeShadowVertex(0, input[0]);
-                writeShadowVertex(1, input[fan]);
-                writeShadowVertex(2, input[fan + 1]);
+                writeShadowVertex(0, input[0], receiverClipDepthBias);
+                writeShadowVertex(1, input[fan], receiverClipDepthBias);
+                writeShadowVertex(2, input[fan + 1], receiverClipDepthBias);
                 GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
             }
         }
