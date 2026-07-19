@@ -1527,6 +1527,46 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
+bool Interpreter::TriangleMatchesStylizedWaterBox(LoadedVertex* const vertices[3]) const {
+    // Static water surfaces are horizontal, but their visual mesh can sit a few units above or below the
+    // collision surface. A small Y tolerance covers that authored offset without accepting walls or effects.
+    constexpr float kSurfaceTolerance = 24.0f;
+    constexpr float kBoundsTolerance = 1.0f;
+
+    float triangleMinX = vertices[0]->wx;
+    float triangleMaxX = vertices[0]->wx;
+    float triangleMinZ = vertices[0]->wz;
+    float triangleMaxZ = vertices[0]->wz;
+    for (int i = 1; i < 3; i++) {
+        triangleMinX = std::min(triangleMinX, vertices[i]->wx);
+        triangleMaxX = std::max(triangleMaxX, vertices[i]->wx);
+        triangleMinZ = std::min(triangleMinZ, vertices[i]->wz);
+        triangleMaxZ = std::max(triangleMaxZ, vertices[i]->wz);
+    }
+
+    for (const StylizedWaterBox& box : mStylizedWaterBoxes) {
+        bool onSurface = true;
+        for (int i = 0; i < 3; i++) {
+            if (std::abs(vertices[i]->wy - box.surfaceY) > kSurfaceTolerance) {
+                onSurface = false;
+                break;
+            }
+        }
+        if (!onSurface) {
+            continue;
+        }
+
+        const bool overlapsX = triangleMaxX >= box.minX - kBoundsTolerance &&
+                               triangleMinX <= box.maxX + kBoundsTolerance;
+        const bool overlapsZ = triangleMaxZ >= box.minZ - kBoundsTolerance &&
+                               triangleMinZ <= box.maxZ + kBoundsTolerance;
+        if (overlapsX && overlapsZ) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
@@ -1637,7 +1677,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool invisible =
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
-    bool use_stylized_water = mRdp->stylized_water;
+    const bool use_stylized_water = mRdp->stylized_water == G_STYLIZED_WATER_FORCE ||
+                                      (mRdp->stylized_water == G_STYLIZED_WATER_AUTO && !is_rect &&
+                                       TriangleMatchesStylizedWaterBox(v_arr));
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
     // Water owns its complete lighting model. Excluding it here also prevents a lit water display list from
     // receiving the actor toon ramp a second time when it is drawn inside the global actor bracket.
@@ -5885,14 +5927,14 @@ bool gfx_set_toon_shadow_edge_plane_handler_custom(F3DGfx** cmd0) {
 bool gfx_set_stylized_water_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const bool enabled = cmd->words.w1 != 0;
+    const uint8_t mode = static_cast<uint8_t>(cmd->words.w1);
 
-    if (gfx->mRdp->stylized_water != enabled) {
+    if (gfx->mRdp->stylized_water != mode) {
         gfx->Flush();
-        if (enabled) {
+        if (mode != G_STYLIZED_WATER_OFF) {
             gfx->mRapi->PrepareStylizedWater();
         }
-        gfx->mRdp->stylized_water = enabled;
+        gfx->mRdp->stylized_water = mode;
     }
     return false;
 }

@@ -230,6 +230,17 @@ struct LoadedVertex {
     float wx, wy, wz;
 };
 
+// SOH [Enhancement] Collision-backed bounds used to recognize water that belongs to a room's static
+// translucent mesh. They are refreshed by the game once per frame and intentionally contain no game-side
+// pointers, keeping Fast3D independent from OoT's collision structures.
+struct StylizedWaterBox {
+    float minX;
+    float maxX;
+    float surfaceY;
+    float minZ;
+    float maxZ;
+};
+
 struct RawTexMetadata {
     uint16_t width, height;
     float h_byte_scale = 1, v_pixel_scale = 1;
@@ -349,7 +360,8 @@ struct RDP {
     bool grayscale;
     bool toon;        // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
     bool toon_shadow; // SOH [Enhancement] actor shadow armed for the current object (set by gSPToonShadow)
-    bool stylized_water; // SOH [Enhancement] water material active for the current draw (set by gSPStylizedWater)
+    // 0 = disabled, 1 = explicitly marked water, 2 = classify static room triangles against WaterBoxes.
+    uint8_t stylized_water;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
@@ -501,6 +513,10 @@ class Interpreter {
     void Destroy();
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY);
     GfxRenderingAPI* GetCurrentRenderingAPI();
+    // SOH [Enhancement] Active scene WaterBoxes used by the lightweight static-room water classifier.
+    void SetStylizedWaterBoxes(const std::vector<StylizedWaterBox>& boxes) {
+        mStylizedWaterBoxes = boxes;
+    }
     // SOH [Enhancement] Actor shadow: global look tuning pushed once per frame by the game. alpha is the
     // core blend strength; minElevation bounds the projected shadow length.
     void SetToonShadowParams(float alpha, float minElevation, float softness) {
@@ -576,6 +592,7 @@ class Interpreter {
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
+    bool TriangleMatchesStylizedWaterBox(LoadedVertex* const vertices[3]) const;
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpExtraGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* data);
@@ -669,6 +686,7 @@ class Interpreter {
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
     int mToonShadowResolution = 96;       // fixed silhouette-mask size; edge quality is reconstructed in the shader
+    std::vector<StylizedWaterBox> mStylizedWaterBoxes;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

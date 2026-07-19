@@ -2824,8 +2824,11 @@ typedef union Gfx {
 #define gsSPToon(state) \
     { (_SHIFTL(G_SETTOON, 24, 8)), (state) }
 
-// SOH [Enhancement] Explicit water-material marker. Keeping this separate from translucent render modes
-// prevents particles, glass, fire and UI from compiling or sampling the depth-aware water shader.
+// SOH [Enhancement] Explicit water-material marker. FORCE brackets known water display lists; AUTO lets
+// static room XLU geometry opt in triangle-by-triangle when it matches an active collision WaterBox.
+#define G_STYLIZED_WATER_OFF 0
+#define G_STYLIZED_WATER_FORCE 1
+#define G_STYLIZED_WATER_AUTO 2
 #define gSPStylizedWater(pkt, state)                       \
     {                                                      \
         Gfx* _g = (Gfx*)(pkt);                             \
