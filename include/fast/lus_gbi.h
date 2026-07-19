@@ -73,6 +73,7 @@ constexpr int8_t OTR_G_SETTOONSHADOWID = OPCODE(0x4c); // SOH [Enhancement] acto
 constexpr int8_t OTR_G_SETTOONSHADOWPLANE = OPCODE(0x4d); // SOH [Enhancement] actor shadow receiver plane
 constexpr int8_t OTR_G_SETTOONSHADOWEDGEPLANE = OPCODE(0x4e); // SOH [Enhancement] actor shadow edge receiver plane
 constexpr int8_t OTR_G_SETTOONSHADOWRECEIVERMESH = OPCODE(0x4f); // SOH [Enhancement] shadow receiver triangles
+constexpr int8_t OTR_G_SETSTYLIZEDWATER = OPCODE(0x50); // SOH [Enhancement] depth-aware water material
 constexpr int8_t OTR_G_SETSTENCIL = OPCODE(0x46); // SOH [Enhancement] world light casting
 constexpr int8_t OTR_G_MOVEMEM_HASH = OPCODE(0x42);
 constexpr int8_t OTR_G_LOAD_SHADER = OPCODE(0x43);

@@ -40,6 +40,35 @@ struct PerToonCB {
     float toon_rim_direction_influence;
 };
 
+// SOH [Enhancement] Stylized-water material constants (register b3). The grouping mirrors HLSL's
+// 16-byte packing exactly; keeping it separate means ordinary Fast3D draws pay no uniform upload cost.
+struct PerWaterCB {
+    float shallow_color[4];
+    float deep_color[4];
+    float foam_color[4];
+    float camera_pos[3];
+    float fade_distance;
+    float light_dir[3];
+    float foam_thickness;
+    float light_color[3];
+    float normal_scale;
+    float uv_speed1[2];
+    float uv_speed2[2];
+    float normal_strength;
+    float reflection_intensity;
+    float reflection_distortion;
+    float fresnel_power;
+    float specular_threshold;
+    float specular_intensity;
+    float near_plane;
+    float far_plane;
+    float viewport_size[2];
+    float depth_available;
+    float msaa_samples;
+    float time_seconds;
+    float _water_pad[3];
+};
+
 struct PerDrawCB {
     struct Texture {
         uint32_t width;
@@ -83,6 +112,7 @@ struct ShaderProgramD3D11 {
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false; // SOH [Enhancement] toon lighting variant
+    bool opt_stylized_water = false; // SOH [Enhancement] depth-aware water variant
 };
 
 class GfxWindowBackendDXGI;
@@ -134,6 +164,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    void PrepareStylizedWater() override;
     bool UsesToonWorldPosition() const override {
         return true;
     }
@@ -162,6 +193,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb; // SOH [Enhancement] toon lighting (register b2)
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerWaterCb; // SOH [Enhancement] stylized water (register b3)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -179,6 +211,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
     PerToonCB mPerToonCbData; // SOH [Enhancement] toon lighting
+    PerWaterCB mPerWaterCbData; // SOH [Enhancement] stylized water
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 
@@ -187,6 +220,21 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES];
 
     std::vector<FramebufferDX11> mFrameBuffers;
+
+    // Opaque-scene snapshots sampled only by the water shader. Color is resolved to one sample; depth keeps
+    // the source sample count so both non-MSAA and MSAA paths remain exact without a full-screen resolve pass.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mWaterSceneColorTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mWaterSceneColorSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mWaterSceneDepthTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mWaterSceneDepthSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mWaterSceneDepthMsaaSrv;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mWaterSceneSampler;
+    uint32_t mWaterSceneWidth = 0;
+    uint32_t mWaterSceneHeight = 0;
+    uint32_t mWaterSceneSamples = 1;
+    DXGI_FORMAT mWaterSceneColorFormat = DXGI_FORMAT_UNKNOWN;
+    bool mWaterSceneCaptured = false;
+    bool mWaterDepthAvailable = false;
 
     // Current state
 

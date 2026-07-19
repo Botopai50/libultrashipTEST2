@@ -1315,6 +1315,16 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
 
+        // SOH [Enhancement] Water is commonly unlit Fast3D geometry, so it cannot rely on the G_LIGHTING
+        // branch below to populate world position. The material uses XZ for its two stable panning fields and
+        // XYZ for Fresnel, independent of the original room/object UV scroll.
+        if (mRdp->stylized_water) {
+            float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+            d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+            d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+        }
+
         if (mRsp->geometry_mode & G_LIGHTING) {
             if (mRsp->lights_changed) {
                 for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
@@ -1627,11 +1637,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool invisible =
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
+    bool use_stylized_water = mRdp->stylized_water;
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
-    bool use_toon = mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
+    // Water owns its complete lighting model. Excluding it here also prevents a lit water display list from
+    // receiving the actor toon ramp a second time when it is drawn inside the global actor bracket.
+    bool use_toon = !use_stylized_water && mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
     // OpenGL's rim-light shader also consumes the world position that GfxSpVertex already calculated for
     // toon actors. Resolve this once per triangle so the per-vertex packing has no repeated virtual call.
     bool use_toon_world_position = use_toon && mRapi->UsesToonWorldPosition();
+    bool use_world_position = use_stylized_water || use_toon_world_position;
     auto shader = mRdp->current_shader;
 
     if (texture_edge) {
@@ -1639,6 +1653,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             alpha_threshold = true;
             texture_edge = false;
         }
+        use_alpha = true;
+    }
+    if (use_stylized_water) {
+        // The material owns opacity through depth fade even if a legacy water display list happened to use
+        // an opaque blender setup. This affects only explicitly bracketed draws.
         use_alpha = true;
     }
 
@@ -1669,6 +1688,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_toon) {
         cc_options |= SHADER_OPT(TOON);
     }
+    if (use_stylized_water) {
+        cc_options |= SHADER_OPT(STYLIZED_WATER);
+    }
     if (mShadowComposite && mToonShadowSoftness <= 0.001f) {
         // In crisp mode, threshold the sampled coverage after bilinear filtering. This removes the low-alpha
         // fringe without applying the threshold to ordinary alpha-tested game textures. Positive softness
@@ -1689,9 +1711,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
-        // SOH [Enhancement] shader.id packs above the option bits; shifted 18->19 to make room for the
-        // SHADOW_SOLID opt bit (18). Keep in lockstep with the decode in gfx_cc_get_features.
-        cc_options |= (shader.id << 19);
+        // SOH [Enhancement] shader.id packs above the option bits; shifted to 20 after adding the explicit
+        // STYLIZED_WATER option. Keep in lockstep with the decode in gfx_cc_get_features.
+        cc_options |= (shader.id << 20);
     }
 
     ColorCombinerKey key;
@@ -1891,11 +1913,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBufVbo[mBufVboLen++] = v_arr[i]->nx;
             mBufVbo[mBufVboLen++] = v_arr[i]->ny;
             mBufVbo[mBufVboLen++] = v_arr[i]->nz;
-            if (use_toon_world_position) {
-                mBufVbo[mBufVboLen++] = v_arr[i]->wx;
-                mBufVbo[mBufVboLen++] = v_arr[i]->wy;
-                mBufVbo[mBufVboLen++] = v_arr[i]->wz;
-            }
+        }
+        if (use_world_position) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->wx;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wy;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wz;
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -5857,6 +5879,24 @@ bool gfx_set_toon_shadow_edge_plane_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// SOH [Enhancement] Explicit depth-aware water bracket. The transition flushes pending triangles so no
+// ordinary translucent draw can inherit the material. On the opening edge the backend snapshots opaque
+// scene color/depth once per frame before the water starts feeding back into the target.
+bool gfx_set_stylized_water_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const bool enabled = cmd->words.w1 != 0;
+
+    if (gfx->mRdp->stylized_water != enabled) {
+        gfx->Flush();
+        if (enabled) {
+            gfx->mRapi->PrepareStylizedWater();
+        }
+        gfx->mRdp->stylized_water = enabled;
+    }
+    return false;
+}
+
 bool gfx_set_toon_shadow_receiver_mesh_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -6400,6 +6440,8 @@ static constexpr UcodeHandler otrHandlers = {
       { "G_SETTOONSHADOWRECEIVERMESH", gfx_set_toon_shadow_receiver_mesh_handler_custom } }, // 0x4f
     { OTR_G_SETTOONSHADOW,
       { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow
+    { OTR_G_SETSTYLIZEDWATER,
+      { "G_SETSTYLIZEDWATER", gfx_set_stylized_water_handler_custom } }, // 0x50 depth-aware water material
     { OTR_G_SETSTENCIL, { "G_SETSTENCIL", gfx_set_stencil_handler_custom } }, // G_SETSTENCIL (0x46)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_LOAD_SHADER, { "G_LOAD_SHADER", gfx_set_shader_custom } },
@@ -7043,6 +7085,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
     cc_features->opt_shadow_solid = (shader_id1 & SHADER_OPT(SHADOW_SOLID)) != 0;
+    cc_features->opt_stylized_water = (shader_id1 & SHADER_OPT(STYLIZED_WATER)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -7050,7 +7093,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->clamp[1][1] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_T);
 
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
-        cc_features->shader_id = (shader_id1 >> 19) & 0xFFFF; // SOH [Enhancement] 18->19 for SHADOW_SOLID
+        cc_features->shader_id = (shader_id1 >> 20) & 0x0FFF; // option bits 0..19; remaining high bits are shader id
     }
 
     cc_features->usedTextures[0] = false;

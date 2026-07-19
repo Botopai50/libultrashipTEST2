@@ -69,6 +69,7 @@ struct ShaderProgramMetal {
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false; // SOH [Enhancement] toon lighting variant
+    bool opt_stylized_water = false;
 
     // hashed by msaa_level
     MTL::RenderPipelineState* pipeline_state_variants[9];
@@ -134,6 +135,27 @@ struct DrawUniforms {
     simd::float1 toonHighlightIntensity;
     simd::float1 toonShadowIntensity;
     simd::float1 toonDebug;
+    simd::float1 waterShallowColor[4];
+    simd::float1 waterDeepColor[4];
+    simd::float1 waterFoamColor[4];
+    simd::float1 waterCameraPos[3];
+    simd::float1 waterFadeDistance;
+    simd::float1 waterLightDir[3];
+    simd::float1 waterFoamThickness;
+    simd::float1 waterLightColor[3];
+    simd::float1 waterNormalScale;
+    simd::float1 waterUvSpeed1[2];
+    simd::float1 waterUvSpeed2[2];
+    simd::float1 waterNormalStrength;
+    simd::float1 waterReflectionIntensity;
+    simd::float1 waterReflectionDistortion;
+    simd::float1 waterFresnelPower;
+    simd::float1 waterSpecularThreshold;
+    simd::float1 waterSpecularIntensity;
+    simd::float1 waterNearPlane;
+    simd::float1 waterFarPlane;
+    simd::float1 waterTimeSeconds;
+    simd::float1 waterPadding[3];
 };
 
 struct CoordUniforms {

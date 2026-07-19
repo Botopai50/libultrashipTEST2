@@ -236,6 +236,7 @@ MTL::VertexDescriptor* gfx_metal_build_shader(std::string& result, size_t& numFl
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_shadow_solid", cc_features.opt_shadow_solid },
         { "o_toon", cc_features.opt_toon },
+        { "o_water", cc_features.opt_stylized_water },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },

@@ -197,6 +197,7 @@
 #define G_SETTOONSHADOWPLANE 0x4d // SOH [Enhancement] actor shadow receiver plane
 #define G_SETTOONSHADOWEDGEPLANE 0x4e // SOH [Enhancement] actor shadow edge receiver plane
 #define G_SETTOONSHADOWRECEIVERMESH 0x4f // SOH [Enhancement] actor shadow collision receiver triangles
+#define G_SETSTYLIZEDWATER 0x50 // SOH [Enhancement] depth-aware stylized water material
 #define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
 #define G_LOAD_SHADER 0x43
 #define G_SETTILESIZE_INTERP 0x44
@@ -2822,6 +2823,19 @@ typedef union Gfx {
 
 #define gsSPToon(state) \
     { (_SHIFTL(G_SETTOON, 24, 8)), (state) }
+
+// SOH [Enhancement] Explicit water-material marker. Keeping this separate from translucent render modes
+// prevents particles, glass, fire and UI from compiling or sampling the depth-aware water shader.
+#define gSPStylizedWater(pkt, state)                       \
+    {                                                      \
+        Gfx* _g = (Gfx*)(pkt);                             \
+                                                           \
+        _g->words.w0 = _SHIFTL(G_SETSTYLIZEDWATER, 24, 8); \
+        _g->words.w1 = (state);                            \
+    }
+
+#define gsSPStylizedWater(state) \
+    { (_SHIFTL(G_SETSTYLIZEDWATER, 24, 8)), (state) }
 
 // SOH [Enhancement] Toon lighting per-object key light. dx/dy/dz are the signed key direction
 // (world space, * 127) and r/g/b the key light color, packed into the two command words.

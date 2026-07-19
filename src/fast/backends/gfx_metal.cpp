@@ -268,6 +268,7 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     prg->numInputs = cc_features.numInputs;
     prg->numFloats = numFloats;
     prg->opt_toon = cc_features.opt_toon; // SOH [Enhancement] toon lighting
+    prg->opt_stylized_water = cc_features.opt_stylized_water;
 
     // Prepoluate pipeline state cache with program and available msaa levels
     for (int i = 0; i < ARRAY_COUNT(mMsaaNumQualityLevels); i++) {
@@ -575,7 +576,36 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         mDrawUniforms.toonDebug = mToonDebug;
     }
 
-    if (textures_changed || mShaderProgram->opt_toon) {
+    if (mShaderProgram->opt_stylized_water) {
+        for (int j = 0; j < 4; j++) {
+            mDrawUniforms.waterShallowColor[j] = mWaterShallowColor[j];
+            mDrawUniforms.waterDeepColor[j] = mWaterDeepColor[j];
+            mDrawUniforms.waterFoamColor[j] = mWaterFoamColor[j];
+        }
+        for (int j = 0; j < 3; j++) {
+            mDrawUniforms.waterCameraPos[j] = mWaterCameraPos[j];
+            mDrawUniforms.waterLightDir[j] = mWaterLightDir[j];
+            mDrawUniforms.waterLightColor[j] = mWaterLightColor[j];
+        }
+        for (int j = 0; j < 2; j++) {
+            mDrawUniforms.waterUvSpeed1[j] = mWaterUvSpeed1[j];
+            mDrawUniforms.waterUvSpeed2[j] = mWaterUvSpeed2[j];
+        }
+        mDrawUniforms.waterFadeDistance = mWaterFadeDistance;
+        mDrawUniforms.waterFoamThickness = mWaterFoamThickness;
+        mDrawUniforms.waterNormalScale = mWaterNormalScale;
+        mDrawUniforms.waterNormalStrength = mWaterNormalStrength;
+        mDrawUniforms.waterReflectionIntensity = mWaterReflectionIntensity;
+        mDrawUniforms.waterReflectionDistortion = mWaterReflectionDistortion;
+        mDrawUniforms.waterFresnelPower = mWaterFresnelPower;
+        mDrawUniforms.waterSpecularThreshold = mWaterSpecularThreshold;
+        mDrawUniforms.waterSpecularIntensity = mWaterSpecularIntensity;
+        mDrawUniforms.waterNearPlane = mWaterNearPlane;
+        mDrawUniforms.waterFarPlane = mWaterFarPlane;
+        mDrawUniforms.waterTimeSeconds = mWaterTimeSeconds;
+    }
+
+    if (textures_changed || mShaderProgram->opt_toon || mShaderProgram->opt_stylized_water) {
         current_framebuffer.mCommandEncoder->setFragmentBytes(&mDrawUniforms, sizeof(DrawUniforms), 1);
     }
 

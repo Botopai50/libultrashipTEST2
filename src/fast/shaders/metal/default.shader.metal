@@ -23,6 +23,27 @@ struct DrawUniforms {
     float toonHighlightIntensity;
     float toonShadowIntensity;
     float toonDebug;
+    float4 waterShallowColor;
+    float4 waterDeepColor;
+    float4 waterFoamColor;
+    packed_float3 waterCameraPos;
+    float waterFadeDistance;
+    packed_float3 waterLightDir;
+    float waterFoamThickness;
+    packed_float3 waterLightColor;
+    float waterNormalScale;
+    float2 waterUvSpeed1;
+    float2 waterUvSpeed2;
+    float waterNormalStrength;
+    float waterReflectionIntensity;
+    float waterReflectionDistortion;
+    float waterFresnelPower;
+    float waterSpecularThreshold;
+    float waterSpecularIntensity;
+    float waterNearPlane;
+    float waterFarPlane;
+    float waterTimeSeconds;
+    packed_float3 waterPadding;
 };
 
 struct Vertex {
@@ -54,6 +75,10 @@ struct Vertex {
     @end
     @if(o_toon)
         float3 normal [[attribute(@{get_vertex_index()})]];
+        @{update_floats(3)}
+    @end
+    @if(o_water)
+        float3 worldPos [[attribute(@{get_vertex_index()})]];
         @{update_floats(3)}
     @end
     @for(i in 0..o_inputs)
@@ -91,6 +116,9 @@ struct ProjectedVertex {
     @if(o_toon)
         float3 normal;
     @end
+    @if(o_water)
+        float3 worldPos;
+    @end
     @for(i in 0..o_inputs)
         @if(o_alpha)
             float4 input@{i + 1};
@@ -125,6 +153,9 @@ vertex ProjectedVertex vertexShader(Vertex in [[stage_in]]) {
     @end
     @if(o_toon)
         out.normal = in.normal;
+    @end
+    @if(o_water)
+        out.worldPos = in.worldPos;
     @end
     @for(i in 0..o_inputs)
          out.input@{i + 1} = in.input@{i + 1};
@@ -285,6 +316,62 @@ fragment float4 fragmentShader(
     texel = WRAP(texel, -0.51, 1.51);
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
+
+    @if(o_water)
+        float2 waterBaseUv = in.worldPos.xz * max(drawUniforms.waterNormalScale, 0.00001);
+        float2 waterUv1 = waterBaseUv + float2(drawUniforms.waterUvSpeed1) * drawUniforms.waterTimeSeconds;
+        float2 waterUv2 = float2(-waterBaseUv.y, waterBaseUv.x) +
+                          float2(drawUniforms.waterUvSpeed2) * drawUniforms.waterTimeSeconds;
+        float2 waterSlope1;
+        @if(o_textures[0])
+            float2 waterTexel1 = 1.0 / float2(uTex0.get_width(), uTex0.get_height());
+            float waterH1 = dot(uTex0.sample(uTex0Smplr, waterUv1).xyz, float3(0.299, 0.587, 0.114));
+            waterSlope1 = float2(
+                dot(uTex0.sample(uTex0Smplr, waterUv1 + float2(waterTexel1.x, 0.0)).xyz,
+                    float3(0.299, 0.587, 0.114)) - waterH1,
+                dot(uTex0.sample(uTex0Smplr, waterUv1 + float2(0.0, waterTexel1.y)).xyz,
+                    float3(0.299, 0.587, 0.114)) - waterH1);
+        @else
+            waterSlope1 = float2(cos(waterUv1.x * 6.283), sin(waterUv1.y * 6.283)) * 0.08;
+        @end
+        float2 waterSlope2;
+        @if(o_textures[1])
+            float2 waterTexel2 = 1.0 / float2(uTex1.get_width(), uTex1.get_height());
+            float waterH2 = dot(uTex1.sample(uTex1Smplr, waterUv2).xyz, float3(0.299, 0.587, 0.114));
+            waterSlope2 = float2(
+                dot(uTex1.sample(uTex1Smplr, waterUv2 + float2(waterTexel2.x, 0.0)).xyz,
+                    float3(0.299, 0.587, 0.114)) - waterH2,
+                dot(uTex1.sample(uTex1Smplr, waterUv2 + float2(0.0, waterTexel2.y)).xyz,
+                    float3(0.299, 0.587, 0.114)) - waterH2);
+        @else
+            waterSlope2 = float2(sin(waterUv2.x * 5.17), cos(waterUv2.y * 7.11)) * 0.08;
+        @end
+        float3 waterDx = dfdx(in.worldPos);
+        float3 waterDy = dfdy(in.worldPos);
+        float3 waterGeometricN = normalize(cross(waterDx, waterDy));
+        float3 waterV = normalize(float3(drawUniforms.waterCameraPos) - in.worldPos);
+        if (dot(waterGeometricN, waterV) < 0.0) waterGeometricN = -waterGeometricN;
+        float3 waterTangent = normalize(waterDx);
+        float3 waterBitangent = normalize(cross(waterGeometricN, waterTangent));
+        float2 waterSlope = (waterSlope1 + waterSlope2) * max(drawUniforms.waterNormalStrength, 0.0) * 6.0;
+        float3 waterN = normalize(waterGeometricN - waterTangent * waterSlope.x - waterBitangent * waterSlope.y);
+
+        float legacyDepthHint = clamp(texel.w, 0.0, 1.0);
+        float4 waterBaseColor = mix(drawUniforms.waterShallowColor, drawUniforms.waterDeepColor, legacyDepthHint);
+        float waterFresnel = pow(1.0 - clamp(dot(waterN, waterV), 0.0, 1.0),
+                                 max(drawUniforms.waterFresnelPower, 0.01));
+        float3 waterSkyTint = mix(float3(drawUniforms.waterDeepColor.xyz),
+                                  float3(drawUniforms.waterLightColor), 0.35);
+        waterBaseColor.xyz = mix(waterBaseColor.xyz, waterSkyTint,
+                                 clamp(waterFresnel * drawUniforms.waterReflectionIntensity, 0.0, 1.0));
+        float3 waterL = normalize(float3(drawUniforms.waterLightDir));
+        float3 waterH = normalize(waterL + waterV);
+        float waterSpecular = step(clamp(drawUniforms.waterSpecularThreshold, 0.0, 1.0),
+                                   max(dot(waterN, waterH), 0.0));
+        waterSpecular *= step(0.0, dot(waterN, waterL)) * max(drawUniforms.waterSpecularIntensity, 0.0);
+        waterBaseColor.xyz += float3(drawUniforms.waterLightColor) * waterSpecular;
+        texel = clamp(waterBaseColor, 0.0, 1.0);
+    @end
 
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.

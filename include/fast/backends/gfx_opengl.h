@@ -54,6 +54,30 @@ struct ShaderProgram {
     GLint toon_rim_width_location;
     GLint toon_rim_softness_location;
     GLint toon_rim_direction_influence_location;
+    // SOH [Enhancement] Stylized water
+    bool opt_stylized_water;
+    GLint water_shallow_color_location;
+    GLint water_deep_color_location;
+    GLint water_foam_color_location;
+    GLint water_camera_pos_location;
+    GLint water_light_dir_location;
+    GLint water_light_color_location;
+    GLint water_uv_speed1_location;
+    GLint water_uv_speed2_location;
+    GLint water_fade_distance_location;
+    GLint water_foam_thickness_location;
+    GLint water_normal_scale_location;
+    GLint water_normal_strength_location;
+    GLint water_reflection_intensity_location;
+    GLint water_reflection_distortion_location;
+    GLint water_fresnel_power_location;
+    GLint water_specular_threshold_location;
+    GLint water_specular_intensity_location;
+    GLint water_near_plane_location;
+    GLint water_far_plane_location;
+    GLint water_viewport_size_location;
+    GLint water_depth_available_location;
+    GLint water_time_seconds_location;
 };
 
 struct FramebufferOGL {
@@ -116,6 +140,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    void PrepareStylizedWater() override;
     bool UsesToonWorldPosition() const override {
         return true;
     }
@@ -153,6 +178,14 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    GLuint mWaterSceneFbo = 0;
+    GLuint mWaterSceneColor = 0;
+    GLuint mWaterSceneDepth = 0;
+    uint32_t mWaterSceneWidth = 0;
+    uint32_t mWaterSceneHeight = 0;
+    bool mWaterSceneCaptured = false;
+    bool mWaterDepthAvailable = false;
 };
 
 } // namespace Fast

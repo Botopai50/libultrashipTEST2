@@ -38,8 +38,11 @@ float4 grayscale : GRAYSCALE;
 @end
 @if(o_toon)
 float3 normal : NORMAL;
+@{update_floats(3)}
+@end
+@if(o_toon || o_water)
 float3 worldPos : WORLDPOS;
-@{update_floats(6)}
+@{update_floats(3)}
 @end
 
 @for(i in 0..o_inputs)
@@ -93,6 +96,65 @@ cbuffer PerToonCB : register(b2) {
     float toon_rim_width;
     float toon_rim_softness;
     float toon_rim_direction_influence;
+}
+@end
+
+@if(o_water)
+Texture2D<float4> water_scene_color : register(t6);
+Texture2D<float> water_scene_depth : register(t7);
+Texture2DMS<float> water_scene_depth_ms : register(t8);
+SamplerState water_scene_sampler : register(s6);
+
+cbuffer PerWaterCB : register(b3) {
+    float4 water_shallow_color;
+    float4 water_deep_color;
+    float4 water_foam_color;
+    float3 water_camera_pos;
+    float water_fade_distance;
+    float3 water_light_dir;
+    float water_foam_thickness;
+    float3 water_light_color;
+    float water_normal_scale;
+    float2 water_uv_speed1;
+    float2 water_uv_speed2;
+    float water_normal_strength;
+    float water_reflection_intensity;
+    float water_reflection_distortion;
+    float water_fresnel_power;
+    float water_specular_threshold;
+    float water_specular_intensity;
+    float water_near_plane;
+    float water_far_plane;
+    float2 water_viewport_size;
+    float water_depth_available;
+    float water_msaa_samples;
+    float water_time_seconds;
+    float3 _water_pad;
+}
+
+float2 waterHash22(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.xx + p3.yz) * p3.zy);
+}
+
+float waterCellular(float2 p) {
+    float2 cell = floor(p);
+    float2 local = frac(p);
+    float nearest = 2.0;
+    [unroll] for (int y = 0; y <= 1; ++y) {
+        [unroll] for (int x = 0; x <= 1; ++x) {
+            float2 corner = float2((float)x, (float)y);
+            float2 feature = corner + waterHash22(cell + corner);
+            nearest = min(nearest, length(feature - local));
+        }
+    }
+    return nearest;
+}
+
+float waterLinearDepth(float depth01) {
+    return (water_near_plane * water_far_plane) /
+           max(water_far_plane - depth01 * (water_far_plane - water_near_plane), 0.0001);
 }
 @end
 
@@ -150,6 +212,8 @@ PSInput VSMain(
 @end
 @if(o_toon)
     , float3 normal : NORMAL
+@end
+@if(o_toon || o_water)
     , float3 worldPos : WORLDPOS
 @end
 @for(i in 0..o_inputs)
@@ -187,6 +251,8 @@ PSInput VSMain(
 
     @if(o_toon)
         result.normal = normal;
+    @end
+    @if(o_toon || o_water)
         result.worldPos = worldPos;
     @end
 
@@ -335,6 +401,100 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     texel = WRAP(texel, -0.51, 1.51);
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
+
+    @if(o_water)
+        float waterTime = water_time_seconds;
+        float2 waterBaseUv = input.worldPos.xz * max(water_normal_scale, 0.00001);
+        float2 waterUv1 = waterBaseUv + water_uv_speed1 * waterTime;
+        float2 waterUv2 = float2(-waterBaseUv.y, waterBaseUv.x) + water_uv_speed2 * waterTime;
+
+        float2 waterSlope1;
+        @if(o_textures[0])
+            uint waterWidth1, waterHeight1;
+            g_texture0.GetDimensions(waterWidth1, waterHeight1);
+            float2 waterTexel1 = 1.0 / max(float2(waterWidth1, waterHeight1), float2(1.0, 1.0));
+            float waterH1 = dot(g_texture0.Sample(g_sampler0, waterUv1).rgb, float3(0.299, 0.587, 0.114));
+            waterSlope1 = float2(
+                dot(g_texture0.Sample(g_sampler0, waterUv1 + float2(waterTexel1.x, 0.0)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH1,
+                dot(g_texture0.Sample(g_sampler0, waterUv1 + float2(0.0, waterTexel1.y)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH1);
+        @else
+            waterSlope1 = float2(cos(waterUv1.x * 6.283), sin(waterUv1.y * 6.283)) * 0.08;
+        @end
+
+        float2 waterSlope2;
+        @if(o_textures[1])
+            uint waterWidth2, waterHeight2;
+            g_texture1.GetDimensions(waterWidth2, waterHeight2);
+            float2 waterTexel2 = 1.0 / max(float2(waterWidth2, waterHeight2), float2(1.0, 1.0));
+            float waterH2 = dot(g_texture1.Sample(g_sampler1, waterUv2).rgb, float3(0.299, 0.587, 0.114));
+            waterSlope2 = float2(
+                dot(g_texture1.Sample(g_sampler1, waterUv2 + float2(waterTexel2.x, 0.0)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH2,
+                dot(g_texture1.Sample(g_sampler1, waterUv2 + float2(0.0, waterTexel2.y)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH2);
+        @elseif(o_textures[0])
+            uint waterWidth2, waterHeight2;
+            g_texture0.GetDimensions(waterWidth2, waterHeight2);
+            float2 waterTexel2 = 1.0 / max(float2(waterWidth2, waterHeight2), float2(1.0, 1.0));
+            float waterH2 = dot(g_texture0.Sample(g_sampler0, waterUv2).rgb, float3(0.299, 0.587, 0.114));
+            waterSlope2 = float2(
+                dot(g_texture0.Sample(g_sampler0, waterUv2 + float2(waterTexel2.x, 0.0)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH2,
+                dot(g_texture0.Sample(g_sampler0, waterUv2 + float2(0.0, waterTexel2.y)).rgb,
+                    float3(0.299, 0.587, 0.114)) - waterH2);
+        @else
+            waterSlope2 = float2(sin(waterUv2.x * 5.17), cos(waterUv2.y * 7.11)) * 0.08;
+        @end
+
+        float3 waterDx = ddx(input.worldPos);
+        float3 waterDy = ddy(input.worldPos);
+        float3 waterGeometricN = normalize(cross(waterDx, waterDy));
+        float3 waterV = normalize(water_camera_pos - input.worldPos);
+        if (dot(waterGeometricN, waterV) < 0.0) waterGeometricN = -waterGeometricN;
+        float3 waterTangent = normalize(waterDx);
+        float3 waterBitangent = normalize(cross(waterGeometricN, waterTangent));
+        float2 waterSlope = (waterSlope1 + waterSlope2) * max(water_normal_strength, 0.0) * 6.0;
+        float3 waterN = normalize(waterGeometricN - waterTangent * waterSlope.x - waterBitangent * waterSlope.y);
+
+        float2 waterScreenUv = screenSpace.xy / max(water_viewport_size, float2(1.0, 1.0));
+        float waterDepthGap = max(water_fade_distance, 1.0);
+        if (water_depth_available > 0.5) {
+            int2 waterPixel = int2(clamp(screenSpace.xy, float2(0.0, 0.0), water_viewport_size - 1.0));
+            float waterSceneZ = water_msaa_samples > 1.5
+                                    ? water_scene_depth_ms.Load(waterPixel, 0)
+                                    : water_scene_depth.Load(int3(waterPixel, 0));
+            waterDepthGap = max(waterLinearDepth(waterSceneZ) - waterLinearDepth(screenSpace.z), 0.0);
+        }
+        float waterDeepFactor = smoothstep(0.0, max(water_fade_distance, 1.0), waterDepthGap);
+        float4 waterBaseColor = lerp(water_shallow_color, water_deep_color, waterDeepFactor);
+        float legacyDetail = saturate(dot(texel.rgb, float3(0.299, 0.587, 0.114)));
+        waterBaseColor.rgb *= lerp(0.88, 1.12, legacyDetail);
+
+        float waterFresnel = pow(1.0 - saturate(dot(waterN, waterV)), max(water_fresnel_power, 0.01));
+        float2 waterReflectUv = clamp(waterScreenUv + waterN.xz * water_reflection_distortion,
+                                      float2(0.002, 0.002), float2(0.998, 0.998));
+        float3 waterSceneReflection = water_scene_color.Sample(water_scene_sampler, waterReflectUv).rgb;
+        waterBaseColor.rgb = lerp(waterBaseColor.rgb, waterSceneReflection,
+                                  saturate(waterFresnel * water_reflection_intensity));
+
+        float3 waterL = normalize(water_light_dir);
+        float3 waterH = normalize(waterL + waterV);
+        float waterSpecular = step(saturate(water_specular_threshold), max(dot(waterN, waterH), 0.0));
+        waterSpecular *= step(0.0, dot(waterN, waterL)) * max(water_specular_intensity, 0.0);
+        waterBaseColor.rgb += water_light_color * waterSpecular;
+
+        float waterFoam = 0.0;
+        if (water_depth_available > 0.5) {
+            float waterContact = 1.0 - smoothstep(0.0, max(water_foam_thickness, 0.001), waterDepthGap);
+            float waterCells = waterCellular(waterBaseUv * 10.0 + water_uv_speed1 * waterTime * 2.7);
+            float waterIrregular = smoothstep(0.15, 0.72, 1.0 - waterCells);
+            waterFoam = saturate(waterContact * lerp(0.45, 1.0, waterIrregular));
+        }
+        waterBaseColor = lerp(waterBaseColor, water_foam_color, waterFoam * water_foam_color.a);
+        texel = saturate(waterBaseColor);
+    @end
 
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.

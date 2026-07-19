@@ -136,6 +136,49 @@ class GfxRenderingAPI {
         return false;
     }
 
+    // SOH [Enhancement] Depth-aware stylized water. The application owns the artistic policy and pushes
+    // every tunable once per frame; the renderer only transports it to explicitly marked water draws.
+    // Colors arrive as normalized RGBA values in the same working color space as the legacy combiner.
+    virtual void SetStylizedWaterParams(const float shallowColor[4], const float deepColor[4],
+                                        const float foamColor[4], float fadeDistance, float foamThickness,
+                                        const float uvSpeed1[2], const float uvSpeed2[2], float normalScale,
+                                        float normalStrength, float reflectionIntensity, float reflectionDistortion,
+                                        float fresnelPower, float specularThreshold, float specularIntensity,
+                                        const float cameraPos[3], const float lightDir[3], const float lightColor[3],
+                                        float nearPlane, float farPlane, float timeSeconds) {
+        for (int i = 0; i < 4; i++) {
+            mWaterShallowColor[i] = shallowColor[i];
+            mWaterDeepColor[i] = deepColor[i];
+            mWaterFoamColor[i] = foamColor[i];
+        }
+        for (int i = 0; i < 3; i++) {
+            mWaterCameraPos[i] = cameraPos[i];
+            mWaterLightDir[i] = lightDir[i];
+            mWaterLightColor[i] = lightColor[i];
+        }
+        for (int i = 0; i < 2; i++) {
+            mWaterUvSpeed1[i] = uvSpeed1[i];
+            mWaterUvSpeed2[i] = uvSpeed2[i];
+        }
+        mWaterFadeDistance = fadeDistance;
+        mWaterFoamThickness = foamThickness;
+        mWaterNormalScale = normalScale;
+        mWaterNormalStrength = normalStrength;
+        mWaterReflectionIntensity = reflectionIntensity;
+        mWaterReflectionDistortion = reflectionDistortion;
+        mWaterFresnelPower = fresnelPower;
+        mWaterSpecularThreshold = specularThreshold;
+        mWaterSpecularIntensity = specularIntensity;
+        mWaterNearPlane = nearPlane;
+        mWaterFarPlane = farPlane;
+        mWaterTimeSeconds = timeSeconds;
+    }
+
+    // Called on the first gSPStylizedWater(true) marker of a frame. Backends that support scene sampling
+    // snapshot the current opaque color/depth here, before the water starts writing into the same target.
+    virtual void PrepareStylizedWater() {
+    }
+
     // SOH [Enhancement] World light casting / actor shadows: the interpreter pushes the current stencil
     // mode here when a gSPStencil command is seen, or directly from FlushToonShadow; backends read
     // mStencilMode in their per-draw path. Off (0) is normal rendering, so ordinary draws are unaffected.
@@ -161,6 +204,26 @@ class GfxRenderingAPI {
     float mToonRimWidth = 0.28f;      // perceptual thin-line width control
     float mToonRimSoftness = 0.035f;  // screen-space contour antialiasing control
     float mToonRimDirectionInfluence = 1.0f;
+    float mWaterShallowColor[4] = { 0.08f, 0.72f, 0.72f, 0.28f };
+    float mWaterDeepColor[4] = { 0.0f, 0.20f, 0.62f, 0.86f };
+    float mWaterFoamColor[4] = { 0.82f, 0.98f, 0.94f, 1.0f };
+    float mWaterCameraPos[3] = { 0.0f, 0.0f, 0.0f };
+    float mWaterLightDir[3] = { 0.0f, 1.0f, 0.0f };
+    float mWaterLightColor[3] = { 1.0f, 1.0f, 1.0f };
+    float mWaterUvSpeed1[2] = { 0.018f, 0.010f };
+    float mWaterUvSpeed2[2] = { -0.012f, 0.016f };
+    float mWaterFadeDistance = 500.0f;
+    float mWaterFoamThickness = 36.0f;
+    float mWaterNormalScale = 0.0035f;
+    float mWaterNormalStrength = 0.55f;
+    float mWaterReflectionIntensity = 0.45f;
+    float mWaterReflectionDistortion = 0.018f;
+    float mWaterFresnelPower = 4.0f;
+    float mWaterSpecularThreshold = 0.78f;
+    float mWaterSpecularIntensity = 0.85f;
+    float mWaterNearPlane = 10.0f;
+    float mWaterFarPlane = 12800.0f;
+    float mWaterTimeSeconds = 0.0f;
     int mStencilMode = 0; // SOH [Enhancement] world light casting (see StencilMode)
     int mStencilRef = 0;  // SOH [Enhancement] actor shadows: per-tap reference value for ShadowMask
     int8_t mCurrentDepthTest = 0;

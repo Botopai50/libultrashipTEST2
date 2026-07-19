@@ -84,9 +84,10 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     USE_SHADER,
     TOON, // SOH [Enhancement] toon-lighting variant. Bit 17; the loaded-shader id packs ABOVE it
-          // (interpreter.cpp shifts shader.id by 19). Adding an opt here without bumping that shift
+          // (interpreter.cpp shifts shader.id by 20). Adding an opt here without bumping that shift
           // would overlap the id and corrupt shader selection.
-    SHADOW_SOLID, // SOH [Enhancement] actor-shadow alpha threshold. Bit 18; loaded-shader ids start at bit 19.
+    SHADOW_SOLID, // SOH [Enhancement] actor-shadow alpha threshold. Bit 18.
+    STYLIZED_WATER, // SOH [Enhancement] explicitly marked water material. Bit 19; shader ids start at bit 20.
     MAX
 };
 
@@ -118,6 +119,7 @@ struct CCFeatures {
     bool opt_invisible;
     bool opt_grayscale;
     bool opt_toon; // SOH [Enhancement] toon lighting
+    bool opt_stylized_water; // SOH [Enhancement] depth-aware stylized water
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -347,6 +349,7 @@ struct RDP {
     bool grayscale;
     bool toon;        // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
     bool toon_shadow; // SOH [Enhancement] actor shadow armed for the current object (set by gSPToonShadow)
+    bool stylized_water; // SOH [Enhancement] water material active for the current draw (set by gSPStylizedWater)
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;

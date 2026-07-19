@@ -91,6 +91,41 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         glUniform1f(mCurrentShaderProgram->toon_rim_softness_location, mToonRimSoftness);
         glUniform1f(mCurrentShaderProgram->toon_rim_direction_influence_location, mToonRimDirectionInfluence);
     }
+
+    if (mCurrentShaderProgram->opt_stylized_water) {
+        const FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
+        const float viewport[2] = { static_cast<float>(fb.width), static_cast<float>(fb.height) };
+        glUniform4fv(mCurrentShaderProgram->water_shallow_color_location, 1, mWaterShallowColor);
+        glUniform4fv(mCurrentShaderProgram->water_deep_color_location, 1, mWaterDeepColor);
+        glUniform4fv(mCurrentShaderProgram->water_foam_color_location, 1, mWaterFoamColor);
+        glUniform3fv(mCurrentShaderProgram->water_camera_pos_location, 1, mWaterCameraPos);
+        glUniform3fv(mCurrentShaderProgram->water_light_dir_location, 1, mWaterLightDir);
+        glUniform3fv(mCurrentShaderProgram->water_light_color_location, 1, mWaterLightColor);
+        glUniform2fv(mCurrentShaderProgram->water_uv_speed1_location, 1, mWaterUvSpeed1);
+        glUniform2fv(mCurrentShaderProgram->water_uv_speed2_location, 1, mWaterUvSpeed2);
+        glUniform1f(mCurrentShaderProgram->water_fade_distance_location, mWaterFadeDistance);
+        glUniform1f(mCurrentShaderProgram->water_foam_thickness_location, mWaterFoamThickness);
+        glUniform1f(mCurrentShaderProgram->water_normal_scale_location, mWaterNormalScale);
+        glUniform1f(mCurrentShaderProgram->water_normal_strength_location, mWaterNormalStrength);
+        glUniform1f(mCurrentShaderProgram->water_reflection_intensity_location, mWaterReflectionIntensity);
+        glUniform1f(mCurrentShaderProgram->water_reflection_distortion_location, mWaterReflectionDistortion);
+        glUniform1f(mCurrentShaderProgram->water_fresnel_power_location, mWaterFresnelPower);
+        glUniform1f(mCurrentShaderProgram->water_specular_threshold_location, mWaterSpecularThreshold);
+        glUniform1f(mCurrentShaderProgram->water_specular_intensity_location, mWaterSpecularIntensity);
+        glUniform1f(mCurrentShaderProgram->water_near_plane_location, mWaterNearPlane);
+        glUniform1f(mCurrentShaderProgram->water_far_plane_location, mWaterFarPlane);
+        glUniform2fv(mCurrentShaderProgram->water_viewport_size_location, 1, viewport);
+        glUniform1f(mCurrentShaderProgram->water_depth_available_location, mWaterDepthAvailable ? 1.0f : 0.0f);
+        glUniform1f(mCurrentShaderProgram->water_time_seconds_location, mWaterTimeSeconds);
+
+        glActiveTexture(GL_TEXTURE6);
+        glBindTexture(GL_TEXTURE_2D, mWaterSceneColor);
+        glActiveTexture(GL_TEXTURE7);
+        glBindTexture(GL_TEXTURE_2D, mWaterSceneDepth);
+        if (mLastActiveTexture >= 0) {
+            glActiveTexture(GL_TEXTURE0 + mLastActiveTexture);
+        }
+    }
 }
 
 void GfxRenderingAPIOGL::UnloadShader(ShaderProgram* old_prg) {
@@ -267,6 +302,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_shadow_solid", cc_features.opt_shadow_solid },
         { "o_toon", cc_features.opt_toon },
+        { "o_water", cc_features.opt_stylized_water },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -358,6 +394,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "o_fog", cc_features.opt_fog },
                                      { "o_grayscale", cc_features.opt_grayscale },
                                      { "o_toon", cc_features.opt_toon },
+                                     { "o_water", cc_features.opt_stylized_water },
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
@@ -487,6 +524,8 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aNormal");
         prg->attribSizes[cnt] = 3;
         ++cnt;
+    }
+    if (cc_features.opt_toon || cc_features.opt_stylized_water) {
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, "aWorldPos");
         prg->attribSizes[cnt] = 3;
         ++cnt;
@@ -535,6 +574,31 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->toon_rim_direction_influence_location =
         glGetUniformLocation(shader_program, "toon_rim_direction_influence");
 
+    prg->opt_stylized_water = cc_features.opt_stylized_water;
+    prg->water_shallow_color_location = glGetUniformLocation(shader_program, "water_shallow_color");
+    prg->water_deep_color_location = glGetUniformLocation(shader_program, "water_deep_color");
+    prg->water_foam_color_location = glGetUniformLocation(shader_program, "water_foam_color");
+    prg->water_camera_pos_location = glGetUniformLocation(shader_program, "water_camera_pos");
+    prg->water_light_dir_location = glGetUniformLocation(shader_program, "water_light_dir");
+    prg->water_light_color_location = glGetUniformLocation(shader_program, "water_light_color");
+    prg->water_uv_speed1_location = glGetUniformLocation(shader_program, "water_uv_speed1");
+    prg->water_uv_speed2_location = glGetUniformLocation(shader_program, "water_uv_speed2");
+    prg->water_fade_distance_location = glGetUniformLocation(shader_program, "water_fade_distance");
+    prg->water_foam_thickness_location = glGetUniformLocation(shader_program, "water_foam_thickness");
+    prg->water_normal_scale_location = glGetUniformLocation(shader_program, "water_normal_scale");
+    prg->water_normal_strength_location = glGetUniformLocation(shader_program, "water_normal_strength");
+    prg->water_reflection_intensity_location = glGetUniformLocation(shader_program, "water_reflection_intensity");
+    prg->water_reflection_distortion_location =
+        glGetUniformLocation(shader_program, "water_reflection_distortion");
+    prg->water_fresnel_power_location = glGetUniformLocation(shader_program, "water_fresnel_power");
+    prg->water_specular_threshold_location = glGetUniformLocation(shader_program, "water_specular_threshold");
+    prg->water_specular_intensity_location = glGetUniformLocation(shader_program, "water_specular_intensity");
+    prg->water_near_plane_location = glGetUniformLocation(shader_program, "water_near_plane");
+    prg->water_far_plane_location = glGetUniformLocation(shader_program, "water_far_plane");
+    prg->water_viewport_size_location = glGetUniformLocation(shader_program, "water_viewport_size");
+    prg->water_depth_available_location = glGetUniformLocation(shader_program, "water_depth_available");
+    prg->water_time_seconds_location = glGetUniformLocation(shader_program, "water_time_seconds");
+
     LoadShader(prg);
 
     if (cc_features.usedTextures[0]) {
@@ -560,6 +624,10 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     if (cc_features.used_blend[1]) {
         GLint sampler_location = glGetUniformLocation(shader_program, "uTexBlend1");
         glUniform1i(sampler_location, 5);
+    }
+    if (cc_features.opt_stylized_water) {
+        glUniform1i(glGetUniformLocation(shader_program, "water_scene_color"), 6);
+        glUniform1i(glGetUniformLocation(shader_program, "water_scene_depth"), 7);
     }
 
     return prg;
@@ -780,6 +848,10 @@ void GfxRenderingAPIOGL::Init() {
 
     mPixelDepthRbSize = 1;
 
+    glGenFramebuffers(1, &mWaterSceneFbo);
+    glGenTextures(1, &mWaterSceneColor);
+    glGenTextures(1, &mWaterSceneDepth);
+
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
 }
 
@@ -788,6 +860,68 @@ void GfxRenderingAPIOGL::OnResize() {
 
 void GfxRenderingAPIOGL::StartFrame() {
     mFrameCount++;
+    mWaterSceneCaptured = false;
+    mWaterDepthAvailable = false;
+}
+
+void GfxRenderingAPIOGL::PrepareStylizedWater() {
+    if (mWaterSceneCaptured || mCurrentFrameBuffer >= mFrameBuffers.size()) {
+        return;
+    }
+
+    const FramebufferOGL& source = mFrameBuffers[mCurrentFrameBuffer];
+    if (source.width == 0 || source.height == 0) {
+        return;
+    }
+
+    if (mWaterSceneWidth != source.width || mWaterSceneHeight != source.height) {
+        mWaterSceneWidth = source.width;
+        mWaterSceneHeight = source.height;
+
+        glBindTexture(GL_TEXTURE_2D, mWaterSceneColor);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, source.width, source.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        glBindTexture(GL_TEXTURE_2D, mWaterSceneDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, source.width, source.height, 0, GL_DEPTH_STENCIL,
+                     GL_UNSIGNED_INT_24_8, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, mWaterSceneFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mWaterSceneColor, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, mWaterSceneDepth, 0);
+    }
+
+    const bool restoreScissor = mLastScissorEnabled != 0;
+    if (restoreScissor) {
+        glDisable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 0;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, source.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mWaterSceneFbo);
+    GLbitfield mask = GL_COLOR_BUFFER_BIT;
+    // OpenGL cannot resolve multisampled depth with a regular depth blit. Keep reflection available under
+    // MSAA and disable only depth fade/foam rather than stalling through a CPU readback.
+    if (source.has_depth_buffer && source.msaa_level <= 1) {
+        mask |= GL_DEPTH_BUFFER_BIT;
+        mWaterDepthAvailable = true;
+    }
+    glBlitFramebuffer(0, 0, source.width, source.height, 0, 0, source.width, source.height, mask, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, source.fbo);
+
+    if (restoreScissor) {
+        glEnable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 1;
+    }
+    mWaterSceneCaptured = true;
 }
 
 void GfxRenderingAPIOGL::EndFrame() {

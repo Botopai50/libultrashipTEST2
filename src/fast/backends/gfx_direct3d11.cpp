@@ -298,6 +298,22 @@ void GfxRenderingAPIDX11::Init() {
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerToonCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create toon-lighting constant buffer.");
 
+    // SOH [Enhancement] Stylized-water constants and a dedicated linear/clamp sampler for the opaque-scene
+    // snapshot. Legacy material samplers remain untouched and continue to wrap their normal/height layers.
+    constant_buffer_desc.ByteWidth = sizeof(PerWaterCB);
+    ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerWaterCb.GetAddressOf()),
+                  mWindowBackend->GetWindowHandle(), "Failed to create stylized-water constant buffer.");
+
+    D3D11_SAMPLER_DESC water_sampler_desc = {};
+    water_sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    water_sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    water_sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    water_sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    water_sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    water_sampler_desc.MinLOD = 0.0f;
+    water_sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    ThrowIfFailed(mDevice->CreateSamplerState(&water_sampler_desc, mWaterSceneSampler.GetAddressOf()));
+
     // Create compute shader that can be used to retrieve depth buffer values
 
     const char* shader_source = R"(
@@ -479,6 +495,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         ied[ied_index++] = {
             "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
+    }
+    if (cc_features.opt_toon || cc_features.opt_stylized_water) {
         ied[ied_index++] = {
             "WORLDPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
@@ -520,6 +538,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->numInputs = cc_features.numInputs;
     prg->numFloats = numFloats;
     prg->opt_toon = cc_features.opt_toon; // SOH [Enhancement] toon lighting
+    prg->opt_stylized_water = cc_features.opt_stylized_water;
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
     prg->usedTextures[2] = cc_features.used_masks[0];
@@ -829,6 +848,50 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->Unmap(mPerToonCb.Get(), 0);
     }
 
+    if (mShaderProgram->opt_stylized_water) {
+        for (int j = 0; j < 4; j++) {
+            mPerWaterCbData.shallow_color[j] = mWaterShallowColor[j];
+            mPerWaterCbData.deep_color[j] = mWaterDeepColor[j];
+            mPerWaterCbData.foam_color[j] = mWaterFoamColor[j];
+        }
+        for (int j = 0; j < 3; j++) {
+            mPerWaterCbData.camera_pos[j] = mWaterCameraPos[j];
+            mPerWaterCbData.light_dir[j] = mWaterLightDir[j];
+            mPerWaterCbData.light_color[j] = mWaterLightColor[j];
+        }
+        for (int j = 0; j < 2; j++) {
+            mPerWaterCbData.uv_speed1[j] = mWaterUvSpeed1[j];
+            mPerWaterCbData.uv_speed2[j] = mWaterUvSpeed2[j];
+        }
+        mPerWaterCbData.fade_distance = mWaterFadeDistance;
+        mPerWaterCbData.foam_thickness = mWaterFoamThickness;
+        mPerWaterCbData.normal_scale = mWaterNormalScale;
+        mPerWaterCbData.normal_strength = mWaterNormalStrength;
+        mPerWaterCbData.reflection_intensity = mWaterReflectionIntensity;
+        mPerWaterCbData.reflection_distortion = mWaterReflectionDistortion;
+        mPerWaterCbData.fresnel_power = mWaterFresnelPower;
+        mPerWaterCbData.specular_threshold = mWaterSpecularThreshold;
+        mPerWaterCbData.specular_intensity = mWaterSpecularIntensity;
+        mPerWaterCbData.near_plane = mWaterNearPlane;
+        mPerWaterCbData.far_plane = mWaterFarPlane;
+        mPerWaterCbData.viewport_size[0] = static_cast<float>(mWaterSceneWidth);
+        mPerWaterCbData.viewport_size[1] = static_cast<float>(mWaterSceneHeight);
+        mPerWaterCbData.depth_available = mWaterDepthAvailable ? 1.0f : 0.0f;
+        mPerWaterCbData.msaa_samples = static_cast<float>(mWaterSceneSamples);
+        mPerWaterCbData.time_seconds = mWaterTimeSeconds;
+
+        D3D11_MAPPED_SUBRESOURCE waterMs = {};
+        mContext->Map(mPerWaterCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &waterMs);
+        memcpy(waterMs.pData, &mPerWaterCbData, sizeof(PerWaterCB));
+        mContext->Unmap(mPerWaterCb.Get(), 0);
+
+        ID3D11ShaderResourceView* waterResources[3] = { mWaterSceneColorSrv.Get(), mWaterSceneDepthSrv.Get(),
+                                                       mWaterSceneDepthMsaaSrv.Get() };
+        mContext->PSSetShaderResources(6, 3, waterResources);
+        ID3D11SamplerState* waterSampler = mWaterSceneSampler.Get();
+        mContext->PSSetSamplers(6, 1, &waterSampler);
+    }
+
     // Set vertex buffer data
 
     D3D11_MAPPED_SUBRESOURCE ms;
@@ -871,15 +934,107 @@ void GfxRenderingAPIDX11::OnResize() {
 
 void GfxRenderingAPIDX11::StartFrame() {
     // Set per-frame constant buffer
-    // SOH [Enhancement] mPerToonCb bound at slot b2 for the toon pixel shader; ignored by other shaders.
-    ID3D11Buffer* buffers[3] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerToonCb.Get() };
-    mContext->PSSetConstantBuffers(0, 3, buffers);
+    // SOH [Enhancement] b2/b3 are consumed only by their toon/water variants.
+    ID3D11Buffer* buffers[4] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerToonCb.Get(), mPerWaterCb.Get() };
+    mContext->PSSetConstantBuffers(0, 4, buffers);
+    mWaterSceneCaptured = false;
+    mWaterDepthAvailable = false;
 
     mPerFrameCbData.noise_frame++;
     if (mPerFrameCbData.noise_frame > 150) {
         // No high values, as noise starts to look ugly
         mPerFrameCbData.noise_frame = 0;
     }
+}
+
+void GfxRenderingAPIDX11::PrepareStylizedWater() {
+    if (mWaterSceneCaptured || mCurrentFramebuffer < 0 ||
+        mCurrentFramebuffer >= static_cast<int>(mFrameBuffers.size())) {
+        return;
+    }
+
+    FramebufferDX11& source = mFrameBuffers[mCurrentFramebuffer];
+    TextureData& sourceColor = mTextures[source.texture_id];
+    if (sourceColor.texture == nullptr || sourceColor.width == 0 || sourceColor.height == 0) {
+        return;
+    }
+
+    // The previous frame may still have the snapshots bound at t6..t8. Explicitly unbind before copying
+    // into them to avoid D3D11's read/write hazard fallback.
+    ID3D11ShaderResourceView* nullWaterResources[3] = { nullptr, nullptr, nullptr };
+    mContext->PSSetShaderResources(6, 3, nullWaterResources);
+
+    const uint32_t samples = std::max(source.msaa_level, 1U);
+    D3D11_TEXTURE2D_DESC sourceColorDesc = {};
+    sourceColor.texture->GetDesc(&sourceColorDesc);
+    if (mWaterSceneWidth != sourceColor.width || mWaterSceneHeight != sourceColor.height ||
+        mWaterSceneSamples != samples || mWaterSceneColorFormat != sourceColorDesc.Format ||
+        mWaterSceneColorTexture == nullptr) {
+        mWaterSceneWidth = sourceColor.width;
+        mWaterSceneHeight = sourceColor.height;
+        mWaterSceneSamples = samples;
+        mWaterSceneColorFormat = sourceColorDesc.Format;
+        mWaterSceneColorTexture.Reset();
+        mWaterSceneColorSrv.Reset();
+        mWaterSceneDepthTexture.Reset();
+        mWaterSceneDepthSrv.Reset();
+        mWaterSceneDepthMsaaSrv.Reset();
+
+        D3D11_TEXTURE2D_DESC colorDesc = {};
+        colorDesc.Width = mWaterSceneWidth;
+        colorDesc.Height = mWaterSceneHeight;
+        colorDesc.MipLevels = 1;
+        colorDesc.ArraySize = 1;
+        colorDesc.Format = mWaterSceneColorFormat;
+        colorDesc.SampleDesc.Count = 1;
+        colorDesc.Usage = D3D11_USAGE_DEFAULT;
+        colorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ThrowIfFailed(mDevice->CreateTexture2D(&colorDesc, nullptr, mWaterSceneColorTexture.GetAddressOf()));
+        ThrowIfFailed(mDevice->CreateShaderResourceView(mWaterSceneColorTexture.Get(), nullptr,
+                                                        mWaterSceneColorSrv.GetAddressOf()));
+    }
+
+    if (samples > 1) {
+        mContext->ResolveSubresource(mWaterSceneColorTexture.Get(), 0, sourceColor.texture.Get(), 0,
+                                     mWaterSceneColorFormat);
+    } else {
+        mContext->CopyResource(mWaterSceneColorTexture.Get(), sourceColor.texture.Get());
+    }
+
+    if (source.depth_stencil_srv != nullptr) {
+        ComPtr<ID3D11Resource> sourceDepthResource;
+        ComPtr<ID3D11Texture2D> sourceDepthTexture;
+        source.depth_stencil_srv->GetResource(sourceDepthResource.GetAddressOf());
+        sourceDepthResource.As(&sourceDepthTexture);
+
+        if (mWaterSceneDepthTexture == nullptr) {
+            D3D11_TEXTURE2D_DESC depthDesc = {};
+            sourceDepthTexture->GetDesc(&depthDesc);
+            depthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            depthDesc.CPUAccessFlags = 0;
+            depthDesc.MiscFlags = 0;
+            depthDesc.Usage = D3D11_USAGE_DEFAULT;
+            ThrowIfFailed(mDevice->CreateTexture2D(&depthDesc, nullptr, mWaterSceneDepthTexture.GetAddressOf()));
+
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            if (samples > 1) {
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+                ThrowIfFailed(mDevice->CreateShaderResourceView(mWaterSceneDepthTexture.Get(), &srvDesc,
+                                                                mWaterSceneDepthMsaaSrv.GetAddressOf()));
+            } else {
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MostDetailedMip = 0;
+                srvDesc.Texture2D.MipLevels = 1;
+                ThrowIfFailed(mDevice->CreateShaderResourceView(mWaterSceneDepthTexture.Get(), &srvDesc,
+                                                                mWaterSceneDepthSrv.GetAddressOf()));
+            }
+        }
+        mContext->CopyResource(mWaterSceneDepthTexture.Get(), sourceDepthTexture.Get());
+        mWaterDepthAvailable = true;
+    }
+
+    mWaterSceneCaptured = true;
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
@@ -1476,6 +1631,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_shadow_solid", cc_features.opt_shadow_solid },
         { "o_toon", cc_features.opt_toon },
+        { "o_water", cc_features.opt_stylized_water },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },

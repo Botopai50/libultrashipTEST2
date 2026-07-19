@@ -2,6 +2,10 @@
 
 @{GLSL_VERSION}
 
+@if(opengles && o_water)
+precision highp float;
+@end
+
 @if(core_opengl || opengles)
 out vec4 vOutColor;
 @end
@@ -24,7 +28,7 @@ out vec4 vOutColor;
 @if(o_fog) @{attr} vec4 vFog;
 @if(o_grayscale) @{attr} vec4 vGrayscaleColor;
 @if(o_toon) @{attr} vec3 vNormal;
-@if(o_toon) @{attr} vec3 vWorldPos;
+@if(o_toon || o_water) @{attr} vec3 vWorldPos;
 
 @for(i in 0..o_inputs)
     @if(o_alpha)
@@ -62,6 +66,66 @@ uniform float toon_rim_intensity;
 uniform float toon_rim_width;
 uniform float toon_rim_softness;
 uniform float toon_rim_direction_influence;
+@end
+
+@if(o_water)
+uniform sampler2D water_scene_color;
+uniform sampler2D water_scene_depth;
+uniform vec4 water_shallow_color;
+uniform vec4 water_deep_color;
+uniform vec4 water_foam_color;
+uniform vec3 water_camera_pos;
+uniform vec3 water_light_dir;
+uniform vec3 water_light_color;
+uniform vec2 water_uv_speed1;
+uniform vec2 water_uv_speed2;
+uniform float water_fade_distance;
+uniform float water_foam_thickness;
+uniform float water_normal_scale;
+uniform float water_normal_strength;
+uniform float water_reflection_intensity;
+uniform float water_reflection_distortion;
+uniform float water_fresnel_power;
+uniform float water_specular_threshold;
+uniform float water_specular_intensity;
+uniform float water_near_plane;
+uniform float water_far_plane;
+uniform vec2 water_viewport_size;
+uniform float water_depth_available;
+uniform float water_time_seconds;
+
+vec2 waterHash22(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// Four-cell Worley approximation: enough irregularity for a narrow intersection stripe without the
+// nine-cell cost of a general-purpose cellular-noise function.
+float waterCellular(vec2 p) {
+    vec2 cell = floor(p);
+    vec2 local = fract(p);
+    float nearest = 2.0;
+    for (int y = 0; y <= 1; ++y) {
+        for (int x = 0; x <= 1; ++x) {
+            vec2 corner = vec2(float(x), float(y));
+            vec2 feature = corner + waterHash22(cell + corner);
+            nearest = min(nearest, length(feature - local));
+        }
+    }
+    return nearest;
+}
+
+float waterLinearDepth(float depth01) {
+    float zNdc = depth01 * 2.0 - 1.0;
+    @if(opengles)
+        // The GLES vertex path compresses clip-space Z to preserve the port's legacy depth behavior.
+        // Undo that mapping before applying the ordinary perspective-depth inverse.
+        zNdc /= 0.3;
+    @end
+    return (2.0 * water_near_plane * water_far_plane) /
+           max(water_far_plane + water_near_plane - zNdc * (water_far_plane - water_near_plane), 0.0001);
+}
 @end
 
 uniform int texture_width[2];
@@ -200,6 +264,87 @@ void main() {
     texel = WRAP(texel, -0.51, 1.51);
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
+
+    @if(o_water)
+        float waterTime = water_time_seconds;
+        vec2 waterBaseUv = vWorldPos.xz * max(water_normal_scale, 0.00001);
+        vec2 waterUv1 = waterBaseUv + water_uv_speed1 * waterTime;
+        vec2 waterUv2 = vec2(-waterBaseUv.y, waterBaseUv.x) + water_uv_speed2 * waterTime;
+
+        vec2 waterSlope1;
+        @if(o_textures[0])
+            vec2 waterTexel1 = 1.0 / max(vec2(texture_width[0], texture_height[0]), vec2(1.0));
+            float waterH1 = dot(@{texture}(uTex0, waterUv1).rgb, vec3(0.299, 0.587, 0.114));
+            waterSlope1 = vec2(
+                dot(@{texture}(uTex0, waterUv1 + vec2(waterTexel1.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114)) - waterH1,
+                dot(@{texture}(uTex0, waterUv1 + vec2(0.0, waterTexel1.y)).rgb, vec3(0.299, 0.587, 0.114)) - waterH1);
+        @else
+            waterSlope1 = vec2(cos(waterUv1.x * 6.283), sin(waterUv1.y * 6.283)) * 0.08;
+        @end
+
+        vec2 waterSlope2;
+        @if(o_textures[1])
+            vec2 waterTexel2 = 1.0 / max(vec2(texture_width[1], texture_height[1]), vec2(1.0));
+            float waterH2 = dot(@{texture}(uTex1, waterUv2).rgb, vec3(0.299, 0.587, 0.114));
+            waterSlope2 = vec2(
+                dot(@{texture}(uTex1, waterUv2 + vec2(waterTexel2.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114)) - waterH2,
+                dot(@{texture}(uTex1, waterUv2 + vec2(0.0, waterTexel2.y)).rgb, vec3(0.299, 0.587, 0.114)) - waterH2);
+        @elseif(o_textures[0])
+            vec2 waterTexel2 = 1.0 / max(vec2(texture_width[0], texture_height[0]), vec2(1.0));
+            float waterH2 = dot(@{texture}(uTex0, waterUv2).rgb, vec3(0.299, 0.587, 0.114));
+            waterSlope2 = vec2(
+                dot(@{texture}(uTex0, waterUv2 + vec2(waterTexel2.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114)) - waterH2,
+                dot(@{texture}(uTex0, waterUv2 + vec2(0.0, waterTexel2.y)).rgb, vec3(0.299, 0.587, 0.114)) - waterH2);
+        @else
+            waterSlope2 = vec2(sin(waterUv2.x * 5.17), cos(waterUv2.y * 7.11)) * 0.08;
+        @end
+
+        vec3 waterDx = dFdx(vWorldPos);
+        vec3 waterDy = dFdy(vWorldPos);
+        vec3 waterGeometricN = normalize(cross(waterDx, waterDy));
+        vec3 waterV = normalize(water_camera_pos - vWorldPos);
+        if (dot(waterGeometricN, waterV) < 0.0) waterGeometricN = -waterGeometricN;
+        vec3 waterTangent = normalize(waterDx);
+        vec3 waterBitangent = normalize(cross(waterGeometricN, waterTangent));
+        vec2 waterSlope = (waterSlope1 + waterSlope2) * max(water_normal_strength, 0.0) * 6.0;
+        vec3 waterN = normalize(waterGeometricN - waterTangent * waterSlope.x - waterBitangent * waterSlope.y);
+
+        vec2 waterScreenUv = gl_FragCoord.xy / max(water_viewport_size, vec2(1.0));
+        float waterDepthGap = max(water_fade_distance, 1.0);
+        if (water_depth_available > 0.5) {
+            float waterSceneZ = @{texture}(water_scene_depth, clamp(waterScreenUv, 0.0, 1.0)).r;
+            waterDepthGap = max(waterLinearDepth(waterSceneZ) - waterLinearDepth(gl_FragCoord.z), 0.0);
+        }
+        float waterDeepFactor = smoothstep(0.0, max(water_fade_distance, 1.0), waterDepthGap);
+        vec4 waterBaseColor = mix(water_shallow_color, water_deep_color, waterDeepFactor);
+        float legacyDetail = clamp(dot(texel.rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
+        waterBaseColor.rgb *= mix(0.88, 1.12, legacyDetail);
+
+        float waterFresnel = pow(1.0 - clamp(dot(waterN, waterV), 0.0, 1.0),
+                                 max(water_fresnel_power, 0.01));
+        vec2 waterReflectUv = clamp(waterScreenUv + waterN.xz * water_reflection_distortion,
+                                    vec2(0.002), vec2(0.998));
+        vec3 waterSceneReflection = @{texture}(water_scene_color, waterReflectUv).rgb;
+        waterBaseColor.rgb = mix(waterBaseColor.rgb, waterSceneReflection,
+                                 clamp(waterFresnel * water_reflection_intensity, 0.0, 1.0));
+
+        vec3 waterL = normalize(water_light_dir);
+        vec3 waterH = normalize(waterL + waterV);
+        float waterSpecular = step(clamp(water_specular_threshold, 0.0, 1.0),
+                                   max(dot(waterN, waterH), 0.0));
+        waterSpecular *= step(0.0, dot(waterN, waterL)) * max(water_specular_intensity, 0.0);
+        waterBaseColor.rgb += water_light_color * waterSpecular;
+
+        float waterFoam = 0.0;
+        if (water_depth_available > 0.5) {
+            float waterContact = 1.0 - smoothstep(0.0, max(water_foam_thickness, 0.001), waterDepthGap);
+            float waterCells = waterCellular(waterBaseUv * 10.0 + water_uv_speed1 * waterTime * 2.7);
+            float waterIrregular = smoothstep(0.15, 0.72, 1.0 - waterCells);
+            waterFoam = clamp(waterContact * mix(0.45, 1.0, waterIrregular), 0.0, 1.0);
+        }
+        waterBaseColor = mix(waterBaseColor, water_foam_color, waterFoam * water_foam_color.a);
+        texel = clamp(waterBaseColor, 0.0, 1.0);
+    @end
 
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single
     // dominant light through a soft half-Lambert ramp. Wind Waker-style two-tone.
