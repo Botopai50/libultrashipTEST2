@@ -2419,11 +2419,11 @@ constexpr float kShadowDropSurfaceBias = -0.5f;
 // Preserve enough source silhouette around the raw floor/wall intersection to cover receiver bias and filtering.
 constexpr float kShadowWallSeamOverlap = 10.0f;
 constexpr float kShadowClipDepthBias = -0.0015f;
-// Exact collision floors need a little more depth separation than walls. Keep this negative in clip space: unlike a
-// world-normal offset it cannot bury the decal when the camera approaches the receiving plane.
-constexpr float kShadowMeshFloorClipDepthBias = -0.0025f;
-constexpr float kShadowWallBiasNear = -0.5f;
-constexpr float kShadowWallBiasGrazing = -4.0f;
+constexpr float kShadowAdaptiveBiasNear = -0.5f;
+constexpr float kShadowAdaptiveBiasGrazing = -4.0f;
+// Floor bias units are converted to clip depth rather than world displacement, so the same -0.5..-4 range cannot
+// bury the decal when the camera approaches the floor.
+constexpr float kShadowFloorClipBiasPerUnit = 0.001f;
 constexpr float kShadowWallSeamTolerance = 4.0f;
 
 static int ShadowSignExtend7(uint32_t value) {
@@ -3559,8 +3559,18 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             if ((receiverIsWall || receiverIsAfterWallFloor) && !wallTouchesMask) {
                 continue;
             }
-            const float receiverClipDepthBias =
-                receiverIsWall ? kShadowClipDepthBias : kShadowMeshFloorClipDepthBias;
+            float receiverClipDepthBias = kShadowClipDepthBias;
+            if (!receiverIsWall) {
+                float floorNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
+                if (ShadowNormalize(floorNormal)) {
+                    const float incidence = std::max(fabsf(ShadowDot(floorNormal, meshCastDirection)), 0.125f);
+                    const float biasMagnitude = std::clamp(
+                        -kShadowAdaptiveBiasNear / incidence, -kShadowAdaptiveBiasNear,
+                        -kShadowAdaptiveBiasGrazing);
+                    const float adaptiveClipBias = -biasMagnitude * kShadowFloorClipBiasPerUnit;
+                    receiverClipDepthBias = std::min(receiverClipDepthBias, adaptiveClipBias);
+                }
+            }
             float wallBiasNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
             float wallSurfaceBias = 0.0f;
             const bool biasReceiverWall = receiverIsWall && hasCastAlongBase && ShadowNormalize(wallBiasNormal);
@@ -3585,7 +3595,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 }
                 const float incidence = std::max(fabsf(normalCastAlignment), 0.125f);
                 const float biasMagnitude = std::clamp(
-                    -kShadowWallBiasNear / incidence, -kShadowWallBiasNear, -kShadowWallBiasGrazing);
+                    -kShadowAdaptiveBiasNear / incidence, -kShadowAdaptiveBiasNear,
+                    -kShadowAdaptiveBiasGrazing);
                 wallSurfaceBias = -biasMagnitude;
             }
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
