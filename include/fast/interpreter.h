@@ -500,11 +500,10 @@ class Interpreter {
     GfxRenderingAPI* GetCurrentRenderingAPI();
     // SOH [Enhancement] Actor shadow: global look tuning pushed once per frame by the game. alpha is the
     // core blend strength; minElevation bounds the projected shadow length.
-    void SetToonShadowParams(float alpha, float minElevation, float softness, int resolution) {
+    void SetToonShadowParams(float alpha, float minElevation, float softness) {
         mToonShadowAlpha = alpha;
         mToonShadowMinElevation = minElevation;
         mToonShadowSoftness = softness;
-        mToonShadowResolution = resolution < 64 ? 64 : (resolution > 512 ? 512 : resolution);
     }
     void StartFrame();
     void RunGuiOnly();
@@ -666,7 +665,7 @@ class Interpreter {
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
-    int mToonShadowResolution = 96;       // runtime silhouette-mask size, clamped to 64..512
+    int mToonShadowResolution = 96;       // fixed silhouette-mask size; edge quality is reconstructed in the shader
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

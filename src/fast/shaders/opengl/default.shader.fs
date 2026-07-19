@@ -146,10 +146,12 @@ void main() {
     @end
 
     @if(o_shadow_solid)
-        // Actor-shadow coverage is deliberately thresholded after bilinear filtering. The texture itself is
-        // binary, but bilinear sampling otherwise reintroduces a noisy low-alpha fringe at the silhouette.
-        if (texVal0.a < 0.5) discard;
-        texVal0.a = 1.0;
+        // Reconstruct a solid silhouette from the 96x96 coverage mask with a one-screen-pixel transition.
+        // Derivative scaling keeps the contour clean under magnification, minification and perspective without
+        // paying the CPU/upload cost of a larger mask.
+        float shadowEdgeWidth = max(fwidth(texVal0.a) * 0.75, 1.0 / 255.0);
+        texVal0.a = smoothstep(0.5 - shadowEdgeWidth, 0.5 + shadowEdgeWidth, texVal0.a);
+        if (texVal0.a <= 1.0 / 255.0) discard;
     @end
 
     @if(o_alpha) 
@@ -225,9 +227,9 @@ void main() {
                     vec3 V = viewDelta * inversesqrt(max(dot(viewDelta, viewDelta), 0.000001));
                     float edge = 1.0 - clamp(dot(toonN, V), 0.0, 1.0);
                     // Treat Width as a perceptual control: most of its travel is reserved for a very thin
-                    // silhouette contour, while the top end can still produce a broader stylized rim.
+                    // silhouette contour, while the top end can still make that fine line more visible.
                     float widthControl = clamp(toon_rim_width, 0.0, 1.0);
-                    float rimWidth = mix(0.02, 0.22, widthControl * widthControl);
+                    float rimWidth = mix(0.003, 0.045, widthControl * widthControl);
                     float threshold = 1.0 - rimWidth;
                     // Smoothness now scales screen-space antialiasing instead of being hidden behind a fixed
                     // 3.5% floor. This makes every part of the UI range visibly affect the transition without

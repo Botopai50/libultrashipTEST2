@@ -279,9 +279,10 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     @end
 
     @if(o_shadow_solid)
-        // Threshold actor-shadow coverage after bilinear filtering so the silhouette stays solid.
-        if (texVal0.a < 0.5) discard;
-        texVal0.a = 1.0;
+        // Screen-space antialiasing reconstructs a clean solid contour from the fixed 96x96 coverage mask.
+        float shadowEdgeWidth = max(fwidth(texVal0.a) * 0.75, 1.0 / 255.0);
+        texVal0.a = smoothstep(0.5 - shadowEdgeWidth, 0.5 + shadowEdgeWidth, texVal0.a);
+        if (texVal0.a <= 1.0 / 255.0) discard;
     @end
 
     @if(o_alpha) 
@@ -359,7 +360,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
                     float3 V = viewDelta * rsqrt(max(dot(viewDelta, viewDelta), 0.000001));
                     float edge = 1.0 - saturate(dot(toonN, V));
                     float widthControl = saturate(toon_rim_width);
-                    float rimWidth = lerp(0.02, 0.22, widthControl * widthControl);
+                    float rimWidth = lerp(0.003, 0.045, widthControl * widthControl);
                     float threshold = 1.0 - rimWidth;
                     float smoothControl = saturate(toon_rim_softness / 0.15);
                     float feather = max(fwidth(edge), 0.0005) * lerp(0.55, 4.0, smoothControl);

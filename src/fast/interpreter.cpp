@@ -3021,7 +3021,10 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     // Softness controls the number of optional four-neighbour passes. With softness at zero this loop is
     // skipped, preserving a solid binary mask; higher values retain the smooth-edge option.
     const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
-    const int smoothingPasses = std::clamp((int)(softness * 3.0f + 0.5f), 0, 3);
+    // Any positive setting must have a visible effect. The previous rounding left 0.01..0.16 at zero passes,
+    // making the low end of the UI appear broken; one to three cheap 96x96 passes provide the soft option.
+    const int smoothingPasses =
+        softness <= 0.001f ? 0 : std::clamp((int)ceilf(softness * 3.0f), 1, 3);
     std::vector<uint8_t> softened = values;
     for (int pass = 0; pass < smoothingPasses; pass++) {
         std::vector<uint8_t> next(softened.size(), 0);

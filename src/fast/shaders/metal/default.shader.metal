@@ -229,9 +229,10 @@ fragment float4 fragmentShader(
     @end
     
     @if(o_shadow_solid)
-        // Threshold actor-shadow coverage after bilinear filtering so the silhouette stays solid.
-        if (texVal0.w < 0.5) discard_fragment();
-        texVal0.w = 1.0;
+        // Screen-space antialiasing reconstructs a clean solid contour from the fixed 96x96 coverage mask.
+        float shadowEdgeWidth = max(fwidth(texVal0.w) * 0.75, 1.0 / 255.0);
+        texVal0.w = smoothstep(0.5 - shadowEdgeWidth, 0.5 + shadowEdgeWidth, texVal0.w);
+        if (texVal0.w <= 1.0 / 255.0) discard_fragment();
     @end
 
     @if(o_alpha)
