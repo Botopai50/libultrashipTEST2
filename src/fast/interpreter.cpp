@@ -2422,6 +2422,9 @@ constexpr float kShadowClipDepthBias = -0.0015f;
 // Exact collision floors need a little more depth separation than walls. Keep this negative in clip space: unlike a
 // world-normal offset it cannot bury the decal when the camera approaches the receiving plane.
 constexpr float kShadowMeshFloorClipDepthBias = -0.0025f;
+constexpr float kShadowWallBiasNear = -0.5f;
+constexpr float kShadowWallBiasGrazing = -4.0f;
+constexpr float kShadowWallSeamTolerance = 4.0f;
 
 static int ShadowSignExtend7(uint32_t value) {
     return (value & 0x40U) != 0 ? (int)value - 0x80 : (int)value;
@@ -3432,25 +3435,41 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         bool wallTouchesMask = true;
         if (foldWallValid && cache.coverage.size() == kShadowMaskBytes) {
             wallTouchesMask = false;
+            const int seamRadiusU = std::clamp(
+                (int)ceilf(kShadowWallSeamTolerance / effectiveWidth * (kShadowMaskSize - 1)), 2, 8);
+            const int seamRadiusV = std::clamp(
+                (int)ceilf(kShadowWallSeamTolerance / effectiveHeight * (kShadowMaskSize - 1)), 2, 8);
+            constexpr int integralStride = kShadowMaskSize + 1;
+            uint16_t coverageIntegral[integralStride * integralStride]{};
+            for (int y = 1; y <= kShadowMaskSize; y++) {
+                uint16_t rowCoverage = 0;
+                for (int x = 1; x <= kShadowMaskSize; x++) {
+                    rowCoverage += cache.coverage[(y - 1) * kShadowMaskSize + (x - 1)] >= 32 ? 1 : 0;
+                    coverageIntegral[y * integralStride + x] =
+                        coverageIntegral[(y - 1) * integralStride + x] + rowCoverage;
+                }
+            }
             auto maskCoveredAt = [&](float u, float v) {
                 const float pixelX = u * (kShadowMaskSize - 1);
                 const float pixelY = v * (kShadowMaskSize - 1);
                 const int centerX = (int)roundf(pixelX);
                 const int centerY = (int)roundf(pixelY);
-                for (int offsetY = -2; offsetY <= 2; offsetY++) {
-                    const int y = centerY + offsetY;
-                    if (y < 0 || y >= kShadowMaskSize) {
-                        continue;
-                    }
-                    for (int offsetX = -2; offsetX <= 2; offsetX++) {
-                        const int x = centerX + offsetX;
-                        if (x >= 0 && x < kShadowMaskSize &&
-                            cache.coverage[y * kShadowMaskSize + x] >= 32) {
-                            return true;
-                        }
-                    }
+                const int minX = std::max(0, centerX - seamRadiusU);
+                const int maxX = std::min(kShadowMaskSize - 1, centerX + seamRadiusU);
+                const int minY = std::max(0, centerY - seamRadiusV);
+                const int maxY = std::min(kShadowMaskSize - 1, centerY + seamRadiusV);
+                if (minX > maxX || minY > maxY) {
+                    return false;
                 }
-                return false;
+                const int x0 = minX;
+                const int x1 = maxX + 1;
+                const int y0 = minY;
+                const int y1 = maxY + 1;
+                const uint16_t covered = coverageIntegral[y1 * integralStride + x1] -
+                                         coverageIntegral[y0 * integralStride + x1] -
+                                         coverageIntegral[y1 * integralStride + x0] +
+                                         coverageIntegral[y0 * integralStride + x0];
+                return covered != 0;
             };
             for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count && !wallTouchesMask; triangle++) {
                 if ((cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) == 0) {
@@ -3542,6 +3561,33 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             }
             const float receiverClipDepthBias =
                 receiverIsWall ? kShadowClipDepthBias : kShadowMeshFloorClipDepthBias;
+            float wallBiasNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
+            float wallSurfaceBias = 0.0f;
+            const bool biasReceiverWall = receiverIsWall && hasCastAlongBase && ShadowNormalize(wallBiasNormal);
+            if (biasReceiverWall) {
+                float centroid[3]{};
+                for (int vertex = 0; vertex < 3; vertex++) {
+                    for (int axis = 0; axis < 3; axis++) {
+                        centroid[axis] += cachedTriangle[vertex][axis] / 3.0f;
+                    }
+                }
+                const bool receiverAboveBase =
+                    ShadowDot(meshBaseNormal, centroid) + meshBasePlaneD >= 0.0f;
+                float normalCastAlignment = ShadowDot(wallBiasNormal, castAlongBase);
+                // A rising wall is exposed toward the source; a cliff face is exposed away from it. Orient the
+                // normal so the requested negative bias always moves onto that open side without using the camera.
+                if ((receiverAboveBase && normalCastAlignment < 0.0f) ||
+                    (!receiverAboveBase && normalCastAlignment > 0.0f)) {
+                    for (float& axis : wallBiasNormal) {
+                        axis = -axis;
+                    }
+                    normalCastAlignment = -normalCastAlignment;
+                }
+                const float incidence = std::max(fabsf(normalCastAlignment), 0.125f);
+                const float biasMagnitude = std::clamp(
+                    -kShadowWallBiasNear / incidence, -kShadowWallBiasNear, -kShadowWallBiasGrazing);
+                wallSurfaceBias = -biasMagnitude;
+            }
             if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
                 receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
@@ -3697,6 +3743,13 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 count = clipUvBoundary(input, count, output, axes[boundary], boundaries[boundary],
                                        keepGreater[boundary]);
                 std::swap(input, output);
+            }
+            if (biasReceiverWall) {
+                for (int vertex = 0; vertex < count; vertex++) {
+                    for (int axis = 0; axis < 3; axis++) {
+                        input[vertex].world[axis] += wallBiasNormal[axis] * wallSurfaceBias;
+                    }
+                }
             }
             for (int fan = 1; fan + 1 < count; fan++) {
                 writeShadowVertex(0, input[0], receiverClipDepthBias);
