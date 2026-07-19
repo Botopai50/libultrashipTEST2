@@ -3331,12 +3331,48 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         const float effectiveMinV = centerV - halfV;
         const float effectiveWidth = halfU * 2.0f;
         const float effectiveHeight = halfV * 2.0f;
-        float castAlongBase[3] = {
-            meshCastDirection[0] - meshBaseNormal[0] * ShadowDot(meshBaseNormal, meshCastDirection),
-            meshCastDirection[1] - meshBaseNormal[1] * ShadowDot(meshBaseNormal, meshCastDirection),
-            meshCastDirection[2] - meshBaseNormal[2] * ShadowDot(meshBaseNormal, meshCastDirection),
+        // The 96x96 source mask intentionally stays on a stable canonical plane, but wall seams must use the real
+        // floor triangle under Link. Otherwise an inclined floor intersects a nearby wall at the wrong height.
+        float receiverBaseNormal[3] = { meshBaseNormal[0], meshBaseNormal[1], meshBaseNormal[2] };
+        float receiverBasePlaneD = meshBasePlaneD;
+        if ((cache.receiver_triangle_flags[0] & TOON_SHADOW_RECEIVER_FLAG_WALL) == 0) {
+            float baseTriangle[3][3]{};
+            for (int vertex = 0; vertex < 3; vertex++) {
+                for (int axis = 0; axis < 3; axis++) {
+                    baseTriangle[vertex][axis] =
+                        cache.receiver_triangles[0][vertex][axis] - cache.world_offset[axis];
+                }
+            }
+            const float edgeA[3] = { baseTriangle[1][0] - baseTriangle[0][0],
+                                     baseTriangle[1][1] - baseTriangle[0][1],
+                                     baseTriangle[1][2] - baseTriangle[0][2] };
+            const float edgeB[3] = { baseTriangle[2][0] - baseTriangle[0][0],
+                                     baseTriangle[2][1] - baseTriangle[0][1],
+                                     baseTriangle[2][2] - baseTriangle[0][2] };
+            float actualNormal[3]{};
+            ShadowCross(edgeA, edgeB, actualNormal);
+            if (ShadowNormalize(actualNormal)) {
+                if (ShadowDot(actualNormal, meshBaseNormal) < 0.0f) {
+                    for (float& axis : actualNormal) {
+                        axis = -axis;
+                    }
+                }
+                memcpy(receiverBaseNormal, actualNormal, sizeof(receiverBaseNormal));
+                receiverBasePlaneD = -ShadowDot(receiverBaseNormal, baseTriangle[0]);
+            }
+        }
+        float castAlongReceiverBase[3] = {
+            meshCastDirection[0] - receiverBaseNormal[0] * ShadowDot(receiverBaseNormal, meshCastDirection),
+            meshCastDirection[1] - receiverBaseNormal[1] * ShadowDot(receiverBaseNormal, meshCastDirection),
+            meshCastDirection[2] - receiverBaseNormal[2] * ShadowDot(receiverBaseNormal, meshCastDirection),
         };
-        const bool hasCastAlongBase = ShadowNormalize(castAlongBase);
+        const bool hasCastAlongReceiverBase = ShadowNormalize(castAlongReceiverBase);
+        auto projectReceiverPointToMaskPlane = [&](const float point[3], float out[3]) {
+            const float t = -(ShadowDot(meshBaseNormal, point) + meshBasePlaneD) / castDenom;
+            for (int axis = 0; axis < 3; axis++) {
+                out[axis] = point[axis] + meshCastDirection[axis] * t;
+            }
+        };
         auto clipUvBoundary = [](const ShadowQuadPoint* input, int inputCount, ShadowQuadPoint* output, int axis,
                                  float boundary, bool keepGreater) {
             int outputCount = 0;
@@ -3386,7 +3422,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         float foldFloorOut[3]{};
         float foldReceiverDownFloorRate = 0.0f;
         bool foldWallValid = false;
-        if (hasCastAlongBase) {
+        if (hasCastAlongReceiverBase) {
             for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count && !foldWallValid; triangle++) {
                 if ((cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) == 0) {
                     continue;
@@ -3409,24 +3445,24 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     continue;
                 }
                 foldWallPlaneD = -ShadowDot(foldWallNormal, wallTriangle[0]);
-                const float receiverAlignment = ShadowDot(meshBaseNormal, foldWallNormal);
+                const float receiverAlignment = ShadowDot(receiverBaseNormal, foldWallNormal);
                 for (int axis = 0; axis < 3; axis++) {
                     foldReceiverDown[axis] =
-                        -meshBaseNormal[axis] + foldWallNormal[axis] * receiverAlignment;
+                        -receiverBaseNormal[axis] + foldWallNormal[axis] * receiverAlignment;
                     foldFloorOut[axis] =
-                        -foldWallNormal[axis] + meshBaseNormal[axis] * receiverAlignment;
+                        -foldWallNormal[axis] + receiverBaseNormal[axis] * receiverAlignment;
                 }
                 if (!ShadowNormalize(foldReceiverDown) || !ShadowNormalize(foldFloorOut)) {
                     continue;
                 }
-                if (ShadowDot(foldFloorOut, castAlongBase) < 0.0f) {
+                if (ShadowDot(foldFloorOut, castAlongReceiverBase) < 0.0f) {
                     for (float& axis : foldFloorOut) {
                         axis = -axis;
                     }
                 }
-                foldReceiverDownFloorRate = ShadowDot(meshBaseNormal, foldReceiverDown);
+                foldReceiverDownFloorRate = ShadowDot(receiverBaseNormal, foldReceiverDown);
                 foldWallValid = foldReceiverDownFloorRate < -0.1f &&
-                                ShadowDot(foldFloorOut, castAlongBase) > 0.1f;
+                                ShadowDot(foldFloorOut, castAlongReceiverBase) > 0.1f;
             }
         }
 
@@ -3483,15 +3519,17 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                         cachedPoint[axis] =
                             cache.receiver_triangles[triangle][vertex][axis] - cache.world_offset[axis];
                     }
-                    const float floorDistance = ShadowDot(meshBaseNormal, cachedPoint) + meshBasePlaneD;
+                    const float floorDistance = ShadowDot(receiverBaseNormal, cachedPoint) + receiverBasePlaneD;
                     const float signedWallDistance = floorDistance / foldReceiverDownFloorRate;
                     float seamPoint[3]{};
                     for (int axis = 0; axis < 3; axis++) {
                         seamPoint[axis] = cachedPoint[axis] -
                                           foldReceiverDown[axis] * signedWallDistance;
                     }
-                    const float relative[3] = { seamPoint[0] - planeOrigin[0], seamPoint[1] - planeOrigin[1],
-                                                seamPoint[2] - planeOrigin[2] };
+                    float maskPoint[3]{};
+                    projectReceiverPointToMaskPlane(seamPoint, maskPoint);
+                    const float relative[3] = { maskPoint[0] - planeOrigin[0], maskPoint[1] - planeOrigin[1],
+                                                maskPoint[2] - planeOrigin[2] };
                     seamUv[vertex][0] = (ShadowDot(basisU, relative) - effectiveMinU) / effectiveWidth;
                     seamUv[vertex][1] = (ShadowDot(basisV, relative) - effectiveMinV) / effectiveHeight;
                     validSeam = validSeam && std::isfinite(seamUv[vertex][0]) &&
@@ -3573,7 +3611,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             }
             float wallBiasNormal[3] = { receiverNormal[0], receiverNormal[1], receiverNormal[2] };
             float wallSurfaceBias = 0.0f;
-            const bool biasReceiverWall = receiverIsWall && hasCastAlongBase && ShadowNormalize(wallBiasNormal);
+            const bool biasReceiverWall =
+                receiverIsWall && hasCastAlongReceiverBase && ShadowNormalize(wallBiasNormal);
             if (biasReceiverWall) {
                 float centroid[3]{};
                 for (int vertex = 0; vertex < 3; vertex++) {
@@ -3582,8 +3621,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     }
                 }
                 const bool receiverAboveBase =
-                    ShadowDot(meshBaseNormal, centroid) + meshBasePlaneD >= 0.0f;
-                float normalCastAlignment = ShadowDot(wallBiasNormal, castAlongBase);
+                    ShadowDot(receiverBaseNormal, centroid) + receiverBasePlaneD >= 0.0f;
+                float normalCastAlignment = ShadowDot(wallBiasNormal, castAlongReceiverBase);
                 // A rising wall is exposed toward the source; a cliff face is exposed away from it. Orient the
                 // normal so the requested negative bias always moves onto that open side without using the camera.
                 if ((receiverAboveBase && normalCastAlignment < 0.0f) ||
@@ -3599,23 +3638,23 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     -kShadowAdaptiveBiasGrazing);
                 wallSurfaceBias = -biasMagnitude;
             }
-            if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
-                const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
-                receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
-                receiverDown[1] = -meshBaseNormal[1] + receiverNormal[1] * receiverAlignment;
-                receiverDown[2] = -meshBaseNormal[2] + receiverNormal[2] * receiverAlignment;
-                floorOut[0] = -receiverNormal[0] + meshBaseNormal[0] * receiverAlignment;
-                floorOut[1] = -receiverNormal[1] + meshBaseNormal[1] * receiverAlignment;
-                floorOut[2] = -receiverNormal[2] + meshBaseNormal[2] * receiverAlignment;
+            if (receiverIsWall && hasCastAlongReceiverBase && ShadowNormalize(receiverNormal)) {
+                const float receiverAlignment = ShadowDot(receiverBaseNormal, receiverNormal);
+                receiverDown[0] = -receiverBaseNormal[0] + receiverNormal[0] * receiverAlignment;
+                receiverDown[1] = -receiverBaseNormal[1] + receiverNormal[1] * receiverAlignment;
+                receiverDown[2] = -receiverBaseNormal[2] + receiverNormal[2] * receiverAlignment;
+                floorOut[0] = -receiverNormal[0] + receiverBaseNormal[0] * receiverAlignment;
+                floorOut[1] = -receiverNormal[1] + receiverBaseNormal[1] * receiverAlignment;
+                floorOut[2] = -receiverNormal[2] + receiverBaseNormal[2] * receiverAlignment;
                 if (ShadowNormalize(receiverDown) && ShadowNormalize(floorOut)) {
-                    if (ShadowDot(floorOut, castAlongBase) < 0.0f) {
+                    if (ShadowDot(floorOut, castAlongReceiverBase) < 0.0f) {
                         floorOut[0] = -floorOut[0];
                         floorOut[1] = -floorOut[1];
                         floorOut[2] = -floorOut[2];
                     }
-                    receiverDownFloorRate = ShadowDot(meshBaseNormal, receiverDown);
+                    receiverDownFloorRate = ShadowDot(receiverBaseNormal, receiverDown);
                     unfoldReceiver = receiverDownFloorRate < -0.1f &&
-                                     ShadowDot(floorOut, castAlongBase) > 0.1f;
+                                     ShadowDot(floorOut, castAlongReceiverBase) > 0.1f;
                 }
             }
 
@@ -3623,7 +3662,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             float lowerOutWallRate = 0.0f;
             bool unfoldAfterWallFloor = false;
             if (receiverIsAfterWallFloor && foldWallValid && ShadowNormalize(receiverNormal)) {
-                if (ShadowDot(receiverNormal, meshBaseNormal) < 0.0f) {
+                if (ShadowDot(receiverNormal, receiverBaseNormal) < 0.0f) {
                     for (float& axis : receiverNormal) {
                         axis = -axis;
                     }
@@ -3633,7 +3672,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     lowerOut[axis] = foldFloorOut[axis] - receiverNormal[axis] * floorOutAlignment;
                 }
                 if (ShadowNormalize(lowerOut)) {
-                    if (ShadowDot(lowerOut, castAlongBase) < 0.0f) {
+                    if (ShadowDot(lowerOut, castAlongReceiverBase) < 0.0f) {
                         for (float& axis : lowerOut) {
                             axis = -axis;
                         }
@@ -3660,25 +3699,30 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                     for (int axis = 0; axis < 3; axis++) {
                         lowerEdge[axis] = cachedTriangle[vertex][axis] - lowerOut[axis] * lowerDistance;
                     }
-                    const float floorDistance = ShadowDot(meshBaseNormal, lowerEdge) + meshBasePlaneD;
+                    const float floorDistance = ShadowDot(receiverBaseNormal, lowerEdge) + receiverBasePlaneD;
                     const float signedWallDistance = floorDistance / foldReceiverDownFloorRate;
                     const float wallDistance = fabsf(signedWallDistance);
+                    float unfoldedPoint[3]{};
                     for (int axis = 0; axis < 3; axis++) {
                         const float topEdge = lowerEdge[axis] -
                                               foldReceiverDown[axis] * signedWallDistance;
-                        basePoint[axis] = topEdge + foldFloorOut[axis] * (wallDistance + lowerDistance);
+                        unfoldedPoint[axis] =
+                            topEdge + foldFloorOut[axis] * (wallDistance + lowerDistance);
                     }
+                    projectReceiverPointToMaskPlane(unfoldedPoint, basePoint);
                     valid = valid && std::isfinite(lowerDistance) && std::isfinite(signedWallDistance);
                 } else if (unfoldReceiver) {
                     const float floorDistance =
-                        ShadowDot(meshBaseNormal, cachedTriangle[vertex]) + meshBasePlaneD;
+                        ShadowDot(receiverBaseNormal, cachedTriangle[vertex]) + receiverBasePlaneD;
                     const float signedWallDistance = floorDistance / receiverDownFloorRate;
                     const float wallDistance = fabsf(signedWallDistance);
+                    float unfoldedPoint[3]{};
                     for (int axis = 0; axis < 3; axis++) {
                         const float edgePoint = cachedTriangle[vertex][axis] -
                                                 receiverDown[axis] * signedWallDistance;
-                        basePoint[axis] = edgePoint + floorOut[axis] * wallDistance;
+                        unfoldedPoint[axis] = edgePoint + floorOut[axis] * wallDistance;
                     }
+                    projectReceiverPointToMaskPlane(unfoldedPoint, basePoint);
                 } else {
                     const float t = -(ShadowDot(meshBaseNormal, cachedTriangle[vertex]) + meshBasePlaneD) / castDenom;
                     for (int axis = 0; axis < 3; axis++) {
