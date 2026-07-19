@@ -225,18 +225,19 @@ void main() {
                 if (toon_rim_enabled > 0.5) {
                     vec3 viewDelta = toon_camera_pos - vWorldPos;
                     vec3 V = viewDelta * inversesqrt(max(dot(viewDelta, viewDelta), 0.000001));
-                    float edge = 1.0 - clamp(dot(toonN, V), 0.0, 1.0);
-                    // Treat Width as a perceptual control: most of its travel is reserved for a very thin
-                    // silhouette contour, while the top end can still make that fine line more visible.
+                    float facing = clamp(dot(toonN, V), 0.0, 1.0);
+                    // Convert angular facing into an approximate screen-pixel distance from the silhouette.
+                    // A nearly side-facing triangle with little variation therefore no longer lights up as a
+                    // whole face, which is the characteristic failure of a plain Fresnel threshold.
+                    float facingGradient = max(fwidth(facing), 0.0001);
+                    float silhouetteDistancePixels = facing / facingGradient;
                     float widthControl = clamp(toon_rim_width, 0.0, 1.0);
-                    float rimWidth = mix(0.003, 0.045, widthControl * widthControl);
-                    float threshold = 1.0 - rimWidth;
-                    // Smoothness now scales screen-space antialiasing instead of being hidden behind a fixed
-                    // 3.5% floor. This makes every part of the UI range visibly affect the transition without
-                    // changing the contour's geometric width.
+                    float rimWidthPixels = mix(0.25, 1.0, widthControl * widthControl);
                     float smoothControl = clamp(toon_rim_softness / 0.15, 0.0, 1.0);
-                    float feather = max(fwidth(edge), 0.0005) * mix(0.55, 4.0, smoothControl);
-                    float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
+                    float featherPixels = mix(0.30, 0.65, smoothControl);
+                    float rimBand = 1.0 - smoothstep(rimWidthPixels - featherPixels,
+                                                     rimWidthPixels + featherPixels,
+                                                     silhouetteDistancePixels);
 
                     float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
                     float backLighting = smoothstep(0.0, 0.65, dot(-V, toonL));

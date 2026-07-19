@@ -3021,27 +3021,33 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     // Softness controls the number of optional four-neighbour passes. With softness at zero this loop is
     // skipped, preserving a solid binary mask; higher values retain the smooth-edge option.
     const float softness = std::clamp(mToonShadowSoftness, 0.0f, 1.0f);
-    // Any positive setting must have a visible effect. The previous rounding left 0.01..0.16 at zero passes,
-    // making the low end of the UI appear broken; one to three cheap 96x96 passes provide the soft option.
+    // Keep the low end subtle: the old 50/50 box kernel made the first positive step look heavily blurred.
+    // Pass count still responds immediately, while blend strength grows continuously with the slider.
     const int smoothingPasses =
         softness <= 0.001f ? 0 : std::clamp((int)ceilf(softness * 3.0f), 1, 3);
+    const float blurStrength = softness * 0.35f;
     std::vector<uint8_t> softened = values;
     for (int pass = 0; pass < smoothingPasses; pass++) {
         std::vector<uint8_t> next(softened.size(), 0);
         for (int y = 0; y < shadowMaskSize; y++) {
             for (int x = 0; x < shadowMaskSize; x++) {
                 const int center = softened[y * shadowMaskSize + x];
-                int sum = center * 4;
+                int neighbourSum = 0;
+                int neighbourCount = 0;
                 const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
                 for (const auto& offset : offsets) {
                     const int nx = x + offset[0];
                     const int ny = y + offset[1];
                     if (nx >= 0 && nx < shadowMaskSize && ny >= 0 && ny < shadowMaskSize) {
                         const int neighbour = softened[ny * shadowMaskSize + nx];
-                        sum += neighbour;
+                        neighbourSum += neighbour;
+                        neighbourCount++;
                     }
                 }
-                next[y * shadowMaskSize + x] = (uint8_t)(sum / 8);
+                const float neighbourAverage =
+                    neighbourCount != 0 ? (float)neighbourSum / neighbourCount : (float)center;
+                next[y * shadowMaskSize + x] =
+                    (uint8_t)std::clamp((int)roundf(center + (neighbourAverage - center) * blurStrength), 0, 255);
             }
         }
         softened.swap(next);

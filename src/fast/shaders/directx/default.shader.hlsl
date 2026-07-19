@@ -358,13 +358,16 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
                 if (toon_rim_enabled > 0.5) {
                     float3 viewDelta = toon_camera_pos - input.worldPos;
                     float3 V = viewDelta * rsqrt(max(dot(viewDelta, viewDelta), 0.000001));
-                    float edge = 1.0 - saturate(dot(toonN, V));
+                    float facing = saturate(dot(toonN, V));
+                    float facingGradient = max(fwidth(facing), 0.0001);
+                    float silhouetteDistancePixels = facing / facingGradient;
                     float widthControl = saturate(toon_rim_width);
-                    float rimWidth = lerp(0.003, 0.045, widthControl * widthControl);
-                    float threshold = 1.0 - rimWidth;
+                    float rimWidthPixels = lerp(0.25, 1.0, widthControl * widthControl);
                     float smoothControl = saturate(toon_rim_softness / 0.15);
-                    float feather = max(fwidth(edge), 0.0005) * lerp(0.55, 4.0, smoothControl);
-                    float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
+                    float featherPixels = lerp(0.30, 0.65, smoothControl);
+                    float rimBand = 1.0 - smoothstep(rimWidthPixels - featherPixels,
+                                                     rimWidthPixels + featherPixels,
+                                                     silhouetteDistancePixels);
 
                     float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
                     float backLighting = smoothstep(0.0, 0.65, dot(-V, toonL));
