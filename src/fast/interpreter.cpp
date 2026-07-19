@@ -3398,25 +3398,25 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             float receiverDown[3]{};
             float floorOut[3]{};
             float receiverDownFloorRate = 0.0f;
-            if (hasCastAlongBase && ShadowNormalize(receiverNormal)) {
+            const bool receiverIsWall =
+                (cache.receiver_triangle_flags[triangle] & TOON_SHADOW_RECEIVER_FLAG_WALL) != 0;
+            if (receiverIsWall && hasCastAlongBase && ShadowNormalize(receiverNormal)) {
                 const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
-                if (fabsf(receiverAlignment) <= 0.8f) {
-                    receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
-                    receiverDown[1] = -meshBaseNormal[1] + receiverNormal[1] * receiverAlignment;
-                    receiverDown[2] = -meshBaseNormal[2] + receiverNormal[2] * receiverAlignment;
-                    floorOut[0] = -receiverNormal[0] + meshBaseNormal[0] * receiverAlignment;
-                    floorOut[1] = -receiverNormal[1] + meshBaseNormal[1] * receiverAlignment;
-                    floorOut[2] = -receiverNormal[2] + meshBaseNormal[2] * receiverAlignment;
-                    if (ShadowNormalize(receiverDown) && ShadowNormalize(floorOut)) {
-                        if (ShadowDot(floorOut, castAlongBase) < 0.0f) {
-                            floorOut[0] = -floorOut[0];
-                            floorOut[1] = -floorOut[1];
-                            floorOut[2] = -floorOut[2];
-                        }
-                        receiverDownFloorRate = ShadowDot(meshBaseNormal, receiverDown);
-                        unfoldReceiver = receiverDownFloorRate < -0.1f &&
-                                         ShadowDot(floorOut, castAlongBase) > 0.1f;
+                receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
+                receiverDown[1] = -meshBaseNormal[1] + receiverNormal[1] * receiverAlignment;
+                receiverDown[2] = -meshBaseNormal[2] + receiverNormal[2] * receiverAlignment;
+                floorOut[0] = -receiverNormal[0] + meshBaseNormal[0] * receiverAlignment;
+                floorOut[1] = -receiverNormal[1] + meshBaseNormal[1] * receiverAlignment;
+                floorOut[2] = -receiverNormal[2] + meshBaseNormal[2] * receiverAlignment;
+                if (ShadowNormalize(receiverDown) && ShadowNormalize(floorOut)) {
+                    if (ShadowDot(floorOut, castAlongBase) < 0.0f) {
+                        floorOut[0] = -floorOut[0];
+                        floorOut[1] = -floorOut[1];
+                        floorOut[2] = -floorOut[2];
                     }
+                    receiverDownFloorRate = ShadowDot(meshBaseNormal, receiverDown);
+                    unfoldReceiver = receiverDownFloorRate < -0.1f &&
+                                     ShadowDot(floorOut, castAlongBase) > 0.1f;
                 }
             }
 
@@ -5512,6 +5512,7 @@ bool gfx_set_toon_shadow_receiver_mesh_handler_custom(F3DGfx** cmd0) {
             }
         }
         if (finite) {
+            cache.receiver_triangle_flags[cache.receiver_triangle_count] = mesh->triangleFlags[triangle];
             cache.receiver_triangle_count++;
         }
     }
