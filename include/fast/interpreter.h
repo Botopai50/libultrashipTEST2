@@ -413,6 +413,7 @@ struct ShadowMaskProjection {
     uint32_t version = 0;
     uint32_t texture_id = 0;
     uintptr_t texture_key = 0;
+    uint16_t resolution = 96;
     std::vector<uint8_t> coverage;
     float plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float plane_d = 0.0f;
@@ -435,6 +436,7 @@ struct ShadowMaskCache {
     uint8_t texture_count = 0;
     uint32_t texture_ids[3] = {};
     uintptr_t texture_keys[3] = {};
+    uint16_t resolution = 96;
     // Keep the rasterized coverage at 8 bits until the texture upload. Quantizing the edge to CI4 before
     // filtering produces visible alpha steps around the projected silhouette.
     std::vector<uint8_t> coverage;
@@ -448,7 +450,7 @@ struct ShadowMaskCache {
     float max_u = 0.0f;
     float min_v = 0.0f;
     float max_v = 0.0f;
-    // Live placement is updated every actor pass even when the 96x96 mask is reused.
+    // Live placement is updated every actor pass even when the configurable mask is reused.
     float draw_plane_normal[3] = { 0.0f, 1.0f, 0.0f };
     float draw_plane_d = 0.0f;
     // Secondary receivers use the same light-ray projection for walls above the floor and faces below a drop.
@@ -498,10 +500,11 @@ class Interpreter {
     GfxRenderingAPI* GetCurrentRenderingAPI();
     // SOH [Enhancement] Actor shadow: global look tuning pushed once per frame by the game. alpha is the
     // core blend strength; minElevation bounds the projected shadow length.
-    void SetToonShadowParams(float alpha, float minElevation, float softness) {
+    void SetToonShadowParams(float alpha, float minElevation, float softness, int resolution) {
         mToonShadowAlpha = alpha;
         mToonShadowMinElevation = minElevation;
         mToonShadowSoftness = softness;
+        mToonShadowResolution = resolution < 64 ? 64 : (resolution > 512 ? 512 : resolution);
     }
     void StartFrame();
     void RunGuiOnly();
@@ -555,7 +558,7 @@ class Interpreter {
     void SelectToonLight();
 
     // SOH [Enhancement] Actor shadow: rasterize the current object's captured world-space triangles into a
-    // cached 96x96 8-bit coverage silhouette. Work is performed only for an actor version scheduled by the game-side
+    // cached 8-bit coverage silhouette. Work is performed only for an actor version scheduled by the game-side
     // update budget.
     void FlushToonShadow();
     // SOH [Enhancement] Actor shadow: draw every valid cached mask as one textured quad.
@@ -663,6 +666,7 @@ class Interpreter {
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
     float mToonShadowSoftness = 0.35f;    // edge smoothing passes, 0 = crisp, 1 = broad
+    int mToonShadowResolution = 96;       // runtime silhouette-mask size, clamped to 64..512
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

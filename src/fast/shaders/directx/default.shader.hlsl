@@ -358,8 +358,11 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
                     float3 viewDelta = toon_camera_pos - input.worldPos;
                     float3 V = viewDelta * rsqrt(max(dot(viewDelta, viewDelta), 0.000001));
                     float edge = 1.0 - saturate(dot(toonN, V));
-                    float feather = max(max(toon_rim_softness, 0.035), fwidth(edge) * 1.5);
-                    float threshold = saturate(1.0 - toon_rim_width);
+                    float widthControl = saturate(toon_rim_width);
+                    float rimWidth = lerp(0.02, 0.22, widthControl * widthControl);
+                    float threshold = 1.0 - rimWidth;
+                    float smoothControl = saturate(toon_rim_softness / 0.15);
+                    float feather = max(fwidth(edge), 0.0005) * lerp(0.55, 4.0, smoothControl);
                     float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
 
                     float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
@@ -369,9 +372,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
                     directionalMask = lerp(1.0, directionalMask, directionInfluence);
 
                     float materialRimMask = 1.0;
-                    float rimMask = saturate(rimBand * directionalMask * materialRimMask * 0.45 *
+                    float rimMask = saturate(rimBand * directionalMask * materialRimMask *
                                              max(toon_rim_intensity, 0.0));
-                    float3 rimColor = lerp(albedoColor, toon_light_color, 0.65);
+                    float3 rimColor = lerp(float3(1.0, 1.0, 1.0), saturate(toon_light_color), 0.35);
                     texel.rgb = lerp(texel.rgb, rimColor, rimMask);
                 }
             @end

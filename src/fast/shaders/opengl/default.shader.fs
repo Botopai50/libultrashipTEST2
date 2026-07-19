@@ -224,8 +224,16 @@ void main() {
                     vec3 viewDelta = toon_camera_pos - vWorldPos;
                     vec3 V = viewDelta * inversesqrt(max(dot(viewDelta, viewDelta), 0.000001));
                     float edge = 1.0 - clamp(dot(toonN, V), 0.0, 1.0);
-                    float feather = max(max(toon_rim_softness, 0.035), fwidth(edge) * 1.5);
-                    float threshold = clamp(1.0 - toon_rim_width, 0.0, 1.0);
+                    // Treat Width as a perceptual control: most of its travel is reserved for a very thin
+                    // silhouette contour, while the top end can still produce a broader stylized rim.
+                    float widthControl = clamp(toon_rim_width, 0.0, 1.0);
+                    float rimWidth = mix(0.02, 0.22, widthControl * widthControl);
+                    float threshold = 1.0 - rimWidth;
+                    // Smoothness now scales screen-space antialiasing instead of being hidden behind a fixed
+                    // 3.5% floor. This makes every part of the UI range visibly affect the transition without
+                    // changing the contour's geometric width.
+                    float smoothControl = clamp(toon_rim_softness / 0.15, 0.0, 1.0);
+                    float feather = max(fwidth(edge), 0.0005) * mix(0.55, 4.0, smoothControl);
                     float rimBand = smoothstep(threshold - feather, threshold + feather, edge);
 
                     float lightSide = smoothstep(-0.35, 0.10, dot(toonN, toonL));
@@ -239,9 +247,11 @@ void main() {
                     // This shader variant itself is the material mask: opaque + lit + actor-toon eligible.
                     // Emissive/unlit and transparent materials never reach this branch.
                     float materialRimMask = 1.0;
-                    float rimMask = clamp(rimBand * directionalMask * materialRimMask * 0.45 *
+                    float rimMask = clamp(rimBand * directionalMask * materialRimMask *
                                           max(toon_rim_intensity, 0.0), 0.0, 1.0);
-                    vec3 rimColor = mix(albedoColor, toon_light_color, 0.65);
+                    // A mostly pale key-light tint matches the reference's bright outline instead of merely
+                    // lifting the material albedo across a wide side-facing region.
+                    vec3 rimColor = mix(vec3(1.0), clamp(toon_light_color, 0.0, 1.0), 0.35);
                     texel.rgb = mix(texel.rgb, rimColor, rimMask);
                 }
             @end

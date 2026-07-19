@@ -2402,9 +2402,7 @@ static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d
 }
 
 namespace {
-constexpr int kShadowMaskSize = 96;
 constexpr int kShadowCoverageSamples = 4;
-constexpr size_t kShadowMaskBytes = kShadowMaskSize * kShadowMaskSize;
 constexpr int kShadowTextureBuffers = 3;
 constexpr uint8_t kShadowPaletteIntensity = 0;
 constexpr uint8_t kShadowFlagValid = 1 << 0;
@@ -2513,7 +2511,8 @@ void Interpreter::FlushToonShadow() {
     }
 
     ShadowMaskCache& cache = cacheIt->second;
-    if (cache.version == mRsp->toon_shadow_version && cache.texture_count != 0) {
+    if (cache.version == mRsp->toon_shadow_version && cache.texture_count != 0 &&
+        cache.resolution == mToonShadowResolution) {
         mShadowVerts.clear();
         return;
     }
@@ -2532,6 +2531,7 @@ void Interpreter::FlushToonShadow() {
         mRsp->toon_shadow_edge_valid) {
         ShadowMaskCache edgeCache;
         edgeCache.version = cache.edge.version;
+        edgeCache.resolution = cache.edge.resolution;
         edgeCache.texture_count = cache.edge.texture_id != 0 ? 1 : 0;
         memcpy(edgeCache.plane_normal, cache.edge.plane_normal, sizeof(edgeCache.plane_normal));
         edgeCache.plane_d = cache.edge.plane_d;
@@ -2566,6 +2566,7 @@ void Interpreter::FlushToonShadow() {
             cache.edge.max_u = edgeCache.max_u;
             cache.edge.min_v = edgeCache.min_v;
             cache.edge.max_v = edgeCache.max_v;
+            cache.edge.resolution = edgeCache.resolution;
             cache.edge.coverage = std::move(edgeCache.coverage);
             UploadShadowProjection(cache.edge);
             cache.edge.valid = cache.edge.texture_id != 0;
@@ -2578,6 +2579,8 @@ void Interpreter::FlushToonShadow() {
 
 void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     cache.coverage.clear();
+    const int shadowMaskSize = mToonShadowResolution;
+    cache.resolution = (uint16_t)shadowMaskSize;
     if (!cache.reuse_cast_direction) {
         cache.cast_direction_valid = false;
     }
@@ -2896,7 +2899,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         return;
     }
 
-    const float pad = std::max(width, height) / (float)kShadowMaskSize;
+    const float pad = std::max(width, height) / (float)shadowMaskSize;
     minU -= pad;
     maxU += pad;
     minV -= pad;
@@ -2904,7 +2907,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     float rasterWidth = maxU - minU;
     float rasterHeight = maxV - minV;
 
-    // Keep the 96x96 world-to-texel mapping stable while an actor animates. Recomputing a tight box for every
+    // Keep the world-to-texel mapping stable while an actor animates. Recomputing a tight box for every
     // pose makes the quad scale and slide by sub-texel amounts, which reads as shimmer on a running Link. Reuse
     // the previous footprint size, follow the current silhouette center, and snap that center to a half-texel
     // grid. A genuinely larger pose can still expand the footprint; it is never clipped by the stabilizer.
@@ -2916,8 +2919,8 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         rasterHeight = std::max(rasterHeight, previousHeight);
         const float centerU = (minU + maxU) * 0.5f;
         const float centerV = (minV + maxV) * 0.5f;
-        const float quantumU = rasterWidth / (float)(kShadowMaskSize - 1) * 0.5f;
-        const float quantumV = rasterHeight / (float)(kShadowMaskSize - 1) * 0.5f;
+        const float quantumU = rasterWidth / (float)(shadowMaskSize - 1) * 0.5f;
+        const float quantumV = rasterHeight / (float)(shadowMaskSize - 1) * 0.5f;
         const float stableCenterU = quantumU > 0.0001f ? roundf(centerU / quantumU) * quantumU : centerU;
         const float stableCenterV = quantumV > 0.0001f ? roundf(centerV / quantumV) * quantumV : centerV;
         minU = stableCenterU - rasterWidth * 0.5f;
@@ -2925,11 +2928,11 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         minV = stableCenterV - rasterHeight * 0.5f;
         maxV = stableCenterV + rasterHeight * 0.5f;
     }
-    std::vector<uint8_t> values(kShadowMaskSize * kShadowMaskSize, 0);
+    std::vector<uint8_t> values((size_t)shadowMaskSize * shadowMaskSize, 0);
 
     auto toPixel = [&](float u, float v, float out[2]) {
-        out[0] = (u - minU) / rasterWidth * (float)(kShadowMaskSize - 1);
-        out[1] = (v - minV) / rasterHeight * (float)(kShadowMaskSize - 1);
+        out[0] = (u - minU) / rasterWidth * (float)(shadowMaskSize - 1);
+        out[1] = (v - minV) / rasterHeight * (float)(shadowMaskSize - 1);
     };
 
     for (const ProjectedTriangle& triangle : triangles) {
@@ -2938,9 +2941,9 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
         toPixel(triangle.p[1][0], triangle.p[1][1], p[1]);
         toPixel(triangle.p[2][0], triangle.p[2][1], p[2]);
         const int x0 = std::max(0, (int)floorf(std::min({ p[0][0], p[1][0], p[2][0] })));
-        const int x1 = std::min(kShadowMaskSize - 1, (int)ceilf(std::max({ p[0][0], p[1][0], p[2][0] })));
+        const int x1 = std::min(shadowMaskSize - 1, (int)ceilf(std::max({ p[0][0], p[1][0], p[2][0] })));
         const int y0 = std::max(0, (int)floorf(std::min({ p[0][1], p[1][1], p[2][1] })));
-        const int y1 = std::min(kShadowMaskSize - 1, (int)ceilf(std::max({ p[0][1], p[1][1], p[2][1] })));
+        const int y1 = std::min(shadowMaskSize - 1, (int)ceilf(std::max({ p[0][1], p[1][1], p[2][1] })));
         for (int y = y0; y <= y1; y++) {
             for (int x = x0; x <= x1; x++) {
                 // Supersample the contour instead of relying on a 2x2 mask, whose five possible coverage
@@ -2957,7 +2960,7 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
                 }
                 const int sampleCount = kShadowCoverageSamples * kShadowCoverageSamples;
                 const uint8_t coverage = (uint8_t)((covered * 255 + sampleCount / 2) / sampleCount);
-                values[y * kShadowMaskSize + x] = std::max(values[y * kShadowMaskSize + x], coverage);
+                values[y * shadowMaskSize + x] = std::max(values[y * shadowMaskSize + x], coverage);
             }
         }
     }
@@ -2978,33 +2981,33 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     flood.reserve(values.size());
 
     auto seedExterior = [&](int x, int y) {
-        const int index = y * kShadowMaskSize + x;
+        const int index = y * shadowMaskSize + x;
         if (exterior[index] == 0 && solid[index] == 0) {
             exterior[index] = 1;
             flood.push_back(index);
         }
     };
-    for (int coordinate = 0; coordinate < kShadowMaskSize; coordinate++) {
+    for (int coordinate = 0; coordinate < shadowMaskSize; coordinate++) {
         seedExterior(coordinate, 0);
-        seedExterior(coordinate, kShadowMaskSize - 1);
+        seedExterior(coordinate, shadowMaskSize - 1);
         seedExterior(0, coordinate);
-        seedExterior(kShadowMaskSize - 1, coordinate);
+        seedExterior(shadowMaskSize - 1, coordinate);
     }
 
     for (size_t cursor = 0; cursor < flood.size(); cursor++) {
         const int index = flood[cursor];
-        const int x = index % kShadowMaskSize;
-        const int y = index / kShadowMaskSize;
+        const int x = index % shadowMaskSize;
+        const int y = index / shadowMaskSize;
         if (x > 0) {
             seedExterior(x - 1, y);
         }
-        if (x + 1 < kShadowMaskSize) {
+        if (x + 1 < shadowMaskSize) {
             seedExterior(x + 1, y);
         }
         if (y > 0) {
             seedExterior(x, y - 1);
         }
-        if (y + 1 < kShadowMaskSize) {
+        if (y + 1 < shadowMaskSize) {
             seedExterior(x, y + 1);
         }
     }
@@ -3022,20 +3025,20 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
     std::vector<uint8_t> softened = values;
     for (int pass = 0; pass < smoothingPasses; pass++) {
         std::vector<uint8_t> next(softened.size(), 0);
-        for (int y = 0; y < kShadowMaskSize; y++) {
-            for (int x = 0; x < kShadowMaskSize; x++) {
-                const int center = softened[y * kShadowMaskSize + x];
+        for (int y = 0; y < shadowMaskSize; y++) {
+            for (int x = 0; x < shadowMaskSize; x++) {
+                const int center = softened[y * shadowMaskSize + x];
                 int sum = center * 4;
                 const int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
                 for (const auto& offset : offsets) {
                     const int nx = x + offset[0];
                     const int ny = y + offset[1];
-                    if (nx >= 0 && nx < kShadowMaskSize && ny >= 0 && ny < kShadowMaskSize) {
-                        const int neighbour = softened[ny * kShadowMaskSize + nx];
+                    if (nx >= 0 && nx < shadowMaskSize && ny >= 0 && ny < shadowMaskSize) {
+                        const int neighbour = softened[ny * shadowMaskSize + nx];
                         sum += neighbour;
                     }
                 }
-                next[y * kShadowMaskSize + x] = (uint8_t)(sum / 8);
+                next[y * shadowMaskSize + x] = (uint8_t)(sum / 8);
             }
         }
         softened.swap(next);
@@ -3057,7 +3060,9 @@ void Interpreter::RasterizeShadowMask(ShadowMaskCache& cache) {
 }
 
 void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
-    if (cache.coverage.size() != kShadowMaskBytes || mRapi == nullptr) {
+    const int shadowMaskSize = cache.resolution;
+    const size_t shadowMaskBytes = (size_t)shadowMaskSize * shadowMaskSize;
+    if (cache.coverage.size() != shadowMaskBytes || mRapi == nullptr) {
         return;
     }
 
@@ -3080,17 +3085,17 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
     mRapi->SelectTexture(0, cache.texture_ids[nextSlot]);
     mRapi->SetSamplerParameters(0, true, G_TX_CLAMP, G_TX_CLAMP);
 
-    mShadowUploadBuffer.resize(kShadowMaskSize * kShadowMaskSize * 4);
+    mShadowUploadBuffer.resize(shadowMaskBytes * 4);
     // The renderer API uploads RGBA32. Keep the high-resolution alpha coverage generated by the rasterizer
     // instead of expanding quantized CI4 indices through a 16-entry palette. Opacity is applied by the
     // primitive alpha in DrawShadowQuad so the shader can threshold the sampled coverage before blending.
-    for (size_t i = 0; i < kShadowMaskSize * kShadowMaskSize; i++) {
+    for (size_t i = 0; i < shadowMaskBytes; i++) {
         mShadowUploadBuffer[i * 4 + 0] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 1] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 2] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 3] = cache.coverage[i];
     }
-    mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
+    mRapi->UploadTexture(mShadowUploadBuffer.data(), shadowMaskSize, shadowMaskSize);
 
     cache.active_texture = nextSlot;
     // The mask upload temporarily owns texture unit 0. Do not try to restore a possibly stale cache entry: clear
@@ -3101,7 +3106,9 @@ void Interpreter::UploadShadowMask(ShadowMaskCache& cache) {
 }
 
 void Interpreter::UploadShadowProjection(ShadowMaskProjection& projection) {
-    if (projection.coverage.size() != kShadowMaskBytes || mRapi == nullptr) {
+    const int shadowMaskSize = projection.resolution;
+    const size_t shadowMaskBytes = (size_t)shadowMaskSize * shadowMaskSize;
+    if (projection.coverage.size() != shadowMaskBytes || mRapi == nullptr) {
         return;
     }
 
@@ -3119,14 +3126,14 @@ void Interpreter::UploadShadowProjection(ShadowMaskProjection& projection) {
     Flush();
     mRapi->SelectTexture(0, projection.texture_id);
     mRapi->SetSamplerParameters(0, true, G_TX_CLAMP, G_TX_CLAMP);
-    mShadowUploadBuffer.resize(kShadowMaskSize * kShadowMaskSize * 4);
-    for (size_t i = 0; i < kShadowMaskSize * kShadowMaskSize; i++) {
+    mShadowUploadBuffer.resize(shadowMaskBytes * 4);
+    for (size_t i = 0; i < shadowMaskBytes; i++) {
         mShadowUploadBuffer[i * 4 + 0] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 1] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 2] = kShadowPaletteIntensity;
         mShadowUploadBuffer[i * 4 + 3] = projection.coverage[i];
     }
-    mRapi->UploadTexture(mShadowUploadBuffer.data(), kShadowMaskSize, kShadowMaskSize);
+    mRapi->UploadTexture(mShadowUploadBuffer.data(), shadowMaskSize, shadowMaskSize);
     projection.coverage.clear();
     mRapi->SelectTexture(0, 0);
     mRenderingState.mTextures[0] = nullptr;
@@ -3156,6 +3163,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     } else if (!cache.valid || cache.texture_count == 0 || cache.active_texture >= cache.texture_count) {
         return;
     }
+    const int shadowMaskSize = projection != nullptr ? projection->resolution : cache.resolution;
     float drawNormal[3];
     float drawPlaneD;
     if (projection != nullptr) {
@@ -3216,14 +3224,14 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
     mRdp->texture_tile[0].shiftt = 0;
     mRdp->texture_tile[0].uls = 0;
     mRdp->texture_tile[0].ult = 0;
-    mRdp->texture_tile[0].lrs = (kShadowMaskSize - 1) * 4;
-    mRdp->texture_tile[0].lrt = (kShadowMaskSize - 1) * 4;
-    mRdp->texture_tile[0].line_size_bytes = kShadowMaskSize * 2;
+    mRdp->texture_tile[0].lrs = (shadowMaskSize - 1) * 4;
+    mRdp->texture_tile[0].lrt = (shadowMaskSize - 1) * 4;
+    mRdp->texture_tile[0].line_size_bytes = shadowMaskSize * 2;
     mRdp->texture_tile[0].tmem_index = 0;
-    mRdp->loaded_texture[0].orig_size_bytes = kShadowMaskSize * kShadowMaskSize * 4;
+    mRdp->loaded_texture[0].orig_size_bytes = shadowMaskSize * shadowMaskSize * 4;
     mRdp->loaded_texture[0].size_bytes = mRdp->loaded_texture[0].orig_size_bytes;
-    mRdp->loaded_texture[0].full_image_line_size_bytes = kShadowMaskSize * 2;
-    mRdp->loaded_texture[0].line_size_bytes = kShadowMaskSize * 2;
+    mRdp->loaded_texture[0].full_image_line_size_bytes = shadowMaskSize * 2;
+    mRdp->loaded_texture[0].line_size_bytes = shadowMaskSize * 2;
     mRdp->loaded_texture[0].masked = false;
     mRdp->loaded_texture[0].blended = false;
     mRdp->other_mode_h = (savedOtherH & ~((3U << G_MDSFT_CYCLETYPE) | (3U << G_MDSFT_TEXTFILT))) |
@@ -3310,8 +3318,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
             // depth quantization from producing grain or letting the shadow fall behind the receiving surface.
             vertex->z += vertex->w * clipDepthBias;
         }
-        vertex->u = (int16_t)(point.uv[0] * (kShadowMaskSize - 1) * 32.0f);
-        vertex->v = (int16_t)(point.uv[1] * (kShadowMaskSize - 1) * 32.0f);
+        vertex->u = (int16_t)(point.uv[0] * (shadowMaskSize - 1) * 32.0f);
+        vertex->v = (int16_t)(point.uv[1] * (shadowMaskSize - 1) * 32.0f);
         vertex->clip_rej = 0;
         vertex->color = { 255, 255, 255, 255 };
     };
@@ -3331,7 +3339,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         const float effectiveMinV = centerV - halfV;
         const float effectiveWidth = halfU * 2.0f;
         const float effectiveHeight = halfV * 2.0f;
-        // The 96x96 source mask intentionally stays on a stable canonical plane, but wall seams must use the real
+        // The source mask intentionally stays on a stable canonical plane, but wall seams must use the real
         // floor triangle under Link. Otherwise an inclined floor intersects a nearby wall at the wrong height.
         float receiverBaseNormal[3] = { meshBaseNormal[0], meshBaseNormal[1], meshBaseNormal[2] };
         float receiverBasePlaneD = meshBasePlaneD;
@@ -3467,33 +3475,39 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         }
 
         // Geometry alone can find a valid wall in a side lane while the opaque silhouette never reaches its seam.
-        // Require actual 96x96 mask coverage along the real floor/wall intersection before drawing that wall family.
+        // Require actual mask coverage along the real floor/wall intersection before drawing that wall family.
         bool wallTouchesMask = true;
-        if (foldWallValid && cache.coverage.size() == kShadowMaskBytes) {
+        const int sourceMaskSize = cache.resolution;
+        const size_t sourceMaskBytes = (size_t)sourceMaskSize * sourceMaskSize;
+        if (foldWallValid && cache.coverage.size() == sourceMaskBytes) {
             wallTouchesMask = false;
+            const int seamRadiusMin = std::max(2, (int)ceilf(2.0f * sourceMaskSize / 96.0f));
+            const int seamRadiusMax = std::max(8, (int)ceilf(8.0f * sourceMaskSize / 96.0f));
             const int seamRadiusU = std::clamp(
-                (int)ceilf(kShadowWallSeamTolerance / effectiveWidth * (kShadowMaskSize - 1)), 2, 8);
+                (int)ceilf(kShadowWallSeamTolerance / effectiveWidth * (sourceMaskSize - 1)), seamRadiusMin,
+                seamRadiusMax);
             const int seamRadiusV = std::clamp(
-                (int)ceilf(kShadowWallSeamTolerance / effectiveHeight * (kShadowMaskSize - 1)), 2, 8);
-            constexpr int integralStride = kShadowMaskSize + 1;
-            uint16_t coverageIntegral[integralStride * integralStride]{};
-            for (int y = 1; y <= kShadowMaskSize; y++) {
-                uint16_t rowCoverage = 0;
-                for (int x = 1; x <= kShadowMaskSize; x++) {
-                    rowCoverage += cache.coverage[(y - 1) * kShadowMaskSize + (x - 1)] >= 32 ? 1 : 0;
+                (int)ceilf(kShadowWallSeamTolerance / effectiveHeight * (sourceMaskSize - 1)), seamRadiusMin,
+                seamRadiusMax);
+            const int integralStride = sourceMaskSize + 1;
+            std::vector<uint32_t> coverageIntegral((size_t)integralStride * integralStride, 0);
+            for (int y = 1; y <= sourceMaskSize; y++) {
+                uint32_t rowCoverage = 0;
+                for (int x = 1; x <= sourceMaskSize; x++) {
+                    rowCoverage += cache.coverage[(y - 1) * sourceMaskSize + (x - 1)] >= 32 ? 1 : 0;
                     coverageIntegral[y * integralStride + x] =
                         coverageIntegral[(y - 1) * integralStride + x] + rowCoverage;
                 }
             }
             auto maskCoveredAt = [&](float u, float v) {
-                const float pixelX = u * (kShadowMaskSize - 1);
-                const float pixelY = v * (kShadowMaskSize - 1);
+                const float pixelX = u * (sourceMaskSize - 1);
+                const float pixelY = v * (sourceMaskSize - 1);
                 const int centerX = (int)roundf(pixelX);
                 const int centerY = (int)roundf(pixelY);
                 const int minX = std::max(0, centerX - seamRadiusU);
-                const int maxX = std::min(kShadowMaskSize - 1, centerX + seamRadiusU);
+                const int maxX = std::min(sourceMaskSize - 1, centerX + seamRadiusU);
                 const int minY = std::max(0, centerY - seamRadiusV);
-                const int maxY = std::min(kShadowMaskSize - 1, centerY + seamRadiusV);
+                const int maxY = std::min(sourceMaskSize - 1, centerY + seamRadiusV);
                 if (minX > maxX || minY > maxY) {
                     return false;
                 }
@@ -3501,7 +3515,7 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 const int x1 = maxX + 1;
                 const int y0 = minY;
                 const int y1 = maxY + 1;
-                const uint16_t covered = coverageIntegral[y1 * integralStride + x1] -
+                const uint32_t covered = coverageIntegral[y1 * integralStride + x1] -
                                          coverageIntegral[y0 * integralStride + x1] -
                                          coverageIntegral[y1 * integralStride + x0] +
                                          coverageIntegral[y0 * integralStride + x0];
@@ -3543,8 +3557,8 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                 float longestPixelsSquared = -1.0f;
                 for (int a = 0; a < 3; a++) {
                     for (int b = a + 1; b < 3; b++) {
-                        const float dx = (seamUv[b][0] - seamUv[a][0]) * (kShadowMaskSize - 1);
-                        const float dy = (seamUv[b][1] - seamUv[a][1]) * (kShadowMaskSize - 1);
+                        const float dx = (seamUv[b][0] - seamUv[a][0]) * (sourceMaskSize - 1);
+                        const float dy = (seamUv[b][1] - seamUv[a][1]) * (sourceMaskSize - 1);
                         const float lengthSquared = dx * dx + dy * dy;
                         if (lengthSquared > longestPixelsSquared) {
                             longestPixelsSquared = lengthSquared;
@@ -5900,7 +5914,8 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     const bool receiverValid = (gfx->mRsp->toon_shadow_flags & kShadowFlagValid) != 0;
     gfx->mRsp->toon_shadow_update = receiverValid &&
                                     (gfx->mRsp->toon_shadow_flags & kShadowFlagRegenerate) &&
-                                    cache.version != gfx->mRsp->toon_shadow_version;
+                                    (cache.version != gfx->mRsp->toon_shadow_version ||
+                                     cache.resolution != gfx->mToonShadowResolution);
 
     if ((gfx->mRsp->toon_shadow_flags & kShadowFlagUsesModelAnchor) != 0) {
         // Link's root matrix is registered with frame interpolation by the game. Reading its translation

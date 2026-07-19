@@ -158,8 +158,8 @@ class GfxRenderingAPI {
     float mToonCameraPos[3] = { 0.0f, 0.0f, 0.0f };
     float mToonRimEnabled = 0.0f;
     float mToonRimIntensity = 1.0f;
-    float mToonRimWidth = 0.28f;      // threshold = 1 - width = 0.72
-    float mToonRimSoftness = 0.035f;  // low-resolution stability floor
+    float mToonRimWidth = 0.28f;      // perceptual thin-line width control
+    float mToonRimSoftness = 0.035f;  // screen-space contour antialiasing control
     float mToonRimDirectionInfluence = 1.0f;
     int mStencilMode = 0; // SOH [Enhancement] world light casting (see StencilMode)
     int mStencilRef = 0;  // SOH [Enhancement] actor shadows: per-tap reference value for ShadowMask
