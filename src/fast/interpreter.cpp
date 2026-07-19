@@ -3317,14 +3317,19 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
                                  ShadowNormalize(meshCastDirection) && halfU > 0.001f && halfV > 0.001f &&
                                  fabsf(ShadowDot(meshBaseNormal, meshCastDirection)) > 0.001f;
     if (useReceiverMesh) {
-        // The mask was rasterized on the cached base floor. Map each real collision vertex back to that floor along
-        // the inverse shadow ray; the resulting base-plane coordinate is its UV. Adjacent floor, ramp and wall
-        // triangles therefore share the same mapping at their common edge without a second decal or fold transform.
+        // The mask was rasterized on the cached base floor. Floors and ramps map back along the inverse shadow ray;
+        // steep receivers unfold around their real floor intersection so the silhouette bends without reversing.
         const float castDenom = ShadowDot(meshBaseNormal, meshCastDirection);
         const float effectiveMinU = centerU - halfU;
         const float effectiveMinV = centerV - halfV;
         const float effectiveWidth = halfU * 2.0f;
         const float effectiveHeight = halfV * 2.0f;
+        float castAlongBase[3] = {
+            meshCastDirection[0] - meshBaseNormal[0] * ShadowDot(meshBaseNormal, meshCastDirection),
+            meshCastDirection[1] - meshBaseNormal[1] * ShadowDot(meshBaseNormal, meshCastDirection),
+            meshCastDirection[2] - meshBaseNormal[2] * ShadowDot(meshBaseNormal, meshCastDirection),
+        };
+        const bool hasCastAlongBase = ShadowNormalize(castAlongBase);
         auto clipUvBoundary = [](const ShadowQuadPoint* input, int inputCount, ShadowQuadPoint* output, int axis,
                                  float boundary, bool keepGreater) {
             int outputCount = 0;
@@ -3369,17 +3374,74 @@ void Interpreter::DrawShadowQuad(const ShadowMaskCache& cache, bool edgeProjecti
         for (uint8_t triangle = 0; triangle < cache.receiver_triangle_count; triangle++) {
             ShadowQuadPoint polygonA[8]{};
             ShadowQuadPoint polygonB[8]{};
+            float cachedTriangle[3][3]{};
+            for (int vertex = 0; vertex < 3; vertex++) {
+                for (int axis = 0; axis < 3; axis++) {
+                    cachedTriangle[vertex][axis] =
+                        cache.receiver_triangles[triangle][vertex][axis] - cache.world_offset[axis];
+                }
+            }
+
+            // A light-ray projection reverses the apparent continuation on a cliff: points farther down the wall
+            // trace back toward the platform. For steep receivers, unfold the real triangle around its intersection
+            // with the base floor instead. The shared edge maps to itself, while distance away from it always follows
+            // the shadow's horizontal travel, producing one continuous silhouette on both rising and falling walls.
+            const float receiverEdgeA[3] = { cachedTriangle[1][0] - cachedTriangle[0][0],
+                                             cachedTriangle[1][1] - cachedTriangle[0][1],
+                                             cachedTriangle[1][2] - cachedTriangle[0][2] };
+            const float receiverEdgeB[3] = { cachedTriangle[2][0] - cachedTriangle[0][0],
+                                             cachedTriangle[2][1] - cachedTriangle[0][1],
+                                             cachedTriangle[2][2] - cachedTriangle[0][2] };
+            float receiverNormal[3]{};
+            ShadowCross(receiverEdgeA, receiverEdgeB, receiverNormal);
+            bool unfoldReceiver = false;
+            float receiverDown[3]{};
+            float floorOut[3]{};
+            float receiverDownFloorRate = 0.0f;
+            if (hasCastAlongBase && ShadowNormalize(receiverNormal)) {
+                const float receiverAlignment = ShadowDot(meshBaseNormal, receiverNormal);
+                if (fabsf(receiverAlignment) <= 0.8f) {
+                    receiverDown[0] = -meshBaseNormal[0] + receiverNormal[0] * receiverAlignment;
+                    receiverDown[1] = -meshBaseNormal[1] + receiverNormal[1] * receiverAlignment;
+                    receiverDown[2] = -meshBaseNormal[2] + receiverNormal[2] * receiverAlignment;
+                    floorOut[0] = -receiverNormal[0] + meshBaseNormal[0] * receiverAlignment;
+                    floorOut[1] = -receiverNormal[1] + meshBaseNormal[1] * receiverAlignment;
+                    floorOut[2] = -receiverNormal[2] + meshBaseNormal[2] * receiverAlignment;
+                    if (ShadowNormalize(receiverDown) && ShadowNormalize(floorOut)) {
+                        if (ShadowDot(floorOut, castAlongBase) < 0.0f) {
+                            floorOut[0] = -floorOut[0];
+                            floorOut[1] = -floorOut[1];
+                            floorOut[2] = -floorOut[2];
+                        }
+                        receiverDownFloorRate = ShadowDot(meshBaseNormal, receiverDown);
+                        unfoldReceiver = receiverDownFloorRate < -0.1f &&
+                                         ShadowDot(floorOut, castAlongBase) > 0.1f;
+                    }
+                }
+            }
+
             bool valid = true;
             for (int vertex = 0; vertex < 3; vertex++) {
-                float cachedWorld[3] = {};
                 for (int axis = 0; axis < 3; axis++) {
                     polygonA[vertex].world[axis] = cache.receiver_triangles[triangle][vertex][axis];
-                    cachedWorld[axis] = polygonA[vertex].world[axis] - cache.world_offset[axis];
                 }
-                const float t = -(ShadowDot(meshBaseNormal, cachedWorld) + meshBasePlaneD) / castDenom;
-                const float basePoint[3] = { cachedWorld[0] + meshCastDirection[0] * t,
-                                             cachedWorld[1] + meshCastDirection[1] * t,
-                                             cachedWorld[2] + meshCastDirection[2] * t };
+                float basePoint[3]{};
+                if (unfoldReceiver) {
+                    const float floorDistance =
+                        ShadowDot(meshBaseNormal, cachedTriangle[vertex]) + meshBasePlaneD;
+                    const float signedWallDistance = floorDistance / receiverDownFloorRate;
+                    const float wallDistance = fabsf(signedWallDistance);
+                    for (int axis = 0; axis < 3; axis++) {
+                        const float edgePoint = cachedTriangle[vertex][axis] -
+                                                receiverDown[axis] * signedWallDistance;
+                        basePoint[axis] = edgePoint + floorOut[axis] * wallDistance;
+                    }
+                } else {
+                    const float t = -(ShadowDot(meshBaseNormal, cachedTriangle[vertex]) + meshBasePlaneD) / castDenom;
+                    for (int axis = 0; axis < 3; axis++) {
+                        basePoint[axis] = cachedTriangle[vertex][axis] + meshCastDirection[axis] * t;
+                    }
+                }
                 const float relative[3] = { basePoint[0] - planeOrigin[0], basePoint[1] - planeOrigin[1],
                                             basePoint[2] - planeOrigin[2] };
                 polygonA[vertex].uv[0] = (ShadowDot(basisU, relative) - effectiveMinU) / effectiveWidth;
