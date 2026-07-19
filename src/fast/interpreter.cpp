@@ -72,6 +72,11 @@ namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 static constexpr uint8_t kShadowFlagCaptureUnlit = 1 << 5;
+// Keep these values in lockstep with G_STYLIZED_WATER_* in gbi.h. interpreter.cpp intentionally does not
+// include that public macro header, so the renderer owns a small typed copy of the command's wire values.
+static constexpr uint8_t kStylizedWaterOff = 0;
+static constexpr uint8_t kStylizedWaterForce = 1;
+static constexpr uint8_t kStylizedWaterAuto = 2;
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -1677,8 +1682,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool invisible =
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
     bool use_grayscale = mRdp->grayscale;
-    const bool use_stylized_water = mRdp->stylized_water == G_STYLIZED_WATER_FORCE ||
-                                      (mRdp->stylized_water == G_STYLIZED_WATER_AUTO && !is_rect &&
+    const bool use_stylized_water = mRdp->stylized_water == kStylizedWaterForce ||
+                                      (mRdp->stylized_water == kStylizedWaterAuto && !is_rect &&
                                        TriangleMatchesStylizedWaterBox(v_arr));
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
     // Water owns its complete lighting model. Excluding it here also prevents a lit water display list from
@@ -5931,7 +5936,7 @@ bool gfx_set_stylized_water_handler_custom(F3DGfx** cmd0) {
 
     if (gfx->mRdp->stylized_water != mode) {
         gfx->Flush();
-        if (mode != G_STYLIZED_WATER_OFF) {
+        if (mode != kStylizedWaterOff) {
             gfx->mRapi->PrepareStylizedWater();
         }
         gfx->mRdp->stylized_water = mode;
