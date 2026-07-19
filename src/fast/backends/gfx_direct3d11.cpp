@@ -400,6 +400,16 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
+    // An unsized Texture2DMS is the only way one cached water shader can read 2x/4x/8x depth snapshots, but
+    // DXBC exposes that form starting at shader model 4.1. Feature-level 10_0 already forces MSAA off below,
+    // so its ps_4_0 fallback compiles the same material without the multisampled resource.
+    const bool waterDynamicMsaa = cc_features.opt_stylized_water && mFeatureLevel >= D3D_FEATURE_LEVEL_10_1;
+    const D3D_SHADER_MACRO shaderMacros[] = {
+        { "WATER_DYNAMIC_MSAA", waterDynamicMsaa ? "1" : "0" },
+        { nullptr, nullptr },
+    };
+    const char* pixelShaderTarget = waterDynamicMsaa ? "ps_4_1" : "ps_4_0";
+
     char* buf;
     size_t len, numFloats;
 
@@ -418,7 +428,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
-    HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
+    HRESULT hr = mD3dCompile(buf, len, nullptr, shaderMacros, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
@@ -430,8 +440,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         throw hr;
     }
 
-    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
-                     error_blob.GetAddressOf());
+    hr = mD3dCompile(buf, len, nullptr, shaderMacros, nullptr, "PSMain", pixelShaderTarget, compile_flags, 0,
+                     ps.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
         const char* err = error_blob != nullptr ? static_cast<const char*>(error_blob->GetBufferPointer())

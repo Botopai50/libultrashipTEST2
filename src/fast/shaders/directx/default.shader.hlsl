@@ -102,7 +102,9 @@ cbuffer PerToonCB : register(b2) {
 @if(o_water)
 Texture2D<float4> water_scene_color : register(t6);
 Texture2D<float> water_scene_depth : register(t7);
+#if WATER_DYNAMIC_MSAA
 Texture2DMS<float> water_scene_depth_ms : register(t8);
+#endif
 SamplerState water_scene_sampler : register(s6);
 
 cbuffer PerWaterCB : register(b3) {
@@ -462,9 +464,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float waterDepthGap = max(water_fade_distance, 1.0);
         if (water_depth_available > 0.5) {
             int2 waterPixel = int2(clamp(screenSpace.xy, float2(0.0, 0.0), water_viewport_size - 1.0));
+#if WATER_DYNAMIC_MSAA
             float waterSceneZ = water_msaa_samples > 1.5
                                     ? water_scene_depth_ms.Load(waterPixel, 0)
                                     : water_scene_depth.Load(int3(waterPixel, 0));
+#else
+            float waterSceneZ = water_scene_depth.Load(int3(waterPixel, 0));
+#endif
             waterDepthGap = max(waterLinearDepth(waterSceneZ) - waterLinearDepth(screenSpace.z), 0.0);
         }
         float waterDeepFactor = smoothstep(0.0, max(water_fade_distance, 1.0), waterDepthGap);
