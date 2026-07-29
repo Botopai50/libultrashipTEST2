@@ -34,6 +34,18 @@ struct PerToonCB {
     float _toon_pad[2];
 };
 
+// SOH [Enhancement] Cascaded shadow maps (register b3). Layout must match the PerShadowCB cbuffer in
+// default.shader.hlsl field for field. Everything is float4-shaped because HLSL gives each element of a
+// scalar array its own 16-byte register -- packing these as float[4] would not match the shader.
+struct PerShadowCB {
+    float shadow_view_proj[SHADOW_MAP_MAX_CASCADES][16];
+    float shadow_splits[4];      // far distance of each cascade, world units
+    float shadow_texel_world[4]; // world size of one texel, per cascade
+    float shadow_texel_uv[4];    // one texel in UV terms (1/resolution), per cascade
+    // x = active cascade count (0 = no shadow map), y = blend fraction, z = normal offset, w = strength
+    float shadow_params[4];
+};
+
 struct PerDrawCB {
     struct Texture {
         uint32_t width;
@@ -76,7 +88,8 @@ struct ShaderProgramD3D11 {
     uint8_t numInputs;
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
-    bool opt_toon = false; // SOH [Enhancement] toon lighting variant
+    bool opt_toon = false;       // SOH [Enhancement] toon lighting variant
+    bool opt_shadow_map = false; // SOH [Enhancement] cascaded shadow-map receiver variant
 };
 
 class GfxWindowBackendDXGI;
@@ -136,6 +149,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) override;
     void ShadowMapEndPass() override;
+    void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
+                            float normalOffset, float strength) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -200,7 +215,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb; // SOH [Enhancement] toon lighting (register b2)
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb;   // SOH [Enhancement] toon lighting (register b2)
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerShadowCb; // SOH [Enhancement] shadow cascades (register b3)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -217,7 +233,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
-    PerToonCB mPerToonCbData; // SOH [Enhancement] toon lighting
+    PerToonCB mPerToonCbData;     // SOH [Enhancement] toon lighting
+    PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
+    bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 

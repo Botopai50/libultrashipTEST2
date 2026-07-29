@@ -1398,7 +1398,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // in the same frame as the world-space key, so the single uniform is correct for all limbs.
             // (object->world uses the same row-vector convention as the position transform above; the
             // shader renormalizes, so uniform limb scale is harmless.)
-            if (mRdp->toon || mRdp->toon_shadow) {
+            // SOH [Enhancement] Shadow maps need the world position on RECEIVERS too, and those are the
+            // draws with no toon marker at all (the room, the terrain). Without mShadowMapEnabled here the
+            // receiver variant would sample the cascades using whatever wx/wy/wz happened to be left in
+            // the vertex from an earlier object.
+            if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
                 // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
                 // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
@@ -1635,6 +1639,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool use_grayscale = mRdp->grayscale;
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
     bool use_toon = mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
+    // SOH [Enhancement] Cascaded shadow maps: which draws RECEIVE shadow. Casters are excluded, so an
+    // actor never samples the depth map it drew into -- that is the design's no-self-shadow rule, and
+    // without it every complex model would stripe itself. Screen-space rects (UI, backgrounds) are
+    // excluded because they have no world position to look up with.
+    bool use_shadow_map = mShadowMapEnabled && !mRdp->toon_shadow && !is_rect;
     auto shader = mRdp->current_shader;
 
     if (texture_edge) {
@@ -1672,6 +1681,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_toon) {
         cc_options |= SHADER_OPT(TOON);
     }
+    if (use_shadow_map) {
+        cc_options |= SHADER_OPT(SHADOW_MAP);
+    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -1686,9 +1698,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
-        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 to make room for the
-        // TOON opt bit (17). Keep in lockstep with the decode in gfx_cc_get_features.
-        cc_options |= (shader.id << 18);
+        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for the TOON opt bit
+        // and 18->19 for SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features.
+        cc_options |= (shader.id << 19);
     }
 
     ColorCombinerKey key;
@@ -1888,6 +1900,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBufVbo[mBufVboLen++] = v_arr[i]->nx;
             mBufVbo[mBufVboLen++] = v_arr[i]->ny;
             mBufVbo[mBufVboLen++] = v_arr[i]->nz;
+        }
+
+        // SOH [Enhancement] Cascaded shadow maps: world position (aWorldPos), so the pixel shader can
+        // project into each cascade. The cascade matrices are uniforms, not per-vertex. Order here must
+        // match the input-layout element order in every backend and the PSInput field order in the shader
+        // -- these three are one implicit contract, and a mismatch shifts every attribute after it.
+        if (use_shadow_map) {
+            mBufVbo[mBufVboLen++] = v_arr[i]->wx;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wy;
+            mBufVbo[mBufVboLen++] = v_arr[i]->wz;
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -5764,6 +5786,8 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_invisible = (shader_id1 & SHADER_OPT(INVISIBLE)) != 0;
     cc_features->opt_grayscale = (shader_id1 & SHADER_OPT(GRAYSCALE)) != 0;
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
+    // SOH [Enhancement] cascaded shadow maps: this draw samples the cascade array
+    cc_features->opt_shadow_map = (shader_id1 & SHADER_OPT(SHADOW_MAP)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -5771,7 +5795,9 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->clamp[1][1] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_T);
 
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
-        cc_features->shader_id = (shader_id1 >> 18) & 0xFFFF; // SOH [Enhancement] 17->18 for the TOON opt bit
+        // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP. Must match the encode in
+        // the ColorCombinerKey build; a mismatch silently selects the wrong shader for every draw.
+        cc_features->shader_id = (shader_id1 >> 19) & 0x1FFF;
     }
 
     cc_features->usedTextures[0] = false;

@@ -40,6 +40,10 @@ float4 grayscale : GRAYSCALE;
 float3 normal : NORMAL;
 @{update_floats(3)}
 @end
+@if(o_shadow_map)
+float3 worldPos : WORLDPOS;
+@{update_floats(3)}
+@end
 
 @for(i in 0..o_inputs)
     @if(o_alpha)
@@ -86,6 +90,102 @@ cbuffer PerToonCB : register(b2) {
     float toon_shadow_intensity;
     float toon_debug;
     float2 _toon_pad;
+}
+@end
+
+// SOH [Enhancement] Cascaded shadow maps. The cascade array binds past the combiner's own texture slots
+// (SHADER_MAX_TEXTURES) so it never collides with a texel sampler, and its cbuffer takes b3 (b0 per-frame,
+// b1 per-draw, b2 toon). Only the receiver variant declares any of this.
+@if(o_shadow_map)
+Texture2DArray g_shadowMap : register(t6);
+SamplerComparisonState g_shadowSampler : register(s6);
+
+// Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
+// register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
+// subtly wrong. Layout matches the PerShadowCB C++ struct exactly.
+cbuffer PerShadowCB : register(b3) {
+    row_major float4x4 shadow_view_proj[@{o_shadow_max_cascades}];
+    float4 shadow_splits;      // far distance of each cascade, world units
+    float4 shadow_texel_world; // world size of one texel, per cascade
+    float4 shadow_texel_uv;    // one texel in UV terms (1/resolution), per cascade
+    // x = active cascade count (0 = no shadow map this frame), y = cross-fade band as a fraction of the
+    // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
+    float4 shadow_params;
+}
+
+// Four taps in a quincunx around the centre. Each tap is a hardware comparison fetch, and with a linear
+// comparison sampler every fetch is itself a filtered 2x2 -- so these four cover a 4x4 neighbourhood for
+// the cost of four samples. That is the whole reason for a comparison sampler over a plain depth read.
+float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv) {
+    const float2 offsets[4] = {
+        float2(-0.5, -0.5), float2(0.5, -0.5),
+        float2(-0.5, 0.5), float2(0.5, 0.5)
+    };
+    float sum = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; i++) {
+        sum += g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
+                                              float3(uv + offsets[i] * texelUv, cascade), z);
+    }
+    return sum * 0.25;
+}
+
+// Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
+// Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
+// what the border-clamped sampler returns, but checking here avoids the fetch entirely.
+float ShadowLitFromCascade(float3 worldPos, float3 normalWs, uint cascade) {
+    // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
+    // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
+    // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
+    // striped self-shadowing (acne). normalWs is zero for receivers that carry no normal (the toon variant
+    // is off), and then this term simply vanishes and the rasterizer's slope bias carries it alone.
+    float3 p = worldPos + normalWs * (shadow_params.z * shadow_texel_world[cascade]);
+
+    float4 clip = mul(float4(p, 1.0), shadow_view_proj[cascade]);
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+    float3 ndc = clip.xyz / clip.w;
+    if (any(abs(ndc.xy) > 1.0) || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0; // outside this cascade's footprint: nothing here is known to occlude
+    }
+    // NDC -> texture space (y flips: NDC is +up, textures are +down).
+    float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+    return SampleShadowPCF4(uv, ndc.z, cascade, shadow_texel_uv[cascade]);
+}
+
+// Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
+// Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
+// moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
+float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth) {
+    uint count = (uint)shadow_params.x;
+    if (count == 0) {
+        return 1.0; // no cascades were rendered this frame
+    }
+
+    uint cascade = count - 1;
+    [unroll]
+    for (uint i = 0; i < 4; i++) {
+        if (i < count && viewDepth <= shadow_splits[i]) {
+            cascade = min(cascade, i);
+        }
+    }
+
+    float lit = ShadowLitFromCascade(worldPos, normalWs, cascade);
+
+    // Cross-fade band at the far edge of this cascade, where the next one also covers the point. Sampling
+    // both and blending is what hides the resolution change; a hard switch draws a visible line that
+    // sweeps across the ground as the camera moves.
+    if (cascade + 1 < count) {
+        float nearEdge = (cascade == 0) ? 0.0 : shadow_splits[cascade - 1];
+        float span = shadow_splits[cascade] - nearEdge;
+        float bandStart = shadow_splits[cascade] - span * shadow_params.y;
+        if (viewDepth > bandStart) {
+            float t = smoothstep(bandStart, shadow_splits[cascade], viewDepth);
+            lit = lerp(lit, ShadowLitFromCascade(worldPos, normalWs, cascade + 1), t);
+        }
+    }
+    return lit;
 }
 @end
 
@@ -144,6 +244,9 @@ PSInput VSMain(
 @if(o_toon)
     , float3 normal : NORMAL
 @end
+@if(o_shadow_map)
+    , float3 worldPos : WORLDPOS
+@end
 @for(i in 0..o_inputs)
     @if(o_alpha)
         , float4 input@{i + 1} : INPUT@{i}
@@ -179,6 +282,10 @@ PSInput VSMain(
 
     @if(o_toon)
         result.normal = normal;
+    @end
+
+    @if(o_shadow_map)
+        result.worldPos = worldPos;
     @end
 
     @for(i in 0..o_inputs)
@@ -335,6 +442,23 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         } else {
             texel.rgb = clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
         }
+    @end
+
+    // SOH [Enhancement] Cascaded shadow maps: darken where the cascades say this point is occluded.
+    // Applied after the toon relight and before fog, so a shadowed surface still fades into the distance
+    // like everything else rather than staying dark through the fog.
+    @if(o_shadow_map)
+        @if(o_toon)
+            float3 shadowN = normalize(input.normal);
+        @else
+            // No normal on this draw, so no normal-offset push -- the rasterizer's slope-scaled bias is
+            // the only thing keeping this surface off its own depth values.
+            float3 shadowN = float3(0.0, 0.0, 0.0);
+        @end
+        // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
+        // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
+        float shadowLit = ShadowLit(input.worldPos, shadowN, input.position.w);
+        texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
     @end
 
     @if(o_fog)

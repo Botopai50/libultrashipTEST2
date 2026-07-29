@@ -23,9 +23,17 @@
 #define SCREEN_HEIGHT 240
 
 // SOH [Enhancement] Max floats packed per vertex into the Fast3D VBO, sized for the largest layout
-// (including toon lighting's world-space normal attribute). The interpreter packs from this and every
-// backend sizes its vertex buffers from it, so they stay in lockstep — change it in one place only.
-#define VBO_MAX_FLOATS_PER_VERTEX 40
+// (including toon lighting's world-space normal attribute and the shadow-map receiver's world position).
+// The interpreter packs from this and every backend sizes its vertex buffers from it, so they stay in
+// lockstep — change it in one place only.
+//
+// Raised 40 -> 43 for the shadow-map world position (3 floats). The headroom is deliberate rather than
+// tight: summing every optional attribute at its maximum (4 position + 4 per texcoord with both clamps +
+// 4 fog + 4 grayscale + 3 normal + 3 world position + 4 per input up to seven inputs) already exceeds
+// this, so the ceiling is set by which combinations actually co-occur -- something not provable from the
+// combiner alone. Over-allocating a few floats per vertex costs a little memory; under-allocating
+// overruns the buffer.
+#define VBO_MAX_FLOATS_PER_VERTEX 43
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -82,9 +90,12 @@ enum class ShaderOpts {
     TEXEL0_BLEND,
     TEXEL1_BLEND,
     USE_SHADER,
-    TOON, // SOH [Enhancement] toon-lighting variant. Bit 17; the loaded-shader id packs ABOVE it
-          // (interpreter.cpp shifts shader.id by 18). Adding an opt here without bumping that shift
-          // would overlap the id and corrupt shader selection.
+    TOON,       // SOH [Enhancement] toon-lighting variant. Bit 17.
+    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18; the loaded-shader id
+                // packs ABOVE it (interpreter.cpp shifts shader.id by 19). Adding an opt here without
+                // bumping that shift would overlap the id and corrupt shader selection.
+                // shader_id1 is 32 bits, so the id keeps the 13 bits from 19 up -- far more than the
+                // handful of loaded shaders that exist, but the ceiling to watch if opts keep growing.
     MAX
 };
 
@@ -115,7 +126,8 @@ struct CCFeatures {
     bool opt_alpha_threshold;
     bool opt_invisible;
     bool opt_grayscale;
-    bool opt_toon; // SOH [Enhancement] toon lighting
+    bool opt_toon;       // SOH [Enhancement] toon lighting
+    bool opt_shadow_map; // SOH [Enhancement] cascaded shadow maps: this draw receives shadow
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];

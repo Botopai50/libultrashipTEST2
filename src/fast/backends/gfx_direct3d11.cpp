@@ -299,6 +299,14 @@ void GfxRenderingAPIDX11::Init() {
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerToonCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create toon-lighting constant buffer.");
 
+    // SOH [Enhancement] Create the shadow-cascade constant buffer (register b3). Created unconditionally
+    // (it is a few hundred bytes) so the binding in StartFrame never has to branch; it stays zeroed --
+    // cascade count 0, which the shader reads as "no shadow map" -- until a depth pass fills it.
+    static_assert(sizeof(PerShadowCB) % 16 == 0, "constant buffers must be a multiple of 16 bytes");
+    constant_buffer_desc.ByteWidth = sizeof(PerShadowCB);
+    ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerShadowCb.GetAddressOf()),
+                  mWindowBackend->GetWindowHandle(), "Failed to create shadow-cascade constant buffer.");
+
     // Create compute shader that can be used to retrieve depth buffer values
 
     const char* shader_source = R"(
@@ -480,6 +488,12 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
             "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
     }
+    // SOH [Enhancement] Cascaded shadow maps: receiver world position (order must match the vbo packing).
+    if (cc_features.opt_shadow_map) {
+        ied[ied_index++] = {
+            "WORLDPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
+        };
+    }
     for (unsigned int i = 0; i < cc_features.numInputs; i++) {
         DXGI_FORMAT format = cc_features.opt_alpha ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32_FLOAT;
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
@@ -516,7 +530,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->shader_id1 = shader_id1;
     prg->numInputs = cc_features.numInputs;
     prg->numFloats = numFloats;
-    prg->opt_toon = cc_features.opt_toon; // SOH [Enhancement] toon lighting
+    prg->opt_toon = cc_features.opt_toon;             // SOH [Enhancement] toon lighting
+    prg->opt_shadow_map = cc_features.opt_shadow_map; // SOH [Enhancement] cascaded shadow maps
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
     prg->usedTextures[2] = cc_features.used_masks[0];
@@ -824,6 +839,18 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->Unmap(mPerToonCb.Get(), 0);
     }
 
+    // SOH [Enhancement] Cascaded shadow maps: the cascade transforms are frame-global, so upload them once
+    // per frame on the first receiver draw rather than per draw like the toon CB.
+    if (mShaderProgram->opt_shadow_map && mShadowCbDirty) {
+        D3D11_MAPPED_SUBRESOURCE shadow_ms;
+        ZeroMemory(&shadow_ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+        if (SUCCEEDED(mContext->Map(mPerShadowCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &shadow_ms))) {
+            memcpy(shadow_ms.pData, &mPerShadowCbData, sizeof(PerShadowCB));
+            mContext->Unmap(mPerShadowCb.Get(), 0);
+            mShadowCbDirty = false;
+        }
+    }
+
     // Set vertex buffer data
 
     D3D11_MAPPED_SUBRESOURCE ms;
@@ -866,9 +893,10 @@ void GfxRenderingAPIDX11::OnResize() {
 
 void GfxRenderingAPIDX11::StartFrame() {
     // Set per-frame constant buffer
-    // SOH [Enhancement] mPerToonCb bound at slot b2 for the toon pixel shader; ignored by other shaders.
-    ID3D11Buffer* buffers[3] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerToonCb.Get() };
-    mContext->PSSetConstantBuffers(0, 3, buffers);
+    // SOH [Enhancement] mPerToonCb bound at slot b2 for the toon pixel shader and mPerShadowCb at b3 for
+    // the shadow-map receiver variant; both are ignored by shaders that do not declare them.
+    ID3D11Buffer* buffers[4] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerToonCb.Get(), mPerShadowCb.Get() };
+    mContext->PSSetConstantBuffers(0, 4, buffers);
 
     mPerFrameCbData.noise_frame++;
     if (mPerFrameCbData.noise_frame > 150) {
@@ -1621,6 +1649,34 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     mShadowLastCasterCount = vertexCount;
 }
 
+void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
+                                             float blendFraction, float normalOffset, float strength) {
+    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, normalOffset, strength);
+
+    ZeroMemory(&mPerShadowCbData, sizeof(mPerShadowCbData));
+    const int count = mShadowCascadesActive;
+    mPerShadowCbData.shadow_params[0] = (float)count;
+    mPerShadowCbData.shadow_params[1] = mShadowBlendFraction;
+    mPerShadowCbData.shadow_params[2] = mShadowNormalOffset;
+    mPerShadowCbData.shadow_params[3] = mShadowStrength;
+
+    for (int c = 0; c < count; c++) {
+        const float* m = &mShadowViewProj[c * 16];
+        memcpy(mPerShadowCbData.shadow_view_proj[c], m, 16 * sizeof(float));
+        mPerShadowCbData.shadow_splits[c] = mShadowSplits[c];
+
+        // Recover the cascade's world extent from its own matrix instead of plumbing it through the API:
+        // the projection scales the light's x axis by 1/radius, and that axis is a unit vector, so the
+        // length of its column IS 1/radius. One texel then spans 2*radius/resolution.
+        const float sx = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+        if (sx > 1e-9f && mShadowResolution > 0) {
+            mPerShadowCbData.shadow_texel_world[c] = 2.0f / (sx * (float)mShadowResolution);
+            mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
+        }
+    }
+    mShadowCbDirty = true;
+}
+
 void GfxRenderingAPIDX11::ShadowMapEndPass() {
     if (!mShadowPassActive) {
         return;
@@ -1838,6 +1894,8 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_invisible", cc_features.opt_invisible },
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_toon", cc_features.opt_toon },
+        { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
+        { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
