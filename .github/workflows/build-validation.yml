@@ -2,6 +2,8 @@ name: build-validation
 on:
   push:
   pull_request:
+  # Allow running the build check by hand from the Actions tab, on any branch.
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

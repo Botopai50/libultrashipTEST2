@@ -1,5 +1,8 @@
 name: tidy-format-validation
-on: [pull_request]
+on:
+  pull_request:
+  # Allow running clang-tidy/clang-format by hand from the Actions tab.
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
