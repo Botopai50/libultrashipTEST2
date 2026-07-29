@@ -1430,20 +1430,23 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
         return false;
     }
 
-    // Comparison sampler: the main pass uses SampleCmpLevelZero, which returns the hardware's own
-    // filtered pass/fail ratio. COMPARISON_MIN_MAG_LINEAR_MIP_POINT makes each fetch a free 2x2 PCF, so
-    // the shader's 4 taps cover a 4x4 neighbourhood for the cost of 4 samples.
+    // Plain point sampler, not a comparison one: the shader fetches the stored depth and compares it
+    // itself, because hardware comparison sampling does not map to the ps_4_0 profile these shaders are
+    // compiled against. Point filtering is also the correct choice for a hand-rolled comparison -- blending
+    // stored depths and comparing once is not the same as comparing per texel and averaging, and only the
+    // latter produces a real penumbra.
     D3D11_SAMPLER_DESC samp_desc;
     ZeroMemory(&samp_desc, sizeof(samp_desc));
-    samp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-    // Clamp with a "fully lit" border: outside a cascade's footprint nothing is known to occlude, and
-    // wrapping would fold a distant part of the map back over the edge.
+    samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    // Clamp to a "nothing occludes" border: outside a cascade's footprint nothing is known to occlude, and
+    // wrapping would fold a distant part of the map back over the edge. 1.0 is the far plane, so any
+    // receiver compares as lit against it.
     samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
     samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
     samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
     samp_desc.BorderColor[0] = samp_desc.BorderColor[1] = 1.0f;
     samp_desc.BorderColor[2] = samp_desc.BorderColor[3] = 1.0f;
-    samp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER; // unused without a comparison filter
     samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(mDevice->CreateSamplerState(&samp_desc, mShadowMapSampler.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the comparison sampler.");
