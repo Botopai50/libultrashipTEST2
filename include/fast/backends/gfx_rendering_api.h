@@ -6,6 +6,7 @@
 #include <set>
 #include "imconfig.h"
 #include "fast/toon_shading.h"
+#include "fast/shadow_map.h"
 
 namespace Fast {
 struct ShaderProgram;
@@ -121,6 +122,48 @@ class GfxRenderingAPI {
     // mStencilMode in their per-draw path. Off (0) is normal rendering, so ordinary draws are unaffected.
     virtual void SetStencilMode(int mode) {
         mStencilMode = mode;
+    }
+
+    // SOH [Enhancement] Cascaded shadow maps (see fast/shadow_map.h). Everything below is a no-op by
+    // default: only Direct3D 11 renders the depth pass, and a backend that does not override these must
+    // behave exactly as it did before. The application MUST consult SupportsShadowMap() before hiding
+    // whatever shadows it was drawing, or an unsupported backend ends up with no shadows at all.
+
+    // Whether this backend can render the depth pass. Checked once per frame by the application.
+    virtual bool SupportsShadowMap() {
+        return false;
+    }
+
+    // Allocate (or resize) the cascade depth array. Safe to call every frame: implementations
+    // reallocate only when the count or resolution actually changes. Returns false if the resources
+    // could not be created, in which case the caller must treat shadow maps as unavailable this frame.
+    // cascadeCount is clamped to [1, SHADOW_MAP_MAX_CASCADES], resolution to the SHADOW_MAP_*_RESOLUTION
+    // bounds.
+    virtual bool ShadowMapConfigure(int cascadeCount, int resolution) {
+        return false;
+    }
+
+    // Begin depth-only rendering into one cascade. lightViewProj is row-major, the same convention the
+    // interpreter already uses for its own matrices. Clears that cascade's depth to far before drawing.
+    virtual void ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) {
+    }
+
+    // Submit caster geometry into the cascade opened by ShadowMapBeginCascade: `vertexCount` vertices of
+    // 3 floats each (world-space xyz), as a plain triangle list. Depth-only -- no textures, no combiner,
+    // no lighting -- which is why casters can be fed in raw rather than through the normal draw path.
+    virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) {
+    }
+
+    // Close the depth pass and restore the render target the frame was drawing to. After this the
+    // cascade array is readable by the main pass.
+    virtual void ShadowMapEndPass() {
+    }
+
+    // Per-frame values the main pass needs to sample the cascades. `viewProj` holds cascadeCount
+    // row-major light matrices back to back; `splitDistances` the far distance of each cascade in world
+    // units (used to pick a cascade and to size its blend band).
+    virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
+                                    float blendFraction, float normalOffset, float strength) {
     }
 
   protected:
