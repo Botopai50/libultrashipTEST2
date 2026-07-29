@@ -38,10 +38,13 @@
 // Expressed as a fraction so the band scales with each cascade's size.
 #define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.1f
 
-// Depth bias applied when rendering the depth maps, in units of one cascade texel.
-// Constant bias alone has to be large enough for the steepest surface, which detaches contact shadows
-// ("peter panning"); slope-scaled bias carries most of the load so the constant term can stay small.
-#define SHADOW_MAP_DEFAULT_CONSTANT_BIAS 1.5f
+// Depth bias applied while rendering the depth maps, in the rasterizer's own units: the constant term
+// counts smallest-representable depth increments of the map's format (D16 here), and the slope-scaled
+// term multiplies the polygon's depth gradient. Constant bias alone would have to be large enough for
+// the steepest surface in the scene, which detaches contact shadows everywhere else ("peter panning"),
+// so the slope-scaled term carries most of the load and the constant one stays small.
+// The constant term is an integer because that is what the rasterizer takes for a UNORM depth format.
+#define SHADOW_MAP_DEFAULT_CONSTANT_BIAS 2
 #define SHADOW_MAP_DEFAULT_SLOPE_BIAS 2.5f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.

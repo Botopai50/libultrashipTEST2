@@ -1289,6 +1289,359 @@ void GfxRenderingAPIDX11::SetSrgbMode() {
     mSrgbMode = true;
 }
 
+// ===========================================================================================
+// SOH [Enhancement] Cascaded shadow maps (see fast/shadow_map.h).
+//
+// Casters are rendered depth-only into one D16 texture array -- no textures, no combiner, no
+// lighting -- so this path deliberately bypasses the normal shader pipeline instead of pushing
+// display lists through it a second time. Because it binds its own shader, layout, states and
+// viewport outside the per-draw path, it must invalidate that path's "last state" caches on the way
+// out, or the next ordinary draw would keep whatever the depth pass left bound.
+//
+// Every failure here degrades to "no shadow map" rather than throwing: an unsupported or
+// out-of-memory device must still render the game.
+// ===========================================================================================
+
+// Depth-only vertex shader. Position is world-space and the matrix is the cascade's light view-proj.
+// row_major matches the interpreter's CPU convention (row vector times row-major matrix); HLSL packs
+// constant-buffer matrices column-major by default, so leaving this off would silently transpose it.
+static const char* kShadowDepthShaderSource = R"(
+cbuffer ShadowDepthCB : register(b0) {
+    row_major float4x4 lightViewProj;
+};
+float4 VSMain(float3 pos : POSITION) : SV_POSITION {
+    return mul(float4(pos, 1.0), lightViewProj);
+}
+)";
+
+// Matches kShadowDepthShaderSource's cbuffer. Constant buffers must be a multiple of 16 bytes; a
+// float4x4 already is.
+struct ShadowDepthCB {
+    float lightViewProj[16];
+};
+
+bool GfxRenderingAPIDX11::SupportsShadowMap() {
+    return true;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
+    if (mShadowPipelineReady) {
+        return true;
+    }
+    if (mShadowPipelineFailed) {
+        return false; // already tried and failed; do not recompile every frame
+    }
+    mShadowPipelineFailed = true; // cleared again only on full success
+
+#if DEBUG_D3D
+    UINT compile_flags = D3DCOMPILE_DEBUG;
+#else
+    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vs, error_blob;
+    HRESULT hr = mD3dCompile(kShadowDepthShaderSource, strlen(kShadowDepthShaderSource), nullptr, nullptr, nullptr,
+                             "VSMain", "vs_4_0", compile_flags, 0, vs.GetAddressOf(), error_blob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Shadow map: depth vertex shader failed to compile: {}",
+                     error_blob ? (const char*)error_blob->GetBufferPointer() : "no error blob");
+        return false;
+    }
+    if (FAILED(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
+                                           mShadowDepthVs.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the depth vertex shader.");
+        return false;
+    }
+
+    const D3D11_INPUT_ELEMENT_DESC ied[1] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    if (FAILED(mDevice->CreateInputLayout(ied, 1, vs->GetBufferPointer(), vs->GetBufferSize(),
+                                          mShadowDepthLayout.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the depth input layout.");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cb_desc;
+    ZeroMemory(&cb_desc, sizeof(cb_desc));
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.ByteWidth = sizeof(ShadowDepthCB);
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(mDevice->CreateBuffer(&cb_desc, nullptr, mShadowDepthCb.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the depth constant buffer.");
+        return false;
+    }
+
+    // Depth bias lives in the rasterizer rather than the shader so it scales with the depth format
+    // automatically. Slope-scaled carries most of the load: a constant bias large enough for the
+    // steepest polygon would detach contact shadows everywhere else ("peter panning").
+    D3D11_RASTERIZER_DESC rast_desc;
+    ZeroMemory(&rast_desc, sizeof(rast_desc));
+    rast_desc.FillMode = D3D11_FILL_SOLID;
+    // Casters here are flattened silhouettes and world geometry that is not reliably closed, so culling
+    // either facing would punch holes in the depth map. Two-sided costs fill rate the depth-only pass
+    // can afford.
+    rast_desc.CullMode = D3D11_CULL_NONE;
+    rast_desc.DepthClipEnable = TRUE;
+    rast_desc.DepthBias = SHADOW_MAP_DEFAULT_CONSTANT_BIAS;
+    rast_desc.SlopeScaledDepthBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
+    if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
+        return false;
+    }
+
+    D3D11_DEPTH_STENCIL_DESC ds_desc;
+    ZeroMemory(&ds_desc, sizeof(ds_desc));
+    ds_desc.DepthEnable = TRUE;
+    ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    ds_desc.DepthFunc = D3D11_COMPARISON_LESS;
+    ds_desc.StencilEnable = FALSE;
+    if (FAILED(mDevice->CreateDepthStencilState(&ds_desc, mShadowDepthStencilState.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the depth-stencil state.");
+        return false;
+    }
+
+    // Comparison sampler: the main pass uses SampleCmpLevelZero, which returns the hardware's own
+    // filtered pass/fail ratio. COMPARISON_MIN_MAG_LINEAR_MIP_POINT makes each fetch a free 2x2 PCF, so
+    // the shader's 4 taps cover a 4x4 neighbourhood for the cost of 4 samples.
+    D3D11_SAMPLER_DESC samp_desc;
+    ZeroMemory(&samp_desc, sizeof(samp_desc));
+    samp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    // Clamp with a "fully lit" border: outside a cascade's footprint nothing is known to occlude, and
+    // wrapping would fold a distant part of the map back over the edge.
+    samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+    samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+    samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+    samp_desc.BorderColor[0] = samp_desc.BorderColor[1] = 1.0f;
+    samp_desc.BorderColor[2] = samp_desc.BorderColor[3] = 1.0f;
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(mDevice->CreateSamplerState(&samp_desc, mShadowMapSampler.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the comparison sampler.");
+        return false;
+    }
+
+    mShadowPipelineFailed = false;
+    mShadowPipelineReady = true;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolution) {
+    if (mShadowMapTexture != nullptr && cascadeCount == mShadowCascadeCount && resolution == mShadowResolution) {
+        return true; // already the right shape
+    }
+
+    // Drop the old array first so the driver can reuse its memory for the new one.
+    for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+        mShadowMapDsv[i].Reset();
+    }
+    mShadowMapSrv.Reset();
+    mShadowMapTexture.Reset();
+    mShadowCascadeCount = 0;
+    mShadowResolution = 0;
+
+    // TYPELESS so the same slices can be a depth target (D16_UNORM) while writing and a texture
+    // (R16_UNORM) while sampling.
+    D3D11_TEXTURE2D_DESC tex_desc;
+    ZeroMemory(&tex_desc, sizeof(tex_desc));
+    tex_desc.Width = (UINT)resolution;
+    tex_desc.Height = (UINT)resolution;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = (UINT)cascadeCount;
+    tex_desc.Format = DXGI_FORMAT_R16_TYPELESS;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(mDevice->CreateTexture2D(&tex_desc, nullptr, mShadowMapTexture.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create a {}x{} x{} depth array.", resolution, resolution, cascadeCount);
+        return false;
+    }
+
+    for (int i = 0; i < cascadeCount; i++) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+        ZeroMemory(&dsv_desc, sizeof(dsv_desc));
+        dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
+        dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv_desc.Texture2DArray.MipSlice = 0;
+        dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
+        dsv_desc.Texture2DArray.ArraySize = 1;
+        if (FAILED(mDevice->CreateDepthStencilView(mShadowMapTexture.Get(), &dsv_desc, mShadowMapDsv[i].GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not create the depth view for cascade {}.", i);
+            for (int j = 0; j < i; j++) {
+                mShadowMapDsv[j].Reset(); // do not leave views pointing at a texture we are dropping
+            }
+            mShadowMapTexture.Reset();
+            return false;
+        }
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format = DXGI_FORMAT_R16_UNORM;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Texture2DArray.MostDetailedMip = 0;
+    srv_desc.Texture2DArray.MipLevels = 1;
+    srv_desc.Texture2DArray.FirstArraySlice = 0;
+    srv_desc.Texture2DArray.ArraySize = (UINT)cascadeCount;
+    if (FAILED(mDevice->CreateShaderResourceView(mShadowMapTexture.Get(), &srv_desc, mShadowMapSrv.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the cascade array resource view.");
+        for (int i = 0; i < cascadeCount; i++) {
+            mShadowMapDsv[i].Reset();
+        }
+        mShadowMapTexture.Reset();
+        return false;
+    }
+
+    mShadowCascadeCount = cascadeCount;
+    mShadowResolution = resolution;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
+    if (cascadeCount < 1) {
+        cascadeCount = 1;
+    } else if (cascadeCount > SHADOW_MAP_MAX_CASCADES) {
+        cascadeCount = SHADOW_MAP_MAX_CASCADES;
+    }
+    if (resolution < SHADOW_MAP_MIN_RESOLUTION) {
+        resolution = SHADOW_MAP_MIN_RESOLUTION;
+    } else if (resolution > SHADOW_MAP_MAX_RESOLUTION) {
+        resolution = SHADOW_MAP_MAX_RESOLUTION;
+    }
+    if (!CreateShadowMapPipeline()) {
+        return false;
+    }
+    return CreateShadowMapTargets(cascadeCount, resolution);
+}
+
+void GfxRenderingAPIDX11::ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) {
+    if (!mShadowPipelineReady || mShadowMapTexture == nullptr || lightViewProj == nullptr) {
+        return;
+    }
+    if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
+        return;
+    }
+
+    if (!mShadowPassActive) {
+        // Remember the viewport once for the whole pass, not per cascade.
+        mShadowSavedViewportCount = 1;
+        mContext->RSGetViewports(&mShadowSavedViewportCount, &mShadowSavedViewport);
+        // The cascade array is about to become a depth target, so it must not still be bound for
+        // reading from the previous frame's main pass.
+        ID3D11ShaderResourceView* null_srv[1] = { nullptr };
+        mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, null_srv);
+        mShadowPassActive = true;
+    }
+
+    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[cascadeIndex].Get());
+    mContext->ClearDepthStencilView(mShadowMapDsv[cascadeIndex].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    D3D11_VIEWPORT viewport;
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width = (float)mShadowResolution;
+    viewport.Height = (float)mShadowResolution;
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &viewport);
+
+    ShadowDepthCB cb;
+    memcpy(cb.lightViewProj, lightViewProj, sizeof(cb.lightViewProj));
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(ms));
+    if (SUCCEEDED(mContext->Map(mShadowDepthCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        memcpy(ms.pData, &cb, sizeof(cb));
+        mContext->Unmap(mShadowDepthCb.Get(), 0);
+    }
+
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->IASetInputLayout(mShadowDepthLayout.Get());
+    mContext->VSSetShader(mShadowDepthVs.Get(), nullptr, 0);
+    mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
+    mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
+    mContext->RSSetState(mShadowRasterizerState.Get());
+    mContext->OMSetDepthStencilState(mShadowDepthStencilState.Get(), 0);
+    mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+}
+
+void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) {
+    if (!mShadowPassActive || worldXyz == nullptr || vertexCount < 3) {
+        return;
+    }
+    vertexCount -= vertexCount % 3; // whole triangles only
+
+    // Grow the caster buffer to fit the largest batch seen so far; batches are then uploaded whole.
+    if (mShadowCasterVb == nullptr || mShadowCasterVbVertices < vertexCount) {
+        size_t capacity = mShadowCasterVbVertices ? mShadowCasterVbVertices : 3072;
+        while (capacity < vertexCount) {
+            capacity *= 2;
+        }
+        D3D11_BUFFER_DESC vb_desc;
+        ZeroMemory(&vb_desc, sizeof(vb_desc));
+        vb_desc.Usage = D3D11_USAGE_DYNAMIC;
+        vb_desc.ByteWidth = (UINT)(capacity * 3 * sizeof(float));
+        vb_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11Buffer> grown;
+        if (FAILED(mDevice->CreateBuffer(&vb_desc, nullptr, grown.GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not grow the caster buffer to {} vertices.", capacity);
+            return;
+        }
+        mShadowCasterVb = grown;
+        mShadowCasterVbVertices = capacity;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(ms));
+    if (FAILED(mContext->Map(mShadowCasterVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return;
+    }
+    memcpy(ms.pData, worldXyz, vertexCount * 3 * sizeof(float));
+    mContext->Unmap(mShadowCasterVb.Get(), 0);
+
+    UINT stride = 3 * sizeof(float);
+    UINT offset = 0;
+    mContext->IASetVertexBuffers(0, 1, mShadowCasterVb.GetAddressOf(), &stride, &offset);
+    mContext->Draw((UINT)vertexCount, 0);
+}
+
+void GfxRenderingAPIDX11::ShadowMapEndPass() {
+    if (!mShadowPassActive) {
+        return;
+    }
+    mShadowPassActive = false;
+
+    // Put back the frame's render target and viewport.
+    if (mCurrentFramebuffer >= 0 && (size_t)mCurrentFramebuffer < mFrameBuffers.size()) {
+        FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];
+        mContext->OMSetRenderTargets(1, fb.render_target_view.GetAddressOf(),
+                                     fb.has_depth_buffer ? fb.depth_stencil_view.Get() : nullptr);
+    }
+    if (mShadowSavedViewportCount > 0) {
+        mContext->RSSetViewports(1, &mShadowSavedViewport);
+    }
+    mContext->RSSetState(mRasterizerState.Get());
+
+    // The depth pass bound its own shader, layout, blend and depth-stencil state behind the per-draw
+    // path's back. Clearing these "last state" trackers forces the next ordinary draw to set all of
+    // them again -- without this it would compare against a stale cache and keep the depth-only
+    // pipeline bound, rendering nothing.
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+    mLastBlendState = nullptr;
+    mLastStencilMode = -1;
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    // Hand the finished cascades to the main pass, past the combiner's own texture slots.
+    if (mShadowMapSrv != nullptr) {
+        mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, mShadowMapSrv.GetAddressOf());
+        mContext->PSSetSamplers(SHADER_MAX_TEXTURES, 1, mShadowMapSampler.GetAddressOf());
+    }
+}
+
 #define RAND_NOISE "((random(float3(floor(screenSpace.xy * noise_scale), noise_frame)) + 1.0) / 2.0)"
 
 static const char* prism_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,

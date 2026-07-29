@@ -129,6 +129,14 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    // SOH [Enhancement] Cascaded shadow maps (see fast/shadow_map.h). This is the only backend that
+    // implements the depth pass.
+    bool SupportsShadowMap() override;
+    bool ShadowMapConfigure(int cascadeCount, int resolution) override;
+    void ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) override;
+    void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) override;
+    void ShadowMapEndPass() override;
+
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
     Microsoft::WRL::ComPtr<ID3D11Device> mDevice;
@@ -138,6 +146,37 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
+
+    // SOH [Enhancement] Cascaded shadow maps: build the depth-only pipeline (shader, layout, states,
+    // sampler, constant/vertex buffers) once, and the cascade array whenever its shape changes.
+    // Both report failure instead of throwing -- a device that cannot make a shadow map must degrade to
+    // "no shadow map" rather than take the whole renderer down.
+    bool CreateShadowMapPipeline();
+    bool CreateShadowMapTargets(int cascadeCount, int resolution);
+
+    // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
+    // slice (written one cascade at a time) and a single shader resource view over all slices (read by
+    // the main pass). Everything stays null until the application first asks for a shadow map.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMapTexture;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMapDsv[SHADOW_MAP_MAX_CASCADES];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMapSrv;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowMapSampler;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowDepthVs;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowDepthLayout;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowDepthCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerState;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
+    size_t mShadowCasterVbVertices = 0; // capacity of mShadowCasterVb, in vertices
+    int mShadowCascadeCount = 0;        // 0 until the cascade array exists
+    int mShadowResolution = 0;
+    bool mShadowPipelineReady = false;
+    bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
+    bool mShadowPassActive = false;     // between BeginCascade and EndPass
+    // Viewport to put back when the depth pass ends: the pass overwrites it with the cascade's square
+    // one, and the interpreter does not necessarily re-issue SetViewport before the next draw.
+    D3D11_VIEWPORT mShadowSavedViewport = {};
+    UINT mShadowSavedViewportCount = 0;
 
     HMODULE mDX11Module;
 

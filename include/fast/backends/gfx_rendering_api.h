@@ -161,9 +161,26 @@ class GfxRenderingAPI {
 
     // Per-frame values the main pass needs to sample the cascades. `viewProj` holds cascadeCount
     // row-major light matrices back to back; `splitDistances` the far distance of each cascade in world
-    // units (used to pick a cascade and to size its blend band).
+    // units (used to pick a cascade and to size its blend band). Stored here rather than in each
+    // backend so the members are available to every per-draw uniform path, exactly like the toon ones.
     virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
                                     float blendFraction, float normalOffset, float strength) {
+        mShadowCascadesActive = cascadeCount < 0 ? 0
+                                : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
+                                                                         : cascadeCount;
+        if (viewProj != nullptr) {
+            for (int i = 0; i < mShadowCascadesActive * 16; i++) {
+                mShadowViewProj[i] = viewProj[i];
+            }
+        }
+        if (splitDistances != nullptr) {
+            for (int i = 0; i < mShadowCascadesActive; i++) {
+                mShadowSplits[i] = splitDistances[i];
+            }
+        }
+        mShadowBlendFraction = blendFraction;
+        mShadowNormalOffset = normalOffset;
+        mShadowStrength = strength;
     }
 
   protected:
@@ -176,6 +193,15 @@ class GfxRenderingAPI {
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
     int mStencilMode = 0; // SOH [Enhancement] world light casting / actor shadows (see StencilMode)
+    // SOH [Enhancement] Cascaded shadow maps: the frame's cascade transforms and tuning, pushed by
+    // SetShadowMapParams. mShadowCascadesActive == 0 means "no shadow map this frame", which is the
+    // state every backend that does not implement the depth pass stays in forever.
+    float mShadowViewProj[SHADOW_MAP_MAX_CASCADES * 16] = {};
+    float mShadowSplits[SHADOW_MAP_MAX_CASCADES] = {};
+    int mShadowCascadesActive = 0;
+    float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
+    float mShadowNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
+    float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
