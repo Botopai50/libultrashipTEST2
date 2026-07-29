@@ -116,32 +116,57 @@ cbuffer PerShadowCB : register(b3) {
 // Four taps in a quincunx around the centre. Each tap is a hardware comparison fetch, and with a linear
 // comparison sampler every fetch is itself a filtered 2x2 -- so these four cover a 4x4 neighbourhood for
 // the cost of four samples. That is the whole reason for a comparison sampler over a plain depth read.
+// The four taps are written out rather than looped over a local array: a local array can be placed in an
+// indexable temp register, which is exactly the kind of thing ps_4_0 refuses to map. Four lines of
+// repetition buys certainty here. The slice is cast explicitly -- it is a texture coordinate, so it has to
+// arrive as a float, and leaving that to an implicit conversion is what produces truncation warnings.
 float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv) {
-    const float2 offsets[4] = {
-        float2(-0.5, -0.5), float2(0.5, -0.5),
-        float2(-0.5, 0.5), float2(0.5, 0.5)
-    };
-    float sum = 0.0;
-    [unroll]
-    for (int i = 0; i < 4; i++) {
-        sum += g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
-                                              float3(uv + offsets[i] * texelUv, cascade), z);
-    }
+    float slice = (float)cascade;
+    float sum = g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
+                                               float3(uv + float2(-0.5, -0.5) * texelUv, slice), z);
+    sum += g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
+                                          float3(uv + float2(0.5, -0.5) * texelUv, slice), z);
+    sum += g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
+                                          float3(uv + float2(-0.5, 0.5) * texelUv, slice), z);
+    sum += g_shadowMap.SampleCmpLevelZero(g_shadowSampler,
+                                          float3(uv + float2(0.5, 0.5) * texelUv, slice), z);
     return sum * 0.25;
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
 // what the border-clamped sampler returns, but checking here avoids the fetch entirely.
-float ShadowLitFromCascade(float3 worldPos, float3 normalWs, uint cascade) {
+// NOTE ON INDEXING: ps_4_0 has no instruction for reading a vector component by a runtime value, so
+// nothing below may write shadow_splits[c] or shadow_texel_uv[c] with a non-literal c. Doing so does not
+// just fail -- the compiler first treats the expression as the whole float4, which shows up as
+// "implicit truncation of vector type" warnings, and only then reports "cannot map expression to ps_4_0".
+// Every access here is therefore a literal .x/.y/.z/.w behind a small selector.
+float ShadowSplitAt(uint c) {
+    if (c == 0) {
+        return shadow_splits.x;
+    }
+    if (c == 1) {
+        return shadow_splits.y;
+    }
+    if (c == 2) {
+        return shadow_splits.z;
+    }
+    return shadow_splits.w;
+}
+
+// Compare one cascade. The per-cascade values arrive by value rather than being looked up, which is what
+// keeps the caller's selection on literal indices (see the note above). `slice` is only ever a texture
+// coordinate, and those may be dynamic.
+float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld, float texelUv,
+                       uint slice) {
     // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
     // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
     // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
     // striped self-shadowing (acne). normalWs is zero for receivers that carry no normal (the toon variant
     // is off), and then this term simply vanishes and the rasterizer's slope bias carries it alone.
-    float3 p = worldPos + normalWs * (shadow_params.z * shadow_texel_world[cascade]);
+    float3 p = worldPos + normalWs * (shadow_params.z * texelWorld);
 
-    float4 clip = mul(float4(p, 1.0), shadow_view_proj[cascade]);
+    float4 clip = mul(float4(p, 1.0), viewProj);
     if (clip.w <= 0.0) {
         return 1.0;
     }
@@ -151,7 +176,22 @@ float ShadowLitFromCascade(float3 worldPos, float3 normalWs, uint cascade) {
     }
     // NDC -> texture space (y flips: NDC is +up, textures are +down).
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-    return SampleShadowPCF4(uv, ndc.z, cascade, shadow_texel_uv[cascade]);
+    return SampleShadowPCF4(uv, ndc.z, slice, texelUv);
+}
+
+// Dispatch to one cascade with literal indices. The chain covers SHADOW_MAP_MAX_CASCADES entries; if that
+// ever grows, this grows with it.
+float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade) {
+    if (cascade == 0) {
+        return ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x, 0);
+    }
+    if (cascade == 1) {
+        return ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y, 1);
+    }
+    if (cascade == 2) {
+        return ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z, 2);
+    }
+    return ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w, 3);
 }
 
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
@@ -163,26 +203,30 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth) {
         return 1.0; // no cascades were rendered this frame
     }
 
+    // First cascade whose far split still covers this depth; the last one catches everything beyond.
     uint cascade = count - 1;
-    [unroll]
-    for (uint i = 0; i < 4; i++) {
-        if (i < count && viewDepth <= shadow_splits[i]) {
-            cascade = min(cascade, i);
-        }
+    if (count > 0 && viewDepth <= shadow_splits.x) {
+        cascade = 0;
+    } else if (count > 1 && viewDepth <= shadow_splits.y) {
+        cascade = 1;
+    } else if (count > 2 && viewDepth <= shadow_splits.z) {
+        cascade = 2;
     }
 
-    float lit = ShadowLitFromCascade(worldPos, normalWs, cascade);
+    float lit = ShadowLitAt(worldPos, normalWs, cascade);
 
     // Cross-fade band at the far edge of this cascade, where the next one also covers the point. Sampling
     // both and blending is what hides the resolution change; a hard switch draws a visible line that
     // sweeps across the ground as the camera moves.
     if (cascade + 1 < count) {
-        float nearEdge = (cascade == 0) ? 0.0 : shadow_splits[cascade - 1];
-        float span = shadow_splits[cascade] - nearEdge;
-        float bandStart = shadow_splits[cascade] - span * shadow_params.y;
+        // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name at
+        // runtime where a stray definition would be baffling to debug.
+        float farEdge = ShadowSplitAt(cascade);
+        float nearEdge = (cascade == 0) ? 0.0 : ShadowSplitAt(cascade - 1);
+        float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
         if (viewDepth > bandStart) {
-            float t = smoothstep(bandStart, shadow_splits[cascade], viewDepth);
-            lit = lerp(lit, ShadowLitFromCascade(worldPos, normalWs, cascade + 1), t);
+            float t = smoothstep(bandStart, farEdge, viewDepth);
+            lit = lerp(lit, ShadowLitAt(worldPos, normalWs, cascade + 1), t);
         }
     }
     return lit;
