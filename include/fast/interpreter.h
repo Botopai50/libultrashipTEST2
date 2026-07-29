@@ -417,6 +417,37 @@ class Interpreter {
         mShadowEdgeSoftness = edgeSoftness;
         mShadowShowVolume = showVolume;
     }
+    // SOH [Enhancement] Cascaded shadow maps: frame-global policy pushed by the game. `enabled` must
+    // already account for the backend's capability -- the interpreter does not second-guess it, it just
+    // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
+    // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
+    void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, const float splits[4],
+                            const float lightDir[3], float blendFraction, float normalOffset, float strength) {
+        mShadowMapEnabled = enabled;
+        mShadowMapCascadeCount = cascadeCount < 1                       ? 1
+                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
+                                                                          : cascadeCount;
+        mShadowMapResolution = resolution;
+        if (splits != nullptr) {
+            for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+                mShadowMapSplits[i] = splits[i];
+            }
+        }
+        if (lightDir != nullptr) {
+            for (int i = 0; i < 3; i++) {
+                mShadowMapLightDir[i] = lightDir[i];
+            }
+        }
+        mShadowMapBlendFraction = blendFraction;
+        mShadowMapNormalOffset = normalOffset;
+        mShadowMapStrength = strength;
+        if (!enabled) {
+            // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
+            // reappear the moment it is turned back on.
+            mShadowMapCasters.clear();
+            mShadowMapCastersReady.clear();
+        }
+    }
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
@@ -472,6 +503,9 @@ class Interpreter {
     // world-space triangles (projected along the toon key direction) and accumulate it for the frame —
     // nothing draws here. Called at each per-object boundary; RenderShadowVolumes draws the batch.
     void FlushToonShadow();
+    // SOH [Enhancement] Cascaded shadow maps: render last frame's casters into the cascade array and hand
+    // the transforms to the backend. Called at the same pre-actor point as RenderShadowVolumes().
+    void RenderShadowMap();
     // SOH [Enhancement] Actor shadow: draw all volumes accumulated this frame (batched z-fail stencil +
     // composite), then clear them. Called once per frame at the pre-actor hook so shadows fall only on the
     // environment (no self-shadow / no shadowing other actors).
@@ -584,6 +618,30 @@ class Interpreter {
     float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
     int mShadowEdgeSoftness = 1;       // penumbra rings around the silhouette (0 = hard edge, max 2)
     bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
+
+    // SOH [Enhancement] Cascaded shadow maps. Casters are captured in world space exactly where the
+    // stencil-volume system captures its silhouettes (same gSPToonShadow arming), but they are kept as
+    // plain triangles instead of being flattened onto the ground.
+    //
+    // The list is double-buffered because of an ordering problem: the depth maps have to exist before
+    // anything samples them, yet the casters are only known once the frame has drawn. So each frame
+    // renders the cascades from the PREVIOUS frame's casters while accumulating the current ones. That
+    // costs one frame of shadow lag -- the same trade the stencil volumes already make, and equally
+    // imperceptible for shadows that move at gameplay speed.
+    std::vector<float> mShadowMapCasters;      // filling this frame (9 floats per triangle)
+    std::vector<float> mShadowMapCastersReady; // completed last frame; what the depth pass draws
+    bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
+    int mShadowMapCascadeCount = SHADOW_MAP_MAX_CASCADES;
+    int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
+    float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
+                                                        SHADOW_MAP_DEFAULT_SPLIT_2, SHADOW_MAP_DEFAULT_SPLIT_3 };
+    float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels
+    float mShadowMapBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
+    float mShadowMapNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
+    float mShadowMapStrength = SHADOW_MAP_DEFAULT_STRENGTH;
+    // Per-frame budget on captured casters. A pathological scene must cost a dropped shadow, not an
+    // unbounded allocation; 9 floats per triangle makes this a little over a million triangles.
+    static constexpr size_t kShadowMapCasterBudgetFloats = 12u * 1024u * 1024u;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

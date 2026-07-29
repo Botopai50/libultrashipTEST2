@@ -1529,6 +1529,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mShadowVerts.push_back(v_arr[si]->wy);
             mShadowVerts.push_back(v_arr[si]->wz);
         }
+        // SOH [Enhancement] Cascaded shadow maps: the same armed geometry, kept as world-space triangles
+        // rather than flattened onto the ground. Both systems can capture at once because only one of
+        // them is ever enabled -- the mode selector is exclusive -- so this costs nothing in the other
+        // modes. Over budget, stop growing: a scene missing its furthest casters beats an allocation
+        // that grows without bound.
+        if (mShadowMapEnabled && mShadowMapCasters.size() < kShadowMapCasterBudgetFloats) {
+            for (int si = 0; si < 3; si++) {
+                mShadowMapCasters.push_back(v_arr[si]->wx);
+                mShadowMapCasters.push_back(v_arr[si]->wy);
+                mShadowMapCasters.push_back(v_arr[si]->wz);
+            }
+        }
     }
 
     // if (rand()%2) return;
@@ -2756,6 +2768,227 @@ void Interpreter::FlushToonShadow() {
 // FlushToonShadow) gets its own batched z-fail stencil pass pair + one self-clearing composite at the band's
 // stepped-down alpha; the steps read as a small soft edge. Called once per frame at the pre-actor hook
 // (after the room is drawn) so the shadows fall only on the environment.
+// SOH [Enhancement] Cascaded shadow maps: invert a row-vector 4x4 (general case, via cofactors). Used to
+// recover the view axis from the combined view-projection so the cascades can be centred on the camera --
+// the interpreter never sees a separate view matrix, only the product the game hands it.
+// Returns false for a singular matrix, in which case the caller skips the shadow pass this frame.
+static bool ShadowInvertMatrix(const float m[4][4], float out[4][4]) {
+    const float* a = &m[0][0];
+    float inv[16];
+
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] +
+             a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] -
+             a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] +
+             a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] -
+              a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] -
+             a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] +
+             a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] -
+             a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] +
+              a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] +
+             a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] -
+             a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] +
+              a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] -
+              a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] -
+             a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] +
+             a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] -
+              a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] +
+              a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+
+    float det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (std::fabs(det) < 1e-12f) {
+        return false;
+    }
+    det = 1.0f / det;
+    for (int i = 0; i < 16; i++) {
+        (&out[0][0])[i] = inv[i] * det;
+    }
+    return true;
+}
+
+// Transform an NDC point through an inverse view-projection, row-vector convention, with the perspective
+// divide. Used only to walk the view axis, so w == 0 means "no usable point" rather than an error.
+static bool ShadowUnproject(const float invVp[4][4], float x, float y, float z, float out[3]) {
+    const float w = x * invVp[0][3] + y * invVp[1][3] + z * invVp[2][3] + invVp[3][3];
+    if (std::fabs(w) < 1e-9f) {
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        out[i] = (x * invVp[0][i] + y * invVp[1][i] + z * invVp[2][i] + invVp[3][i]) / w;
+    }
+    return true;
+}
+
+// SOH [Enhancement] Cascaded shadow maps: render last frame's casters into the cascade array.
+//
+// Each cascade is an orthographic box centred on a point along the view axis, sized by that cascade's
+// split distance. The box is fitted to a SPHERE rather than to the view frustum's corners: a sphere's
+// radius does not change as the camera turns, so the projection stays the same size frame to frame. A
+// frustum-corner fit would resize it constantly and every shadow edge would crawl.
+//
+// The centre is then snapped to whole texels in light space. Without that, sub-texel movement of the
+// centre reshuffles which texel each surface lands in and the edges shimmer as the camera walks
+// ("shadow swimming") -- the artefact the design calls out first.
+void Interpreter::RenderShadowMap() {
+    auto swapCasterBuffers = [this] {
+        mShadowMapCastersReady.swap(mShadowMapCasters);
+        mShadowMapCasters.clear();
+    };
+
+    if (!mShadowMapEnabled) {
+        swapCasterBuffers();
+        return;
+    }
+    if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution)) {
+        // Backend could not give us the maps; report no cascades so the main pass does not sample a
+        // texture that was never filled.
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+    if (mShadowMapCastersReady.size() < 9) {
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+
+    float invVp[4][4];
+    if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+
+    // Two points on the view axis give the camera position and the direction it looks.
+    float nearC[3], farC[3];
+    if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, nearC) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, farC)) {
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+    float viewDir[3] = { farC[0] - nearC[0], farC[1] - nearC[1], farC[2] - nearC[2] };
+    float viewLen = std::sqrt(viewDir[0] * viewDir[0] + viewDir[1] * viewDir[1] + viewDir[2] * viewDir[2]);
+    if (viewLen < 1e-6f) {
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        viewDir[i] /= viewLen;
+    }
+
+    // Light basis. The up reference is world up unless the light is nearly vertical, where that would be
+    // degenerate and any horizontal reference does.
+    float lz[3] = { mShadowMapLightDir[0], mShadowMapLightDir[1], mShadowMapLightDir[2] };
+    float lzLen = std::sqrt(lz[0] * lz[0] + lz[1] * lz[1] + lz[2] * lz[2]);
+    if (lzLen < 1e-6f) {
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
+                                  mShadowMapStrength);
+        swapCasterBuffers();
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        lz[i] /= lzLen;
+    }
+    float up[3] = { 0.0f, 1.0f, 0.0f };
+    if (std::fabs(lz[1]) > 0.99f) {
+        up[0] = 1.0f;
+        up[1] = 0.0f;
+    }
+    float lx[3] = { up[1] * lz[2] - up[2] * lz[1], up[2] * lz[0] - up[0] * lz[2], up[0] * lz[1] - up[1] * lz[0] };
+    float lxLen = std::sqrt(lx[0] * lx[0] + lx[1] * lx[1] + lx[2] * lx[2]);
+    for (int i = 0; i < 3; i++) {
+        lx[i] /= lxLen;
+    }
+    const float ly[3] = { lz[1] * lx[2] - lz[2] * lx[1], lz[2] * lx[0] - lz[0] * lx[2], lz[0] * lx[1] - lz[1] * lx[0] };
+
+    float matrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
+    float splits[SHADOW_MAP_MAX_CASCADES] = {};
+    float nearDist = 0.0f;
+
+    for (int c = 0; c < mShadowMapCascadeCount; c++) {
+        const float farDist = mShadowMapSplits[c] > nearDist ? mShadowMapSplits[c] : nearDist + 1.0f;
+        splits[c] = farDist;
+
+        // Sphere around this slice of the view axis: centred at its midpoint, with a radius that also
+        // covers the frustum's lateral spread. Half the slice length is a deliberate over-estimate --
+        // cheap, and erring large only wastes a little resolution while erring small clips shadows off.
+        const float mid = (nearDist + farDist) * 0.5f;
+        const float radius = (farDist - nearDist) * 0.5f + mid * 0.5f;
+        float center[3] = { nearC[0] + viewDir[0] * mid, nearC[1] + viewDir[1] * mid, nearC[2] + viewDir[2] * mid };
+
+        // Snap the centre to whole texels along the light's own axes (see the note above).
+        const float texelWorldSize = (2.0f * radius) / (float)mShadowMapResolution;
+        if (texelWorldSize > 0.0f) {
+            float cx = center[0] * lx[0] + center[1] * lx[1] + center[2] * lx[2];
+            float cy = center[0] * ly[0] + center[1] * ly[1] + center[2] * ly[2];
+            const float cz = center[0] * lz[0] + center[1] * lz[1] + center[2] * lz[2];
+            cx = std::floor(cx / texelWorldSize) * texelWorldSize;
+            cy = std::floor(cy / texelWorldSize) * texelWorldSize;
+            for (int i = 0; i < 3; i++) {
+                center[i] = lx[i] * cx + ly[i] * cy + lz[i] * cz;
+            }
+        }
+
+        // Pull the eye back far enough that casters above the slice still fall inside the depth range.
+        const float back = radius * 2.0f + 1000.0f;
+        const float eye[3] = { center[0] - lz[0] * back, center[1] - lz[1] * back, center[2] - lz[2] * back };
+        const float zNear = 0.0f;
+        const float zFar = back + radius * 2.0f;
+
+        // view * ortho, folded into one row-vector matrix (world position * M -> clip).
+        float* m = &matrices[c * 16];
+        const float sx = 1.0f / radius;
+        const float sy = 1.0f / radius;
+        const float sz = 1.0f / (zFar - zNear);
+        m[0] = lx[0] * sx;
+        m[1] = ly[0] * sy;
+        m[2] = lz[0] * sz;
+        m[3] = 0.0f;
+        m[4] = lx[1] * sx;
+        m[5] = ly[1] * sy;
+        m[6] = lz[1] * sz;
+        m[7] = 0.0f;
+        m[8] = lx[2] * sx;
+        m[9] = ly[2] * sy;
+        m[10] = lz[2] * sz;
+        m[11] = 0.0f;
+        m[12] = -(eye[0] * lx[0] + eye[1] * lx[1] + eye[2] * lx[2]) * sx;
+        m[13] = -(eye[0] * ly[0] + eye[1] * ly[1] + eye[2] * ly[2]) * sy;
+        m[14] = (-(eye[0] * lz[0] + eye[1] * lz[1] + eye[2] * lz[2]) - zNear) * sz;
+        m[15] = 1.0f;
+
+        mRapi->ShadowMapBeginCascade(c, m);
+        mRapi->ShadowMapDrawCasters(mShadowMapCastersReady.data(), mShadowMapCastersReady.size() / 3);
+
+        nearDist = farDist;
+    }
+
+    mRapi->ShadowMapEndPass();
+    mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
+                              mShadowMapNormalOffset, mShadowMapStrength);
+    swapCasterBuffers();
+}
+
 void Interpreter::RenderShadowVolumes() {
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     auto clearAccums = [this] {
@@ -4459,6 +4692,11 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     // shadow volumes now" (emitted at the pre-actor hook so shadows land only on the environment).
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
         gfx->RenderShadowVolumes();
+        // SOH [Enhancement] Cascaded shadow maps share this hook: the cascades must be filled before
+        // anything samples them, and only one of the two systems is ever enabled, so they never both
+        // draw. RenderShadowMap() is called unconditionally because it also swaps the caster buffers --
+        // skipping it while the mode is off would leave the previous frame's casters to reappear.
+        gfx->RenderShadowMap();
         return false;
     }
 

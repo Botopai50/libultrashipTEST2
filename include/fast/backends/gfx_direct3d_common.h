@@ -168,6 +168,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices = 0; // capacity of mShadowCasterVb, in vertices
+    // What the caster buffer currently holds, so the cascades after the first can reuse it. Valid only
+    // within one depth pass -- reset when a pass opens, since the caller's buffer is typically the same
+    // allocation every frame with different contents.
+    const float* mShadowLastCasterPtr = nullptr;
+    size_t mShadowLastCasterCount = 0;
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists
     int mShadowResolution = 0;
     bool mShadowPipelineReady = false;

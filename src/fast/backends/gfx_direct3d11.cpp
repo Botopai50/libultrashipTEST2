@@ -1531,6 +1531,11 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int cascadeIndex, const float li
         // reading from the previous frame's main pass.
         ID3D11ShaderResourceView* null_srv[1] = { nullptr };
         mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, null_srv);
+        // Forget the previous pass's upload. The caster vector usually keeps the same allocation frame to
+        // frame while its contents change completely, so a pointer match across passes would wrongly skip
+        // the upload and render last frame's geometry forever.
+        mShadowLastCasterPtr = nullptr;
+        mShadowLastCasterCount = 0;
         mShadowPassActive = true;
     }
 
@@ -1571,6 +1576,14 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     }
     vertexCount -= vertexCount % 3; // whole triangles only
 
+    // Every cascade draws the same caster list, so after the first one the buffer already holds exactly
+    // what is needed. Re-uploading it per cascade would cost four full copies of the frame's geometry for
+    // nothing; the vertex buffer is still bound, so just issue the draw.
+    if (mShadowLastCasterPtr == worldXyz && mShadowLastCasterCount == vertexCount && mShadowCasterVb != nullptr) {
+        mContext->Draw((UINT)vertexCount, 0);
+        return;
+    }
+
     // Grow the caster buffer to fit the largest batch seen so far; batches are then uploaded whole.
     if (mShadowCasterVb == nullptr || mShadowCasterVbVertices < vertexCount) {
         size_t capacity = mShadowCasterVbVertices ? mShadowCasterVbVertices : 3072;
@@ -1604,6 +1617,8 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     UINT offset = 0;
     mContext->IASetVertexBuffers(0, 1, mShadowCasterVb.GetAddressOf(), &stride, &offset);
     mContext->Draw((UINT)vertexCount, 0);
+    mShadowLastCasterPtr = worldXyz;
+    mShadowLastCasterCount = vertexCount;
 }
 
 void GfxRenderingAPIDX11::ShadowMapEndPass() {
