@@ -162,6 +162,28 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
     return lerp(top, bottom, subTexel.y);
 }
 
+// Wider filter: four bilinear taps two texels apart, covering a 4x4 texel neighbourhood. Sixteen fetches
+// instead of four.
+//
+// This is the only lever on distant jaggedness that costs neither range nor memory. Texel size is what
+// quantizes a shadow edge, and the far cascade spends 2048 texels on a radius of about 4000 world units --
+// four units per texel. Shortening its range or raising the resolution both fix that directly but cost
+// something; a wider filter cannot make the edge more accurate, it can only spread the step over enough
+// pixels to stop reading as a staircase. On this kind of workload the extra fetches are the cheapest of
+// the three currencies.
+//
+// Redistributing the cascade splits was checked first and does not help: the far cascade's radius comes
+// mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
+// split only trades the near cascades (already ~36x oversampled) for almost nothing.
+float SampleShadowPCF16(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
+    float d = texelUv * 2.0;
+    float sum = SampleShadowPCF4(uv + float2(-d, -d), z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(d, -d), z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(-d, d), z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(d, d), z, cascade, texelUv, sliceBase);
+    return sum * 0.25;
+}
+
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
 // what the border-clamped sampler returns, but checking here avoids the fetch entirely.
@@ -207,7 +229,7 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
         if (inside) {
             // NDC -> texture space (y flips: NDC is +up, textures are +down).
             float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-            lit = SampleShadowPCF4(uv, ndc.z - depthBias, slice, texelUv, sliceBase);
+            lit = SampleShadowPCF16(uv, ndc.z - depthBias, slice, texelUv, sliceBase);
         }
     }
     return lit;
