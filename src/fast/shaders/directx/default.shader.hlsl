@@ -41,8 +41,9 @@ float3 normal : NORMAL;
 @{update_floats(3)}
 @end
 @if(o_shadow_map)
-float3 worldPos : WORLDPOS;
-@{update_floats(3)}
+// xyz is the world position; w is 1 for scenery and 0 for a character (see the note in ShaderOpts).
+float4 worldPos : WORLDPOS;
+@{update_floats(4)}
 @end
 
 @for(i in 0..o_inputs)
@@ -370,7 +371,7 @@ PSInput VSMain(
     , float3 normal : NORMAL
 @end
 @if(o_shadow_map)
-    , float3 worldPos : WORLDPOS
+    , float4 worldPos : WORLDPOS
 @end
 @for(i in 0..o_inputs)
     @if(o_alpha)
@@ -582,17 +583,22 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // geometry that most needs it, which is why the walls no longer have to be excluded from
             // casting to stay clean. ddx/ddy are core pixel-shader instructions, so this costs nothing
             // structurally.
-            float3 shadowN = normalize(cross(ddx(input.worldPos), ddy(input.worldPos)));
+            float3 shadowN = normalize(cross(ddx(input.worldPos.xyz), ddy(input.worldPos.xyz)));
         @end
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
         // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
         // character is shadowed by the world but never by another character (or by itself) -- the
         // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.
-        float shadowLit = ShadowLit(input.worldPos, shadowN, input.position.w, 0.0);
-        @if(o_shadow_map_actors)
-            shadowLit = min(shadowLit, ShadowLit(input.worldPos, shadowN, input.position.w, shadow_params.x));
-        @end
+        float shadowLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, 0.0);
+        // Scenery also takes the actor caster layer; a character does not, so it is never shadowed by
+        // another character or by itself. [branch] because the value is constant across a draw call, so the
+        // character case genuinely skips the second set of taps rather than computing and discarding them.
+        [branch]
+        if (input.worldPos.w > 0.5) {
+            shadowLit = min(shadowLit,
+                            ShadowLit(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x));
+        }
         texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
     @end
 

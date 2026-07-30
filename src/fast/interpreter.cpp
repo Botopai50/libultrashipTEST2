@@ -1708,9 +1708,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_shadow_map) {
         cc_options |= SHADER_OPT(SHADOW_MAP);
     }
-    if (use_shadow_map_actors) {
-        cc_options |= SHADER_OPT(SHADOW_MAP_ACTORS);
-    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -1726,9 +1723,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
         // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
-        // SHADOW_MAP and 19->20 for SHADOW_MAP_ACTORS. Keep in lockstep with the decode in
-        // gfx_cc_get_features -- a mismatch selects the wrong shader for every draw in the game.
-        cc_options |= (shader.id << 20);
+        // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
+        // wrong shader for every draw in the game.
+        cc_options |= (shader.id << 19);
     }
 
     ColorCombinerKey key;
@@ -1938,6 +1935,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mBufVbo[mBufVboLen++] = v_arr[i]->wx;
             mBufVbo[mBufVboLen++] = v_arr[i]->wy;
             mBufVbo[mBufVboLen++] = v_arr[i]->wz;
+            // Receiver kind rides in w: 1 = scenery, which also samples the actor caster layer, 0 = a
+            // character, which must not. Carried per vertex rather than as a shader option because each
+            // option doubles the shader variants, and every new variant is compiled mid-frame -- felt as
+            // the game hitching the first time shadows appear.
+            mBufVbo[mBufVboLen++] = use_shadow_map_actors ? 1.0f : 0.0f;
         }
 
         for (int j = 0; j < numInputs; j++) {
@@ -5908,7 +5910,6 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
     // SOH [Enhancement] cascaded shadow maps: this draw samples the cascade array
     cc_features->opt_shadow_map = (shader_id1 & SHADER_OPT(SHADOW_MAP)) != 0;
-    cc_features->opt_shadow_map_actors = (shader_id1 & SHADER_OPT(SHADOW_MAP_ACTORS)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -5918,7 +5919,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
         // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP. Must match the encode in
         // the ColorCombinerKey build; a mismatch silently selects the wrong shader for every draw.
-        cc_features->shader_id = (shader_id1 >> 20) & 0xFFF;
+        cc_features->shader_id = (shader_id1 >> 19) & 0x1FFF;
     }
 
     cc_features->usedTextures[0] = false;

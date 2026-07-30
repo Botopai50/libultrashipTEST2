@@ -490,9 +490,13 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     }
     // SOH [Enhancement] Cascaded shadow maps: receiver world position (order must match the vbo packing).
     if (cc_features.opt_shadow_map) {
-        ied[ied_index++] = {
-            "WORLDPOS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
-        };
+        ied[ied_index++] = { "WORLDPOS",
+                             0,
+                             DXGI_FORMAT_R32G32B32A32_FLOAT, // xyz world position, w the receiver kind
+                             0,
+                             D3D11_APPEND_ALIGNED_ELEMENT,
+                             D3D11_INPUT_PER_VERTEX_DATA,
+                             0 };
     }
     for (unsigned int i = 0; i < cc_features.numInputs; i++) {
         DXGI_FORMAT format = cc_features.opt_alpha ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32_FLOAT;
@@ -1924,7 +1928,6 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
-        { "o_shadow_map_actors", cc_features.opt_shadow_map_actors },
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
