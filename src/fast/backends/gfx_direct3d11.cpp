@@ -1407,20 +1407,14 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     D3D11_RASTERIZER_DESC rast_desc;
     ZeroMemory(&rast_desc, sizeof(rast_desc));
     rast_desc.FillMode = D3D11_FILL_SOLID;
-    // Cull front faces, so only surfaces facing AWAY from the light are recorded. This is the standard
-    // answer to a surface shadowing itself, and it is the one that works here: the depth written for a wall
-    // is its far side, a whole wall thickness behind the side being shaded, so the comparison has real
-    // clearance instead of fighting for it with bias.
-    //
-    // Bias alone cannot fix this case. A wall lit at a grazing angle has an enormous depth slope, and its
-    // brick relief is finer than one shadow texel, so the surface keeps crossing its own recorded depth --
-    // which is what produced the comb of light teeth along every brick course. Normal-offset bias would
-    // normally take over, but the room mesh carries no vertex normals, so for exactly the geometry that
-    // needs it most that term is zero.
-    //
-    // The cost is that single-sided geometry stops casting, since its only face is the front one. Flat
-    // ground is the main example, and it does not need to shadow itself.
-    rast_desc.CullMode = D3D11_CULL_FRONT;
+    // Two-sided. Culling front faces is the other classic answer to a surface shadowing itself, and it was
+    // tried here -- but it records the FAR side of a wall, a whole wall thickness behind the side being
+    // shaded, and that offset is peter panning by construction: shadows visibly detached from what cast
+    // them. The self-shadowing it was covering for is handled properly now, by a normal-offset bias that
+    // works on the room mesh (the shader recovers a face normal from screen derivatives where no vertex
+    // normal exists). Two-sided also keeps single-sided geometry casting at all, which front-face culling
+    // silently dropped.
+    rast_desc.CullMode = D3D11_CULL_NONE;
     rast_desc.DepthClipEnable = TRUE;
     // No constant bias here. It is applied in the shader instead, in world units divided by each
     // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different

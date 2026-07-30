@@ -62,13 +62,21 @@
 // Expressed in world units and divided by each cascade's own depth range at upload time, one value means
 // the same physical offset everywhere. The slope term stays with the rasterizer, where being relative to
 // the polygon's own gradient is exactly what it should be.
-#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 2.0f
+// 1.0 rather than 2.0: the normal-offset term below now does real work on the room mesh (the shader
+// recovers a face normal from screen derivatives where no vertex normal exists), so the constant term no
+// longer has to carry the whole load, and every unit of it is peter panning.
+#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 1.0f
 #define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
-// This is the term that actually removes the striped self-shadowing (acne) on curved surfaces, where a
-// depth-only bias cannot: it moves the sample sideways off the shadow-casting surface itself.
-#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 1.0f
+// This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
+// where a depth-only bias cannot: it moves the sample sideways off the shadow-casting surface itself rather
+// than sliding it along the light ray, still inside the same polygon.
+// Scaling with the texel is what makes one value work across cascades -- acne appears at the scale of the
+// map's own resolution, so the push has to be measured in the same unit.
+// 2.0 rather than 1.0: this term is now the primary defence against self-shadowing, replacing both the
+// front-face culling that caused peter panning and half of the constant bias that did the same.
+#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 2.0f
 
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f

@@ -539,9 +539,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         @if(o_toon)
             float3 shadowN = normalize(input.normal);
         @else
-            // No normal on this draw, so no normal-offset push -- the rasterizer's slope-scaled bias is
-            // the only thing keeping this surface off its own depth values.
-            float3 shadowN = float3(0.0, 0.0, 0.0);
+            // No vertex normal on this draw -- the room mesh is drawn unlit. Recover the geometric face
+            // normal from the world position's screen derivatives instead: two tangents across the pixel
+            // quad, crossed. That gives the normal-offset bias something to push along for exactly the
+            // geometry that most needs it, which is why the walls no longer have to be excluded from
+            // casting to stay clean. ddx/ddy are core pixel-shader instructions, so this costs nothing
+            // structurally.
+            float3 shadowN = normalize(cross(ddx(input.worldPos), ddy(input.worldPos)));
         @end
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
         // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
