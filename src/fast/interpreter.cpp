@@ -2906,7 +2906,7 @@ void Interpreter::RenderShadowMap() {
     auto swapCasterBuffers = [this] {
         for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
             mShadowMapCastersReady[l].swap(mShadowMapCasters[l]);
-            mShadowMapCasters[l].clear();
+            mShadowMapCasters[l].clear(); // keeps capacity, so the per-triangle push_backs stop reallocating
         }
     };
 

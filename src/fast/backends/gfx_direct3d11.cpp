@@ -1632,7 +1632,11 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
 
     // Grow the caster buffer to fit the largest batch seen so far; batches are then uploaded whole.
     if (mShadowCasterVb == nullptr || mShadowCasterVbVertices < vertexCount) {
-        size_t capacity = mShadowCasterVbVertices ? mShadowCasterVbVertices : 3072;
+        // Start large rather than at a few thousand vertices. Growing means creating a new buffer, which is
+        // a driver allocation in the middle of a frame -- and the caster count climbs as the camera turns
+        // and more of the scene is submitted, so a small starting size turns every early rotation into a
+        // series of stalls. 128k vertices is about 1.5 MB and covers a room mesh plus its actors outright.
+        size_t capacity = mShadowCasterVbVertices ? mShadowCasterVbVertices : 128u * 1024u;
         while (capacity < vertexCount) {
             capacity *= 2;
         }
