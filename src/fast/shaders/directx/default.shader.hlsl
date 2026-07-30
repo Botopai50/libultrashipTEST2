@@ -162,7 +162,7 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
     return lerp(top, bottom, subTexel.y);
 }
 
-// Wider filter: four bilinear taps two texels apart, covering a 4x4 texel neighbourhood. Sixteen fetches
+// Wider filter: four bilinear taps one texel apart, covering a 4x4 texel neighbourhood. Sixteen fetches
 // instead of four.
 //
 // This is the only lever on distant jaggedness that costs neither range nor memory. Texel size is what
@@ -176,7 +176,11 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
 float SampleShadowPCF16(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
-    float d = texelUv * 2.0;
+    // One texel, not two. Each bilinear tap already spans a 2x2 texel quad, so taps a single texel either
+    // side put those quads edge to edge and cover 4x4 contiguously. Spacing them two texels apart leaves
+    // the middle two texels of each axis sampled by nothing -- a regular hole in the kernel, which reads on
+    // screen as a grid laid over the ground.
+    float d = texelUv;
     float sum = SampleShadowPCF4(uv + float2(-d, -d), z, cascade, texelUv, sliceBase);
     sum += SampleShadowPCF4(uv + float2(d, -d), z, cascade, texelUv, sliceBase);
     sum += SampleShadowPCF4(uv + float2(-d, d), z, cascade, texelUv, sliceBase);
