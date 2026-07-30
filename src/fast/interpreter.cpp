@@ -1545,6 +1545,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mShadowMapCasters.push_back(v_arr[si]->wz);
             }
         }
+    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && !is_rect &&
+               mShadowMapCasters.size() < kShadowMapCasterBudgetFloats) {
+        // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
+        // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the actor path -- the
+        // room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
+        for (int si = 0; si < 3; si++) {
+            mShadowMapCasters.push_back(v_arr[si]->wx);
+            mShadowMapCasters.push_back(v_arr[si]->wy);
+            mShadowMapCasters.push_back(v_arr[si]->wz);
+        }
     }
 
     // if (rand()%2) return;
@@ -4722,6 +4732,17 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
     // Sentinel (gSPToonShadowFlush): a zero normal with this magic w1 means "render the frame's accumulated
     // shadow volumes now" (emitted at the pre-actor hook so shadows land only on the environment).
     if ((nx | ny | nz) == 0 && sizeOrSentinel <= -1.0e29f) {
+        // SOH [Enhancement] Cascaded shadow maps: the world-caster bracket rides further down the same
+        // sentinel range, so it has to be tested BEFORE the flush -- the flush's own test (<= -1e29) would
+        // otherwise swallow both of these.
+        if (sizeOrSentinel <= -2.5e30f) {
+            gfx->mRdp->shadow_world_caster = false; // gSPShadowMapWorldCasterEnd
+            return false;
+        }
+        if (sizeOrSentinel <= -1.5e30f) {
+            gfx->mRdp->shadow_world_caster = true; // gSPShadowMapWorldCasterBegin
+            return false;
+        }
         gfx->RenderShadowVolumes();
         // SOH [Enhancement] Cascaded shadow maps share this hook: the cascades must be filled before
         // anything samples them, and only one of the two systems is ever enabled, so they never both

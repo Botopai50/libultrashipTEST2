@@ -2862,6 +2862,15 @@ typedef union Gfx {
 // sentinel planeD (-1e30) tells gfx_set_toon_shadow_handler_custom to call RenderShadowVolumes().
 #define gSPToonShadowFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.0e30f)
 
+// SOH [Enhancement] Cascaded shadow maps: bracket the draws that are world geometry (the room mesh), so the
+// depth pass captures them as casters and the scene can shadow itself. Distinct from the actor arming above:
+// an actor is excluded from RECEIVING shadow so it cannot shadow itself, whereas world geometry has to both
+// cast and receive -- that is what scenery-shadows-scenery means.
+// These ride the same opcode on further planeD sentinels. The handler tests the more negative values first,
+// because the flush sentinel's own test (<= -1e29) would otherwise swallow them.
+#define gSPShadowMapWorldCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -2.0e30f)
+#define gSPShadowMapWorldCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -3.0e30f)
+
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \

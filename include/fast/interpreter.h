@@ -346,6 +346,10 @@ struct RDP {
     bool grayscale;
     bool toon;        // SOH [Enhancement] toon lighting active for the current draw (set by gSPToon)
     bool toon_shadow; // SOH [Enhancement] actor shadow armed for the current object (set by gSPToonShadow)
+    // SOH [Enhancement] Cascaded shadow maps: the current draws are world geometry, so capture them as
+    // casters. Deliberately separate from toon_shadow, which also means "do not receive": world geometry
+    // must cast AND receive, since scenery shadowing scenery is the whole point.
+    bool shadow_world_caster;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
