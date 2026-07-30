@@ -3005,7 +3005,27 @@ void Interpreter::RenderShadowMap() {
         const float halfAtFar = halfNear + (halfFar - halfNear) * std::clamp(farDist / axisLen, 0.0f, 1.0f);
         const float halfLen = (farDist - nearDist) * 0.5f;
         const float lateral = std::max(halfAtNear, halfAtFar);
-        const float radius = std::sqrt(halfLen * halfLen + lateral * lateral);
+        float radius = std::sqrt(halfLen * halfLen + lateral * lateral);
+
+        // Hold the radius steady. Rotation-invariance alone is not enough to stop the edges crawling: the
+        // fit above is derived from the near/far planes, which the game moves around, so the radius wobbles
+        // a little every frame. The texel grid is sized 2*radius/resolution, so a wobbling radius means a
+        // wobbling grid -- and the snapping below, which quantizes the centre in units of one texel, is then
+        // measuring against a ruler that keeps changing length, which does nothing at all.
+        //
+        // Quantizing alone still flips between two neighbouring steps when the fit sits near a boundary, so
+        // the held value only moves when it has to: up whenever the fit no longer fits, down only once the
+        // fit is clearly smaller. It must never end up below the fitted radius or the cascade would clip
+        // shadows at its edge.
+        if (radius > 1e-4f) {
+            const float step = std::exp2(std::floor(std::log2(radius)) - 3.0f);
+            const float quantized = std::ceil(radius / step) * step;
+            float& held = mShadowMapCascadeRadius[c];
+            if (held <= 0.0f || radius > held || radius < held - 2.0f * step) {
+                held = quantized;
+            }
+            radius = held;
+        }
         float center[3] = { nearC[0] + viewDir[0] * mid, nearC[1] + viewDir[1] * mid, nearC[2] + viewDir[2] * mid };
 
         // Snap the centre to whole texels along the light's own axes (see the note above).

@@ -658,6 +658,12 @@ class Interpreter {
     // Per-frame budget on captured casters. A pathological scene must cost a dropped shadow, not an
     // unbounded allocation; 9 floats per triangle makes this a little over a million triangles.
     static constexpr size_t kShadowMapCasterBudgetFloats = 12u * 1024u * 1024u;
+    // Radius each cascade is currently holding, kept across frames on purpose. The fitted radius wobbles
+    // a little every frame because the game moves its near/far planes, and the texel grid is sized from
+    // the radius -- so letting it follow the wobble resizes the grid and the texel snapping stops working,
+    // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
+    // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
+    float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
