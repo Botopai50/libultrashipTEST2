@@ -1543,10 +1543,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
     // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
     if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
-        for (int si = 0; si < 3; si++) {
-            mShadowVerts.push_back(v_arr[si]->wx);
-            mShadowVerts.push_back(v_arr[si]->wy);
-            mShadowVerts.push_back(v_arr[si]->wz);
+        // Only for the stencil volumes. In shadow-map mode FlushToonShadow discards this list untouched --
+        // the two systems are mutually exclusive -- so filling it would be three push_backs per vertex of
+        // every casting actor, every frame, thrown away.
+        if (!mShadowMapEnabled) {
+            for (int si = 0; si < 3; si++) {
+                mShadowVerts.push_back(v_arr[si]->wx);
+                mShadowVerts.push_back(v_arr[si]->wy);
+                mShadowVerts.push_back(v_arr[si]->wz);
+            }
         }
         // SOH [Enhancement] Cascaded shadow maps: the same armed geometry, kept as world-space triangles
         // rather than flattened onto the ground. Both systems can capture at once because only one of

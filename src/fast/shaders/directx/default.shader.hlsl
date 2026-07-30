@@ -253,25 +253,43 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
 
 // Dispatch to one cascade with literal indices. The chain covers SHADOW_MAP_MAX_CASCADES entries; if that
 // ever grows, this grows with it.
-// [branch] asks for a real branch instead of evaluating every arm and discarding all but one. Flattened,
-// this would cost four cascades' worth of fetches on every pixel -- sixteen instead of four.
+//
+// It SELECTS the cascade's constants and then samples once, rather than branching around four separate
+// calls to ShadowLitCascade. That distinction is the difference between a shader that compiles in
+// milliseconds and one that does not. ShadowLitCascade has no callable form -- ps_4_0 inlines everything --
+// so a four-arm dispatch pasted its sixteen-tap filter in four times; ShadowLit calls this twice (the
+// cascade and its cross-fade partner) and PSMain calls ShadowLit twice (the world layer and the actor
+// layer), which multiplied out to 256 inlined texture-fetch sites in every receiver shader. FXC at
+// optimisation level 2 takes a long time over that, and it runs SYNCHRONOUSLY inside a frame the first time
+// each material is drawn -- which is exactly the hitch felt as new geometry rotates into view. Selecting
+// first cuts it to 64 sites with identical output: only one arm's fetches ever executed anyway.
+//
+// Each branch moves four registers' worth of constants, so there is nothing left worth a real branch;
+// flattening to conditional moves is cheaper than the jump. Every index stays literal -- see ShadowSplitAt
+// for why a computed one cannot be used here.
 float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBase) {
-    float lit = 1.0;
-    [branch]
-    if (cascade == 0) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x,
-                               shadow_depth_bias.x, 0, sliceBase);
-    } else if (cascade == 1) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y,
-                               shadow_depth_bias.y, 1, sliceBase);
+    float4x4 viewProj = shadow_view_proj[0];
+    float texelWorld = shadow_texel_world.x;
+    float texelUv = shadow_texel_uv.x;
+    float depthBias = shadow_depth_bias.x;
+    if (cascade == 1) {
+        viewProj = shadow_view_proj[1];
+        texelWorld = shadow_texel_world.y;
+        texelUv = shadow_texel_uv.y;
+        depthBias = shadow_depth_bias.y;
     } else if (cascade == 2) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z,
-                               shadow_depth_bias.z, 2, sliceBase);
-    } else {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w,
-                               shadow_depth_bias.w, 3, sliceBase);
+        viewProj = shadow_view_proj[2];
+        texelWorld = shadow_texel_world.z;
+        texelUv = shadow_texel_uv.z;
+        depthBias = shadow_depth_bias.z;
+    } else if (cascade == 3) {
+        viewProj = shadow_view_proj[3];
+        texelWorld = shadow_texel_world.w;
+        texelUv = shadow_texel_uv.w;
+        depthBias = shadow_depth_bias.w;
     }
-    return lit;
+    // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowLitCascade.
+    return ShadowLitCascade(worldPos, normalWs, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
 }
 
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.

@@ -18,13 +18,10 @@
 // the application may configure fewer at runtime, never more.
 #define SHADOW_MAP_MAX_CASCADES 4
 
-// How many are actually built unless the application says otherwise. Two, not four: every cascade is a full
-// re-rasterisation of the caster set for BOTH layers, so the depth pass costs 2 * cascades draws of the room
-// mesh per frame. Four cascades bought resolution the game does not really show off -- shadows in OoT are
-// read at gameplay camera distance, not inspected up close -- while doubling that cost, and the frame-time
-// spikes it produced were far more visible than the extra crispness. The application may still raise it
-// back up to SHADOW_MAP_MAX_CASCADES at runtime.
-#define SHADOW_MAP_DEFAULT_CASCADES 2
+// How many are actually built unless the application says otherwise. All of them: the split ladder below is
+// absolute distances and the count selects how much of it is used, so lowering the count is not a quality
+// knob -- it shortens the shadowed range and the caster capture reach with it.
+#define SHADOW_MAP_DEFAULT_CASCADES SHADOW_MAP_MAX_CASCADES
 
 // Casters are split into two layers, because the four interaction rules cannot be satisfied by one map:
 // scenery must be shadowed by characters, while characters must NOT be shadowed by characters. The same
