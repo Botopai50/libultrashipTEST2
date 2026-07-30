@@ -1649,11 +1649,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool use_grayscale = mRdp->grayscale;
     // SOH [Enhancement] Toon lighting only applies to lit geometry (where vertex normals exist).
     bool use_toon = mRdp->toon && (mRsp->geometry_mode & G_LIGHTING);
-    // SOH [Enhancement] Cascaded shadow maps: which draws RECEIVE shadow. Casters are excluded, so an
-    // actor never samples the depth map it drew into -- that is the design's no-self-shadow rule, and
-    // without it every complex model would stripe itself. Screen-space rects (UI, backgrounds) are
-    // excluded because they have no world position to look up with.
-    bool use_shadow_map = mShadowMapEnabled && !mRdp->toon_shadow && !is_rect;
+    // SOH [Enhancement] Cascaded shadow maps: which draws RECEIVE shadow. Everything with a world position
+    // does -- including the actors that also cast, so characters are shadowed by the scenery around them.
+    //
+    // Actors used to be excluded here to keep them from sampling the very depth map they drew into. That
+    // did prevent self-shadowing, but it also meant a character standing in a building's shadow stayed
+    // lit, which is worse: being shadowed by the world is the more visible of the two behaviours by far.
+    // The proper fix is two sets of maps -- world-only for actors to sample, world-plus-actors for the
+    // world -- which is a bigger change than one flag. Until then actors do self-shadow, which is correct
+    // in principle (an arm should shade the torso) and relies on the normal-offset bias to stay clean;
+    // actors carry vertex normals, so that bias actually applies to them, unlike the room mesh.
+    //
+    // Screen-space rects (UI, backgrounds) stay out: they have no world position to look up with.
+    bool use_shadow_map = mShadowMapEnabled && !is_rect;
     auto shader = mRdp->current_shader;
 
     if (texture_edge) {
