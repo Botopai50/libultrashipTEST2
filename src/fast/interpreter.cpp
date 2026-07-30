@@ -1279,6 +1279,21 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    // SOH [Enhancement] Cascaded shadow maps: signature of the world-caster geometry drawn this frame, used to
+    // decide whether the cached caster list is still valid (see mShadowMapWorldCache). Every batch that runs
+    // inside the bracket folds its source address and size in, order-sensitively, so a different room, a
+    // different scene, or a different distance-culled subset all produce a different value. This runs on the
+    // vertex-batch path rather than the triangle path on purpose: there are one or two orders of magnitude
+    // fewer batches than triangles, and it costs nothing at all outside the bracket.
+    if (mShadowMapEnabled && mRdp->shadow_world_caster) {
+        uint64_t h = mShadowWorldKeyAccum ^ ((uint64_t)(uintptr_t)vertices + (uint64_t)n_vertices * 0x9E3779B9u);
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 33;
+        // Never let the running value land on 0: that is the "no world casters drawn at all this frame"
+        // marker, and mistaking a real room for one would drop the cache.
+        mShadowWorldKeyAccum = h | 1ull;
+    }
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -1547,11 +1562,13 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 dst.push_back(v_arr[si]->wz);
             }
         }
-    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && !is_rect &&
+    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
         // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
         // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the actor path -- the
         // room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
+        // mShadowWorldCapture gates this to the frames that actually rebuild the cache; on every other frame
+        // the room mesh costs nothing here and the cached list is reused as-is.
         std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_WORLD];
         for (int si = 0; si < 3; si++) {
             dst.push_back(v_arr[si]->wx);
@@ -2905,15 +2922,39 @@ static bool ShadowUnproject(const float invVp[4][4], float x, float y, float z, 
 // centre reshuffles which texel each surface lands in and the edges shimmer as the camera walks
 // ("shadow swimming") -- the artefact the design calls out first.
 void Interpreter::RenderShadowMap() {
-    auto swapCasterBuffers = [this] {
-        for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
-            mShadowMapCastersReady[l].swap(mShadowMapCasters[l]);
-            mShadowMapCasters[l].clear(); // keeps capacity, so the per-triangle push_backs stop reallocating
+    // Roll both caster layers forward for this frame. Done up front, before anything can return early, so
+    // there is exactly one place that owns the buffers and no exit path can leak a frame's captures.
+    //
+    // This hook fires after the room has drawn but before the actors do, which is why the two layers are
+    // handled differently: the world captures are already complete and can be consumed immediately, while
+    // the actor captures sitting in the buffer are the previous frame's -- hence the swap and the documented
+    // one frame of lag on character shadows.
+    {
+        if (mShadowWorldKeyAccum != 0) {
+            if (mShadowWorldCapture) {
+                // A rebuild was pending and this frame captured it: adopt it and stop capturing.
+                mShadowMapWorldCache.swap(mShadowMapCasters[SHADOW_MAP_LAYER_WORLD]);
+                mShadowWorldKeyCached = mShadowWorldKeyAccum;
+                mShadowWorldCapture = false;
+            } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
+                // Different geometry ran this frame than the cache was built from. The frame is already past
+                // the point where it could have been captured, so arm the rebuild for the next one -- the
+                // cache is one frame stale across a room change, the same lag the actors carry permanently.
+                mShadowWorldCapture = true;
+            }
         }
-    };
+        // A zero signature means no world casters were bracketed at all this frame (paused, a cutscene, a
+        // menu). That is not a geometry change, so the cache is left exactly as it is rather than being
+        // rebuilt as empty and then rebuilt again the moment the room comes back -- which would flicker the
+        // scenery shadows off and on.
+        mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].clear(); // keeps capacity for the next rebuild
+        mShadowWorldKeyAccum = 0;
+
+        mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS]);
+        mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].clear();
+    }
 
     if (!mShadowMapEnabled) {
-        swapCasterBuffers();
         return;
     }
     if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution)) {
@@ -2921,14 +2962,11 @@ void Interpreter::RenderShadowMap() {
         // texture that was never filled.
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
-    if (mShadowMapCastersReady[SHADOW_MAP_LAYER_WORLD].size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() <
-        9) {
+    if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() < 9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
 
@@ -2936,7 +2974,6 @@ void Interpreter::RenderShadowMap() {
     if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
 
@@ -2945,7 +2982,6 @@ void Interpreter::RenderShadowMap() {
     if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, nearC) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, farC)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
     // Lateral half-extent of the frustum at the near and far planes, from the actual corners. Without this
@@ -2973,7 +3009,6 @@ void Interpreter::RenderShadowMap() {
     if (viewLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -2987,7 +3022,6 @@ void Interpreter::RenderShadowMap() {
     if (lzLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
-        swapCasterBuffers();
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -3106,7 +3140,11 @@ void Interpreter::RenderShadowMap() {
     // Both layers are still cleared and drawn even when empty, so a layer that had casters last frame and
     // none now comes back clear instead of holding stale depth.
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
-        const std::vector<float>& casters = mShadowMapCastersReady[l];
+        // The world layer draws from the cache, which usually holds the same vector contents as last frame --
+        // so on top of skipping the capture, the backend's "same list as the previous call" check also skips
+        // the upload across frames, not just across cascades.
+        const std::vector<float>& casters =
+            (l == SHADOW_MAP_LAYER_WORLD) ? mShadowMapWorldCache : mShadowMapCastersReady[l];
         for (int c = 0; c < mShadowMapCascadeCount; c++) {
             mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16]);
             if (casters.size() >= 9) {
@@ -3118,7 +3156,6 @@ void Interpreter::RenderShadowMap() {
     mRapi->ShadowMapEndPass();
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
                               mShadowMapNormalOffset, mShadowMapStrength);
-    swapCasterBuffers();
 }
 
 void Interpreter::RenderShadowVolumes() {

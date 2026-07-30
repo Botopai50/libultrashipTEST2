@@ -180,15 +180,23 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowDepthVs;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowDepthLayout;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowDepthCb;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb;
+    // One caster buffer per layer, not one shared buffer. The two layers have very different lifetimes:
+    // the actor layer changes every frame, while the world layer is a cached, static room mesh (see
+    // Interpreter::mShadowMapWorldCache) that is usually byte-identical frame after frame. With a single
+    // buffer the actor upload would clobber the world contents on every frame, forcing the room mesh --
+    // the largest list by far -- to be re-uploaded forever. Kept apart, the world buffer is written once
+    // per room and then only bound and drawn.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb[SHADOW_MAP_LAYERS];
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
-    size_t mShadowCasterVbVertices = 0; // capacity of mShadowCasterVb, in vertices
-    // What the caster buffer currently holds, so the cascades after the first can reuse it. Valid only
-    // within one depth pass -- reset when a pass opens, since the caller's buffer is typically the same
-    // allocation every frame with different contents.
-    const float* mShadowLastCasterPtr = nullptr;
-    size_t mShadowLastCasterCount = 0;
+    size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS] = {}; // capacity of each buffer, in vertices
+    // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
+    // the next cascade nor for the next frame. The interpreter guarantees the pointer identity is
+    // meaningful: a layer whose contents change gets a fresh push into a cleared vector, and the world
+    // cache is only ever swapped wholesale when it is genuinely rebuilt.
+    const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS] = {};
+    size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS] = {};
+    int mShadowCurrentLayer = 0; // layer named by the most recent ShadowMapBeginCascade
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists
     int mShadowResolution = 0;
     bool mShadowPipelineReady = false;

@@ -1590,13 +1590,19 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // reading from the previous frame's main pass.
         ID3D11ShaderResourceView* null_srv[1] = { nullptr };
         mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, null_srv);
-        // Forget the previous pass's upload. The caster vector usually keeps the same allocation frame to
-        // frame while its contents change completely, so a pointer match across passes would wrongly skip
-        // the upload and render last frame's geometry forever.
-        mShadowLastCasterPtr = nullptr;
-        mShadowLastCasterCount = 0;
+        // Forget the previous pass's ACTOR upload. That vector is double-buffered by the interpreter, so it
+        // keeps the same two allocations frame to frame while its contents change completely -- a pointer
+        // match across passes would wrongly skip the upload and render last frame's characters forever.
+        //
+        // The WORLD layer is deliberately NOT reset: it is a cache that is only ever replaced by swapping in
+        // the separate capture vector, so its data pointer necessarily changes whenever its contents do.
+        // Keeping the record alive across passes is the whole point -- an unchanged room mesh then costs one
+        // bind and one draw per cascade, with no upload at all.
+        mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS] = nullptr;
+        mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS] = 0;
         mShadowPassActive = true;
     }
+    mShadowCurrentLayer = layer;
 
     mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
     mContext->ClearDepthStencilView(mShadowMapDsv[slice].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
@@ -1635,21 +1641,28 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     }
     vertexCount -= vertexCount % 3; // whole triangles only
 
-    // Every cascade draws the same caster list, so after the first one the buffer already holds exactly
-    // what is needed. Re-uploading it per cascade would cost four full copies of the frame's geometry for
-    // nothing; the vertex buffer is still bound, so just issue the draw.
-    if (mShadowLastCasterPtr == worldXyz && mShadowLastCasterCount == vertexCount && mShadowCasterVb != nullptr) {
+    const int layer = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    const UINT stride = 3 * sizeof(float);
+    const UINT offset = 0;
+
+    // Every cascade draws the same caster list, and for the world layer the list is usually the same one as
+    // last frame too, so the buffer already holds exactly what is needed. Re-uploading it would cost a full
+    // copy of the room mesh per cascade per frame for nothing.
+    if (mShadowLastCasterPtr[layer] == worldXyz && mShadowLastCasterCount[layer] == vertexCount &&
+        mShadowCasterVb[layer] != nullptr) {
+        // The other layer may have bound its own buffer since, so rebind -- it is a state change, not a copy.
+        mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
         mContext->Draw((UINT)vertexCount, 0);
         return;
     }
 
-    // Grow the caster buffer to fit the largest batch seen so far; batches are then uploaded whole.
-    if (mShadowCasterVb == nullptr || mShadowCasterVbVertices < vertexCount) {
+    // Grow this layer's caster buffer to fit the largest batch seen so far; batches are then uploaded whole.
+    if (mShadowCasterVb[layer] == nullptr || mShadowCasterVbVertices[layer] < vertexCount) {
         // Start large rather than at a few thousand vertices. Growing means creating a new buffer, which is
         // a driver allocation in the middle of a frame -- and the caster count climbs as the camera turns
         // and more of the scene is submitted, so a small starting size turns every early rotation into a
         // series of stalls. 128k vertices is about 1.5 MB and covers a room mesh plus its actors outright.
-        size_t capacity = mShadowCasterVbVertices ? mShadowCasterVbVertices : 128u * 1024u;
+        size_t capacity = mShadowCasterVbVertices[layer] ? mShadowCasterVbVertices[layer] : 128u * 1024u;
         while (capacity < vertexCount) {
             capacity *= 2;
         }
@@ -1664,24 +1677,25 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
             SPDLOG_ERROR("Shadow map: could not grow the caster buffer to {} vertices.", capacity);
             return;
         }
-        mShadowCasterVb = grown;
-        mShadowCasterVbVertices = capacity;
+        mShadowCasterVb[layer] = grown;
+        mShadowCasterVbVertices[layer] = capacity;
+        // The new buffer holds nothing yet, so any record of what the old one held is worthless.
+        mShadowLastCasterPtr[layer] = nullptr;
+        mShadowLastCasterCount[layer] = 0;
     }
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
-    if (FAILED(mContext->Map(mShadowCasterVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+    if (FAILED(mContext->Map(mShadowCasterVb[layer].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         return;
     }
     memcpy(ms.pData, worldXyz, vertexCount * 3 * sizeof(float));
-    mContext->Unmap(mShadowCasterVb.Get(), 0);
+    mContext->Unmap(mShadowCasterVb[layer].Get(), 0);
 
-    UINT stride = 3 * sizeof(float);
-    UINT offset = 0;
-    mContext->IASetVertexBuffers(0, 1, mShadowCasterVb.GetAddressOf(), &stride, &offset);
+    mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
     mContext->Draw((UINT)vertexCount, 0);
-    mShadowLastCasterPtr = worldXyz;
-    mShadowLastCasterCount = vertexCount;
+    mShadowLastCasterPtr[layer] = worldXyz;
+    mShadowLastCasterCount[layer] = vertexCount;
 }
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,

@@ -472,6 +472,12 @@ class Interpreter {
                 mShadowMapCasters[l].clear();
                 mShadowMapCastersReady[l].clear();
             }
+            // Same reasoning for the cached world layer, plus: force a rebuild on the next enable, since
+            // nothing accumulated a signature while the mode was off.
+            mShadowMapWorldCache.clear();
+            mShadowWorldKeyAccum = 0;
+            mShadowWorldKeyCached = 0;
+            mShadowWorldCapture = true;
         }
     }
     void StartFrame();
@@ -658,8 +664,22 @@ class Interpreter {
     // scenery without casting onto each other -- see fast/shadow_map.h.
     std::vector<float> mShadowMapCasters[SHADOW_MAP_LAYERS];      // filling this frame (9 floats per tri)
     std::vector<float> mShadowMapCastersReady[SHADOW_MAP_LAYERS]; // completed last frame; what the pass draws
+    // SOH [Enhancement] Cascaded shadow maps: the WORLD layer does not use the double buffer above -- it is
+    // cached instead. The room mesh is by far the largest caster set and it is also completely static, so
+    // re-walking it into a fresh vector every frame (and re-uploading it) was pure waste; that cost showed up
+    // as hitching. The cache is rebuilt only when the geometry actually being drawn changes.
+    //
+    // "Changes" is detected with a running signature over the vertex batches loaded inside the world-caster
+    // bracket (see GfxSpVertex). That is deliberately not a room number: the type-2 room handler distance-culls
+    // individual shapes, so the drawn set moves with the player even within one room, and a room-number key
+    // would freeze whichever subset happened to be visible at capture time. Hashing the batches that actually
+    // run covers room changes, scene changes and per-shape culling with one mechanism.
+    std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
+    uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
+    uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from
+    bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
-    int mShadowMapCascadeCount = SHADOW_MAP_MAX_CASCADES;
+    int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
                                                         SHADOW_MAP_DEFAULT_SPLIT_2, SHADOW_MAP_DEFAULT_SPLIT_3 };

@@ -18,6 +18,14 @@
 // the application may configure fewer at runtime, never more.
 #define SHADOW_MAP_MAX_CASCADES 4
 
+// How many are actually built unless the application says otherwise. Two, not four: every cascade is a full
+// re-rasterisation of the caster set for BOTH layers, so the depth pass costs 2 * cascades draws of the room
+// mesh per frame. Four cascades bought resolution the game does not really show off -- shadows in OoT are
+// read at gameplay camera distance, not inspected up close -- while doubling that cost, and the frame-time
+// spikes it produced were far more visible than the extra crispness. The split defaults below are tuned for
+// this count; the application may still raise it back up to SHADOW_MAP_MAX_CASCADES at runtime.
+#define SHADOW_MAP_DEFAULT_CASCADES 2
+
 // Casters are split into two layers, because the four interaction rules cannot be satisfied by one map:
 // scenery must be shadowed by characters, while characters must NOT be shadowed by characters. The same
 // map cannot both contain and not contain the actors, so there are two.
@@ -40,9 +48,14 @@
 
 // Default split distances (world units from the camera) for the four cascades. These bound the far
 // plane of each cascade's ortho projection; the near plane of cascade N is the far plane of N-1.
-#define SHADOW_MAP_DEFAULT_SPLIT_0 150.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_1 350.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_2 1500.0f
+//
+// The first two carry the whole useful range, because SHADOW_MAP_DEFAULT_CASCADES is 2 and the last active
+// split is also the distance out to which casters are captured at all. Left at 150/350 the default would
+// have stopped casting anything past 350 units, which is barely past the player. 300/1500 keeps the near
+// cascade tight enough for character shadows while the second reaches across a field.
+#define SHADOW_MAP_DEFAULT_SPLIT_0 300.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_1 1500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_2 3000.0f
 #define SHADOW_MAP_DEFAULT_SPLIT_3 6000.0f
 
 // Fraction of a cascade's range over which it cross-fades into the next one. The shader samples both
