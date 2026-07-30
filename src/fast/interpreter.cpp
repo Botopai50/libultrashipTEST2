@@ -3095,17 +3095,24 @@ void Interpreter::RenderShadowMap() {
         m[14] = (-(eye[0] * lz[0] + eye[1] * lz[1] + eye[2] * lz[2]) - zNear) * sz;
         m[15] = 1.0f;
 
-        // Each layer gets its own slice of this cascade. Both are cleared and drawn even when empty, so a
-        // layer that had casters last frame and none now comes back clear instead of holding stale depth.
-        for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
-            mRapi->ShadowMapBeginCascade(l, c, m);
-            const std::vector<float>& casters = mShadowMapCastersReady[l];
+        nearDist = farDist;
+    }
+
+    // Render layer by layer, cascades within. Every cascade of a layer draws the same caster list, and the
+    // backend skips re-uploading a list it already holds -- but only for consecutive calls. Walking
+    // cascade-first alternated between the two layers on every call, so the check never matched and the
+    // whole list was pushed to the GPU eight times a frame instead of twice. Each of those uploads
+    // discards and reallocates the buffer, which is felt as a stutter once a room's mesh is large.
+    // Both layers are still cleared and drawn even when empty, so a layer that had casters last frame and
+    // none now comes back clear instead of holding stale depth.
+    for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
+        const std::vector<float>& casters = mShadowMapCastersReady[l];
+        for (int c = 0; c < mShadowMapCascadeCount; c++) {
+            mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16]);
             if (casters.size() >= 9) {
                 mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3);
             }
         }
-
-        nearDist = farDist;
     }
 
     mRapi->ShadowMapEndPass();
