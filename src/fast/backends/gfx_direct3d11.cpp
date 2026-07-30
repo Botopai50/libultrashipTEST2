@@ -1419,7 +1419,16 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // normal exists). Two-sided also keeps single-sided geometry casting at all, which front-face culling
     // silently dropped.
     rast_desc.CullMode = D3D11_CULL_NONE;
-    rast_desc.DepthClipEnable = TRUE;
+    // Clamp depth instead of clipping it. With clipping on, any caster in front of the near plane is
+    // discarded outright -- it writes no depth and therefore casts nothing. The eye is pulled back by three
+    // times the cascade radius, so a tall caster clears that margin in a small cascade while easily fitting
+    // in a large one: the same object would cast in one cascade and not in another, and which cascade a
+    // receiver used changed with the camera angle. That is why large shadows blinked as the camera tilted
+    // while small ones, whose caster sits right next to the receiver, never did.
+    // Clamped, an out-of-range caster still rasterizes at the limit depth and still occludes, which is what
+    // it should do. The far side is safe too: a caster clamped to the far value never wins a comparison it
+    // should lose, so nothing gains a shadow it should not have.
+    rast_desc.DepthClipEnable = FALSE;
     // No constant bias here. It is applied in the shader instead, in world units divided by each
     // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different
     // physical distance in every cascade. The slope term stays: being relative to the polygon's own
