@@ -225,7 +225,18 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     // Single return from a pre-initialized local (see ShadowSplitAt): 1.0 is also the right answer for
     // every rejected case, since a point this cascade cannot see is a point it knows nothing occluding.
     float lit = 1.0;
-    float3 p = worldPos + normalWs * (shadow_params.z * texelWorld);
+    // Orient the normal to face the light before pushing along it. The offset only helps if it moves the
+    // sample OFF the surface towards the light; pushed the other way it drives the sample into the geometry
+    // and makes the self-shadowing worse than no offset at all. That sign is not something the caller can
+    // guarantee: a normal recovered from screen-space derivatives comes out either way depending on
+    // triangle winding and which way the screen's y axis runs, and a vertex normal can disagree with the
+    // face it sits on.
+    // The light's own axis is the third column of this cascade's matrix (the projection scales the unit z
+    // axis by 1/(zFar - zNear)), so the test needs no extra uniform. A surface facing the light has a
+    // normal pointing against the direction the light travels.
+    float3 lightAxis = normalize(viewProj._13_23_33);
+    float3 n = dot(normalWs, lightAxis) > 0.0 ? -normalWs : normalWs;
+    float3 p = worldPos + n * (shadow_params.z * texelWorld);
     float4 clip = mul(float4(p, 1.0), viewProj);
     if (clip.w > 0.0) {
         float3 ndc = clip.xyz / clip.w;
