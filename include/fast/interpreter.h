@@ -478,6 +478,11 @@ class Interpreter {
             // Same reasoning for the cached world layer, plus: force a rebuild on the next enable, since
             // nothing accumulated a signature while the mode was off.
             mShadowMapWorldCache.clear();
+            for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
+                mShadowAlphaCasters[l].clear();
+                mShadowAlphaReady[l].clear();
+            }
+            mShadowAlphaWorldCache.clear();
             mShadowWorldKeyAccum = 0;
             mShadowWorldKeyCached = 0;
             mShadowWorldCapture = true;
@@ -677,6 +682,52 @@ class Interpreter {
     // individual shapes, so the drawn set moves with the player even within one room, and a room-number key
     // would freeze whichever subset happened to be visible at capture time. Hashing the batches that actually
     // run covers room changes, scene changes and per-shape culling with one mechanism.
+    // Alpha-cutout casters, kept apart from the opaque list above. Foliage in this game is a billboard with
+    // a leaf texture, so a depth-only pass with no pixel shader records the whole quad and a tree casts a
+    // rectangle. Getting the leaf shape means sampling the material's own texture and clipping, which needs
+    // per-vertex UVs and a texture binding -- neither of which the opaque path has, and both of which cost a
+    // draw call per material. Splitting them keeps the overwhelming majority of casters on the one-upload,
+    // one-draw path and pays the per-material cost only for the geometry that actually needs it.
+    struct ShadowAlphaRange {
+        TextureCacheKey key;          // resolved against the texture cache at pass time, not at capture time
+        uint32_t textureId;           // filled in by ResolveShadowAlphaTextures; 0 means "could not resolve"
+        uint32_t firstVertex;         // into ShadowAlphaCasters::verts
+        uint32_t vertexCount;
+    };
+    struct ShadowAlphaCasters {
+        std::vector<float> verts; // 5 floats per vertex: world xyz + uv
+        std::vector<ShadowAlphaRange> ranges;
+        void clear() {
+            verts.clear();
+            ranges.clear();
+        }
+        void swap(ShadowAlphaCasters& o) {
+            verts.swap(o.verts);
+            ranges.swap(o.ranges);
+        }
+        size_t VertexCount() const {
+            return verts.size() / 5;
+        }
+    };
+    ShadowAlphaCasters mShadowAlphaCasters[SHADOW_MAP_LAYERS];
+    ShadowAlphaCasters mShadowAlphaReady[SHADOW_MAP_LAYERS];
+    ShadowAlphaCasters mShadowAlphaWorldCache;
+    // Turns each range's texture-cache key into a live GPU texture id, once per frame rather than once per
+    // cascade. Ranges whose texture has since been evicted are marked unresolved and skipped -- a missing
+    // leaf shadow beats reinstating the solid rectangle this whole path exists to remove.
+    void ResolveShadowAlphaTextures(ShadowAlphaCasters& set);
+    // Tile geometry and texture coordinates for the caster capture, which runs before the combiner setup
+    // that normally derives them (see the definitions for why they are duplicated rather than shared).
+    void ShadowCasterTexSize(int tile, float* outWidth, float* outHeight);
+    void ShadowCasterTexcoord(int tile, const struct LoadedVertex* v, float texWidth, float texHeight, float* outU,
+                              float* outV);
+    bool ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey);
+    // Appends one captured triangle to a layer's alpha list, extending the open range when the material has
+    // not changed. Consecutive triangles almost always share a texture, so this keeps the range count near
+    // the material count rather than near the triangle count.
+    void CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& key, struct LoadedVertex* const v[3],
+                                    float texWidth, float texHeight);
+
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
     uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from

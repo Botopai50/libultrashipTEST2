@@ -1346,6 +1346,45 @@ float4 VSMain(float3 pos : POSITION) : SV_POSITION {
 }
 )";
 
+// SOH [Enhancement] Cascaded shadow maps: the alpha-cutout caster pipeline. Foliage is a billboard with a
+// leaf texture, so the depth-only pipeline above records the whole quad and a tree casts a rectangle. This
+// one carries the material's texture coordinate through and clips against its alpha, which is the only way
+// the depth map can hold the shape of the leaves.
+//
+// It still writes nothing but depth -- the pixel shader returns void and exists purely so clip() has
+// somewhere to live. Sampling at mip 0 rather than letting the hardware pick: there are no derivatives
+// worth trusting at shadow-map resolution, and a blurred mip would eat the cutout.
+// The cutout threshold is a shared constant (fast/shadow_map.h) spliced into the shader text, so the value
+// cannot drift between the two places it would otherwise be written.
+#define SHADOW_MAP_STR2(x) #x
+#define SHADOW_MAP_STR(x) SHADOW_MAP_STR2(x)
+#define SHADOW_MAP_ALPHA_CUTOUT_STR SHADOW_MAP_STR(SHADOW_MAP_ALPHA_CUTOUT)
+
+static const char* kShadowAlphaDepthShaderSource = R"(
+cbuffer ShadowDepthCB : register(b0) {
+    row_major float4x4 lightViewProj;
+};
+Texture2D g_casterTex : register(t0);
+SamplerState g_casterSampler : register(s0);
+
+struct VSOutput {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VSOutput VSMain(float3 pos : POSITION, float2 uv : TEXCOORD0) {
+    VSOutput o;
+    o.position = mul(float4(pos, 1.0), lightViewProj);
+    o.uv = uv;
+    return o;
+}
+
+void PSMain(VSOutput input) {
+    float alpha = g_casterTex.SampleLevel(g_casterSampler, input.uv, 0).a;
+    clip(alpha - )" SHADOW_MAP_ALPHA_CUTOUT_STR R"();
+}
+)";
+
 // Matches kShadowDepthShaderSource's cbuffer. Constant buffers must be a multiple of 16 bytes; a
 // float4x4 already is.
 struct ShadowDepthCB {
@@ -1474,6 +1513,51 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
         return false;
     }
 
+    // Alpha-cutout caster pipeline. Failing to build it is NOT fatal: the opaque path still works, and
+    // foliage falls back to casting its quad -- worse looking, but a scene with shadows.
+    {
+        ComPtr<ID3DBlob> avs, aps, aerr;
+        HRESULT ahr = mD3dCompile(kShadowAlphaDepthShaderSource, strlen(kShadowAlphaDepthShaderSource), nullptr,
+                                  nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0, avs.GetAddressOf(),
+                                  aerr.GetAddressOf());
+        if (SUCCEEDED(ahr)) {
+            ahr = mD3dCompile(kShadowAlphaDepthShaderSource, strlen(kShadowAlphaDepthShaderSource), nullptr, nullptr,
+                              nullptr, "PSMain", "ps_4_0", compile_flags, 0, aps.GetAddressOf(),
+                              aerr.ReleaseAndGetAddressOf());
+        }
+        if (FAILED(ahr)) {
+            SPDLOG_ERROR("Shadow map: alpha caster shader failed to compile: {}",
+                         aerr ? (const char*)aerr->GetBufferPointer() : "no error blob");
+        } else {
+            const D3D11_INPUT_ELEMENT_DESC aied[2] = {
+                { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+                { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            };
+            D3D11_SAMPLER_DESC casterSamp;
+            ZeroMemory(&casterSamp, sizeof(casterSamp));
+            // Linear, and wrapping. Wrapping rather than clamping because a repeated material (a vine
+            // sheet, a canopy) genuinely tiles, and clamping it would smear the edge row across the whole
+            // repeat. Cutout geometry keeps its coordinates inside the tile either way.
+            casterSamp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            casterSamp.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+            casterSamp.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+            casterSamp.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+            casterSamp.ComparisonFunc = D3D11_COMPARISON_NEVER;
+            casterSamp.MaxLOD = D3D11_FLOAT32_MAX;
+            if (SUCCEEDED(mDevice->CreateVertexShader(avs->GetBufferPointer(), avs->GetBufferSize(), nullptr,
+                                                      mShadowAlphaVs.GetAddressOf())) &&
+                SUCCEEDED(mDevice->CreatePixelShader(aps->GetBufferPointer(), aps->GetBufferSize(), nullptr,
+                                                     mShadowAlphaPs.GetAddressOf())) &&
+                SUCCEEDED(mDevice->CreateInputLayout(aied, 2, avs->GetBufferPointer(), avs->GetBufferSize(),
+                                                     mShadowAlphaLayout.GetAddressOf())) &&
+                SUCCEEDED(mDevice->CreateSamplerState(&casterSamp, mShadowAlphaSampler.GetAddressOf()))) {
+                mShadowAlphaPipelineReady = true;
+            } else {
+                SPDLOG_ERROR("Shadow map: could not create the alpha caster pipeline objects.");
+            }
+        }
+    }
+
     mShadowPipelineFailed = false;
     mShadowPipelineReady = true;
     return true;
@@ -1600,9 +1684,17 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // bind and one draw per cascade, with no upload at all.
         mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS] = nullptr;
         mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS] = 0;
+        // The alpha list gets no such exemption: it shares one buffer between the two layers, so whatever it
+        // holds is overwritten within the pass anyway, and the actor half is double-buffered exactly like the
+        // opaque one. Forget it wholesale rather than reason about which half is safe.
+        mShadowAlphaLastPtr = nullptr;
+        mShadowAlphaLastCount = 0;
         mShadowPassActive = true;
     }
     mShadowCurrentLayer = layer;
+    // Everything below re-establishes the OPAQUE pipeline, so any alpha binding from the previous cascade is
+    // gone by the time this returns.
+    mShadowAlphaBound = false;
 
     mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
     mContext->ClearDepthStencilView(mShadowMapDsv[slice].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
@@ -1698,6 +1790,81 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     mShadowLastCasterCount[layer] = vertexCount;
 }
 
+void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+    if (!mShadowPassActive || !mShadowAlphaPipelineReady || xyzUv == nullptr || vertexCount < 3) {
+        return;
+    }
+    // Same reuse rule as the opaque list: identical pointer and count means the buffer already holds this
+    // geometry, whether that is from the previous cascade or (for the cached world layer) the previous
+    // frame. Only the world layer's record survives a pass; see ShadowMapBeginCascade.
+    if (mShadowAlphaLastPtr == xyzUv && mShadowAlphaLastCount == vertexCount && mShadowAlphaVb != nullptr) {
+        return;
+    }
+
+    if (mShadowAlphaVb == nullptr || mShadowAlphaVbVertices < vertexCount) {
+        size_t capacity = mShadowAlphaVbVertices ? mShadowAlphaVbVertices : 32u * 1024u;
+        while (capacity < vertexCount) {
+            capacity *= 2;
+        }
+        D3D11_BUFFER_DESC vb_desc;
+        ZeroMemory(&vb_desc, sizeof(vb_desc));
+        vb_desc.Usage = D3D11_USAGE_DYNAMIC;
+        vb_desc.ByteWidth = (UINT)(capacity * 5 * sizeof(float));
+        vb_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11Buffer> grown;
+        if (FAILED(mDevice->CreateBuffer(&vb_desc, nullptr, grown.GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not grow the alpha caster buffer to {} vertices.", capacity);
+            return;
+        }
+        mShadowAlphaVb = grown;
+        mShadowAlphaVbVertices = capacity;
+        mShadowAlphaLastPtr = nullptr;
+        mShadowAlphaLastCount = 0;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(ms));
+    if (FAILED(mContext->Map(mShadowAlphaVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return;
+    }
+    memcpy(ms.pData, xyzUv, vertexCount * 5 * sizeof(float));
+    mContext->Unmap(mShadowAlphaVb.Get(), 0);
+    mShadowAlphaLastPtr = xyzUv;
+    mShadowAlphaLastCount = vertexCount;
+}
+
+void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
+    if (!mShadowPassActive || !mShadowAlphaPipelineReady || mShadowAlphaVb == nullptr || vertexCount < 3) {
+        return;
+    }
+    if (firstVertex + vertexCount > mShadowAlphaLastCount) {
+        return; // range does not lie inside what was uploaded
+    }
+    if (textureId >= mTextures.size() || mTextures[textureId].resource_view == nullptr) {
+        return;
+    }
+    vertexCount -= vertexCount % 3;
+
+    // Switch the pipeline once and leave it: consecutive ranges differ only by texture and draw offset.
+    // ShadowMapBeginCascade puts the opaque pipeline back for the next cascade.
+    if (!mShadowAlphaBound) {
+        UINT stride = 5 * sizeof(float);
+        UINT offset = 0;
+        mContext->IASetInputLayout(mShadowAlphaLayout.Get());
+        mContext->IASetVertexBuffers(0, 1, mShadowAlphaVb.GetAddressOf(), &stride, &offset);
+        mContext->VSSetShader(mShadowAlphaVs.Get(), nullptr, 0);
+        mContext->PSSetShader(mShadowAlphaPs.Get(), nullptr, 0);
+        mContext->PSSetSamplers(0, 1, mShadowAlphaSampler.GetAddressOf());
+        mShadowAlphaBound = true;
+        // The main pass tracks which resource views it left bound; this pass binds its own, so that record
+        // has to be invalidated or the next draw would skip a rebind it actually needs.
+        mLastResourceViews[0] = nullptr;
+    }
+    mContext->PSSetShaderResources(0, 1, mTextures[textureId].resource_view.GetAddressOf());
+    mContext->Draw((UINT)vertexCount, (UINT)firstVertex);
+}
+
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
                                              float blendFraction, float normalOffset, float strength,
                                              float filterWidth) {
@@ -1741,6 +1908,7 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
         return;
     }
     mShadowPassActive = false;
+    mShadowAlphaBound = false;
 
     // Put back the frame's render target and viewport.
     if (mCurrentFramebuffer >= 0 && (size_t)mCurrentFramebuffer < mFrameBuffers.size()) {

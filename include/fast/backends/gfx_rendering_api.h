@@ -155,6 +155,19 @@ class GfxRenderingAPI {
     virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) {
     }
 
+    // Alpha-cutout casters, in two parts because the geometry is uploaded once but drawn once per material.
+    // `xyzUv` is `vertexCount` vertices of 5 floats (world xyz + normalised uv), laid out so that every
+    // range handed to ShadowMapDrawAlphaRange is contiguous within it. Upload is safe to call per cascade:
+    // implementations skip a buffer they already hold, exactly as for the opaque list.
+    virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+    }
+
+    // Draw one material's slice of the uploaded alpha casters, clipping against that texture's alpha so the
+    // depth map records the leaf rather than the quad holding it. `textureId` is a texture the backend
+    // already holds from the main pass.
+    virtual void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
+    }
+
     // Close the depth pass and restore the render target the frame was drawing to. After this the
     // cascade array is readable by the main pass.
     virtual void ShadowMapEndPass() {

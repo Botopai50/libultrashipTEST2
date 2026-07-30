@@ -151,6 +151,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
     void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) override;
+    void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
+    void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float normalOffset, float strength, float filterWidth) override;
@@ -199,6 +201,20 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS] = {};
     size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS] = {};
     int mShadowCurrentLayer = 0; // layer named by the most recent ShadowMapBeginCascade
+    // SOH [Enhancement] Alpha-cutout caster pipeline: a second vertex shader (position + uv), pixel shader
+    // (sample and clip) and layout, used for foliage so the depth map records the leaf instead of the quad.
+    // Optional -- if any of it fails to build, mShadowAlphaPipelineReady stays false and foliage simply keeps
+    // casting its quad, which is worse looking but is still a scene with shadows.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowAlphaVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowAlphaPs;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowAlphaLayout;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowAlphaSampler;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowAlphaVb;
+    size_t mShadowAlphaVbVertices = 0;
+    const float* mShadowAlphaLastPtr = nullptr;
+    size_t mShadowAlphaLastCount = 0;
+    bool mShadowAlphaPipelineReady = false; // every alpha object built successfully
+    bool mShadowAlphaBound = false;         // the alpha pipeline is the one currently set on the context
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists
     int mShadowResolution = 0;
     bool mShadowPipelineReady = false;

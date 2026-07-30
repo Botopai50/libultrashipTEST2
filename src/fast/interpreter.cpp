@@ -1278,6 +1278,134 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
+// SOH [Enhancement] Cascaded shadow maps: the tile's texture dimensions, split out of GfxSpTri1's combiner
+// setup so the caster capture can compute UVs without waiting for it. The capture has to run BEFORE the
+// trivial clip rejection -- a tree behind the camera still casts into the view, and culling casters by the
+// view frustum is what made shadows blink out when the camera turned -- but the combiner setup that
+// normally derives these runs long after. Same arithmetic, deliberately duplicated rather than shared,
+// because the original is interleaved with texture importing and render-state flushing that must NOT
+// happen during a capture.
+void Interpreter::ShadowCasterTexSize(int tile, float* outWidth, float* outHeight) {
+    uint32_t tex_size_bytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
+    uint32_t line_size = mRdp->texture_tile[tile].line_size_bytes;
+    if (line_size == 0) {
+        line_size = 1;
+    }
+    uint32_t height = tex_size_bytes / line_size;
+    switch (mRdp->texture_tile[tile].siz) {
+        case G_IM_SIZ_4b:
+            line_size <<= 1;
+            break;
+        case G_IM_SIZ_8b:
+            break;
+        case G_IM_SIZ_16b:
+            line_size /= G_IM_SIZ_16b_LINE_BYTES;
+            break;
+        case G_IM_SIZ_32b:
+            line_size /= G_IM_SIZ_32b_LINE_BYTES;
+            height /= 2;
+            break;
+    }
+    *outWidth = (float)(line_size == 0 ? 1 : line_size);
+    *outHeight = (float)(height == 0 ? 1 : height);
+}
+
+// One vertex's normalised texture coordinate for tile 0, mirroring the packing loop in GfxSpTri1. The
+// half-texel that linear filtering adds is included: the shadow samples the same texels the main pass
+// does, so a mismatch here would offset the cutout against the visible leaf.
+void Interpreter::ShadowCasterTexcoord(int tile, const struct LoadedVertex* v, float texWidth, float texHeight,
+                                       float* outU, float* outV) {
+    float u = v->u / 32.0f;
+    float w = v->v / 32.0f;
+    const int shifts = mRdp->texture_tile[tile].shifts;
+    const int shiftt = mRdp->texture_tile[tile].shiftt;
+    if (shifts != 0) {
+        if (shifts <= 10) {
+            u /= 1 << shifts;
+        } else {
+            u *= 1 << (16 - shifts);
+        }
+    }
+    if (shiftt != 0) {
+        if (shiftt <= 10) {
+            w /= 1 << shiftt;
+        } else {
+            w *= 1 << (16 - shiftt);
+        }
+    }
+    u -= mRdp->texture_tile[tile].uls / 4.0f;
+    w -= mRdp->texture_tile[tile].ult / 4.0f;
+    if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
+        u += 0.5f;
+        w += 0.5f;
+    }
+    *outU = u / texWidth;
+    *outV = w / texHeight;
+}
+
+// True when this draw punches its own silhouette out of the texture's alpha rather than filling its
+// polygon -- the two render-mode bits GfxSpTri1 turns into the shader's texture_edge / alpha_threshold
+// options. Alpha BLENDING is deliberately not included: a blended surface is see-through, and a
+// see-through surface casting a hard shadow looks worse than casting none.
+bool Interpreter::ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey) {
+    const bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+    const bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
+    if (!texture_edge && !alpha_threshold) {
+        return false;
+    }
+    const uint32_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
+    const uint8_t* addr = mRdp->loaded_texture[tmemIndex].addr;
+    if (addr == nullptr) {
+        return false;
+    }
+    // Same key ImportTexture builds, so the lookup at pass time finds the texture the main pass uploaded.
+    // Built here rather than resolved here: the texture may not have been imported yet at capture time.
+    const uint8_t fmt = mRdp->texture_tile[tile].fmt;
+    const uint8_t siz = mRdp->texture_tile[tile].siz;
+    const uint8_t paletteIndex = mRdp->texture_tile[tile].palette;
+    const uint32_t origSizeBytes = mRdp->loaded_texture[tmemIndex].orig_size_bytes;
+    if (fmt == G_IM_FMT_CI) {
+        *outKey = { addr, { mRdp->palettes[0], mRdp->palettes[1] }, fmt, siz, paletteIndex, origSizeBytes };
+    } else {
+        *outKey = { addr, {}, fmt, siz, paletteIndex, origSizeBytes };
+    }
+    return true;
+}
+
+void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& key, struct LoadedVertex* const v[3],
+                                             float texWidth, float texHeight) {
+    ShadowAlphaCasters& dst = mShadowAlphaCasters[layer];
+    if (dst.verts.size() >= kShadowMapCasterBudgetFloats) {
+        return;
+    }
+    // Extend the open range when the material has not changed. Draws arrive grouped by material, so this
+    // keeps the range count near the number of materials rather than near the number of triangles -- which
+    // matters because every range is its own draw call in every cascade.
+    if (dst.ranges.empty() || !(dst.ranges.back().key == key)) {
+        dst.ranges.push_back({ key, 0u, (uint32_t)(dst.verts.size() / 5), 0u });
+    }
+    for (int si = 0; si < 3; si++) {
+        float u, w;
+        ShadowCasterTexcoord(mRdp->first_tile_index, v[si], texWidth, texHeight, &u, &w);
+        dst.verts.push_back(v[si]->wx);
+        dst.verts.push_back(v[si]->wy);
+        dst.verts.push_back(v[si]->wz);
+        dst.verts.push_back(u);
+        dst.verts.push_back(w);
+    }
+    dst.ranges.back().vertexCount += 3;
+}
+
+void Interpreter::ResolveShadowAlphaTextures(ShadowAlphaCasters& set) {
+    for (ShadowAlphaRange& r : set.ranges) {
+        TextureCacheMap::iterator it = mTextureCache.map.find(r.key);
+        // Unresolved ranges are skipped at draw time rather than drawn untextured. The whole point of this
+        // path is to stop foliage casting its bounding quad, so falling back to the opaque draw would
+        // reinstate exactly the artefact it exists to remove.
+        r.textureId = (it != mTextureCache.map.end()) ? it->second.texture_id : UINT32_MAX;
+    }
+}
+
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     // SOH [Enhancement] Cascaded shadow maps: signature of the world-caster geometry drawn this frame, used to
     // decide whether the cached caster list is still valid (see mShadowMapWorldCache). Every batch that runs
@@ -1542,16 +1670,39 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // at the object boundary. is_rect screen-space quads (UI) have no world position, so skip them. The
     // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
     // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
-    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
-        // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
-        // here: the stencil volumes need the whole silhouette before they can build one, and the shadow map
-        // needs the object's bounding box before it can decide the object is worth casting at all (see
-        // FlushToonShadow). Only one system is ever enabled, so this list is never contended.
-        for (int si = 0; si < 3; si++) {
-            mShadowVerts.push_back(v_arr[si]->wx);
-            mShadowVerts.push_back(v_arr[si]->wy);
-            mShadowVerts.push_back(v_arr[si]->wz);
+    // SOH [Enhancement] Cascaded shadow maps: alpha-cutout materials take a separate path in both layers.
+    // Resolved here, before either capture, because the answer and the texture key come from RDP state that
+    // the combiner setup further down would have moved on from.
+    TextureCacheKey shadowAlphaKey{};
+    bool shadowAlphaCaster = false;
+    float shadowTexW = 1.0f, shadowTexH = 1.0f;
+    if (mShadowMapEnabled && !is_rect && (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
+        shadowAlphaCaster = ShadowCasterIsAlphaTested(mRdp->first_tile_index, &shadowAlphaKey);
+        if (shadowAlphaCaster) {
+            ShadowCasterTexSize(mRdp->first_tile_index, &shadowTexW, &shadowTexH);
         }
+    }
+
+    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
+        if (shadowAlphaCaster) {
+            // Straight into the layer's alpha list. It does NOT go through mShadowVerts, so it also skips the
+            // per-object size gate below -- foliage is exactly the case where the bounding box is a poor
+            // proxy for the shadow, since most of that box is transparent.
+            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
+        } else {
+            // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
+            // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
+            // map needs the object's bounding box before it can decide the object is worth casting at all
+            // (see FlushToonShadow).
+            for (int si = 0; si < 3; si++) {
+                mShadowVerts.push_back(v_arr[si]->wx);
+                mShadowVerts.push_back(v_arr[si]->wy);
+                mShadowVerts.push_back(v_arr[si]->wz);
+            }
+        }
+    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
+               shadowAlphaCaster) {
+        CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
         // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
@@ -2948,6 +3099,7 @@ void Interpreter::RenderShadowMap() {
             if (mShadowWorldCapture) {
                 // A rebuild was pending and this frame captured it: adopt it and stop capturing.
                 mShadowMapWorldCache.swap(mShadowMapCasters[SHADOW_MAP_LAYER_WORLD]);
+                mShadowAlphaWorldCache.swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_WORLD]);
                 mShadowWorldKeyCached = mShadowWorldKeyAccum;
                 mShadowWorldCapture = false;
             } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
@@ -2962,10 +3114,13 @@ void Interpreter::RenderShadowMap() {
         // rebuilt as empty and then rebuilt again the moment the room comes back -- which would flicker the
         // scenery shadows off and on.
         mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].clear(); // keeps capacity for the next rebuild
+        mShadowAlphaCasters[SHADOW_MAP_LAYER_WORLD].clear();
         mShadowWorldKeyAccum = 0;
 
         mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS]);
         mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].clear();
+        mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS]);
+        mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].clear();
     }
 
     if (!mShadowMapEnabled) {
@@ -2978,7 +3133,9 @@ void Interpreter::RenderShadowMap() {
                                   mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
-    if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() < 9) {
+    if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() +
+            mShadowAlphaWorldCache.verts.size() + mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts.size() <
+        9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength, mShadowMapFilterWidth);
         return;
@@ -3153,16 +3310,33 @@ void Interpreter::RenderShadowMap() {
     // discards and reallocates the buffer, which is felt as a stutter once a room's mesh is large.
     // Both layers are still cleared and drawn even when empty, so a layer that had casters last frame and
     // none now comes back clear instead of holding stale depth.
+    // Texture ids are resolved once per frame, not once per cascade: the lookup is the same for all eight
+    // slices, and a range whose texture has been evicted must be skipped consistently across them.
+    ResolveShadowAlphaTextures(mShadowAlphaWorldCache);
+    ResolveShadowAlphaTextures(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
+
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
         // The world layer draws from the cache, which usually holds the same vector contents as last frame --
         // so on top of skipping the capture, the backend's "same list as the previous call" check also skips
         // the upload across frames, not just across cascades.
         const std::vector<float>& casters =
             (l == SHADOW_MAP_LAYER_WORLD) ? mShadowMapWorldCache : mShadowMapCastersReady[l];
+        const ShadowAlphaCasters& alpha =
+            (l == SHADOW_MAP_LAYER_WORLD) ? mShadowAlphaWorldCache : mShadowAlphaReady[l];
         for (int c = 0; c < mShadowMapCascadeCount; c++) {
             mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16]);
             if (casters.size() >= 9) {
                 mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3);
+            }
+            // Alpha-cutout casters second, so the one big opaque batch keeps the fast path to itself and the
+            // pipeline switch happens once per cascade rather than being interleaved.
+            if (alpha.VertexCount() >= 3) {
+                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
+                for (const ShadowAlphaRange& r : alpha.ranges) {
+                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3) {
+                        mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
+                    }
+                }
             }
         }
     }

@@ -113,6 +113,18 @@
 // worth casting (Link is roughly 60 tall).
 #define SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE 40.0f
 
+// Alpha below which a textured caster's pixel is punched out of the depth map entirely.
+//
+// Foliage in this game is alpha-cutout billboards -- a quad with a leaf texture. A depth-only pass with no
+// pixel shader records the whole quad, so a tree casts a rectangle and a flowering plant casts a solid
+// slab. The alpha caster path samples the material's own texture and clips, which is the only way the
+// shadow can take the shape of the leaves rather than of the polygon holding them.
+//
+// 0.5 rather than the main pass's cutout: a shadow silhouette wants the solid core of the leaf, not its
+// antialiased fringe, and a lower threshold makes every soft edge in the texture cast a full-strength
+// shadow that reads as grime.
+#define SHADOW_MAP_ALPHA_CUTOUT 0.5f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
