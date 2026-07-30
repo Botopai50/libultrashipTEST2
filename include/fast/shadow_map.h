@@ -78,6 +78,14 @@
 // front-face culling that caused peter panning and half of the constant bias that did the same.
 #define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 2.0f
 
+// Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
+// above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches
+// every shadow towards infinity, which reads as wrong long before it is geometrically wrong -- and it also
+// wastes the cascade, since the projection has to cover a footprint far longer than the scene it is
+// shading. The light's compass bearing is preserved; only its height is lifted.
+// 0.5 is 30 degrees, which caps a shadow at about 1.7x the caster's height.
+#define SHADOW_MAP_DEFAULT_MIN_ELEVATION 0.5f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
