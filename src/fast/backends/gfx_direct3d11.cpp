@@ -1407,10 +1407,20 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     D3D11_RASTERIZER_DESC rast_desc;
     ZeroMemory(&rast_desc, sizeof(rast_desc));
     rast_desc.FillMode = D3D11_FILL_SOLID;
-    // Casters here are flattened silhouettes and world geometry that is not reliably closed, so culling
-    // either facing would punch holes in the depth map. Two-sided costs fill rate the depth-only pass
-    // can afford.
-    rast_desc.CullMode = D3D11_CULL_NONE;
+    // Cull front faces, so only surfaces facing AWAY from the light are recorded. This is the standard
+    // answer to a surface shadowing itself, and it is the one that works here: the depth written for a wall
+    // is its far side, a whole wall thickness behind the side being shaded, so the comparison has real
+    // clearance instead of fighting for it with bias.
+    //
+    // Bias alone cannot fix this case. A wall lit at a grazing angle has an enormous depth slope, and its
+    // brick relief is finer than one shadow texel, so the surface keeps crossing its own recorded depth --
+    // which is what produced the comb of light teeth along every brick course. Normal-offset bias would
+    // normally take over, but the room mesh carries no vertex normals, so for exactly the geometry that
+    // needs it most that term is zero.
+    //
+    // The cost is that single-sided geometry stops casting, since its only face is the front one. Flat
+    // ground is the main example, and it does not need to shadow itself.
+    rast_desc.CullMode = D3D11_CULL_FRONT;
     rast_desc.DepthClipEnable = TRUE;
     rast_desc.DepthBias = SHADOW_MAP_DEFAULT_CONSTANT_BIAS;
     rast_desc.SlopeScaledDepthBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
