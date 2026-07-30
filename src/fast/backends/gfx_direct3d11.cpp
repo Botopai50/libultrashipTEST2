@@ -1699,8 +1699,10 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
 }
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                             float blendFraction, float normalOffset, float strength) {
-    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, normalOffset, strength);
+                                             float blendFraction, float normalOffset, float strength,
+                                             float filterWidth) {
+    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, normalOffset, strength,
+                                        filterWidth);
 
     ZeroMemory(&mPerShadowCbData, sizeof(mPerShadowCbData));
     const int count = mShadowCascadesActive;
@@ -1708,6 +1710,7 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mPerShadowCbData.shadow_params[1] = mShadowBlendFraction;
     mPerShadowCbData.shadow_params[2] = mShadowNormalOffset;
     mPerShadowCbData.shadow_params[3] = mShadowStrength;
+    mPerShadowCbData.shadow_filter[0] = mShadowFilterWidth;
 
     for (int c = 0; c < count; c++) {
         const float* m = &mShadowViewProj[c * 16];

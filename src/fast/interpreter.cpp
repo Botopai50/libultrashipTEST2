@@ -1543,29 +1543,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // replayed shadow geometry itself runs with toon_shadow cleared, so it is never re-captured. NOTE: this
     // is gated on toon_shadow only (NOT mRdp->toon), so shadows work even when the cel relight is disabled.
     if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
-        // Only for the stencil volumes. In shadow-map mode FlushToonShadow discards this list untouched --
-        // the two systems are mutually exclusive -- so filling it would be three push_backs per vertex of
-        // every casting actor, every frame, thrown away.
-        if (!mShadowMapEnabled) {
-            for (int si = 0; si < 3; si++) {
-                mShadowVerts.push_back(v_arr[si]->wx);
-                mShadowVerts.push_back(v_arr[si]->wy);
-                mShadowVerts.push_back(v_arr[si]->wz);
-            }
-        }
-        // SOH [Enhancement] Cascaded shadow maps: the same armed geometry, kept as world-space triangles
-        // rather than flattened onto the ground. Both systems can capture at once because only one of
-        // them is ever enabled -- the mode selector is exclusive -- so this costs nothing in the other
-        // modes. Over budget, stop growing: a scene missing its furthest casters beats an allocation
-        // that grows without bound.
-        if (mShadowMapEnabled &&
-            mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
-            std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
-            for (int si = 0; si < 3; si++) {
-                dst.push_back(v_arr[si]->wx);
-                dst.push_back(v_arr[si]->wy);
-                dst.push_back(v_arr[si]->wz);
-            }
+        // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
+        // here: the stencil volumes need the whole silhouette before they can build one, and the shadow map
+        // needs the object's bounding box before it can decide the object is worth casting at all (see
+        // FlushToonShadow). Only one system is ever enabled, so this list is never contended.
+        for (int si = 0; si < 3; si++) {
+            mShadowVerts.push_back(v_arr[si]->wx);
+            mShadowVerts.push_back(v_arr[si]->wy);
+            mShadowVerts.push_back(v_arr[si]->wz);
         }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
@@ -2512,6 +2497,30 @@ void Interpreter::FlushToonShadow() {
     // the two systems are mutually exclusive, and building volumes nobody draws would rasterize a
     // footprint grid per object for nothing.
     if (mShadowMapEnabled) {
+        // Size gate. Grass tufts, flowers and other ground clutter are armed as casters like everything
+        // else, but their shadow is a smudge a few texels across that reads as dirt on the ground rather
+        // than as a shadow -- and every one of them costs a full re-rasterisation in each cascade. Measure
+        // the object's world-space bounding box, which is the only per-object information this layer has,
+        // and drop anything whose largest extent is under the threshold.
+        //
+        // The largest extent, not the height: a caster can be small in every direction and still matter if
+        // it is long (a fence rail), and a flat wide thing casts a real shadow at a low sun.
+        if (mShadowVerts.size() >= 9 &&
+            mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
+            float mn[3] = { 1e30f, 1e30f, 1e30f };
+            float mx[3] = { -1e30f, -1e30f, -1e30f };
+            for (size_t i = 0; i + 3 <= mShadowVerts.size(); i += 3) {
+                for (int a = 0; a < 3; a++) {
+                    mn[a] = std::min(mn[a], mShadowVerts[i + a]);
+                    mx[a] = std::max(mx[a], mShadowVerts[i + a]);
+                }
+            }
+            const float extent = std::max({ mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2] });
+            if (extent >= mShadowMapMinCasterSize) {
+                std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
+                dst.insert(dst.end(), mShadowVerts.begin(), mShadowVerts.end());
+            }
+        }
         mShadowVerts.clear();
         return;
     }
@@ -2966,19 +2975,19 @@ void Interpreter::RenderShadowMap() {
         // Backend could not give us the maps; report no cascades so the main pass does not sample a
         // texture that was never filled.
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
     if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() < 9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
 
     float invVp[4][4];
     if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
 
@@ -2986,7 +2995,7 @@ void Interpreter::RenderShadowMap() {
     float nearC[3], farC[3];
     if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, nearC) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, farC)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
     // Lateral half-extent of the frustum at the near and far planes, from the actual corners. Without this
@@ -3013,7 +3022,7 @@ void Interpreter::RenderShadowMap() {
     float viewLen = std::sqrt(viewDir[0] * viewDir[0] + viewDir[1] * viewDir[1] + viewDir[2] * viewDir[2]);
     if (viewLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -3026,7 +3035,7 @@ void Interpreter::RenderShadowMap() {
     float lzLen = std::sqrt(lz[0] * lz[0] + lz[1] * lz[1] + lz[2] * lz[2]);
     if (lzLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength);
+                                  mShadowMapStrength, mShadowMapFilterWidth);
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -3160,7 +3169,7 @@ void Interpreter::RenderShadowMap() {
 
     mRapi->ShadowMapEndPass();
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
-                              mShadowMapNormalOffset, mShadowMapStrength);
+                              mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth);
 }
 
 void Interpreter::RenderShadowVolumes() {

@@ -95,6 +95,24 @@
 // 0.5 is 30 degrees, which caps a shadow at about 1.7x the caster's height.
 #define SHADOW_MAP_DEFAULT_MIN_ELEVATION 0.5f
 
+// Radius of the PCF kernel, in cascade texels. The filter is sixteen fetches whatever this is; the value
+// only says how far apart they sit, so it trades edge softness against fetch coverage at no extra cost.
+//
+// 0.5 rather than 1.0: at a full texel the four bilinear taps put their 2x2 quads edge to edge and cover a
+// 4x4 neighbourhood, which is what finally killed the stair-stepping -- but 4x4 texels of the third cascade
+// is several world units of penumbra, and shadows came out looking smeared rather than soft. At half a
+// texel the quads overlap into roughly 3x3, which still filters (the failure mode to avoid is taps landing
+// inside ONE texel, which is what a POINT-sampled quincunx at this radius would do -- these are bilinear,
+// so every tap is already an interpolation over four texels).
+#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.5f
+
+// Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
+// Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, but at
+// this scale a shadow is a few texels wide and reads as a smudge of dirt rather than as a shadow, while
+// still costing a full re-rasterisation in every cascade. 40 units sits between that clutter and the props
+// worth casting (Link is roughly 60 tall).
+#define SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE 40.0f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

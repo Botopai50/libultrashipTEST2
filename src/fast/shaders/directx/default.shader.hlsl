@@ -122,6 +122,8 @@ cbuffer PerShadowCB : register(b3) {
     // x = active cascade count (0 = no shadow map this frame), y = cross-fade band as a fraction of the
     // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
     float4 shadow_params;
+    // x = PCF kernel radius in texels (see SHADOW_MAP_DEFAULT_FILTER_WIDTH); y/z/w unused.
+    float4 shadow_filter;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -177,11 +179,13 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
 float SampleShadowPCF16(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
-    // One texel, not two. Each bilinear tap already spans a 2x2 texel quad, so taps a single texel either
-    // side put those quads edge to edge and cover 4x4 contiguously. Spacing them two texels apart leaves
-    // the middle two texels of each axis sampled by nothing -- a regular hole in the kernel, which reads on
-    // screen as a grid laid over the ground.
-    float d = texelUv;
+    // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
+    // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
+    // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
+    // which reads on screen as a grid laid over the ground. Two texels did exactly that. Below one the
+    // quads overlap instead, which only costs redundancy, so this is safe to turn down for a tighter
+    // penumbra and must not be turned above 1.0.
+    float d = texelUv * min(shadow_filter.x, 1.0);
     float sum = SampleShadowPCF4(uv + float2(-d, -d), z, cascade, texelUv, sliceBase);
     sum += SampleShadowPCF4(uv + float2(d, -d), z, cascade, texelUv, sliceBase);
     sum += SampleShadowPCF4(uv + float2(-d, d), z, cascade, texelUv, sliceBase);

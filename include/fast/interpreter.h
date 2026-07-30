@@ -446,7 +446,8 @@ class Interpreter {
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
     // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
     void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, const float splits[4],
-                            const float lightDir[3], float blendFraction, float normalOffset, float strength) {
+                            const float lightDir[3], float blendFraction, float normalOffset, float strength,
+                            float filterWidth, float minCasterSize) {
         mShadowMapEnabled = enabled;
         mShadowMapCascadeCount = cascadeCount < 1                       ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
@@ -465,6 +466,8 @@ class Interpreter {
         mShadowMapBlendFraction = blendFraction;
         mShadowMapNormalOffset = normalOffset;
         mShadowMapStrength = strength;
+        mShadowMapFilterWidth = filterWidth;
+        mShadowMapMinCasterSize = minCasterSize;
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
@@ -687,6 +690,8 @@ class Interpreter {
     float mShadowMapBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowMapNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
     float mShadowMapStrength = SHADOW_MAP_DEFAULT_STRENGTH;
+    float mShadowMapFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
+    float mShadowMapMinCasterSize = SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE;
     // Per-frame budget on captured casters. A pathological scene must cost a dropped shadow, not an
     // unbounded allocation; 9 floats per triangle makes this a little over a million triangles.
     static constexpr size_t kShadowMapCasterBudgetFloats = 12u * 1024u * 1024u;
