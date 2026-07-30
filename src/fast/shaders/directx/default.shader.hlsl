@@ -130,13 +130,31 @@ float ShadowTap(float2 uv, float slice, float z) {
 // array can land in an indexable temp register, which ps_4_0 refuses to map. The slice is cast explicitly
 // -- it is a texture coordinate and has to arrive as a float, and leaving that implicit is what produces
 // the truncation warnings.
+// Bilinear PCF over the four texels surrounding the sample point: compare each, then weight the RESULTS by
+// the sub-texel position. Comparing first and filtering after is the whole point -- filtering the stored
+// depths and comparing once would give a wrong penumbra.
+//
+// The offsets have to be a full texel apart, and land on texel centres. An earlier version kept the
+// half-texel quincunx offsets that suited a hardware comparison sampler, where every fetch already
+// straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
+// return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
+// edges stair-step.
 float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv) {
     float slice = (float)cascade;
-    float sum = ShadowTap(uv + float2(-0.5, -0.5) * texelUv, slice, z);
-    sum += ShadowTap(uv + float2(0.5, -0.5) * texelUv, slice, z);
-    sum += ShadowTap(uv + float2(-0.5, 0.5) * texelUv, slice, z);
-    sum += ShadowTap(uv + float2(0.5, 0.5) * texelUv, slice, z);
-    return sum * 0.25;
+    // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
+    float2 texelPos = uv / texelUv - 0.5;
+    float2 baseTexel = floor(texelPos);
+    float2 subTexel = texelPos - baseTexel;
+    float2 uv00 = (baseTexel + 0.5) * texelUv;
+
+    float s00 = ShadowTap(uv00, slice, z);
+    float s10 = ShadowTap(uv00 + float2(texelUv, 0.0), slice, z);
+    float s01 = ShadowTap(uv00 + float2(0.0, texelUv), slice, z);
+    float s11 = ShadowTap(uv00 + float2(texelUv, texelUv), slice, z);
+
+    float top = lerp(s00, s10, subTexel.x);
+    float bottom = lerp(s01, s11, subTexel.x);
+    return lerp(top, bottom, subTexel.y);
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
