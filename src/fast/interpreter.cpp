@@ -2454,6 +2454,15 @@ static constexpr size_t kShadowAccumBudgetFloats = 8u * 1024u * 1024u;
 // and partially-covered edge cells render at lighter steps (see pass 3), which smooths the staircase the
 // grid would otherwise show along the silhouette.
 void Interpreter::FlushToonShadow() {
+    // SOH [Enhancement] Shadow-map mode reuses the same caster arming as the stencil volumes, because that
+    // marker is how the game says "this object casts". The world-space capture in GfxSpTri1 has already
+    // taken what the cascades need, so drop the silhouette here instead of building a volume from it:
+    // the two systems are mutually exclusive, and building volumes nobody draws would rasterize a
+    // footprint grid per object for nothing.
+    if (mShadowMapEnabled) {
+        mShadowVerts.clear();
+        return;
+    }
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
     if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f) {
         mShadowVerts.clear();
