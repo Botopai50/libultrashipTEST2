@@ -113,6 +113,11 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_splits;      // far distance of each cascade, world units
     float4 shadow_texel_world; // world size of one texel, per cascade
     float4 shadow_texel_uv;    // one texel in UV terms (1/resolution), per cascade
+    // Constant bias in NDC depth, per cascade. Held per cascade rather than as one number because each
+    // cascade covers a different depth range: a single NDC value would mean a different physical distance
+    // in each one, which detaches distant shadows and makes the same shadow land in two places across a
+    // cascade transition.
+    float4 shadow_depth_bias;
     // x = active cascade count (0 = no shadow map this frame), y = cross-fade band as a fraction of the
     // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
     float4 shadow_params;
@@ -185,7 +190,7 @@ float ShadowSplitAt(uint c) {
 // keeps the caller's selection on literal indices (see the note above). `slice` is only ever a texture
 // coordinate, and those may be dynamic.
 float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld, float texelUv,
-                       uint slice, float sliceBase) {
+                       float depthBias, uint slice, float sliceBase) {
     // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
     // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
     // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
@@ -202,7 +207,7 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
         if (inside) {
             // NDC -> texture space (y flips: NDC is +up, textures are +down).
             float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-            lit = SampleShadowPCF4(uv, ndc.z, slice, texelUv, sliceBase);
+            lit = SampleShadowPCF4(uv, ndc.z - depthBias, slice, texelUv, sliceBase);
         }
     }
     return lit;
@@ -216,13 +221,17 @@ float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBas
     float lit = 1.0;
     [branch]
     if (cascade == 0) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x, 0, sliceBase);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x,
+                               shadow_depth_bias.x, 0, sliceBase);
     } else if (cascade == 1) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y, 1, sliceBase);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y,
+                               shadow_depth_bias.y, 1, sliceBase);
     } else if (cascade == 2) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z, 2, sliceBase);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z,
+                               shadow_depth_bias.z, 2, sliceBase);
     } else {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w, 3, sliceBase);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w,
+                               shadow_depth_bias.w, 3, sliceBase);
     }
     return lit;
 }

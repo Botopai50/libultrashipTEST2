@@ -1422,7 +1422,11 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // ground is the main example, and it does not need to shadow itself.
     rast_desc.CullMode = D3D11_CULL_FRONT;
     rast_desc.DepthClipEnable = TRUE;
-    rast_desc.DepthBias = SHADOW_MAP_DEFAULT_CONSTANT_BIAS;
+    // No constant bias here. It is applied in the shader instead, in world units divided by each
+    // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different
+    // physical distance in every cascade. The slope term stays: being relative to the polygon's own
+    // gradient is exactly right, and it is the same relative amount whatever the range.
+    rast_desc.DepthBias = 0;
     rast_desc.SlopeScaledDepthBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
     if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
@@ -1693,6 +1697,13 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             mPerShadowCbData.shadow_texel_world[c] = 2.0f / (sx * (float)mShadowResolution);
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
         }
+
+        // Depth bias, in world units, converted into this cascade's NDC depth. The projection scales the
+        // light's unit z axis by 1/(zFar - zNear), so the length of that column IS the conversion factor --
+        // the same trick the texel size uses, and it keeps one tuning number meaning one physical distance
+        // in every cascade instead of drifting by a factor of fifty between the near and far ones.
+        const float sz = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
+        mPerShadowCbData.shadow_depth_bias[c] = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD * sz;
     }
     mShadowCbDirty = true;
 }

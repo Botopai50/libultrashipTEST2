@@ -42,6 +42,7 @@ struct PerShadowCB {
     float shadow_splits[4];      // far distance of each cascade, world units
     float shadow_texel_world[4]; // world size of one texel, per cascade
     float shadow_texel_uv[4];    // one texel in UV terms (1/resolution), per cascade
+    float shadow_depth_bias[4];  // constant bias in NDC depth, per cascade (world units / depth range)
     // x = active cascade count (0 = no shadow map), y = blend fraction, z = normal offset, w = strength
     float shadow_params[4];
 };

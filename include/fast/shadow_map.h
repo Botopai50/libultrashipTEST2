@@ -51,20 +51,18 @@
 // Expressed as a fraction so the band scales with each cascade's size.
 #define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.1f
 
-// Depth bias applied while rendering the depth maps, in the rasterizer's own units: the constant term
-// counts smallest-representable depth increments of the map's format (D16 here), and the slope-scaled
-// term multiplies the polygon's depth gradient. Constant bias alone would have to be large enough for
-// the steepest surface in the scene, which detaches contact shadows everywhere else ("peter panning"),
-// so the slope-scaled term carries most of the load and the constant one stays small.
-// The constant term is an integer because that is what the rasterizer takes for a UNORM depth format.
+// Depth bias for the shadow comparison, in WORLD UNITS and applied in the shader, not handed to the rasterizer.
 //
-// Scale matters here and is easy to get wrong: the unit is one smallest representable depth increment, not
-// one world unit and not one texel. A D16 map spanning a few thousand world units resolves roughly a
-// hundredth of a unit per increment, so a value like 2 is worth a few hundredths of a unit -- far too small
-// to lift a surface off its own depth values. That was the original mistake, and it showed up as terrain
-// shadowing itself across the whole cascade footprint: one enormous dark quad on the ground with straight
-// edges, which were the cascade's own borders.
-#define SHADOW_MAP_DEFAULT_CONSTANT_BIAS 150
+// The rasterizer's own constant bias counts smallest representable depth increments, and each cascade
+// covers a different depth range -- so one setting means wildly different distances per cascade. At 150
+// increments the near cascade got about 1.3 world units and the far one about 70, which detached distant
+// shadows from their casters and, worse, placed the SAME shadow in a different spot in each cascade: at a
+// cascade transition you could see both copies at once, metres apart.
+//
+// Expressed in world units and divided by each cascade's own depth range at upload time, one value means
+// the same physical offset everywhere. The slope term stays with the rasterizer, where being relative to
+// the polygon's own gradient is exactly what it should be.
+#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 2.0f
 #define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
