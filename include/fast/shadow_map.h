@@ -44,8 +44,15 @@
 // the steepest surface in the scene, which detaches contact shadows everywhere else ("peter panning"),
 // so the slope-scaled term carries most of the load and the constant one stays small.
 // The constant term is an integer because that is what the rasterizer takes for a UNORM depth format.
-#define SHADOW_MAP_DEFAULT_CONSTANT_BIAS 2
-#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 2.5f
+//
+// Scale matters here and is easy to get wrong: the unit is one smallest representable depth increment, not
+// one world unit and not one texel. A D16 map spanning a few thousand world units resolves roughly a
+// hundredth of a unit per increment, so a value like 2 is worth a few hundredths of a unit -- far too small
+// to lift a surface off its own depth values. That was the original mistake, and it showed up as terrain
+// shadowing itself across the whole cascade footprint: one enormous dark quad on the ground with straight
+// edges, which were the cascade's own borders.
+#define SHADOW_MAP_DEFAULT_CONSTANT_BIAS 150
+#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
 // This is the term that actually removes the striped self-shadowing (acne) on curved surfaces, where a

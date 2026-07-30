@@ -2925,6 +2925,26 @@ void Interpreter::RenderShadowMap() {
         swapCasterBuffers();
         return;
     }
+    // Lateral half-extent of the frustum at the near and far planes, from the actual corners. Without this
+    // the cascades were sized by a guess that ignored the field of view entirely, so they covered a
+    // narrow tube down the middle of the view: shadows vanished toward the screen edges and popped in and
+    // out as the camera turned, because whole objects kept falling outside the cascade's footprint.
+    float halfNear = 0.0f, halfFar = 0.0f;
+    {
+        float c[3];
+        const float corners[4][2] = { { -1.0f, -1.0f }, { 1.0f, -1.0f }, { -1.0f, 1.0f }, { 1.0f, 1.0f } };
+        for (int i = 0; i < 4; i++) {
+            if (ShadowUnproject(invVp, corners[i][0], corners[i][1], 0.0f, c)) {
+                const float dx = c[0] - nearC[0], dy = c[1] - nearC[1], dz = c[2] - nearC[2];
+                halfNear = std::max(halfNear, std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+            if (ShadowUnproject(invVp, corners[i][0], corners[i][1], 1.0f, c)) {
+                const float dx = c[0] - farC[0], dy = c[1] - farC[1], dz = c[2] - farC[2];
+                halfFar = std::max(halfFar, std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+        }
+    }
+
     float viewDir[3] = { farC[0] - nearC[0], farC[1] - nearC[1], farC[2] - nearC[2] };
     float viewLen = std::sqrt(viewDir[0] * viewDir[0] + viewDir[1] * viewDir[1] + viewDir[2] * viewDir[2]);
     if (viewLen < 1e-6f) {
@@ -2974,7 +2994,18 @@ void Interpreter::RenderShadowMap() {
         // covers the frustum's lateral spread. Half the slice length is a deliberate over-estimate --
         // cheap, and erring large only wastes a little resolution while erring small clips shadows off.
         const float mid = (nearDist + farDist) * 0.5f;
-        const float radius = (farDist - nearDist) * 0.5f + mid * 0.5f;
+        // Sphere that provably contains this slice of the view frustum. The lateral half-extent grows
+        // linearly with distance, so take it at both ends of the slice and keep the larger; combined with
+        // half the slice's length that gives a radius covering every corner.
+        // Fitting a sphere rather than the corners themselves is deliberate: a sphere's radius does not
+        // change as the camera turns, so the projection keeps its size frame to frame. Fitting the corners
+        // would resize it constantly and every shadow edge would crawl.
+        const float axisLen = viewLen > 1e-6f ? viewLen : 1.0f;
+        const float halfAtNear = halfNear + (halfFar - halfNear) * std::clamp(nearDist / axisLen, 0.0f, 1.0f);
+        const float halfAtFar = halfNear + (halfFar - halfNear) * std::clamp(farDist / axisLen, 0.0f, 1.0f);
+        const float halfLen = (farDist - nearDist) * 0.5f;
+        const float lateral = std::max(halfAtNear, halfAtFar);
+        const float radius = std::sqrt(halfLen * halfLen + lateral * lateral);
         float center[3] = { nearC[0] + viewDir[0] * mid, nearC[1] + viewDir[1] * mid, nearC[2] + viewDir[2] * mid };
 
         // Snap the centre to whole texels along the light's own axes (see the note above).
@@ -2991,7 +3022,10 @@ void Interpreter::RenderShadowMap() {
         }
 
         // Pull the eye back far enough that casters above the slice still fall inside the depth range.
-        const float back = radius * 2.0f + 1000.0f;
+        // Margin proportional to the cascade rather than a fixed distance: a flat 1000 units of slack was
+        // most of the depth range for a near cascade, and a D16 map spends its precision on whatever range
+        // it is given. Scaling with the radius keeps every cascade's precision comparable.
+        const float back = radius * 3.0f;
         const float eye[3] = { center[0] - lz[0] * back, center[1] - lz[1] * back, center[2] - lz[2] * back };
         const float zNear = 0.0f;
         const float zFar = back + radius * 2.0f;
