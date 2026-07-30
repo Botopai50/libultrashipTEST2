@@ -143,9 +143,10 @@ class GfxRenderingAPI {
         return false;
     }
 
-    // Begin depth-only rendering into one cascade. lightViewProj is row-major, the same convention the
-    // interpreter already uses for its own matrices. Clears that cascade's depth to far before drawing.
-    virtual void ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) {
+    // Begin depth-only rendering into one cascade of one layer (SHADOW_MAP_LAYER_WORLD or _ACTORS -- see
+    // fast/shadow_map.h for why casters are split). lightViewProj is row-major, the same convention the
+    // interpreter already uses for its own matrices. Clears that slice's depth to far before drawing.
+    virtual void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) {
     }
 
     // Submit caster geometry into the cascade opened by ShadowMapBeginCascade: `vertexCount` vertices of

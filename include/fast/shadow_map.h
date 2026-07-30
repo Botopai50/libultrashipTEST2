@@ -18,6 +18,19 @@
 // the application may configure fewer at runtime, never more.
 #define SHADOW_MAP_MAX_CASCADES 4
 
+// Casters are split into two layers, because the four interaction rules cannot be satisfied by one map:
+// scenery must be shadowed by characters, while characters must NOT be shadowed by characters. The same
+// map cannot both contain and not contain the actors, so there are two.
+//   World layer  -- scenery casters only. Sampled by everything.
+//   Actor layer  -- character casters only. Sampled by scenery, never by characters.
+// Both live in ONE texture array with twice the slices rather than two arrays: the slice is a texture
+// coordinate, so selecting a layer is an index offset and the shader needs only one sampler and one set of
+// sampling code. Layer L, cascade C is slice L*cascadeCount + C.
+#define SHADOW_MAP_LAYERS 2
+#define SHADOW_MAP_LAYER_WORLD 0
+#define SHADOW_MAP_LAYER_ACTORS 1
+#define SHADOW_MAP_MAX_SLICES (SHADOW_MAP_MAX_CASCADES * SHADOW_MAP_LAYERS)
+
 // Per-cascade square resolution bounds. 4096 is the largest the near cascade is ever asked for, and
 // anything under 256 produces texels so large that the bias needed to hide the acne swallows the
 // shadow itself.

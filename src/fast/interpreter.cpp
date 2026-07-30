@@ -1538,22 +1538,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // them is ever enabled -- the mode selector is exclusive -- so this costs nothing in the other
         // modes. Over budget, stop growing: a scene missing its furthest casters beats an allocation
         // that grows without bound.
-        if (mShadowMapEnabled && mShadowMapCasters.size() < kShadowMapCasterBudgetFloats) {
+        if (mShadowMapEnabled &&
+            mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
+            std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
             for (int si = 0; si < 3; si++) {
-                mShadowMapCasters.push_back(v_arr[si]->wx);
-                mShadowMapCasters.push_back(v_arr[si]->wy);
-                mShadowMapCasters.push_back(v_arr[si]->wz);
+                dst.push_back(v_arr[si]->wx);
+                dst.push_back(v_arr[si]->wy);
+                dst.push_back(v_arr[si]->wz);
             }
         }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && !is_rect &&
-               mShadowMapCasters.size() < kShadowMapCasterBudgetFloats) {
+               mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
         // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
         // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the actor path -- the
         // room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
+        std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_WORLD];
         for (int si = 0; si < 3; si++) {
-            mShadowMapCasters.push_back(v_arr[si]->wx);
-            mShadowMapCasters.push_back(v_arr[si]->wy);
-            mShadowMapCasters.push_back(v_arr[si]->wz);
+            dst.push_back(v_arr[si]->wx);
+            dst.push_back(v_arr[si]->wy);
+            dst.push_back(v_arr[si]->wz);
         }
     }
 
@@ -1661,7 +1664,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // actors carry vertex normals, so that bias actually applies to them, unlike the room mesh.
     //
     // Screen-space rects (UI, backgrounds) stay out: they have no world position to look up with.
-    bool use_shadow_map = mShadowMapEnabled && !is_rect;
+    bool use_shadow_map = mShadowMapEnabled && !is_rect && !mRdp->shadow_no_receive;
+    // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
+    // characters from shadowing each other (or themselves) while still being shadowed by the world.
+    bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
     auto shader = mRdp->current_shader;
 
     if (texture_edge) {
@@ -1702,6 +1708,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_shadow_map) {
         cc_options |= SHADER_OPT(SHADOW_MAP);
     }
+    if (use_shadow_map_actors) {
+        cc_options |= SHADER_OPT(SHADOW_MAP_ACTORS);
+    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -1716,9 +1725,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
-        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for the TOON opt bit
-        // and 18->19 for SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features.
-        cc_options |= (shader.id << 19);
+        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
+        // SHADOW_MAP and 19->20 for SHADOW_MAP_ACTORS. Keep in lockstep with the decode in
+        // gfx_cc_get_features -- a mismatch selects the wrong shader for every draw in the game.
+        cc_options |= (shader.id << 20);
     }
 
     ColorCombinerKey key;
@@ -2894,8 +2904,10 @@ static bool ShadowUnproject(const float invVp[4][4], float x, float y, float z, 
 // ("shadow swimming") -- the artefact the design calls out first.
 void Interpreter::RenderShadowMap() {
     auto swapCasterBuffers = [this] {
-        mShadowMapCastersReady.swap(mShadowMapCasters);
-        mShadowMapCasters.clear();
+        for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
+            mShadowMapCastersReady[l].swap(mShadowMapCasters[l]);
+            mShadowMapCasters[l].clear();
+        }
     };
 
     if (!mShadowMapEnabled) {
@@ -2910,7 +2922,8 @@ void Interpreter::RenderShadowMap() {
         swapCasterBuffers();
         return;
     }
-    if (mShadowMapCastersReady.size() < 9) {
+    if (mShadowMapCastersReady[SHADOW_MAP_LAYER_WORLD].size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() <
+        9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength);
         swapCasterBuffers();
@@ -3080,8 +3093,15 @@ void Interpreter::RenderShadowMap() {
         m[14] = (-(eye[0] * lz[0] + eye[1] * lz[1] + eye[2] * lz[2]) - zNear) * sz;
         m[15] = 1.0f;
 
-        mRapi->ShadowMapBeginCascade(c, m);
-        mRapi->ShadowMapDrawCasters(mShadowMapCastersReady.data(), mShadowMapCastersReady.size() / 3);
+        // Each layer gets its own slice of this cascade. Both are cleared and drawn even when empty, so a
+        // layer that had casters last frame and none now comes back clear instead of holding stale depth.
+        for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
+            mRapi->ShadowMapBeginCascade(l, c, m);
+            const std::vector<float>& casters = mShadowMapCastersReady[l];
+            if (casters.size() >= 9) {
+                mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3);
+            }
+        }
 
         nearDist = farDist;
     }
@@ -4797,6 +4817,14 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // SOH [Enhancement] Cascaded shadow maps: the world-caster bracket rides further down the same
         // sentinel range, so it has to be tested BEFORE the flush -- the flush's own test (<= -1e29) would
         // otherwise swallow both of these.
+        if (sizeOrSentinel <= -4.5e30f) {
+            gfx->mRdp->shadow_no_receive = false; // gSPShadowMapReceiveOn
+            return false;
+        }
+        if (sizeOrSentinel <= -3.5e30f) {
+            gfx->mRdp->shadow_no_receive = true; // gSPShadowMapReceiveOff
+            return false;
+        }
         if (sizeOrSentinel <= -2.5e30f) {
             gfx->mRdp->shadow_world_caster = false; // gSPShadowMapWorldCasterEnd
             return false;
@@ -5880,6 +5908,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
     // SOH [Enhancement] cascaded shadow maps: this draw samples the cascade array
     cc_features->opt_shadow_map = (shader_id1 & SHADER_OPT(SHADOW_MAP)) != 0;
+    cc_features->opt_shadow_map_actors = (shader_id1 & SHADER_OPT(SHADOW_MAP_ACTORS)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -5889,7 +5918,7 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
         // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP. Must match the encode in
         // the ColorCombinerKey build; a mismatch silently selects the wrong shader for every draw.
-        cc_features->shader_id = (shader_id1 >> 19) & 0x1FFF;
+        cc_features->shader_id = (shader_id1 >> 20) & 0xFFF;
     }
 
     cc_features->usedTextures[0] = false;

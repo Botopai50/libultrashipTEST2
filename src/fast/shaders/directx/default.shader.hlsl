@@ -139,8 +139,8 @@ float ShadowTap(float2 uv, float slice, float z) {
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
-float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv) {
-    float slice = (float)cascade;
+float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
+    float slice = sliceBase + (float)cascade;
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
@@ -185,7 +185,7 @@ float ShadowSplitAt(uint c) {
 // keeps the caller's selection on literal indices (see the note above). `slice` is only ever a texture
 // coordinate, and those may be dynamic.
 float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld, float texelUv,
-                       uint slice) {
+                       uint slice, float sliceBase) {
     // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
     // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
     // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
@@ -202,7 +202,7 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
         if (inside) {
             // NDC -> texture space (y flips: NDC is +up, textures are +down).
             float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-            lit = SampleShadowPCF4(uv, ndc.z, slice, texelUv);
+            lit = SampleShadowPCF4(uv, ndc.z, slice, texelUv, sliceBase);
         }
     }
     return lit;
@@ -212,17 +212,17 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
 // ever grows, this grows with it.
 // [branch] asks for a real branch instead of evaluating every arm and discarding all but one. Flattened,
 // this would cost four cascades' worth of fetches on every pixel -- sixteen instead of four.
-float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade) {
+float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBase) {
     float lit = 1.0;
     [branch]
     if (cascade == 0) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x, 0);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[0], shadow_texel_world.x, shadow_texel_uv.x, 0, sliceBase);
     } else if (cascade == 1) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y, 1);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[1], shadow_texel_world.y, shadow_texel_uv.y, 1, sliceBase);
     } else if (cascade == 2) {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z, 2);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[2], shadow_texel_world.z, shadow_texel_uv.z, 2, sliceBase);
     } else {
-        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w, 3);
+        lit = ShadowLitCascade(worldPos, normalWs, shadow_view_proj[3], shadow_texel_world.w, shadow_texel_uv.w, 3, sliceBase);
     }
     return lit;
 }
@@ -230,7 +230,7 @@ float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade) {
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
 // Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
 // moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
-float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth) {
+float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBase) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0).
     float lit = 1.0;
@@ -247,7 +247,7 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth) {
         }
         cascade = min(cascade, count - 1);
 
-        lit = ShadowLitAt(worldPos, normalWs, cascade);
+        lit = ShadowLitAt(worldPos, normalWs, cascade, sliceBase);
 
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -260,7 +260,7 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth) {
             float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
             if (viewDepth > bandStart) {
                 float t = smoothstep(bandStart, farEdge, viewDepth);
-                lit = lerp(lit, ShadowLitAt(worldPos, normalWs, cascade + 1), t);
+                lit = lerp(lit, ShadowLitAt(worldPos, normalWs, cascade + 1, sliceBase), t);
             }
         }
     }
@@ -536,7 +536,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         @end
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
         // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
-        float shadowLit = ShadowLit(input.worldPos, shadowN, input.position.w);
+        // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
+        // character is shadowed by the world but never by another character (or by itself) -- the
+        // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.
+        float shadowLit = ShadowLit(input.worldPos, shadowN, input.position.w, 0.0);
+        @if(o_shadow_map_actors)
+            shadowLit = min(shadowLit, ShadowLit(input.worldPos, shadowN, input.position.w, shadow_params.x));
+        @end
         texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
     @end
 

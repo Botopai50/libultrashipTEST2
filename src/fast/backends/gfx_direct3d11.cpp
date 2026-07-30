@@ -1474,7 +1474,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     }
 
     // Drop the old array first so the driver can reuse its memory for the new one.
-    for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+    for (int i = 0; i < SHADOW_MAP_MAX_SLICES; i++) {
         mShadowMapDsv[i].Reset();
     }
     mShadowMapSrv.Reset();
@@ -1489,7 +1489,8 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     tex_desc.Width = (UINT)resolution;
     tex_desc.Height = (UINT)resolution;
     tex_desc.MipLevels = 1;
-    tex_desc.ArraySize = (UINT)cascadeCount;
+    // Twice the slices: the world layer occupies [0, cascadeCount) and the actor layer the rest.
+    tex_desc.ArraySize = (UINT)(cascadeCount * SHADOW_MAP_LAYERS);
     tex_desc.Format = DXGI_FORMAT_R16_TYPELESS;
     tex_desc.SampleDesc.Count = 1;
     tex_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -1499,7 +1500,8 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
         return false;
     }
 
-    for (int i = 0; i < cascadeCount; i++) {
+    const int sliceCount = cascadeCount * SHADOW_MAP_LAYERS;
+    for (int i = 0; i < sliceCount; i++) {
         D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
         ZeroMemory(&dsv_desc, sizeof(dsv_desc));
         dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
@@ -1508,7 +1510,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
         dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
         dsv_desc.Texture2DArray.ArraySize = 1;
         if (FAILED(mDevice->CreateDepthStencilView(mShadowMapTexture.Get(), &dsv_desc, mShadowMapDsv[i].GetAddressOf()))) {
-            SPDLOG_ERROR("Shadow map: could not create the depth view for cascade {}.", i);
+            SPDLOG_ERROR("Shadow map: could not create the depth view for slice {}.", i);
             for (int j = 0; j < i; j++) {
                 mShadowMapDsv[j].Reset(); // do not leave views pointing at a texture we are dropping
             }
@@ -1524,10 +1526,10 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     srv_desc.Texture2DArray.MostDetailedMip = 0;
     srv_desc.Texture2DArray.MipLevels = 1;
     srv_desc.Texture2DArray.FirstArraySlice = 0;
-    srv_desc.Texture2DArray.ArraySize = (UINT)cascadeCount;
+    srv_desc.Texture2DArray.ArraySize = (UINT)sliceCount;
     if (FAILED(mDevice->CreateShaderResourceView(mShadowMapTexture.Get(), &srv_desc, mShadowMapSrv.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the cascade array resource view.");
-        for (int i = 0; i < cascadeCount; i++) {
+        for (int i = 0; i < sliceCount; i++) {
             mShadowMapDsv[i].Reset();
         }
         mShadowMapTexture.Reset();
@@ -1556,13 +1558,18 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
     return CreateShadowMapTargets(cascadeCount, resolution);
 }
 
-void GfxRenderingAPIDX11::ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) {
+void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) {
     if (!mShadowPipelineReady || mShadowMapTexture == nullptr || lightViewProj == nullptr) {
         return;
     }
     if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
         return;
     }
+    if (layer < 0 || layer >= SHADOW_MAP_LAYERS) {
+        return;
+    }
+    // Layer L, cascade C lives in slice L*cascadeCount + C (see fast/shadow_map.h).
+    const int slice = layer * mShadowCascadeCount + cascadeIndex;
 
     if (!mShadowPassActive) {
         // Remember the viewport once for the whole pass, not per cascade.
@@ -1580,8 +1587,8 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int cascadeIndex, const float li
         mShadowPassActive = true;
     }
 
-    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[cascadeIndex].Get());
-    mContext->ClearDepthStencilView(mShadowMapDsv[cascadeIndex].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
+    mContext->ClearDepthStencilView(mShadowMapDsv[slice].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
     D3D11_VIEWPORT viewport;
     viewport.TopLeftX = 0.0f;
@@ -1908,6 +1915,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
+        { "o_shadow_map_actors", cc_features.opt_shadow_map_actors },
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },

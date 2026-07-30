@@ -91,11 +91,14 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     USE_SHADER,
     TOON,       // SOH [Enhancement] toon-lighting variant. Bit 17.
-    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18; the loaded-shader id
-                // packs ABOVE it (interpreter.cpp shifts shader.id by 19). Adding an opt here without
-                // bumping that shift would overlap the id and corrupt shader selection.
-                // shader_id1 is 32 bits, so the id keeps the 13 bits from 19 up -- far more than the
-                // handful of loaded shaders that exist, but the ceiling to watch if opts keep growing.
+    SHADOW_MAP,        // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18.
+    SHADOW_MAP_ACTORS, // SOH [Enhancement] this receiver also takes the ACTOR caster layer, i.e. it is
+                       // scenery. Characters set SHADOW_MAP without this, so they are shadowed by the
+                       // world and never by other characters. Bit 19; the loaded-shader id packs ABOVE it
+                       // (interpreter.cpp shifts shader.id by 20). Adding an opt here without bumping that
+                       // shift would overlap the id and corrupt shader selection for every draw.
+                       // shader_id1 is 32 bits, so the id keeps the 12 bits from 20 up -- far more than the
+                       // handful of loaded shaders that exist, but the ceiling to watch as opts grow.
     MAX
 };
 
@@ -127,7 +130,8 @@ struct CCFeatures {
     bool opt_invisible;
     bool opt_grayscale;
     bool opt_toon;       // SOH [Enhancement] toon lighting
-    bool opt_shadow_map; // SOH [Enhancement] cascaded shadow maps: this draw receives shadow
+    bool opt_shadow_map;        // SOH [Enhancement] cascaded shadow maps: this draw receives shadow
+    bool opt_shadow_map_actors; // SOH [Enhancement] ... and also from the actor caster layer (scenery)
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -350,6 +354,9 @@ struct RDP {
     // casters. Deliberately separate from toon_shadow, which also means "do not receive": world geometry
     // must cast AND receive, since scenery shadowing scenery is the whole point.
     bool shadow_world_caster;
+    // SOH [Enhancement] Cascaded shadow maps: the current draws must not be shadowed at all (sky, sun,
+    // moon). Receiving is otherwise implicit for anything with a world position.
+    bool shadow_no_receive;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
@@ -460,8 +467,10 @@ class Interpreter {
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
-            mShadowMapCasters.clear();
-            mShadowMapCastersReady.clear();
+            for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
+                mShadowMapCasters[l].clear();
+                mShadowMapCastersReady[l].clear();
+            }
         }
     }
     void StartFrame();
@@ -644,8 +653,10 @@ class Interpreter {
     // renders the cascades from the PREVIOUS frame's casters while accumulating the current ones. That
     // costs one frame of shadow lag -- the same trade the stencil volumes already make, and equally
     // imperceptible for shadows that move at gameplay speed.
-    std::vector<float> mShadowMapCasters;      // filling this frame (9 floats per triangle)
-    std::vector<float> mShadowMapCastersReady; // completed last frame; what the depth pass draws
+    // One list per caster layer (SHADOW_MAP_LAYER_WORLD / _ACTORS), because characters must cast onto the
+    // scenery without casting onto each other -- see fast/shadow_map.h.
+    std::vector<float> mShadowMapCasters[SHADOW_MAP_LAYERS];      // filling this frame (9 floats per tri)
+    std::vector<float> mShadowMapCastersReady[SHADOW_MAP_LAYERS]; // completed last frame; what the pass draws
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_MAX_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;

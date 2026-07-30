@@ -146,7 +146,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // implements the depth pass.
     bool SupportsShadowMap() override;
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
-    void ShadowMapBeginCascade(int cascadeIndex, const float lightViewProj[16]) override;
+    void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) override;
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
@@ -173,7 +173,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
     // the main pass). Everything stays null until the application first asks for a shadow map.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMapTexture;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMapDsv[SHADOW_MAP_MAX_CASCADES];
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMapDsv[SHADOW_MAP_MAX_SLICES];
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMapSrv;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowMapSampler;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowDepthVs;

@@ -2871,6 +2871,13 @@ typedef union Gfx {
 #define gSPShadowMapWorldCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -2.0e30f)
 #define gSPShadowMapWorldCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -3.0e30f)
 
+// SOH [Enhancement] Cascaded shadow maps: bracket draws that must NOT be shadowed. Receiving is otherwise
+// automatic for anything with a world position, which is right for the room and for actors but wrong for
+// the sky: a skybox is real 3D geometry, so it was being projected into the cascades and coming back with
+// dark streaks smeared across it, and the sun and moon the same.
+#define gSPShadowMapReceiveOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -4.0e30f)
+#define gSPShadowMapReceiveOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -5.0e30f)
+
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \
