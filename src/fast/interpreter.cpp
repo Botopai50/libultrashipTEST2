@@ -1293,11 +1293,12 @@ bool Interpreter::ShadowCasterExcludedByRenderMode() const {
     if (zmode == ZMODE_DEC || zmode == ZMODE_XLU) {
         return true;
     }
-    // FORCE_BL marks the blender as unconditional rather than coverage-driven, which is what separates a
-    // genuinely translucent surface from an opaque one using the N64's antialiasing blend. The blender
-    // configuration alone cannot tell them apart: G_RM_AA_ZB_OPA_SURF sets the same CLR_MEM/1MA pair that
-    // an XLU mode does, so testing that would have rejected most of the opaque world.
-    return (mRdp->other_mode_l & FORCE_BL) == FORCE_BL;
+    // The zmode field alone, and nothing else. FORCE_BL was tested here too, on the reasoning that it marks
+    // a blend as unconditional rather than coverage-driven -- but plenty of visually solid geometry sets it
+    // while staying in ZMODE_OPA, and excluding those punched holes in the shadows of solid walls. Every
+    // genuinely translucent surface mode carries ZMODE_XLU anyway, so the narrower test loses nothing and
+    // cannot take an opaque caster with it.
+    return false;
 }
 
 // SOH [Enhancement] Cascaded shadow maps: the tile's texture dimensions, split out of GfxSpTri1's combiner
@@ -1378,6 +1379,13 @@ bool Interpreter::ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey) {
     const uint32_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
     const uint8_t* addr = mRdp->loaded_texture[tmemIndex].addr;
     if (addr == nullptr) {
+        return false;
+    }
+    // Intensity textures carry no opacity: the importer expands I4/I8 by copying the intensity into all
+    // four channels, so alpha there is a brightness map. Clipping against it punches the texture's own dark
+    // areas out of the depth map, which on a solid stone wall means a shadow full of holes and no
+    // transparency anywhere in sight. Those materials cast as plain opaque geometry.
+    if (mRdp->texture_tile[tile].fmt == G_IM_FMT_I) {
         return false;
     }
     // Same key ImportTexture builds, so the lookup at pass time finds the texture the main pass uploaded.
