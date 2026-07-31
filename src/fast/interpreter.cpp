@@ -1278,6 +1278,28 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
     }
 }
 
+// SOH [Enhancement] Cascaded shadow maps: geometry that must never be recorded as a caster, whatever else
+// it is. Only consulted when the shadow map is on, so the stencil volumes keep their previous behaviour
+// exactly.
+//
+// This became necessary the moment the actor capture stopped requiring G_LIGHTING. That change was right --
+// unlit geometry blocks light -- but "unlit" is also what decals and translucent overlays are, and those
+// had been excluded by accident rather than by intent. A decal is glued coplanar to the surface under it,
+// so recording one makes that surface shadow itself: a hard-edged blotch appearing and disappearing with
+// sub-texel depth noise, which is not a shadow of anything. Translucent geometry is see-through, and a
+// see-through surface casting a solid shadow looks worse than casting none.
+bool Interpreter::ShadowCasterExcludedByRenderMode() const {
+    const uint32_t zmode = mRdp->other_mode_l & ZMODE_DEC; // ZMODE_DEC is the full two-bit field mask
+    if (zmode == ZMODE_DEC || zmode == ZMODE_XLU) {
+        return true;
+    }
+    // FORCE_BL marks the blender as unconditional rather than coverage-driven, which is what separates a
+    // genuinely translucent surface from an opaque one using the N64's antialiasing blend. The blender
+    // configuration alone cannot tell them apart: G_RM_AA_ZB_OPA_SURF sets the same CLR_MEM/1MA pair that
+    // an XLU mode does, so testing that would have rejected most of the opaque world.
+    return (mRdp->other_mode_l & FORCE_BL) == FORCE_BL;
+}
+
 // SOH [Enhancement] Cascaded shadow maps: the tile's texture dimensions, split out of GfxSpTri1's combiner
 // setup so the caster capture can compute UVs without waiting for it. The capture has to run BEFORE the
 // trivial clip rejection -- a tree behind the camera still casts into the view, and culling casters by the
@@ -1685,7 +1707,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     TextureCacheKey shadowAlphaKey{};
     bool shadowAlphaCaster = false;
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
-    if (mShadowMapEnabled && mShadowAlphaSupported && !is_rect && (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
+    // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
+    // cutout question, because a decal that happens to be alpha-tested is still a decal.
+    const bool shadowCasterExcluded =
+        mShadowMapEnabled && (mRdp->toon_shadow || mRdp->shadow_world_caster) && ShadowCasterExcludedByRenderMode();
+    if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect &&
+        (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
         // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
         // this geometry to go, and diverting it there anyway would mean foliage casts NOTHING rather than
         // casting its quad. Falling back to the opaque list is worse looking and strictly better than a
@@ -1703,7 +1730,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // the shadow map is off, so the stencil mode is untouched.
     const bool armedCaster = mRdp->toon_shadow && !is_rect;
     const bool casterLit = (mRsp->geometry_mode & G_LIGHTING) != 0;
-    if (armedCaster && (mShadowMapEnabled ? true : casterLit)) {
+    if (armedCaster && (mShadowMapEnabled ? !shadowCasterExcluded : casterLit)) {
         // Every armed triangle grows the object's bounding box, whichever list it lands in. The box is what
         // the size gate in FlushToonShadow judges the object by, so measuring only the opaque half would
         // shrink a mostly-cutout actor below the threshold and drop its whole shadow -- and which half of a
@@ -1722,6 +1749,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
         if (shadowAlphaCaster) {
             CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
+        } else if (shadowCasterExcluded) {
+            // Nothing: not a caster, and the stencil path is not running (see ShadowCasterExcludedByRenderMode).
         } else if (mShadowMapEnabled || casterLit) {
             // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
             // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
@@ -1734,9 +1763,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
-               shadowAlphaCaster) {
+               !shadowCasterExcluded && shadowAlphaCaster) {
         CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
+               !shadowCasterExcluded &&
                mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
         // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
         // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the stencil path --

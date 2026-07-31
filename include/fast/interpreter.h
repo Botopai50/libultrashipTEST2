@@ -734,6 +734,7 @@ class Interpreter {
     void ShadowCasterTexcoord(int tile, const struct LoadedVertex* v, float texWidth, float texHeight, float* outU,
                               float* outV);
     bool ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey);
+    bool ShadowCasterExcludedByRenderMode() const;
     // Appends one captured triangle to a layer's alpha list, extending the open range when the material has
     // not changed. Consecutive triangles almost always share a texture, so this keeps the range count near
     // the material count rather than near the triangle count.
