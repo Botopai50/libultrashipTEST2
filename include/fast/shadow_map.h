@@ -75,7 +75,14 @@
 // recovers a face normal from screen derivatives where no vertex normal exists), so the constant term no
 // longer has to carry the whole load, and every unit of it is peter panning.
 #define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 1.0f
-#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
+// Slope-scaled bias, handed to the rasterizer. This one is a multiple of the polygon's own depth gradient
+// across a texel, so like the normal offset it grows with the texel -- and the rasterizer takes a single
+// value for every cascade, so it cannot be capped per cascade the way that one is. At 4.0 a surface at
+// forty-five degrees to the light picked up more than twenty world units of bias in the far cascade, on top
+// of the normal offset, which is most of a character's height of detachment.
+// 2.0: the normal offset is the primary defence against acne now, and it does its work in the near cascades
+// where the acne is actually legible.
+#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 2.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
 // This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
@@ -86,6 +93,18 @@
 // 2.0 rather than 1.0: this term is now the primary defence against self-shadowing, replacing both the
 // front-face culling that caused peter panning and half of the constant bias that did the same.
 #define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 2.0f
+
+// Ceiling on that push, in WORLD units, applied per cascade before the shader sees it.
+//
+// Measuring the offset in texels is right while a texel is small, but a texel of the far cascade is several
+// world units, so two of them is nearly twelve -- and the shader moves the receiver's sample that far
+// towards the light before comparing. The shadow lifts off whatever cast it, by more the further away the
+// receiver is, because the cascade it lands in is coarser. That is peter panning that grows with distance.
+//
+// 3.0 is under a tenth of a character's height, so the detachment stays below what the eye reads as a gap,
+// and it only starts binding partway through the third cascade -- the near cascades keep tracking their
+// texel exactly as before.
+#define SHADOW_MAP_MAX_NORMAL_OFFSET_WORLD 3.0f
 
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
 // above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches

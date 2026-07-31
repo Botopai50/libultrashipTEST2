@@ -1899,7 +1899,20 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         // length of its column IS 1/radius. One texel then spans 2*radius/resolution.
         const float sx = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
         if (sx > 1e-9f && mShadowResolution > 0) {
-            mPerShadowCbData.shadow_texel_world[c] = 2.0f / (sx * (float)mShadowResolution);
+            const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
+            // Capped, because the shader multiplies this by the normal offset (in texels) to push the
+            // receiver off its own surface -- and a texel of the far cascade is several world units, so an
+            // offset measured in texels runs away with distance. Two texels is a third of a unit in the
+            // near cascade and nearly twelve in the far one, which is the shadow lifting clean off what
+            // cast it. Peter panning that grows the further you get is exactly this term.
+            //
+            // Capped rather than made constant: acne appears at the scale of the map's own resolution, so
+            // the offset has to track the texel while the texel is small. The cap only bites once tracking
+            // it would cost more than the acne it prevents.
+            const float offsetCap = mShadowNormalOffset > 1e-4f
+                                        ? SHADOW_MAP_MAX_NORMAL_OFFSET_WORLD / mShadowNormalOffset
+                                        : texelWorld;
+            mPerShadowCbData.shadow_texel_world[c] = texelWorld < offsetCap ? texelWorld : offsetCap;
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
         }
 
