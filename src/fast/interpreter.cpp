@@ -3166,6 +3166,11 @@ void Interpreter::RenderShadowMap() {
         mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].clear();
         mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS]);
         mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].clear();
+        // The object mark indexes into the list that was just emptied, so it has to come back to the start
+        // with it -- otherwise the first object of the new frame is measured against last frame's offset and
+        // the size gate cannot roll it back.
+        mShadowAlphaObjectMark = 0;
+        mShadowObjectHasVerts = false;
     }
 
     if (!mShadowMapEnabled) {

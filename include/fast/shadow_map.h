@@ -107,11 +107,20 @@
 #define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.5f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
-// Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, but at
-// this scale a shadow is a few texels wide and reads as a smudge of dirt rather than as a shadow, while
-// still costing a full re-rasterisation in every cascade. 40 units sits between that clutter and the props
-// worth casting (Link is roughly 60 tall).
-#define SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE 40.0f
+// Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at
+// that scale a shadow is a few texels of smudge that reads as dirt rather than as a shadow, while still
+// costing a full re-rasterisation in every cascade.
+//
+// OFF by default, because a threshold is a cliff and a caster sitting on it flickers. 40 units was chosen
+// against adult Link and is roughly CHILD Link's whole height, so his shadow crossed the threshold as the
+// walk cycle bobbed him and blinked once per step. Any value has a band of casters it does this to, and a
+// character blinking is far worse than clutter casting -- so the game names the clutter it does not want
+// casting by actor id (which is exact) and this stays available for tuning rather than guessing on
+// everyone's behalf.
+//
+// Raise it if ground clutter still casts. If a character starts flickering, the value is too close to its
+// height: halve it.
+#define SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE 0.0f
 
 // Alpha below which a textured caster's pixel is punched out of the depth map entirely.
 //
