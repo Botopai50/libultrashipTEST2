@@ -2868,6 +2868,14 @@ typedef union Gfx {
 // cast and receive -- that is what scenery-shadows-scenery means.
 // These ride the same opcode on further planeD sentinels. The handler tests the more negative values first,
 // because the flush sentinel's own test (<= -1e29) would otherwise swallow them.
+// SOH [Enhancement] Cascaded shadow maps: render the cascades. Emitted at the END of the actor draw loop,
+// not at the pre-actor hook where the stencil volumes flush, and the difference is two frames of shadow lag
+// versus one. The room draws BEFORE the actors, so a pass that runs pre-actor renders casters captured a
+// whole frame earlier and the room then samples it a frame later still -- the ground showed the player
+// where he was two frames ago, which while walking is most of a shadow's width. Run after the actors and
+// the pass consumes the frame's own captures; only the room's one-frame wait remains, and that is
+// structural: the receiver is drawn before the caster exists.
+#define gSPShadowMapFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -6.0e30f)
 #define gSPShadowMapWorldCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -2.0e30f)
 #define gSPShadowMapWorldCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -3.0e30f)
 
