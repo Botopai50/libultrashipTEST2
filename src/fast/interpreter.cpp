@@ -1450,6 +1450,24 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         x = AdjXForAspectRatio(x);
 
+        // SOH [Enhancement] World-space vertex position (object x modelview; the camera lives in the
+        // projection matrix, so world pos x P_matrix later yields clip space). Used by the actor-shadow
+        // pass, by shadow-map casters, and by shadow-map receivers.
+        //
+        // OUTSIDE the G_LIGHTING branch below, deliberately. It used to live inside it, which meant unlit
+        // geometry kept whatever world position the last LIT object had left in that loaded-vertex slot.
+        // A caster captured from a stale slot is recorded wherever some other object happened to be, and
+        // which objects fill those slots changes as actors enter and leave the view -- so an unlit caster's
+        // shadow moved, appeared and vanished as the camera turned, with nothing in the scene moving.
+        // Unlit geometry is not rare here either: tree canopies, billboards and much of the room mesh draw
+        // with lighting off, and they all cast.
+        if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled) {
+            float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
+            d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
+            d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
+            d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
+        }
+
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
 
@@ -1545,23 +1563,14 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // draws with no toon marker at all (the room, the terrain). Without mShadowMapEnabled here the
             // receiver variant would sample the cascades using whatever wx/wy/wz happened to be left in
             // the vertex from an earlier object.
-            if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled) {
+            if (mRdp->toon) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
-                // SOH [Enhancement] Actor shadow: world-space position (same object->world transform as the
-                // normal). The shadow pass flattens these onto the ground plane; the camera lives in the
-                // projection matrix, so world pos x P_matrix later yields clip space. Computed whenever the
-                // shadow is armed, so shadows work even when the cel relight (mRdp->toon) is off.
-                d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
-                d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
-                d->wz = v->ob[0] * mv[0][2] + v->ob[1] * mv[1][2] + v->ob[2] * mv[2][2] + mv[3][2];
-                if (mRdp->toon) {
-                    d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
-                    d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
-                    d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
-                    d->color.r = 255;
-                    d->color.g = 255;
-                    d->color.b = 255;
-                }
+                d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
+                d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
+                d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
+                d->color.r = 255;
+                d->color.g = 255;
+                d->color.b = 255;
             }
 
             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
