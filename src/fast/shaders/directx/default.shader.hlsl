@@ -122,7 +122,9 @@ cbuffer PerShadowCB : register(b3) {
     // x = active cascade count (0 = no shadow map this frame), y = cross-fade band as a fraction of the
     // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
     float4 shadow_params;
-    // x = PCF kernel radius in texels (see SHADOW_MAP_DEFAULT_FILTER_WIDTH); y/z/w unused.
+    // x = PCF kernel radius in texels (see SHADOW_MAP_DEFAULT_FILTER_WIDTH)
+    // y = debug: nonzero paints everything OUTSIDE a cascade's footprint as fully occluded instead of
+    //     silently lit, which is the only way to see where a cascade actually ends. z/w unused.
     float4 shadow_filter;
 }
 
@@ -229,7 +231,12 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     // is off), and then this term simply vanishes and the rasterizer's slope bias carries it alone.
     // Single return from a pre-initialized local (see ShadowSplitAt): 1.0 is also the right answer for
     // every rejected case, since a point this cascade cannot see is a point it knows nothing occluding.
-    float lit = 1.0;
+    //
+    // That silence is exactly what makes a mis-sized cascade impossible to diagnose: a receiver outside the
+    // footprint looks identical to one that nothing occludes, so a shadow that stops at the cascade edge
+    // reads as a shadow that was never cast. The debug flag inverts the rejected case to "fully occluded",
+    // which draws the footprint boundary on screen.
+    float lit = shadow_filter.y > 0.5 ? 0.0 : 1.0;
     // Orient the normal to face the light before pushing along it. The offset only helps if it moves the
     // sample OFF the surface towards the light; pushed the other way it drives the sample into the geometry
     // and makes the self-shadowing worse than no offset at all. That sign is not something the caller can

@@ -3184,21 +3184,21 @@ void Interpreter::RenderShadowMap() {
         // Backend could not give us the maps; report no cascades so the main pass does not sample a
         // texture that was never filled.
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
     if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() +
             mShadowAlphaWorldCache.verts.size() + mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts.size() <
         9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
 
     float invVp[4][4];
     if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
 
@@ -3206,7 +3206,7 @@ void Interpreter::RenderShadowMap() {
     float nearC[3], farC[3];
     if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, nearC) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, farC)) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
     // Lateral half-extent of the frustum at the near and far planes, from the actual corners. Without this
@@ -3215,8 +3215,23 @@ void Interpreter::RenderShadowMap() {
     // out as the camera turned, because whole objects kept falling outside the cascade's footprint.
     float halfNear = 0.0f, halfFar = 0.0f;
     {
+        // The screen is WIDER than the projection matrix says. Every transformed vertex goes through
+        // AdjXForAspectRatio, which divides clip x by the aspect ratio so a 4:3 projection fills a
+        // widescreen window -- meaning the edge of the screen is NOT at matrix NDC x = +/-1, it is further
+        // out, by exactly the reciprocal of that division.
+        //
+        // Unprojecting the corners at +/-1 therefore measured the 4:3 frustum and missed everything the
+        // widescreen view actually shows. The cascade came out up to 40% too narrow at 16:9, and a receiver
+        // in the outer part of the screen fell outside the cascade's footprint, where the shader has nothing
+        // to compare against and reports "lit" -- the shadow simply stops. Turning the camera sweeps a
+        // shadow across that boundary, so it vanishes and comes back with no change to the scene.
+        //
+        // Derived from AdjXForAspectRatio itself rather than recomputing the ratio, so the two can never
+        // disagree -- including the framebuffer case, where it is the identity and this is a no-op.
+        const float adj = AdjXForAspectRatio(1.0f);
+        const float kx = (std::fabs(adj) > 1e-6f) ? (1.0f / adj) : 1.0f;
         float c[3];
-        const float corners[4][2] = { { -1.0f, -1.0f }, { 1.0f, -1.0f }, { -1.0f, 1.0f }, { 1.0f, 1.0f } };
+        const float corners[4][2] = { { -kx, -1.0f }, { kx, -1.0f }, { -kx, 1.0f }, { kx, 1.0f } };
         for (int i = 0; i < 4; i++) {
             if (ShadowUnproject(invVp, corners[i][0], corners[i][1], 0.0f, c)) {
                 const float dx = c[0] - nearC[0], dy = c[1] - nearC[1], dz = c[2] - nearC[2];
@@ -3233,7 +3248,7 @@ void Interpreter::RenderShadowMap() {
     float viewLen = std::sqrt(viewDir[0] * viewDir[0] + viewDir[1] * viewDir[1] + viewDir[2] * viewDir[2]);
     if (viewLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -3246,7 +3261,7 @@ void Interpreter::RenderShadowMap() {
     float lzLen = std::sqrt(lz[0] * lz[0] + lz[1] * lz[1] + lz[2] * lz[2]);
     if (lzLen < 1e-6f) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth);
+                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug);
         return;
     }
     for (int i = 0; i < 3; i++) {
@@ -3397,7 +3412,8 @@ void Interpreter::RenderShadowMap() {
 
     mRapi->ShadowMapEndPass();
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
-                              mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth);
+                              mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth,
+                              mShadowMapDebug);
 }
 
 void Interpreter::RenderShadowVolumes() {

@@ -185,7 +185,8 @@ class GfxRenderingAPI {
     // units (used to pick a cascade and to size its blend band). Stored here rather than in each
     // backend so the members are available to every per-draw uniform path, exactly like the toon ones.
     virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                    float blendFraction, float normalOffset, float strength, float filterWidth) {
+                                    float blendFraction, float normalOffset, float strength, float filterWidth,
+                                    float debugMode) {
         mShadowCascadesActive = cascadeCount < 0 ? 0
                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                          : cascadeCount;
@@ -203,6 +204,7 @@ class GfxRenderingAPI {
         mShadowNormalOffset = normalOffset;
         mShadowStrength = strength;
         mShadowFilterWidth = filterWidth;
+        mShadowDebug = debugMode;
     }
 
   protected:
@@ -225,6 +227,7 @@ class GfxRenderingAPI {
     float mShadowNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;
     float mShadowFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
+    float mShadowDebug = 0.0f;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

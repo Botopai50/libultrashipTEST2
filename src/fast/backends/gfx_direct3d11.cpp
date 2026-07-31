@@ -1876,9 +1876,9 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
                                              float blendFraction, float normalOffset, float strength,
-                                             float filterWidth) {
+                                             float filterWidth, float debugMode) {
     GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, normalOffset, strength,
-                                        filterWidth);
+                                        filterWidth, debugMode);
 
     ZeroMemory(&mPerShadowCbData, sizeof(mPerShadowCbData));
     const int count = mShadowCascadesActive;
@@ -1887,6 +1887,7 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mPerShadowCbData.shadow_params[2] = mShadowNormalOffset;
     mPerShadowCbData.shadow_params[3] = mShadowStrength;
     mPerShadowCbData.shadow_filter[0] = mShadowFilterWidth;
+    mPerShadowCbData.shadow_filter[1] = mShadowDebug;
 
     for (int c = 0; c < count; c++) {
         const float* m = &mShadowViewProj[c * 16];

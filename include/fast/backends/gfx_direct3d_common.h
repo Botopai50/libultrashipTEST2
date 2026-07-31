@@ -156,7 +156,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
-                            float normalOffset, float strength, float filterWidth) override;
+                            float normalOffset, float strength, float filterWidth,
+                            float debugMode) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
