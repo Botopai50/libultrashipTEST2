@@ -125,6 +125,18 @@
 // shadow that reads as grime.
 #define SHADOW_MAP_ALPHA_CUTOUT 0.5f
 
+// How far around the camera an actor is drawn purely so it can cast, in world units, in EVERY direction.
+//
+// The game's own culling is a screen-space test, so it drops anything behind the camera outright -- but the
+// light comes from the sky, not from the eye, and a caster behind the camera casts into the view perfectly
+// well. Widening the screen-space margin cannot reach these: behind the camera the projected w is negative
+// and the test degenerates. Only a radial test is orientation-independent.
+//
+// 800 rather than the full caster reach: this draws actors nothing can see, so it is paid in draw calls
+// across the whole sphere. 800 covers the space immediately around and behind the camera, which is where a
+// caster is close enough for its shadow to land inside the view.
+#define SHADOW_MAP_DEFAULT_CASTER_DRAW_RADIUS 800.0f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
