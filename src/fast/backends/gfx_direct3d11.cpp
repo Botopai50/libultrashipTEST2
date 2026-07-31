@@ -1526,7 +1526,10 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
                               aerr.ReleaseAndGetAddressOf());
         }
         if (FAILED(ahr)) {
-            SPDLOG_ERROR("Shadow map: alpha caster shader failed to compile: {}",
+            // Logged loudly on purpose: this is the difference between foliage casting its leaf shape and
+            // foliage casting the quad it is painted on, and nothing else in the frame reports it.
+            SPDLOG_ERROR("Shadow map: alpha caster shader failed to compile, cutout casters fall back to "
+                         "their quad: {}",
                          aerr ? (const char*)aerr->GetBufferPointer() : "no error blob");
         } else {
             const D3D11_INPUT_ELEMENT_DESC aied[2] = {
@@ -1552,6 +1555,8 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
                                                      mShadowAlphaLayout.GetAddressOf())) &&
                 SUCCEEDED(mDevice->CreateSamplerState(&casterSamp, mShadowAlphaSampler.GetAddressOf()))) {
                 mShadowAlphaPipelineReady = true;
+                SPDLOG_INFO("Shadow map: alpha caster pipeline ready; cutout foliage will cast its leaf "
+                            "shape.");
             } else {
                 SPDLOG_ERROR("Shadow map: could not create the alpha caster pipeline objects.");
             }
@@ -1788,6 +1793,10 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     mContext->Draw((UINT)vertexCount, 0);
     mShadowLastCasterPtr[layer] = worldXyz;
     mShadowLastCasterCount[layer] = vertexCount;
+}
+
+bool GfxRenderingAPIDX11::SupportsShadowMapAlphaCasters() {
+    return mShadowAlphaPipelineReady;
 }
 
 void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {

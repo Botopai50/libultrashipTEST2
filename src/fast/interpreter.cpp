@@ -1676,20 +1676,44 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     TextureCacheKey shadowAlphaKey{};
     bool shadowAlphaCaster = false;
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
-    if (mShadowMapEnabled && !is_rect && (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
+    if (mShadowMapEnabled && mShadowAlphaSupported && !is_rect && (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
+        // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
+        // this geometry to go, and diverting it there anyway would mean foliage casts NOTHING rather than
+        // casting its quad. Falling back to the opaque list is worse looking and strictly better than a
+        // missing shadow.
         shadowAlphaCaster = ShadowCasterIsAlphaTested(mRdp->first_tile_index, &shadowAlphaKey);
         if (shadowAlphaCaster) {
             ShadowCasterTexSize(mRdp->first_tile_index, &shadowTexW, &shadowTexH);
         }
     }
 
-    if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {
+    // The stencil volumes need a lit surface (they cast along a per-vertex-normal key), but a shadow MAP
+    // only needs the geometry: unlit geometry blocks light exactly as well as lit geometry does. Tree
+    // canopies, billboards and most scenery props draw with lighting off, and requiring it here is why a
+    // tree cast from its trunk and not from its leaves. The requirement stays exactly as it was whenever
+    // the shadow map is off, so the stencil mode is untouched.
+    const bool armedCaster = mRdp->toon_shadow && !is_rect;
+    const bool casterLit = (mRsp->geometry_mode & G_LIGHTING) != 0;
+    if (armedCaster && (mShadowMapEnabled ? true : casterLit)) {
+        // Every armed triangle grows the object's bounding box, whichever list it lands in. The box is what
+        // the size gate in FlushToonShadow judges the object by, so measuring only the opaque half would
+        // shrink a mostly-cutout actor below the threshold and drop its whole shadow -- and which half of a
+        // skeletal actor is cutout changes with the animation, which is a shadow that flickers as it walks.
+        for (int si = 0; si < 3; si++) {
+            const float p[3] = { v_arr[si]->wx, v_arr[si]->wy, v_arr[si]->wz };
+            for (int a = 0; a < 3; a++) {
+                if (!mShadowObjectHasVerts || p[a] < mShadowObjectMin[a]) {
+                    mShadowObjectMin[a] = p[a];
+                }
+                if (!mShadowObjectHasVerts || p[a] > mShadowObjectMax[a]) {
+                    mShadowObjectMax[a] = p[a];
+                }
+            }
+            mShadowObjectHasVerts = true;
+        }
         if (shadowAlphaCaster) {
-            // Straight into the layer's alpha list. It does NOT go through mShadowVerts, so it also skips the
-            // per-object size gate below -- foliage is exactly the case where the bounding box is a poor
-            // proxy for the shadow, since most of that box is transparent.
             CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
-        } else {
+        } else if (mShadowMapEnabled || casterLit) {
             // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
             // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
             // map needs the object's bounding box before it can decide the object is worth casting at all
@@ -1706,8 +1730,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
         // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
-        // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the actor path -- the
-        // room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
+        // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the stencil path --
+        // the room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
         // mShadowWorldCapture gates this to the frames that actually rebuild the cache; on every other frame
         // the room mesh costs nothing here and the cached list is reused as-is.
         std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_WORLD];
@@ -2647,32 +2671,53 @@ void Interpreter::FlushToonShadow() {
     // taken what the cascades need, so drop the silhouette here instead of building a volume from it:
     // the two systems are mutually exclusive, and building volumes nobody draws would rasterize a
     // footprint grid per object for nothing.
+    // Object boundary bookkeeping, run on every exit from the shadow-map branch below.
+    auto beginNextShadowObject = [this] {
+        mShadowVerts.clear();
+        mShadowObjectHasVerts = false;
+        mShadowAlphaObjectMark = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].verts.size();
+    };
+
     if (mShadowMapEnabled) {
         // Size gate. Grass tufts, flowers and other ground clutter are armed as casters like everything
         // else, but their shadow is a smudge a few texels across that reads as dirt on the ground rather
-        // than as a shadow -- and every one of them costs a full re-rasterisation in each cascade. Measure
-        // the object's world-space bounding box, which is the only per-object information this layer has,
-        // and drop anything whose largest extent is under the threshold.
+        // than as a shadow -- and every one of them costs a full re-rasterisation in each cascade. Judge the
+        // object by the world-space bounding box accumulated over every triangle it captured, opaque and
+        // cutout alike, which is the only per-object information this layer has.
         //
         // The largest extent, not the height: a caster can be small in every direction and still matter if
         // it is long (a fence rail), and a flat wide thing casts a real shadow at a low sun.
-        if (mShadowVerts.size() >= 9 &&
-            mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
-            float mn[3] = { 1e30f, 1e30f, 1e30f };
-            float mx[3] = { -1e30f, -1e30f, -1e30f };
-            for (size_t i = 0; i + 3 <= mShadowVerts.size(); i += 3) {
-                for (int a = 0; a < 3; a++) {
-                    mn[a] = std::min(mn[a], mShadowVerts[i + a]);
-                    mx[a] = std::max(mx[a], mShadowVerts[i + a]);
-                }
-            }
-            const float extent = std::max({ mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2] });
-            if (extent >= mShadowMapMinCasterSize) {
+        const float extent =
+            mShadowObjectHasVerts ? std::max({ mShadowObjectMax[0] - mShadowObjectMin[0],
+                                               mShadowObjectMax[1] - mShadowObjectMin[1],
+                                               mShadowObjectMax[2] - mShadowObjectMin[2] })
+                                  : 0.0f;
+        if (extent >= mShadowMapMinCasterSize) {
+            if (mShadowVerts.size() >= 9 &&
+                mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
                 std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
                 dst.insert(dst.end(), mShadowVerts.begin(), mShadowVerts.end());
             }
+        } else {
+            // Too small: roll the cutout half back to where this object started too, or the gate would only
+            // ever drop half a caster and clutter would keep casting whatever part of it was alpha-tested.
+            ShadowAlphaCasters& alpha = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS];
+            if (alpha.verts.size() > mShadowAlphaObjectMark) {
+                const uint32_t markVertex = (uint32_t)(mShadowAlphaObjectMark / 5);
+                alpha.verts.resize(mShadowAlphaObjectMark);
+                while (!alpha.ranges.empty() && alpha.ranges.back().firstVertex >= markVertex) {
+                    alpha.ranges.pop_back();
+                }
+                if (!alpha.ranges.empty()) {
+                    // The object may have extended a range opened by the previous one; clip it back.
+                    ShadowAlphaRange& last = alpha.ranges.back();
+                    if (last.firstVertex + last.vertexCount > markVertex) {
+                        last.vertexCount = markVertex - last.firstVertex;
+                    }
+                }
+            }
         }
-        mShadowVerts.clear();
+        beginNextShadowObject();
         return;
     }
     const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
@@ -3126,6 +3171,10 @@ void Interpreter::RenderShadowMap() {
     if (!mShadowMapEnabled) {
         return;
     }
+    // Refreshed here rather than read per triangle: the cutout pipeline is built lazily inside
+    // ShadowMapConfigure below, so the answer only becomes true after the first successful configure, and
+    // the captures it governs all happen after this point in the frame.
+    mShadowAlphaSupported = mRapi->SupportsShadowMapAlphaCasters();
     if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution)) {
         // Backend could not give us the maps; report no cascades so the main pass does not sample a
         // texture that was never filled.

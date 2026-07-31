@@ -159,6 +159,13 @@ class GfxRenderingAPI {
     // `xyzUv` is `vertexCount` vertices of 5 floats (world xyz + normalised uv), laid out so that every
     // range handed to ShadowMapDrawAlphaRange is contiguous within it. Upload is safe to call per cascade:
     // implementations skip a buffer they already hold, exactly as for the opaque list.
+    // Whether the cutout caster pipeline above actually exists. Separate from SupportsShadowMap because it
+    // is built lazily and is allowed to fail on its own: the caller must be able to keep cutout geometry on
+    // the opaque list when it does, or foliage casts nothing at all instead of casting its quad.
+    virtual bool SupportsShadowMapAlphaCasters() {
+        return false;
+    }
+
     virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
     }
 

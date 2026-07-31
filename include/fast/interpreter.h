@@ -710,6 +710,17 @@ class Interpreter {
         }
     };
     ShadowAlphaCasters mShadowAlphaCasters[SHADOW_MAP_LAYERS];
+    // Per-object accumulation for the size gate, fed by every armed triangle whichever list it lands in.
+    // Measuring only the opaque half would shrink a mostly-cutout actor under the threshold and drop its
+    // whole shadow -- and which half of a skeletal actor is cutout changes with the animation, so the
+    // shadow would come and go as it walked.
+    float mShadowObjectMin[3] = {};
+    float mShadowObjectMax[3] = {};
+    bool mShadowObjectHasVerts = false;
+    size_t mShadowAlphaObjectMark = 0; // where the current object started in the actor cutout list
+    // Whether the backend can actually draw cutout casters. False keeps them on the opaque list, where they
+    // cast their quad -- which is what this whole path exists to avoid, but is still a shadow.
+    bool mShadowAlphaSupported = false;
     ShadowAlphaCasters mShadowAlphaReady[SHADOW_MAP_LAYERS];
     ShadowAlphaCasters mShadowAlphaWorldCache;
     // Turns each range's texture-cache key into a live GPU texture id, once per frame rather than once per
