@@ -76,9 +76,17 @@
 // longer has to carry the whole load, and every unit of it is peter panning.
 #define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 1.0f
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
-// texel. Being relative to the gradient is exactly right; being relative to the TEXEL is what made it the
-// largest source of peter panning at distance, since a texel of the far cascade is several world units.
-#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 2.0f
+// texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
+// light and large on one edge-on to it, which is where depth runs away across a texel and acne appears.
+// Being relative to the TEXEL is the part that misbehaved, since a texel of the far cascade is several
+// world units, and that is now handled per cascade by the ceiling below.
+//
+// 4.0, back where it started. It was halved to 2.0 to fight peter panning before the per-cascade ceiling
+// existed, which was the wrong instrument: halving it globally took the bias away from the near and middle
+// cascades, where the panning was never the problem and the acne is. On a castle wall -- a vertical surface
+// with the light coming from above, so nearly edge-on to it -- that showed up as horizontal bars, because
+// the lines of constant depth in the map run horizontally across such a wall.
+#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
 
 // Ceiling on what that slope term may displace a receiver by, in WORLD units.
 //
@@ -87,9 +95,15 @@
 // with the slope reduced to whatever keeps its own texel under this ceiling. In the near cascades the
 // ceiling is far above the base value and nothing changes; only the far cascades come down.
 //
-// Same 3.0 as the normal offset's ceiling, for the same reason: under a tenth of a character's height, so
-// the two together stay below what the eye reads as a gap between a caster and its shadow.
-#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 3.0f
+// 6.0, twice the normal offset's ceiling, because this term is self-limiting in a way that one is not: it
+// scales with the polygon's gradient, so it contributes almost nothing on a surface facing the light --
+// exactly where a shadow's contact point is read closely -- and only grows on grazing surfaces, where the
+// contact is at a shallow angle and displacement along the ray barely shows. A ceiling computed as though
+// every surface sat at forty-five degrees, which 3.0 was, priced it as if it cost everywhere.
+//
+// At 6.0 the ceiling clears the base value through the first three cascades and only binds on the fourth,
+// which is the one whose texel made this a problem at all.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 6.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
 // This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
