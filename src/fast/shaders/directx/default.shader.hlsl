@@ -250,7 +250,21 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     // normal pointing against the direction the light travels.
     float3 lightAxis = normalize(viewProj._13_23_33);
     float3 n = dot(normalWs, lightAxis) > 0.0 ? -normalWs : normalWs;
-    float3 p = worldPos + n * (shadow_params.z * texelWorld);
+    // Scale the push by how obliquely the light strikes this surface, sin of the angle between them.
+    //
+    // Acne is a grazing-angle artefact: depth changes fast across a texel exactly when the surface is
+    // nearly edge-on to the light, and hardly at all when it faces the light square. Applying the same
+    // push everywhere therefore spent its whole cost where it bought nothing -- on a floor lit from
+    // overhead the offset is pure displacement along the light ray, which is peter panning and nothing
+    // else, and it is precisely on such floors that a shadow's contact point is most closely read.
+    //
+    // sin also has the right shape at the other end: it goes to 1 as the surface turns edge-on, which is
+    // where the offset stops displacing along the ray at all and starts sliding sideways off the polygon,
+    // which is the only thing that actually removes the stripes. So this is not a trade of one artefact
+    // for the other -- it moves the whole budget to the angles that need it.
+    float ndotl = saturate(dot(n, -lightAxis));
+    float grazing = sqrt(saturate(1.0 - (ndotl * ndotl)));
+    float3 p = worldPos + n * (shadow_params.z * texelWorld * grazing);
     float4 clip = mul(float4(p, 1.0), viewProj);
     if (clip.w > 0.0) {
         float3 ndc = clip.xyz / clip.w;

@@ -97,9 +97,15 @@
 // than sliding it along the light ray, still inside the same polygon.
 // Scaling with the texel is what makes one value work across cascades -- acne appears at the scale of the
 // map's own resolution, so the push has to be measured in the same unit.
-// 2.0 rather than 1.0: this term is now the primary defence against self-shadowing, replacing both the
-// front-face culling that caused peter panning and half of the constant bias that did the same.
-#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 2.0f
+// The shader scales this by the sine of the angle between the surface and the light, so it is the offset at
+// a fully grazing angle, not everywhere. That is where acne lives; a surface square to the light needs
+// nothing and now pays nothing.
+// 3.0 rather than 2.0: the offset costs nothing on the surfaces where its cost was visible, so it can afford
+// to be larger on the ones where it does the work. It remains the primary defence against self-shadowing,
+// having replaced both the front-face culling that caused peter panning and half of the constant bias that
+// did the same -- and now most of the slope bias too, which had to be capped per cascade to stop it
+// detaching distant shadows.
+#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 3.0f
 
 // Ceiling on that push, in WORLD units, applied per cascade before the shader sees it.
 //
