@@ -92,18 +92,19 @@
 //
 // The rasterizer takes one slope value per state, not per draw, so this cannot be capped inside the shader
 // the way the normal offset is -- the backend builds a separate rasterizer state per cascade instead, each
-// with the slope reduced to whatever keeps its own texel under this ceiling. In the near cascades the
-// ceiling is far above the base value and nothing changes; only the far cascades come down.
+// with the slope reduced to whatever keeps its own texel under this ceiling.
 //
-// 6.0, twice the normal offset's ceiling, because this term is self-limiting in a way that one is not: it
-// scales with the polygon's gradient, so it contributes almost nothing on a surface facing the light --
-// exactly where a shadow's contact point is read closely -- and only grows on grazing surfaces, where the
-// contact is at a shallow angle and displacement along the ray barely shows. A ceiling computed as though
-// every surface sat at forty-five degrees, which 3.0 was, priced it as if it cost everywhere.
+// 32.0, which at the default cascade ladder and resolution does not bind on ANY cascade: the far one would
+// need a texel over eight world units to reach it, and it sits at about six. So this is a guard rail rather
+// than a working part -- it exists for configurations with much coarser texels, a raised Split3 or a
+// lowered Resolution, where the term would otherwise run away.
 //
-// At 6.0 the ceiling clears the base value through the first three cascades and only binds on the fourth,
-// which is the one whose texel made this a problem at all.
-#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 6.0f
+// It was 3.0, then 6.0, and both were too tight. The mistake in each was pricing this term as though it
+// cost everywhere, when it scales with the polygon's own gradient: near zero on a surface facing the light,
+// which is where a shadow's contact point is read closely, and large only on grazing surfaces, where the
+// contact is at a shallow angle and displacement along the ray barely shows. Capping it there bought very
+// little panning and cost the acne protection the far cascade needs.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 32.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
 // This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
