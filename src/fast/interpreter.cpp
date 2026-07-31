@@ -3420,6 +3420,24 @@ void Interpreter::RenderShadowMap() {
     }
 
     mRapi->ShadowMapEndPass();
+
+    // Caster census, once a second while a debug mode is on. Whether a vanished shadow is a caster that
+    // stopped being captured or a receiver that stopped sampling is invisible from the picture alone, and
+    // these four numbers separate them: a shadow that disappears while its layer's count holds steady was
+    // captured and not sampled, and one whose count drops was never submitted.
+    if (mShadowMapDebug > 0.5f) {
+        static int sCensusFrames = 0;
+        if (++sCensusFrames >= 60) {
+            sCensusFrames = 0;
+            SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), actors {} tris (+{} "
+                        "cutout in {} batches)",
+                        mShadowMapWorldCache.size() / 9, mShadowAlphaWorldCache.VertexCount() / 3,
+                        mShadowAlphaWorldCache.ranges.size(),
+                        mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() / 9,
+                        mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].VertexCount() / 3,
+                        mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].ranges.size());
+        }
+    }
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
                               mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth,
                               mShadowMapDebug);

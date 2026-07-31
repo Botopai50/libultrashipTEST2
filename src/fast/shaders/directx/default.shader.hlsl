@@ -123,8 +123,10 @@ cbuffer PerShadowCB : register(b3) {
     // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
     float4 shadow_params;
     // x = PCF kernel radius in texels (see SHADOW_MAP_DEFAULT_FILTER_WIDTH)
-    // y = debug: nonzero paints everything OUTSIDE a cascade's footprint as fully occluded instead of
-    //     silently lit, which is the only way to see where a cascade actually ends. z/w unused.
+    // y = debug. 1 paints everything OUTSIDE a cascade's footprint as fully occluded instead of silently
+    //     lit, which is the only way to see where a cascade actually ends. 2 replaces the shading with the
+    //     two caster layers separated by colour: green = occluded by the world layer, red = by the actor
+    //     layer. z/w unused.
     float4 shadow_filter;
 }
 
@@ -619,16 +621,26 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
         // character is shadowed by the world but never by another character (or by itself) -- the
         // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.
-        float shadowLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, 0.0);
+        float shadowWorldLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, 0.0);
         // Scenery also takes the actor caster layer; a character does not, so it is never shadowed by
         // another character or by itself. [branch] because the value is constant across a draw call, so the
         // character case genuinely skips the second set of taps rather than computing and discarding them.
+        float shadowActorLit = 1.0;
         [branch]
         if (input.worldPos.w > 0.5) {
-            shadowLit = min(shadowLit,
-                            ShadowLit(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x));
+            shadowActorLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x);
         }
-        texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+        float shadowLit = min(shadowWorldLit, shadowActorLit);
+        // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
+        // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
+        // layer that stopped capturing or not being sampled at all, and those look identical once the two
+        // are combined -- this is the only way to tell which without guessing.
+        [branch]
+        if (shadow_filter.y > 1.5) {
+            texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
+        } else {
+            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+        }
     @end
 
     @if(o_fog)
