@@ -5200,6 +5200,10 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // SOH [Enhancement] Cascaded shadow maps: the world-caster bracket rides further down the same
         // sentinel range, so it has to be tested BEFORE the flush -- the flush's own test (<= -1e29) would
         // otherwise swallow both of these.
+        if (sizeOrSentinel <= -5.5e30f) {
+            gfx->RenderShadowMap(); // gSPShadowMapFlush
+            return false;
+        }
         if (sizeOrSentinel <= -4.5e30f) {
             gfx->mRdp->shadow_no_receive = false; // gSPShadowMapReceiveOn
             return false;
@@ -5216,12 +5220,12 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
             gfx->mRdp->shadow_world_caster = true; // gSPShadowMapWorldCasterBegin
             return false;
         }
+        // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires
+        // BEFORE the actors draw, so it could only ever render casters captured a frame earlier, and the
+        // room -- drawn earlier still -- then sampled the result a frame after that. Two frames of lag on
+        // a character's own shadow, which reads as the shadow sliding along behind him. It has its own
+        // sentinel now (gSPShadowMapFlush), emitted once the actors are done.
         gfx->RenderShadowVolumes();
-        // SOH [Enhancement] Cascaded shadow maps share this hook: the cascades must be filled before
-        // anything samples them, and only one of the two systems is ever enabled, so they never both
-        // draw. RenderShadowMap() is called unconditionally because it also swaps the caster buffers --
-        // skipping it while the mode is off would leave the previous frame's casters to reappear.
-        gfx->RenderShadowMap();
         return false;
     }
 
