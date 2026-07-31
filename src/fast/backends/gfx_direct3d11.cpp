@@ -1658,6 +1658,64 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
     return CreateShadowMapTargets(cascadeCount, resolution);
 }
 
+// SOH [Enhancement] Cascaded shadow maps: this cascade's rasterizer state, differing from the shared one
+// only in the slope-scaled depth bias.
+//
+// That bias is a multiple of the polygon's depth gradient ACROSS A TEXEL, so its world-space effect scales
+// with the texel -- and a texel of the far cascade is several world units, which made this the largest
+// single source of shadows detaching from their casters at distance. It cannot be capped in the shader the
+// way the normal offset is, because the rasterizer reads it from the pipeline state, not per pixel. So each
+// cascade gets its own state with the multiplier reduced to whatever keeps its own texel under the world
+// ceiling. Near cascades are nowhere near it and keep the base value untouched.
+//
+// The texel size comes out of the matrix rather than being plumbed in: the projection scales the light's
+// unit x axis by 1/radius, so that column's length IS 1/radius, and one texel spans 2*radius/resolution.
+// The result is quantised before it is compared, so a value drifting by a hair does not rebuild the state;
+// combined with the radius hysteresis, rebuilds happen once in a great while rather than per frame.
+ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int cascadeIndex,
+                                                                       const float lightViewProj[16]) {
+    if (cascadeIndex < 0 || cascadeIndex >= SHADOW_MAP_MAX_CASCADES || mShadowResolution <= 0) {
+        return mShadowRasterizerState.Get();
+    }
+
+    float slope = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
+    const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
+                               (lightViewProj[8] * lightViewProj[8]));
+    if (sx > 1e-9f) {
+        const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
+        if (texelWorld > 1e-6f) {
+            const float cap = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD / texelWorld;
+            if (cap < slope) {
+                slope = cap;
+            }
+        }
+    }
+    slope = std::floor((slope * 8.0f) + 0.5f) / 8.0f; // eighths, so a hair of drift rebuilds nothing
+    if (slope < 0.0f) {
+        slope = 0.0f;
+    }
+
+    if (mShadowRasterizerCascade[cascadeIndex] == nullptr || mShadowRasterizerCascadeSlope[cascadeIndex] != slope) {
+        D3D11_RASTERIZER_DESC rast_desc;
+        ZeroMemory(&rast_desc, sizeof(rast_desc));
+        rast_desc.FillMode = D3D11_FILL_SOLID;
+        rast_desc.CullMode = D3D11_CULL_NONE;
+        rast_desc.DepthClipEnable = FALSE;
+        rast_desc.DepthBias = 0;
+        rast_desc.SlopeScaledDepthBias = slope;
+        ComPtr<ID3D11RasterizerState> built;
+        if (FAILED(mDevice->CreateRasterizerState(&rast_desc, built.GetAddressOf()))) {
+            // Not fatal: the shared state is the same thing with the base slope, so the cascade keeps the
+            // bias it had before this refinement existed.
+            SPDLOG_ERROR("Shadow map: could not build the rasterizer state for cascade {}.", cascadeIndex);
+            return mShadowRasterizerState.Get();
+        }
+        mShadowRasterizerCascade[cascadeIndex] = built;
+        mShadowRasterizerCascadeSlope[cascadeIndex] = slope;
+    }
+    return mShadowRasterizerCascade[cascadeIndex].Get();
+}
+
 void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) {
     if (!mShadowPipelineReady || mShadowMapTexture == nullptr || lightViewProj == nullptr) {
         return;
@@ -1727,7 +1785,7 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     mContext->VSSetShader(mShadowDepthVs.Get(), nullptr, 0);
     mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
     mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
-    mContext->RSSetState(mShadowRasterizerState.Get());
+    mContext->RSSetState(ShadowRasterizerForCascade(cascadeIndex, lightViewProj));
     mContext->OMSetDepthStencilState(mShadowDepthStencilState.Get(), 0);
     mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }

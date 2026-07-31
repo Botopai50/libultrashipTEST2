@@ -75,14 +75,21 @@
 // recovers a face normal from screen derivatives where no vertex normal exists), so the constant term no
 // longer has to carry the whole load, and every unit of it is peter panning.
 #define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 1.0f
-// Slope-scaled bias, handed to the rasterizer. This one is a multiple of the polygon's own depth gradient
-// across a texel, so like the normal offset it grows with the texel -- and the rasterizer takes a single
-// value for every cascade, so it cannot be capped per cascade the way that one is. At 4.0 a surface at
-// forty-five degrees to the light picked up more than twenty world units of bias in the far cascade, on top
-// of the normal offset, which is most of a character's height of detachment.
-// 2.0: the normal offset is the primary defence against acne now, and it does its work in the near cascades
-// where the acne is actually legible.
+// Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
+// texel. Being relative to the gradient is exactly right; being relative to the TEXEL is what made it the
+// largest source of peter panning at distance, since a texel of the far cascade is several world units.
 #define SHADOW_MAP_DEFAULT_SLOPE_BIAS 2.0f
+
+// Ceiling on what that slope term may displace a receiver by, in WORLD units.
+//
+// The rasterizer takes one slope value per state, not per draw, so this cannot be capped inside the shader
+// the way the normal offset is -- the backend builds a separate rasterizer state per cascade instead, each
+// with the slope reduced to whatever keeps its own texel under this ceiling. In the near cascades the
+// ceiling is far above the base value and nothing changes; only the far cascades come down.
+//
+// Same 3.0 as the normal offset's ceiling, for the same reason: under a tenth of a character's height, so
+// the two together stay below what the eye reads as a gap between a caster and its shadow.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 3.0f
 
 // How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
 // This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
@@ -121,17 +128,16 @@
 // 2*(1+radius) texels across. At 1.0 the quads sit edge to edge and cover 4x4; above that they separate and
 // leave texels sampled by nothing, which reads on screen as a grid, so the shader clamps there.
 //
-// 0.25 rather than 0.5. Penumbra width on screen is roughly constant across cascades -- texel size grows
-// with distance at almost exactly the rate the screen shrinks it -- and at 0.5 it lands around 9 to 10
-// pixels, which reads as smeared rather than soft. 0.25 puts it near 8, and 0.0 (a single bilinear tap,
-// still a genuine 2x2 filter) near 6, which is the sharpest this can go without giving up filtering
-// altogether. Nothing below 0.5 revives the original stair-stepping: that came from four POINT taps landing
-// inside one texel, and these have been bilinear since.
+// 0.5, and 0.5 is the floor. It was tried at 0.25 on the reasoning that bilinear taps cannot stair-step --
+// that reasoning was wrong. A bilinear tap removes the hardness WITHIN a texel; it does nothing about the
+// staircase BETWEEN texels, because the shadow edge is quantised to the texel grid either way and a
+// one-texel ramp only rounds each step's corner. Hiding a staircase needs a kernel spanning several texels,
+// which is what this radius buys and what 0.25 gave up.
 //
-// Sharper than that is not a filter problem, it is a texel problem, and both cures are priced: halve
-// Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
+// So sharper distant shadows are not available from the filter. That is a texel problem, and both cures are
+// priced: halve Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
 // Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
-#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.25f
+#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.5f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
 // Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at

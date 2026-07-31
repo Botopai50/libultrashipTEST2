@@ -175,6 +175,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // "no shadow map" rather than take the whole renderer down.
     bool CreateShadowMapPipeline();
     bool CreateShadowMapTargets(int cascadeCount, int resolution);
+    ID3D11RasterizerState* ShadowRasterizerForCascade(int cascadeIndex, const float lightViewProj[16]);
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -194,6 +195,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // per room and then only bound and drawn.
     Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb[SHADOW_MAP_LAYERS];
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerState;
+    // Per-cascade copies of that state, differing only in the slope-scaled bias. The rasterizer takes one
+    // slope value per state rather than per draw, and the slope's effect is measured in texels -- so the
+    // far cascades, whose texels are several world units, need a smaller multiplier to stay under the same
+    // world-space ceiling. Rebuilt only when a cascade's required value actually changes, which the radius
+    // hysteresis makes rare; null means "use the shared state above".
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_CASCADES];
+    float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_CASCADES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS] = {}; // capacity of each buffer, in vertices
     // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
