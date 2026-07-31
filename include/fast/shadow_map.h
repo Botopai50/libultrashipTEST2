@@ -98,13 +98,21 @@
 // Radius of the PCF kernel, in cascade texels. The filter is sixteen fetches whatever this is; the value
 // only says how far apart they sit, so it trades edge softness against fetch coverage at no extra cost.
 //
-// 0.5 rather than 1.0: at a full texel the four bilinear taps put their 2x2 quads edge to edge and cover a
-// 4x4 neighbourhood, which is what finally killed the stair-stepping -- but 4x4 texels of the third cascade
-// is several world units of penumbra, and shadows came out looking smeared rather than soft. At half a
-// texel the quads overlap into roughly 3x3, which still filters (the failure mode to avoid is taps landing
-// inside ONE texel, which is what a POINT-sampled quincunx at this radius would do -- these are bilinear,
-// so every tap is already an interpolation over four texels).
-#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.5f
+// Four bilinear taps at +/- this radius, each already spanning a 2x2 texel quad, so the kernel covers
+// 2*(1+radius) texels across. At 1.0 the quads sit edge to edge and cover 4x4; above that they separate and
+// leave texels sampled by nothing, which reads on screen as a grid, so the shader clamps there.
+//
+// 0.25 rather than 0.5. Penumbra width on screen is roughly constant across cascades -- texel size grows
+// with distance at almost exactly the rate the screen shrinks it -- and at 0.5 it lands around 9 to 10
+// pixels, which reads as smeared rather than soft. 0.25 puts it near 8, and 0.0 (a single bilinear tap,
+// still a genuine 2x2 filter) near 6, which is the sharpest this can go without giving up filtering
+// altogether. Nothing below 0.5 revives the original stair-stepping: that came from four POINT taps landing
+// inside one texel, and these have been bilinear since.
+//
+// Sharper than that is not a filter problem, it is a texel problem, and both cures are priced: halve
+// Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
+// Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
+#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.25f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
 // Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at
