@@ -3306,6 +3306,23 @@ void Interpreter::RenderShadowMap() {
     for (int i = 0; i < 3; i++) {
         lz[i] /= lzLen;
     }
+    // Hold the light direction still (see SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS). Everything below builds the
+    // texel grid from these axes, and the grid only does its job if it is the same grid frame to frame --
+    // the game's environment light turns continuously with the time of day, so left alone it rotates the
+    // grid a fraction of a degree every frame and every shadow edge trembles.
+    {
+        float* held = mShadowMapLightDirHeld;
+        const float heldLen = std::sqrt(held[0] * held[0] + held[1] * held[1] + held[2] * held[2]);
+        const float dot = heldLen > 0.5f ? (held[0] * lz[0] + held[1] * lz[1] + held[2] * lz[2]) : -1.0f;
+        if (dot < SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS) {
+            for (int i = 0; i < 3; i++) {
+                held[i] = lz[i];
+            }
+        }
+        for (int i = 0; i < 3; i++) {
+            lz[i] = held[i];
+        }
+    }
     float up[3] = { 0.0f, 1.0f, 0.0f };
     if (std::fabs(lz[1]) > 0.99f) {
         up[0] = 1.0f;
@@ -3369,9 +3386,14 @@ void Interpreter::RenderShadowMap() {
         if (texelWorldSize > 0.0f) {
             float cx = center[0] * lx[0] + center[1] * lx[1] + center[2] * lx[2];
             float cy = center[0] * ly[0] + center[1] * ly[1] + center[2] * ly[2];
-            const float cz = center[0] * lz[0] + center[1] * lz[1] + center[2] * lz[2];
+            float cz = center[0] * lz[0] + center[1] * lz[1] + center[2] * lz[2];
             cx = std::floor(cx / texelWorldSize) * texelWorldSize;
             cy = std::floor(cy / texelWorldSize) * texelWorldSize;
+            // Depth too, not just the two lateral axes. The eye sits a fixed distance behind this point, so
+            // an unsnapped depth slides every stored depth value by a fraction of a texel every frame --
+            // and a comparison that was a hair on one side of the bias lands on the other, which flickers
+            // exactly on the surfaces where the shadow is nearly tangent to the light.
+            cz = std::floor(cz / texelWorldSize) * texelWorldSize;
             for (int i = 0; i < 3; i++) {
                 center[i] = lx[i] * cx + ly[i] * cy + lz[i] * cz;
             }

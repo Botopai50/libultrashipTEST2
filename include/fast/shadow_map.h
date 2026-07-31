@@ -146,6 +146,20 @@
 // caster is close enough for its shadow to land inside the view.
 #define SHADOW_MAP_DEFAULT_CASTER_DRAW_RADIUS 800.0f
 
+// How far the key light may swing before the cascades are rebuilt around the new direction, as the cosine
+// of the angle (0.9994 is about two degrees).
+//
+// The cascade centre is snapped to whole texels along the LIGHT's own axes, which is what stops shadow
+// edges shimmering as the camera moves. That only works if those axes hold still: the game's environment
+// light turns continuously with the time of day, and a basis that turns with it is a grid that turns with
+// it, so the snapping is measuring against a ruler that keeps rotating and every edge trembles.
+//
+// Held with hysteresis rather than quantized, for the same reason the cascade radius is: a quantized
+// direction flips between two neighbouring steps whenever it sits near a boundary. The cost is that the
+// whole shadow grid re-aligns in one step when the threshold is crossed, so the threshold wants to stay
+// small enough that the step is not visible.
+#define SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS 0.9994f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

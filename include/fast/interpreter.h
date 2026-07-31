@@ -766,6 +766,10 @@ class Interpreter {
     // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
     // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
     float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
+    // Light direction the cascades are currently built around, held across frames for the same reason the
+    // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
+    // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.
+    float mShadowMapLightDirHeld[3] = {};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
