@@ -127,7 +127,8 @@ cbuffer PerShadowCB : register(b3) {
     //     lit, which is the only way to see where a cascade actually ends. 2 replaces the shading with the
     //     two caster layers separated by colour: green = occluded by the world layer, red = by the actor
     //     layer.
-    // z = edge hardness, 0 to 1 (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS). w unused.
+    // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
+    //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
     float4 shadow_filter;
 }
 
@@ -318,6 +319,31 @@ float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBas
     }
     // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowLitCascade.
     return ShadowLitCascade(worldPos, normalWs, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
+}
+
+// Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
+//
+// Used to ramp the edge hardness with distance, because the artefact it fights is not one size: the kernel
+// is three texels wide in every cascade, but a texel of the near one is a fraction of a world unit and one
+// of the far one is several, so a single hardness leaves the near edge crisp and the far edge metres wide.
+// Literal indices only, same constraint as ShadowSplitAt, and a single return over a pre-initialised local.
+float ShadowLadderFraction(float viewDepth) {
+    float band = 0.0;
+    uint count = (uint)shadow_params.x;
+    if (count > 1) {
+        float step = 0.0;
+        if (viewDepth > shadow_splits.x) {
+            step = 1.0;
+        }
+        if (viewDepth > shadow_splits.y) {
+            step = 2.0;
+        }
+        if (viewDepth > shadow_splits.z) {
+            step = 3.0;
+        }
+        band = saturate(step / (float)(count - 1));
+    }
+    return band;
 }
 
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
@@ -657,7 +683,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //
         // At hardness 0 the lerp weight is 0 and this is exactly the value that came in -- not an
         // approximation of it, which is why the remap is blended in rather than being fed a widening band.
-        float shadowHardness = saturate(shadow_filter.z);
+        float shadowHardness = saturate(lerp(shadow_filter.z, shadow_filter.w,
+                                             ShadowLadderFraction(input.position.w)));
         float shadowBand = lerp(0.5, 0.03, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);

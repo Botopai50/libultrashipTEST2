@@ -45,7 +45,7 @@ struct PerShadowCB {
     float shadow_depth_bias[4];  // constant bias in NDC depth, per cascade (world units / depth range)
     // x = active cascade count (0 = no shadow map), y = blend fraction, z = normal offset, w = strength
     float shadow_params[4];
-    // x = PCF kernel radius in texels, y = debug mode, z = edge hardness; w unused.
+    // x = PCF kernel radius in texels, y = debug mode, z = edge hardness, w = hardness in the far cascade.
     float shadow_filter[4];
 };
 
@@ -157,7 +157,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float normalOffset, float strength, float filterWidth, float debugMode,
-                            float edgeHardness) override;
+                            float edgeHardness, float edgeHardnessFar) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;

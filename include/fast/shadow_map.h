@@ -238,6 +238,23 @@
 // gradient exactly as it was; 1 is very nearly binary.
 #define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.75f
 
+// Edge hardness in the FURTHEST cascade, ramped to from the value above across the cascade ladder.
+//
+// One hardness for every distance is wrong, because the thing it is fighting is not one size. The kernel is
+// three texels wide whatever the cascade, but a texel of the near cascade is 0.15 world units and one of the
+// far cascade is 5.8 -- so the same hardness leaves a transition 0.14 units wide up close and 5.2 units wide
+// at distance. That is the blur that would not go away.
+//
+// It is also why distant shadows look washed out rather than merely soft. Coverage is what the filter
+// returns, and a shadow feature narrower than the kernel never reaches full coverage anywhere -- at the far
+// cascade the kernel spans 17 world units, so anything thinner than that is averaged into grey and can
+// never be fully dark. Thresholding at half coverage snaps it back to solid. So the two complaints are one
+// artefact and one fix.
+//
+// 1.0, a near-binary edge in the last cascade: 5.2 world units of transition down to 1.05. Set it equal to
+// SHADOW_MAP_DEFAULT_EDGE_HARDNESS for the old uniform behaviour.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR 1.0f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

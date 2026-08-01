@@ -186,7 +186,7 @@ class GfxRenderingAPI {
     // backend so the members are available to every per-draw uniform path, exactly like the toon ones.
     virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
                                     float blendFraction, float normalOffset, float strength, float filterWidth,
-                                    float debugMode, float edgeHardness) {
+                                    float debugMode, float edgeHardness, float edgeHardnessFar) {
         mShadowCascadesActive = cascadeCount < 0 ? 0
                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                          : cascadeCount;
@@ -206,6 +206,7 @@ class GfxRenderingAPI {
         mShadowFilterWidth = filterWidth;
         mShadowDebug = debugMode;
         mShadowEdgeHardness = edgeHardness;
+        mShadowEdgeHardnessFar = edgeHardnessFar;
     }
 
   protected:
@@ -230,6 +231,7 @@ class GfxRenderingAPI {
     float mShadowFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
     float mShadowDebug = 0.0f;
     float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
+    float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
