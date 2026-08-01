@@ -753,6 +753,14 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
         float shadowIncidence = saturate(abs(dot(shadowN, shadowLightAxis)));
         float shadowApply = smoothstep(0.0, @{o_shadow_min_incidence}, shadowIncidence);
+        // Harden in proportion to how well the boundary is sampled, rather than by a fixed amount. The
+        // threshold is only as trustworthy as the contour it traces, and that contour degrades with
+        // incidence well before it stops carrying information: at sixty degrees the boundary already
+        // quantises into steps a couple of world units across, and drawing a hard line through that prints
+        // the steps as facets. Tapering the hardening keeps part of the filter's own gradient exactly where
+        // the steps live and nowhere else, so the surfaces the hard edge was wanted on -- the ones facing
+        // the light, where the boundary is well sampled -- give up nothing.
+        shadowHardness *= smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence}, shadowIncidence);
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);

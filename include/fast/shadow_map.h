@@ -274,6 +274,21 @@
 // 0.35 is about seventy degrees off the normal, past which the step is already several world units.
 #define SHADOW_MAP_MIN_INCIDENCE 0.35f
 
+// Incidence at which the edge may be hardened all the way, as the same cosine. Between this and
+// SHADOW_MAP_MIN_INCIDENCE the hardening tapers off, so the shadow keeps a proportionate amount of the
+// filter's own gradient instead of being cut to an edge.
+//
+// The threshold is only as trustworthy as the contour it traces, and that contour degrades with incidence
+// long before it stops carrying information altogether: the boundary quantises into steps of one texel over
+// the sine of the angle, so it is already a couple of world units out at sixty degrees. Drawing a hard line
+// through that prints the steps as facets. Keeping part of the blur exactly there -- and only there -- is
+// what stops them, and it costs nothing on the surfaces where the boundary is well sampled, which is where
+// the hard edge was wanted in the first place.
+//
+// 0.85 is about thirty-two degrees off the normal. Above it the step is under two world units, which the
+// hardening can trace without showing a facet.
+#define SHADOW_MAP_FULL_INCIDENCE 0.85f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
