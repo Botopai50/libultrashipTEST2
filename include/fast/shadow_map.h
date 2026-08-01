@@ -289,6 +289,21 @@
 // hardening can trace without showing a facet.
 #define SHADOW_MAP_FULL_INCIDENCE 0.85f
 
+// Floor under the incidence taper, as a fraction of the configured hardness.
+//
+// The taper exists because a hard contour on an undersampled boundary prints its steps as facets. But
+// tapering to nothing was too far: the threshold does two things at once, and only one of them is the
+// problem. It clips the faint tail of the penumbra, where the filter reports a sliver of occlusion and the
+// shadow reads as a smear rather than a shadow, and it saturates the core, where a feature narrower than
+// the kernel can never reach full coverage and comes out grey. Neither of those needs a hard edge -- both
+// are contrast, and a ramp that keeps most of its width still delivers them.
+//
+// Only the last stretch towards a step is what draws facets. So the taper now bottoms out here instead of
+// at zero: at 0.4 of the configured hardness the ramp still spans roughly a seventh of the coverage range
+// either side of half, which clips the tail and fills in the core while staying far too wide to trace a
+// texel step.
+#define SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE 0.4f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

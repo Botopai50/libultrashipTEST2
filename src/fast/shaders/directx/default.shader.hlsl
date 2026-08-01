@@ -760,7 +760,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // the steps as facets. Tapering the hardening keeps part of the filter's own gradient exactly where
         // the steps live and nowhere else, so the surfaces the hard edge was wanted on -- the ones facing
         // the light, where the boundary is well sampled -- give up nothing.
-        shadowHardness *= smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence}, shadowIncidence);
+        // Down to a floor, not to nothing. The threshold clips the penumbra's faint tail and saturates its
+        // core, and neither of those needs a hard edge -- both are contrast, and a ramp keeping most of its
+        // width still delivers them. Only the last stretch towards an actual step is what traces the texel
+        // boundary into facets, so that is the only part the taper takes away.
+        shadowHardness *= lerp(@{o_shadow_min_hardness_scale}, 1.0,
+                               smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence},
+                                          shadowIncidence));
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
