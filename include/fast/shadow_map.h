@@ -255,6 +255,25 @@
 // SHADOW_MAP_DEFAULT_EDGE_HARDNESS for the old uniform behaviour.
 #define SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR 1.0f
 
+// How squarely the light must strike a surface for the shadow map to be trusted on it, as the cosine of
+// the angle between the surface normal and the light. Below this the shadow term is faded out entirely.
+//
+// This is NOT softening an artefact away -- it is declining to use data that carries no information. The
+// failure it addresses is projective aliasing, and it is a different animal from acne. Acne is a false
+// comparison, which the receiver plane bias fixes exactly. Projective aliasing is a sampling limit: on a
+// surface turning edge-on to the light the shadow map has almost no resolution along the direction the
+// surface recedes, so the shadow BOUNDARY quantises into steps of texel / sin(angle). At sixty degrees off
+// that is under two world units on the middle cascade; at five degrees it is seventeen; at two, forty-two,
+// which is a character's whole height. Those are the teeth. No bias moves them, because nothing is
+// mis-compared -- the boundary is simply being drawn at a resolution that does not exist.
+//
+// Fading it out there is the physically right answer rather than a retreat: a surface edge-on to the light
+// receives almost no light, so it can carry almost no shadow. Illumination and shadow-map resolution both
+// go to zero together, and the term stops mattering exactly where it stops being computable.
+//
+// 0.35 is about seventy degrees off the normal, past which the step is already several world units.
+#define SHADOW_MAP_MIN_INCIDENCE 0.35f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

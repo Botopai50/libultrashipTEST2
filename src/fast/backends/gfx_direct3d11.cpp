@@ -2207,6 +2207,9 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
+        // Spliced in rather than uploaded: it is a fixed policy value, and having it as a literal lets the
+        // compiler fold the smoothstep that uses it.
+        { "o_shadow_min_incidence", SHADOW_MAP_MIN_INCIDENCE },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },

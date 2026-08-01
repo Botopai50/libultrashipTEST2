@@ -737,11 +737,27 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
         // are combined -- this is the only way to tell which without guessing.
+        // Stop applying the shadow at all as the surface turns edge-on to the light.
+        //
+        // Not a softening: this declines to use a number that carries no information. On a surface nearly
+        // parallel to the light the map has almost no resolution along the direction that surface recedes,
+        // so the shadow BOUNDARY quantises into steps of one texel divided by the sine of the angle -- under
+        // two world units at sixty degrees, seventeen at five, forty-two at two, which is a character's
+        // whole height. Those steps are the teeth, and no bias touches them because nothing is being
+        // mis-compared: the boundary is being drawn at a resolution that does not exist.
+        //
+        // Fading it out is what the physics says anyway. A surface edge-on to the light receives almost no
+        // light and can therefore carry almost no shadow, so illumination and map resolution reach zero
+        // together and the term stops mattering exactly where it stops being computable. The light axis is
+        // the third column of any cascade's matrix; they share a direction, so cascade 0 will do.
+        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
+        float shadowIncidence = saturate(abs(dot(shadowN, shadowLightAxis)));
+        float shadowApply = smoothstep(0.0, @{o_shadow_min_incidence}, shadowIncidence);
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
         } else {
-            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            texel.rgb *= lerp(1.0, lerp(1.0 - shadow_params.w, 1.0, shadowLit), shadowApply);
         }
     @end
 
