@@ -727,9 +727,30 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // approximation of it, which is why the remap is blended in rather than being fed a widening band.
         float shadowHardness = saturate(lerp(shadow_filter.z, shadow_filter.w,
                                              ShadowLadderFraction(input.position.w)));
-        // No fade at grazing incidence any more. That existed to stop the threshold tracing the contour of
-        // a noisy comparison and turning it into teeth -- softening the artefact rather than removing it.
-        // The receiver plane bias removes it, so the hardening applies everywhere it is asked to.
+        // How square-on the surface is to the light. It decides two separate things below -- how far the
+        // threshold is allowed to go, and whether the shadow is applied at all -- so it is measured here,
+        // before either of them. The light axis is the third column of any cascade's matrix; they share a
+        // direction, so cascade 0 will do.
+        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
+        float shadowIncidence = saturate(abs(dot(shadowN, shadowLightAxis)));
+        // Harden in proportion to how well the boundary is sampled, rather than by a fixed amount. The
+        // threshold is only as trustworthy as the contour it traces, and that contour degrades with
+        // incidence well before it stops carrying information: at sixty degrees the boundary already
+        // quantises into steps a couple of world units across, and drawing a hard line through that prints
+        // the steps as facets. Tapering the hardening keeps part of the filter's own gradient exactly where
+        // the steps live and nowhere else, so the surfaces the hard edge was wanted on -- the ones facing
+        // the light, where the boundary is well sampled -- give up nothing.
+        //
+        // Down to a floor, not to nothing. The threshold clips the penumbra's faint tail and saturates its
+        // core, and neither of those needs a hard edge -- both are contrast, and a ramp keeping most of its
+        // width still delivers them. Only the last stretch towards an actual step is what traces the texel
+        // boundary into facets, so that is the only part the taper takes away.
+        shadowHardness *= lerp(@{o_shadow_min_hardness_scale}, 1.0,
+                               smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence},
+                                          shadowIncidence));
+        // Now remap. What the filter returned is coverage; a narrow ramp centred on half coverage collapses
+        // that gradient into an edge. This must come after the taper -- it is the only reader of
+        // shadowHardness, so anything written to it below this point would be discarded by the compiler.
         float shadowBand = lerp(0.5, 0.03, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
@@ -748,25 +769,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //
         // Fading it out is what the physics says anyway. A surface edge-on to the light receives almost no
         // light and can therefore carry almost no shadow, so illumination and map resolution reach zero
-        // together and the term stops mattering exactly where it stops being computable. The light axis is
-        // the third column of any cascade's matrix; they share a direction, so cascade 0 will do.
-        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
-        float shadowIncidence = saturate(abs(dot(shadowN, shadowLightAxis)));
+        // together and the term stops mattering exactly where it stops being computable.
         float shadowApply = smoothstep(0.0, @{o_shadow_min_incidence}, shadowIncidence);
-        // Harden in proportion to how well the boundary is sampled, rather than by a fixed amount. The
-        // threshold is only as trustworthy as the contour it traces, and that contour degrades with
-        // incidence well before it stops carrying information: at sixty degrees the boundary already
-        // quantises into steps a couple of world units across, and drawing a hard line through that prints
-        // the steps as facets. Tapering the hardening keeps part of the filter's own gradient exactly where
-        // the steps live and nowhere else, so the surfaces the hard edge was wanted on -- the ones facing
-        // the light, where the boundary is well sampled -- give up nothing.
-        // Down to a floor, not to nothing. The threshold clips the penumbra's faint tail and saturates its
-        // core, and neither of those needs a hard edge -- both are contrast, and a ramp keeping most of its
-        // width still delivers them. Only the last stretch towards an actual step is what traces the texel
-        // boundary into facets, so that is the only part the taper takes away.
-        shadowHardness *= lerp(@{o_shadow_min_hardness_scale}, 1.0,
-                               smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence},
-                                          shadowIncidence));
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
