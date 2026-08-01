@@ -217,6 +217,27 @@
 // small enough that the step is not visible.
 #define SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS 0.9994f
 
+// How hard the shadow edge is, 0 to 1.
+//
+// The filter above produces a coverage value: how much of the kernel is occluded, 0 to 1. Shading with it
+// directly gives a linear ramp across the whole kernel, which IS the blur. Remapping it through a narrow
+// ramp centred on half coverage instead collapses that gradient into an edge, which is what a cel-shaded
+// look wants anyway.
+//
+// This is genuinely better than simply narrowing the kernel, and for a reason worth stating: the coverage
+// value varies smoothly BETWEEN texels, because every tap is bilinear. So the half-coverage contour is a
+// piecewise-linear curve through the texel grid rather than a staircase along it, and hardening it keeps
+// that sub-texel placement. Narrowing the kernel throws the placement away and lands back on the grid.
+//
+// What it costs: the wide kernel is also what antialiases the edge on screen, and an edge is by definition
+// not antialiased. The remap keeps a narrow ramp rather than a step so a pixel or two of softness survives,
+// but at distance -- where a texel is several world units -- a hard edge will show the contour's facets.
+// That is the same texel limit as ever, traded from blurry to faceted rather than removed.
+//
+// 0.75: clearly an edge, with the ramp still wide enough to carry some antialiasing. 0 leaves the filtered
+// gradient exactly as it was; 1 is very nearly binary.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.75f
+
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 

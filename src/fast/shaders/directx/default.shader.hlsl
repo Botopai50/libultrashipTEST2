@@ -126,7 +126,8 @@ cbuffer PerShadowCB : register(b3) {
     // y = debug. 1 paints everything OUTSIDE a cascade's footprint as fully occluded instead of silently
     //     lit, which is the only way to see where a cascade actually ends. 2 replaces the shading with the
     //     two caster layers separated by colour: green = occluded by the world layer, red = by the actor
-    //     layer. z/w unused.
+    //     layer.
+    // z = edge hardness, 0 to 1 (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS). w unused.
     float4 shadow_filter;
 }
 
@@ -645,6 +646,21 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             shadowActorLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x);
         }
         float shadowLit = min(shadowWorldLit, shadowActorLit);
+        // Harden the edge. What the filter returns is COVERAGE -- how much of the kernel is occluded -- and
+        // shading with it directly spreads that ramp across the whole kernel, which is the blur. Remapping
+        // it through a narrow ramp centred on half coverage collapses the gradient into an edge instead.
+        //
+        // This keeps something that simply narrowing the kernel throws away: every tap is bilinear, so
+        // coverage varies smoothly BETWEEN texels, and the half-coverage contour is a piecewise-linear curve
+        // through the grid rather than a staircase along it. Hardening preserves that sub-texel placement.
+        // A narrow ramp rather than a step, so a pixel or two of antialiasing survives on screen.
+        //
+        // At hardness 0 the lerp weight is 0 and this is exactly the value that came in -- not an
+        // approximation of it, which is why the remap is blended in rather than being fed a widening band.
+        float shadowHardness = saturate(shadow_filter.z);
+        float shadowBand = lerp(0.5, 0.03, shadowHardness);
+        float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
+        shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
