@@ -135,9 +135,23 @@ cbuffer PerShadowCB : register(b3) {
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
 // and then comparing once is not the same thing as comparing per texel and averaging the results, and only
 // the latter gives a correct penumbra.
-float ShadowTap(float2 uv, float slice, float z) {
-    float stored = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv, slice), 0);
-    return z <= stored ? 1.0 : 0.0; // 1 = this texel does not occlude
+// Receiver plane depth bias: compare against the depth the RECEIVER'S OWN PLANE would have at the texel
+// being tapped, not the depth it has at the centre of the kernel.
+//
+// This is the root cause of acne under a wide filter, and every bias in this file up to now has been
+// treating the symptom. A PCF tap reads stored depth one or more texels away from the sample point but
+// compares it against the receiver's depth AT the sample point. On a surface tilted with respect to the
+// light those two are not the same number, and the difference grows with both the tilt and the kernel
+// width -- so the sixteen-tap filter was itself manufacturing the acne that the constant, slope and normal
+// biases were then paying to hide, which is why they had to be so large and why they cost peter panning.
+//
+// `grad` is how fast the receiver's depth changes per unit of shadow-map uv, so this recovers the plane's
+// own depth at the tap and compares like with like. Nothing is displaced: the correction is exact for a
+// flat receiver and needs no margin, which is what makes it free of panning.
+float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z) {
+    float stored = g_shadowMap.SampleLevel(g_shadowSampler, float3(uvTap, slice), 0);
+    float zAtTap = z + dot(uvTap - uvCentre, grad);
+    return zAtTap <= stored ? 1.0 : 0.0; // 1 = this texel does not occlude
 }
 
 // Four taps in a quincunx around the centre, written out rather than looped over a local array: a local
@@ -153,7 +167,8 @@ float ShadowTap(float2 uv, float slice, float z) {
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
-float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
+float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, uint cascade, float texelUv,
+                       float sliceBase) {
     float slice = sliceBase + (float)cascade;
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
@@ -161,10 +176,13 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
     float2 subTexel = texelPos - baseTexel;
     float2 uv00 = (baseTexel + 0.5) * texelUv;
 
-    float s00 = ShadowTap(uv00, slice, z);
-    float s10 = ShadowTap(uv00 + float2(texelUv, 0.0), slice, z);
-    float s01 = ShadowTap(uv00 + float2(0.0, texelUv), slice, z);
-    float s11 = ShadowTap(uv00 + float2(texelUv, texelUv), slice, z);
+    // uvCentre, not uv: every tap in the whole kernel measures its plane correction from the ONE point the
+    // receiver's depth was evaluated at, otherwise each 2x2 quad would correct against itself and the
+    // sixteen-tap kernel would still disagree with itself across its own width.
+    float s00 = ShadowTap(uv00, uvCentre, grad, slice, z);
+    float s10 = ShadowTap(uv00 + float2(texelUv, 0.0), uvCentre, grad, slice, z);
+    float s01 = ShadowTap(uv00 + float2(0.0, texelUv), uvCentre, grad, slice, z);
+    float s11 = ShadowTap(uv00 + float2(texelUv, texelUv), uvCentre, grad, slice, z);
 
     float top = lerp(s00, s10, subTexel.x);
     float bottom = lerp(s01, s11, subTexel.x);
@@ -184,7 +202,7 @@ float SampleShadowPCF4(float2 uv, float z, uint cascade, float texelUv, float sl
 // Redistributing the cascade splits was checked first and does not help: the far cascade's radius comes
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
-float SampleShadowPCF16(float2 uv, float z, uint cascade, float texelUv, float sliceBase) {
+float SampleShadowPCF16(float2 uv, float2 grad, float z, uint cascade, float texelUv, float sliceBase) {
     // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
     // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
     // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
@@ -192,10 +210,10 @@ float SampleShadowPCF16(float2 uv, float z, uint cascade, float texelUv, float s
     // quads overlap instead, which only costs redundancy, so this is safe to turn down for a tighter
     // penumbra and must not be turned above 1.0.
     float d = texelUv * min(shadow_filter.x, 1.0);
-    float sum = SampleShadowPCF4(uv + float2(-d, -d), z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(d, -d), z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(-d, d), z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(d, d), z, cascade, texelUv, sliceBase);
+    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, z, cascade, texelUv, sliceBase);
+    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, z, cascade, texelUv, sliceBase);
     return sum * 0.25;
 }
 
@@ -268,14 +286,38 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     float grazing = sqrt(saturate(1.0 - (ndotl * ndotl)));
     float3 p = worldPos + n * (shadow_params.z * texelWorld * grazing);
     float4 clip = mul(float4(p, 1.0), viewProj);
-    if (clip.w > 0.0) {
-        float3 ndc = clip.xyz / clip.w;
-        bool inside = all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0;
-        if (inside) {
-            // NDC -> texture space (y flips: NDC is +up, textures are +down).
-            float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-            lit = SampleShadowPCF16(uv, ndc.z - depthBias, slice, texelUv, sliceBase);
-        }
+
+    // Projected position and shadow-map coordinate, computed BEFORE any branch on purpose. The screen-space
+    // derivatives below have to be taken in flow every pixel of the quad reaches, or neighbouring pixels
+    // that took different paths would poison them.
+    float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
+    float3 ndc = clip.xyz / safeW;
+    // NDC -> texture space (y flips: NDC is +up, textures are +down).
+    float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+
+    // How fast the receiver's depth changes per unit of shadow-map uv, recovered from screen-space
+    // derivatives. The two derivative pairs give depth and uv per screen pixel; inverting the uv Jacobian
+    // turns that into depth per uv, which is the receiver plane expressed in the map's own coordinates.
+    // ShadowTap uses it to compare each tap against the plane rather than against one point on it.
+    float2 duvdx = ddx(uv);
+    float2 duvdy = ddy(uv);
+    float dzdx = ddx(ndc.z);
+    float dzdy = ddy(ndc.z);
+    float det = (duvdx.x * duvdy.y) - (duvdx.y * duvdy.x);
+    float2 grad = float2(0.0, 0.0);
+    if (abs(det) > 1e-12) {
+        grad = float2((duvdy.y * dzdx) - (duvdx.y * dzdy), (duvdx.x * dzdy) - (duvdy.x * dzdx)) / det;
+    }
+    // Bound it. At a silhouette the quad straddles two surfaces and the derivative is meaningless, and an
+    // unbounded correction there would punch a hole through the shadow. The depth range of every cascade is
+    // five times its radius by construction and a texel is two radii over the resolution, so a surface at
+    // forty-five degrees to the light has a gradient of 2/5 -- the radius and the resolution both cancel.
+    // 3.2 is eight times that, about eighty-three degrees, past which a receiver is edge-on enough that the
+    // constant and normal-offset terms are the right tools.
+    grad = clamp(grad, -3.2, 3.2);
+
+    if (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) {
+        lit = SampleShadowPCF16(uv, grad, ndc.z - depthBias, slice, texelUv, sliceBase);
     }
     return lit;
 }
@@ -685,23 +727,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // approximation of it, which is why the remap is blended in rather than being fed a widening band.
         float shadowHardness = saturate(lerp(shadow_filter.z, shadow_filter.w,
                                              ShadowLadderFraction(input.position.w)));
-        // Only threshold where the comparison being thresholded is trustworthy.
-        //
-        // At grazing incidence depth runs away across a texel, and what survives the bias there is not a
-        // clean coverage ramp but a noisy one. Softening hid that -- it read as a faint gradient. Hardening
-        // does the opposite: it traces the contour of the noise and turns it into sharp teeth, which is
-        // worse than the blur it was meant to cure and is never something a shadow should look like.
-        //
-        // So the hardening fades out as the surface turns edge-on to the light, and this is the exact
-        // mirror of the normal offset, which fades IN there. The two are solving the same problem from
-        // opposite sides: the offset spends its budget where the comparison is fragile, and the threshold
-        // spends its budget where the comparison is sound. Floors keep the hard edge; walls at a shallow
-        // angle to the light keep the soft one.
-        //
-        // The light axis is the third column of any cascade's matrix -- they all share a direction, so
-        // cascade 0 will do, and the index stays literal.
-        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
-        shadowHardness *= smoothstep(0.15, 0.5, saturate(abs(dot(shadowN, shadowLightAxis))));
+        // No fade at grazing incidence any more. That existed to stop the threshold tracing the contour of
+        // a noisy comparison and turning it into teeth -- softening the artefact rather than removing it.
+        // The receiver plane bias removes it, so the hardening applies everywhere it is asked to.
         float shadowBand = lerp(0.5, 0.03, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
