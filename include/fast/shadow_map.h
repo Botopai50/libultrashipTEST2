@@ -149,16 +149,19 @@
 // 2*(1+radius) texels across. At 1.0 the quads sit edge to edge and cover 4x4; above that they separate and
 // leave texels sampled by nothing, which reads on screen as a grid, so the shader clamps there.
 //
-// 0.5, and 0.5 is the floor. It was tried at 0.25 on the reasoning that bilinear taps cannot stair-step --
-// that reasoning was wrong. A bilinear tap removes the hardness WITHIN a texel; it does nothing about the
-// staircase BETWEEN texels, because the shadow edge is quantised to the texel grid either way and a
-// one-texel ramp only rounds each step's corner. Hiding a staircase needs a kernel spanning several texels,
-// which is what this radius buys and what 0.25 gave up.
+// 0.4, which is where two pieces of player feedback bracket it rather than where a calculation puts it:
+// 0.25 read as stair-stepped, 0.5 read as smeared, so this sits nearer the end that was complained about
+// twice. Sweep it live -- it is a CVar and needs no rebuild.
+//
+// 0.25 failing was itself a correction. I had argued that bilinear taps cannot stair-step at any spacing;
+// that was wrong. A bilinear tap removes the hardness WITHIN a texel and does nothing about the staircase
+// BETWEEN texels, because the shadow edge is quantised to the texel grid either way and a one-texel ramp
+// only rounds each step's corner. Hiding a staircase needs a kernel spanning several texels.
 //
 // So sharper distant shadows are not available from the filter. That is a texel problem, and both cures are
 // priced: halve Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
 // Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
-#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.5f
+#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.4f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
 // Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at
