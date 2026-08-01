@@ -685,6 +685,23 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // approximation of it, which is why the remap is blended in rather than being fed a widening band.
         float shadowHardness = saturate(lerp(shadow_filter.z, shadow_filter.w,
                                              ShadowLadderFraction(input.position.w)));
+        // Only threshold where the comparison being thresholded is trustworthy.
+        //
+        // At grazing incidence depth runs away across a texel, and what survives the bias there is not a
+        // clean coverage ramp but a noisy one. Softening hid that -- it read as a faint gradient. Hardening
+        // does the opposite: it traces the contour of the noise and turns it into sharp teeth, which is
+        // worse than the blur it was meant to cure and is never something a shadow should look like.
+        //
+        // So the hardening fades out as the surface turns edge-on to the light, and this is the exact
+        // mirror of the normal offset, which fades IN there. The two are solving the same problem from
+        // opposite sides: the offset spends its budget where the comparison is fragile, and the threshold
+        // spends its budget where the comparison is sound. Floors keep the hard edge; walls at a shallow
+        // angle to the light keep the soft one.
+        //
+        // The light axis is the third column of any cascade's matrix -- they all share a direction, so
+        // cascade 0 will do, and the index stays literal.
+        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
+        shadowHardness *= smoothstep(0.15, 0.5, saturate(abs(dot(shadowN, shadowLightAxis))));
         float shadowBand = lerp(0.5, 0.03, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
