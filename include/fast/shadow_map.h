@@ -214,6 +214,25 @@
 // is the draw itself for off-screen geometry.
 #define SHADOW_MAP_DEFAULT_CASTER_DRAW_RADIUS 1500.0f
 
+// Tallest caster whose stretched shadow is worth following, in world units. This is the OTHER half of the
+// reach: the radius above is a sphere around the camera, and a sphere is the wrong shape for the question.
+//
+// What decides whether a caster matters is not how far away it is but whether its SHADOW arrives, and a low
+// sun sends a shadow far further than the caster stands. At the elevation floor the shadow runs about twice
+// the caster's height along the light -- so a tower can sit well outside any sphere anyone would pay for and
+// still lay its shadow across the ground at the player's feet. Widening the sphere until it reached would
+// mean drawing everything in every direction to catch the few things lying along one of them.
+//
+// So the test follows the light instead: keep a caster when any point of the ray it casts along passes near
+// the camera, out to this much height's worth of shadow. That is a thin cylinder rather than a bigger
+// sphere, and it admits the far tower whose shadow arrives while continuing to reject the equally far one
+// whose shadow goes the other way.
+//
+// Used as a length along the light: shadow reach = this / sin(elevation), so it grows exactly when shadows
+// stretch and shrinks at midday when they do not. 1200 is taller than anything in the game that stands on
+// ground the player also stands on, which at the elevation floor follows a shadow about 2400 units long.
+#define SHADOW_MAP_CASTER_SHADOW_HEIGHT 1200.0f
+
 // How far the key light may swing before the cascades are rebuilt around the new direction, as the cosine
 // of the angle (0.9994 is about two degrees).
 //
