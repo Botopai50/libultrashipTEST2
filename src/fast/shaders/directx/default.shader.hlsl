@@ -36,7 +36,7 @@ float4 fog : FOG;
 float4 grayscale : GRAYSCALE;
 @{update_floats(4)}
 @end
-@if(o_toon)
+@if(o_toon || o_shadow_map)
 float3 normal : NORMAL;
 @{update_floats(3)}
 @end
@@ -249,8 +249,8 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
     // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
     // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
-    // striped self-shadowing (acne). normalWs is zero for receivers that carry no normal (the toon variant
-    // is off), and then this term simply vanishes and the rasterizer's slope bias carries it alone.
+    // striped self-shadowing (acne). normalWs always arrives unit length -- the caller resolves the vertex
+    // normal or a recovered face normal before this point -- so the term is always live.
     // Single return from a pre-initialized local (see ShadowSplitAt): 1.0 is also the right answer for
     // every rejected case, since a point this cascade cannot see is a point it knows nothing occluding.
     //
@@ -481,7 +481,7 @@ PSInput VSMain(
 @if(o_grayscale)
     , float4 grayscale : GRAYSCALE
 @end
-@if(o_toon)
+@if(o_toon || o_shadow_map)
     , float3 normal : NORMAL
 @end
 @if(o_shadow_map)
@@ -520,7 +520,7 @@ PSInput VSMain(
         result.grayscale = grayscale;
     @end
 
-    @if(o_toon)
+    @if(o_toon || o_shadow_map)
         result.normal = normal;
     @end
 
@@ -688,17 +688,25 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     // Applied after the toon relight and before fog, so a shadowed surface still fades into the distance
     // like everything else rather than staying dark through the fog.
     @if(o_shadow_map)
-        @if(o_toon)
-            float3 shadowN = normalize(input.normal);
-        @else
-            // No vertex normal on this draw -- the room mesh is drawn unlit. Recover the geometric face
-            // normal from the world position's screen derivatives instead: two tangents across the pixel
-            // quad, crossed. That gives the normal-offset bias something to push along for exactly the
-            // geometry that most needs it, which is why the walls no longer have to be excluded from
-            // casting to stay clean. ddx/ddy are core pixel-shader instructions, so this costs nothing
-            // structurally.
-            float3 shadowN = normalize(cross(ddx(input.worldPos.xyz), ddy(input.worldPos.xyz)));
-        @end
+        // The vertex normal when the draw has one, and a recovered face normal when it does not. Which of
+        // those applies is decided per DRAW, not by whether the cel relight is on, and that distinction is
+        // the whole point: the attribute arrives zeroed on unlit geometry (see the vbo packing), so its
+        // length is the test.
+        //
+        // Recovering it from the world position's screen derivatives -- two tangents across the pixel quad,
+        // crossed -- is right for the room mesh, which is what it was written for. Large flat triangles, a
+        // quad sits inside one face, and the normal-offset bias gets something true to push along. It is
+        // wrong for a character. Link's mesh is dense enough that most quads straddle a triangle edge,
+        // where the derivative of the world position is a step rather than a tangent, so the "normal" jumps
+        // between neighbouring quads, the bias pushes the sample somewhere different every few pixels, and
+        // the depth comparison flips with it. That is the grey speckle across his skin in shadow, and no
+        // amount of bias tuning could have reached it: the input to the bias was noise.
+        // Both computed unconditionally and then selected. ddx/ddy are gradient instructions and may not
+        // sit inside varying control flow -- the compiler cannot know this particular condition is uniform
+        // across every pixel of the draw, and refuses on that basis.
+        float3 shadowGeoN = cross(ddx(input.worldPos.xyz), ddy(input.worldPos.xyz));
+        float shadowNLen = length(input.normal);
+        float3 shadowN = (shadowNLen > 1e-4) ? (input.normal / shadowNLen) : normalize(shadowGeoN);
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
         // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a

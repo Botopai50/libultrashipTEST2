@@ -1611,11 +1611,21 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             // draws with no toon marker at all (the room, the terrain). Without mShadowMapEnabled here the
             // receiver variant would sample the cascades using whatever wx/wy/wz happened to be left in
             // the vertex from an earlier object.
-            if (mRdp->toon) {
+            // Computed for the shadow map too, not only for the relight. The map's normal-offset bias
+            // needs a surface normal, and with the cel shading turned off this was never written -- so the
+            // shader fell back to recovering one from the world position's screen derivatives. That works
+            // on the room mesh, which is what it was written for: large flat triangles, where a pixel quad
+            // sits inside one face. On a character it does not. Link's mesh is dense enough that most
+            // quads straddle a triangle edge, and the recovered normal there is not a normal at all, so
+            // the bias pushed the sample in a different direction every few pixels and the comparison
+            // flipped with it -- mottled grey speckle across his skin whenever he stood in shadow.
+            if (mRdp->toon || mShadowMapEnabled) {
                 float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
                 d->nx = vn->n[0] * mv[0][0] + vn->n[1] * mv[1][0] + vn->n[2] * mv[2][0];
                 d->ny = vn->n[0] * mv[0][1] + vn->n[1] * mv[1][1] + vn->n[2] * mv[2][1];
                 d->nz = vn->n[0] * mv[0][2] + vn->n[1] * mv[1][2] + vn->n[2] * mv[2][2];
+            }
+            if (mRdp->toon) {
                 d->color.r = 255;
                 d->color.g = 255;
                 d->color.b = 255;
@@ -2173,10 +2183,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
         // SOH [Enhancement] Toon lighting: world-space normal (aNormal). The dominant light/ambient
         // are sent as uniforms (per draw), not per-vertex, to stay within the vertex-attribute limit.
-        if (use_toon) {
-            mBufVbo[mBufVboLen++] = v_arr[i]->nx;
-            mBufVbo[mBufVboLen++] = v_arr[i]->ny;
-            mBufVbo[mBufVboLen++] = v_arr[i]->nz;
+        // SOH [Enhancement] Cascaded shadow maps want it too, for the normal-offset bias, and want it
+        // whether or not the cel relight is on -- so the attribute rides both options. It costs no extra
+        // headroom: a draw with both on already carried it, so the widest stride is unchanged.
+        //
+        // Sent as ZERO when the draw carries no vertex normal, which is the room mesh and most scenery:
+        // that is not a normal pointing nowhere, it is the shader's signal to recover one from the world
+        // position's screen derivatives instead. Zeroing here rather than trusting the vertex is the whole
+        // point -- nx/ny/nz are only written on lit geometry, so an unlit draw would otherwise ship
+        // whatever the last lit object happened to leave in the vertex slot.
+        if (use_toon || use_shadow_map) {
+            const bool haveNormal = (mRsp->geometry_mode & G_LIGHTING) != 0;
+            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nx : 0.0f;
+            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->ny : 0.0f;
+            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nz : 0.0f;
         }
 
         // SOH [Enhancement] Cascaded shadow maps: world position (aWorldPos), so the pixel shader can

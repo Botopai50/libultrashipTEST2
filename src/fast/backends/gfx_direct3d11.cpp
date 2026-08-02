@@ -482,8 +482,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              D3D11_INPUT_PER_VERTEX_DATA,
                              0 };
     }
-    // SOH [Enhancement] Toon lighting world-space normal (order must match the vbo packing).
-    if (cc_features.opt_toon) {
+    // SOH [Enhancement] Toon lighting world-space normal (order must match the vbo packing). The shadow map
+    // takes the same attribute for its normal-offset bias, so it rides either option.
+    if (cc_features.opt_toon || cc_features.opt_shadow_map) {
         ied[ied_index++] = {
             "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
         };
