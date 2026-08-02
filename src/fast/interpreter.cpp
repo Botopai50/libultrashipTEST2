@@ -1290,7 +1290,15 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 // see-through surface casting a solid shadow looks worse than casting none.
 bool Interpreter::ShadowCasterExcludedByRenderMode() const {
     const uint32_t zmode = mRdp->other_mode_l & ZMODE_DEC; // ZMODE_DEC is the full two-bit field mask
-    if (zmode == ZMODE_DEC || zmode == ZMODE_XLU) {
+    if (zmode == ZMODE_DEC) {
+        return true;
+    }
+    // Translucent geometry is see-through and a see-through surface casting a solid shadow looks worse than
+    // casting none -- unless the game has said otherwise for these particular draws. A tree canopy is drawn
+    // translucent so it can fade with distance, but what the texture holds is a leaf silhouette, not a sheet
+    // of glass. Inside the bracket the exclusion lifts; the cutout requirement below it does not, so the
+    // canopy casts leaves through its alpha or it casts nothing.
+    if (zmode == ZMODE_XLU && !mRdp->shadow_xlu_caster) {
         return true;
     }
     // The zmode field alone, and nothing else. FORCE_BL was tested here too, on the reasoning that it marks
@@ -1373,7 +1381,11 @@ void Interpreter::ShadowCasterTexcoord(int tile, const struct LoadedVertex* v, f
 bool Interpreter::ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey) {
     const bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     const bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
-    if (!texture_edge && !alpha_threshold) {
+    // Inside an XLU caster bracket the render state cannot be the witness: the draw declares itself blended
+    // precisely so it can fade, which is the same state a sheet of glass sets. The bracket is the witness
+    // instead -- the game named this actor's canopy -- so the only remaining question is whether there is a
+    // texture whose alpha can be cut against, and that is what the rest of this function answers.
+    if (!texture_edge && !alpha_threshold && !mRdp->shadow_xlu_caster) {
         return false;
     }
     const uint32_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
@@ -1717,10 +1729,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
     // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
     // cutout question, because a decal that happens to be alpha-tested is still a decal.
-    const bool shadowCasterExcluded =
-        mShadowMapEnabled && (mRdp->toon_shadow || mRdp->shadow_world_caster) && ShadowCasterExcludedByRenderMode();
-    if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect &&
-        (mRdp->toon_shadow || mRdp->shadow_world_caster)) {
+    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_xlu_caster;
+    const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
+    if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
         // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
         // this geometry to go, and diverting it there anyway would mean foliage casts NOTHING rather than
         // casting its quad. Falling back to the opaque list is worse looking and strictly better than a
@@ -1769,6 +1780,31 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mShadowVerts.push_back(v_arr[si]->wy);
                 mShadowVerts.push_back(v_arr[si]->wz);
             }
+        }
+    } else if (mShadowMapEnabled && mRdp->shadow_xlu_caster && !is_rect && !shadowCasterExcluded) {
+        // An actor's translucent-pass cutout geometry: tree leaves. It goes straight into the actor layer's
+        // alpha list and nowhere else -- deliberately skipping the bounding box and the opaque staging above,
+        // because both belong to the object-boundary machinery in the OPA stream and there is no boundary
+        // here: by the time the XLU stream runs, every actor has already drawn and been flushed.
+        //
+        // Which also means these captures miss this frame's pass and are rendered by the next one. That is
+        // structural -- the flush marker is in the opaque stream and the whole opaque stream runs first --
+        // and it is left alone rather than moved, because moving the flush behind the translucent stream
+        // would delay every OTHER caster by a frame to save a frame on geometry that does not move. A tree
+        // stands still; a character does not.
+        //
+        // No opaque fallback. Everywhere else a caster that cannot be cut against its alpha still casts its
+        // polygon, which is worse-looking but better than nothing; here the polygon is a quad with a leaf
+        // painted on it, so casting it would drop a rectangle on the ground. Without a texture to cut, this
+        // casts nothing.
+        if (shadowAlphaCaster) {
+            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
+            // Move the object mark past what was just captured. These triangles arrive after the frame's
+            // flush has reset the mark to zero, so the first actor of the NEXT frame to fail the size gate
+            // would resize the list back to that zero and take the leaves with it -- an object rollback
+            // deleting geometry that belongs to no object. Claiming the ground here makes that impossible
+            // whatever the gate is set to.
+            mShadowAlphaObjectMark = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].verts.size();
         }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                !shadowCasterExcluded && shadowAlphaCaster) {
@@ -5232,6 +5268,14 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         }
         if (sizeOrSentinel <= -1.5e30f) {
             gfx->mRdp->shadow_world_caster = true; // gSPShadowMapWorldCasterBegin
+            return false;
+        }
+        if (sizeOrSentinel <= -1.3e30f) {
+            gfx->mRdp->shadow_xlu_caster = true; // gSPShadowMapXluCasterBegin
+            return false;
+        }
+        if (sizeOrSentinel <= -1.1e30f) {
+            gfx->mRdp->shadow_xlu_caster = false; // gSPShadowMapXluCasterEnd
             return false;
         }
         // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires

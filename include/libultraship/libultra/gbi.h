@@ -2886,6 +2886,20 @@ typedef union Gfx {
 #define gSPShadowMapReceiveOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -4.0e30f)
 #define gSPShadowMapReceiveOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -5.0e30f)
 
+// SOH [Enhancement] Cascaded shadow maps: bracket an actor's TRANSLUCENT-pass geometry as a cutout caster.
+// A tree canopy is drawn from the XLU display list -- the trunk goes to POLY_OPA and the leaves to POLY_XLU --
+// and the arming above only ever reaches the OPA stream, which is exactly why a tree cast its trunk and
+// nothing else. These are emitted into POLY_XLU_DISP instead, so they bracket the leaf geometry where it
+// actually lives.
+//
+// Not inferable from render state, which is why it is a bracket and not a test: the canopy declares itself
+// translucent (the game fades it with env alpha) and frequently runs with the alpha compare off, so every
+// signal that would identify a cutout says "blended surface" here. The game names the actors it is true for
+// (ToonShadowXluCaster) and the renderer trusts the bracket -- narrow on purpose, because opening the XLU
+// stream to casters in general would hand a shadow to every water plane, glow and particle in it.
+#define gSPShadowMapXluCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.4e30f)
+#define gSPShadowMapXluCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.2e30f)
+
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \
