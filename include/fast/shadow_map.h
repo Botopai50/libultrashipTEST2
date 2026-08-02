@@ -198,10 +198,21 @@
 // well. Widening the screen-space margin cannot reach these: behind the camera the projected w is negative
 // and the test degenerates. Only a radial test is orientation-independent.
 //
-// 800 rather than the full caster reach: this draws actors nothing can see, so it is paid in draw calls
-// across the whole sphere. 800 covers the space immediately around and behind the camera, which is where a
-// caster is close enough for its shadow to land inside the view.
-#define SHADOW_MAP_DEFAULT_CASTER_DRAW_RADIUS 800.0f
+// Not the full caster reach, because this draws geometry nothing can see and is paid in draw calls across
+// the whole sphere. What sets it instead is the longest shadow the scene can throw: a caster matters behind
+// the camera exactly as far back as its own shadow reaches forward. The elevation floor clamps the sun at
+// thirty degrees (see MIN_ELEVATION), so that length is the caster's height over the tangent of thirty --
+// about one and three quarter times its height.
+//
+// 800 therefore covered casters up to about four hundred and sixty units tall, which is a hut. It is not a
+// tower: the Kakariko windmill stands well above that, so it left the draw list while the ground carrying
+// its shadow was still in full view, and the shadow came and went with the camera angle. 1500 covers a
+// caster around eight hundred and seventy units high, which is every building in the game.
+//
+// Raising it does not cost more capture work -- the world layer's caster list is cached and rebuilt only
+// when the drawn set changes, and a wider sphere makes that set change LESS often, not more. What it costs
+// is the draw itself for off-screen geometry.
+#define SHADOW_MAP_DEFAULT_CASTER_DRAW_RADIUS 1500.0f
 
 // How far the key light may swing before the cascades are rebuilt around the new direction, as the cosine
 // of the angle (0.9994 is about two degrees).
