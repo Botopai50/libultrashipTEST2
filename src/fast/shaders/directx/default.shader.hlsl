@@ -766,7 +766,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
         // are combined -- this is the only way to tell which without guessing.
-        // Stop applying the shadow at all as the surface turns edge-on to the light.
+        // On SCENERY, stop applying the shadow at all as the surface turns edge-on to the light.
         //
         // Not a softening: this declines to use a number that carries no information. On a surface nearly
         // parallel to the light the map has almost no resolution along the direction that surface recedes,
@@ -775,10 +775,27 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // whole height. Those steps are the teeth, and no bias touches them because nothing is being
         // mis-compared: the boundary is being drawn at a resolution that does not exist.
         //
-        // Fading it out is what the physics says anyway. A surface edge-on to the light receives almost no
-        // light and can therefore carry almost no shadow, so illumination and map resolution reach zero
-        // together and the term stops mattering exactly where it stops being computable.
+        // Scenery only, and the "physics" argument that used to be written here is why. It said a surface
+        // edge-on to the light receives almost no light and can therefore carry almost no shadow, so
+        // illumination and map resolution reach zero together. That is true of a renderer whose shading
+        // light IS this light. It is not true of this one: the cel relight runs off a per-actor key, and
+        // with cel shading off the surface is lit by the room's own lamps, neither of which has anything to
+        // do with the global sun the cascades are built from. A surface edge-on to the sun can be fully lit
+        // by a torch, and lifting its shadow leaves it fully lit inside a shadow.
+        //
+        // Which is a band, not a speckle, and it sits exactly at the terminator -- the falloff spans forty
+        // degrees around edge-on, so on anything curved it is a wide ring of unshadowed surface between the
+        // lit part and the shadowed part. It was invisible until the normal became trustworthy: fed the
+        // screen-derivative normal, the incidence was noise and the band was scattered into the speckle
+        // instead of drawn as a ring.
+        //
+        // A wall keeps it, because that is the geometry the falloff was written for and the one it earns
+        // its keep on: flat, broad, and capable of quantising a shadow boundary into steps metres long. A
+        // character cannot do that. Its grazing surfaces are small and curved, so the coarsest boundary
+        // they can produce is a few pixels across, and it lands where the surface is already turning away
+        // from every light in the room. Trading a ring of wrong brightness for that is a bad bargain.
         float shadowApply = smoothstep(0.0, @{o_shadow_min_incidence}, shadowIncidence);
+        shadowApply = (input.worldPos.w > 0.5) ? shadowApply : 1.0;
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
