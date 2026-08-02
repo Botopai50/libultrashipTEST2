@@ -1298,7 +1298,7 @@ bool Interpreter::ShadowCasterExcludedByRenderMode() const {
     // translucent so it can fade with distance, but what the texture holds is a leaf silhouette, not a sheet
     // of glass. Inside the bracket the exclusion lifts; the cutout requirement below it does not, so the
     // canopy casts leaves through its alpha or it casts nothing.
-    if (zmode == ZMODE_XLU && !mRdp->shadow_xlu_caster) {
+    if (zmode == ZMODE_XLU && !mRdp->shadow_scenery_caster) {
         return true;
     }
     // The zmode field alone, and nothing else. FORCE_BL was tested here too, on the reasoning that it marks
@@ -1381,11 +1381,17 @@ void Interpreter::ShadowCasterTexcoord(int tile, const struct LoadedVertex* v, f
 bool Interpreter::ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey) {
     const bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     const bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
-    // Inside an XLU caster bracket the render state cannot be the witness: the draw declares itself blended
-    // precisely so it can fade, which is the same state a sheet of glass sets. The bracket is the witness
-    // instead -- the game named this actor's canopy -- so the only remaining question is whether there is a
-    // texture whose alpha can be cut against, and that is what the rest of this function answers.
-    if (!texture_edge && !alpha_threshold && !mRdp->shadow_xlu_caster) {
+    // Inside a scenery bracket the render state cannot be the witness for TRANSLUCENT geometry: the draw
+    // declares itself blended precisely so it can fade, which is the same state a sheet of glass sets. The
+    // bracket is the witness instead -- the game named this actor's canopy -- so the only remaining question
+    // is whether there is a texture whose alpha can be cut against, which the rest of this function answers.
+    //
+    // Only for the translucent half of it. The same tree's trunk is ordinary opaque geometry and has no
+    // business being diverted through the cutout pipeline: it would pay a pipeline switch and five floats a
+    // vertex to clip against an alpha channel that is solid everywhere.
+    const bool sceneryCutout =
+        mRdp->shadow_scenery_caster && ((mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU);
+    if (!texture_edge && !alpha_threshold && !sceneryCutout) {
         return false;
     }
     const uint32_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
@@ -1729,7 +1735,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
     // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
     // cutout question, because a decal that happens to be alpha-tested is still a decal.
-    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_xlu_caster;
+    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster;
     const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
     if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
         // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
@@ -1781,31 +1787,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mShadowVerts.push_back(v_arr[si]->wz);
             }
         }
-    } else if (mShadowMapEnabled && mRdp->shadow_xlu_caster && !is_rect && !shadowCasterExcluded) {
-        // An actor's translucent-pass cutout geometry: tree leaves. It goes straight into the actor layer's
-        // alpha list and nowhere else -- deliberately skipping the bounding box and the opaque staging above,
-        // because both belong to the object-boundary machinery in the OPA stream and there is no boundary
-        // here: by the time the XLU stream runs, every actor has already drawn and been flushed.
-        //
-        // Which also means these captures miss this frame's pass and are rendered by the next one. That is
-        // structural -- the flush marker is in the opaque stream and the whole opaque stream runs first --
-        // and it is left alone rather than moved, because moving the flush behind the translucent stream
-        // would delay every OTHER caster by a frame to save a frame on geometry that does not move. A tree
-        // stands still; a character does not.
-        //
-        // No opaque fallback. Everywhere else a caster that cannot be cut against its alpha still casts its
-        // polygon, which is worse-looking but better than nothing; here the polygon is a quad with a leaf
-        // painted on it, so casting it would drop a rectangle on the ground. Without a texture to cut, this
-        // casts nothing.
-        if (shadowAlphaCaster) {
-            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
-            // Move the object mark past what was just captured. These triangles arrive after the frame's
-            // flush has reset the mark to zero, so the first actor of the NEXT frame to fail the size gate
-            // would resize the list back to that zero and take the leaves with it -- an object rollback
-            // deleting geometry that belongs to no object. Claiming the ground here makes that impossible
-            // whatever the gate is set to.
-            mShadowAlphaObjectMark = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].verts.size();
-        }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
                !shadowCasterExcluded && shadowAlphaCaster) {
         CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
@@ -1817,6 +1798,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // the room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
         // mShadowWorldCapture gates this to the frames that actually rebuild the cache; on every other frame
         // the room mesh costs nothing here and the cached list is reused as-is.
+        //
+        // Scenery actors arrive here too, through the same bracket (gSPShadowMapSceneryCasterBegin). A tree
+        // belongs in this layer and not the actor one: everything samples this layer, so its shadow lands on
+        // the player standing under it, which the actor layer -- the one characters skip so they cannot
+        // shadow each other -- can never do. Caching them alongside the room mesh is right for the same
+        // reason it is right for the room: they do not move.
         std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_WORLD];
         for (int si = 0; si < 3; si++) {
             dst.push_back(v_arr[si]->wx);
@@ -5270,12 +5257,17 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
             gfx->mRdp->shadow_world_caster = true; // gSPShadowMapWorldCasterBegin
             return false;
         }
+        // A scenery actor casts into the WORLD layer, so the bracket sets the world flag too -- that is what
+        // puts a tree's shadow on the player instead of only on the ground. The scenery flag beside it
+        // carries the cutout permission the world flag deliberately does not (see the RDP field).
         if (sizeOrSentinel <= -1.3e30f) {
-            gfx->mRdp->shadow_xlu_caster = true; // gSPShadowMapXluCasterBegin
+            gfx->mRdp->shadow_scenery_caster = true; // gSPShadowMapSceneryCasterBegin
+            gfx->mRdp->shadow_world_caster = true;
             return false;
         }
         if (sizeOrSentinel <= -1.1e30f) {
-            gfx->mRdp->shadow_xlu_caster = false; // gSPShadowMapXluCasterEnd
+            gfx->mRdp->shadow_scenery_caster = false; // gSPShadowMapSceneryCasterEnd
+            gfx->mRdp->shadow_world_caster = false;
             return false;
         }
         // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires

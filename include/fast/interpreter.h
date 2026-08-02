@@ -358,13 +358,13 @@ struct RDP {
     // SOH [Enhancement] Cascaded shadow maps: the current draws must not be shadowed at all (sky, sun,
     // moon). Receiving is otherwise implicit for anything with a world position.
     bool shadow_no_receive;
-    // SOH [Enhancement] Cascaded shadow maps: the current draws are an actor's TRANSLUCENT-pass geometry and
-    // are a cutout despite it -- a tree canopy, whose leaves are a texture punched out of a quad. Nothing
-    // infers this: the render mode says translucent and the alpha compare is often off entirely, so the game
-    // code names the actors it is true for (ToonShadowXluCaster) and brackets their XLU stream with
-    // gSPShadowMapXluCasterBegin. Separate from toon_shadow because that flag arms the OPA stream and the
-    // stencil volumes with it; this one only ever reaches the shadow map's cutout path.
-    bool shadow_xlu_caster;
+    // SOH [Enhancement] Cascaded shadow maps: the current draws belong to an actor that is really scenery --
+    // a tree. It is set alongside shadow_world_caster, not instead of it, and carries the one thing that
+    // flag does not: inside this bracket translucent geometry is taken as a CUTOUT rather than excluded,
+    // because a canopy declares itself blended in order to fade and the alpha compare is often off entirely.
+    // Nothing infers that from render state; the game names the actors it holds for. Kept separate from
+    // shadow_world_caster so the room's own bracket keeps excluding its water.
+    bool shadow_scenery_caster;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
