@@ -365,6 +365,11 @@ struct RDP {
     // Nothing infers that from render state; the game names the actors it holds for. Kept separate from
     // shadow_world_caster so the room's own bracket keeps excluding its water.
     bool shadow_scenery_caster;
+    // SOH [Enhancement] Cascaded shadow maps: capture is FORBIDDEN for these draws, whatever else is armed.
+    // Every other flag here grants capture and lets the renderer judge the render state; this one overrules
+    // them, for geometry whose exclusion is not a render-state question -- effects, which are light drawn as
+    // polygons and declare whatever mode suited the artist.
+    bool shadow_no_cast;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;

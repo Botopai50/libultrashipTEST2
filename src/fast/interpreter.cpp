@@ -1747,7 +1747,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
     // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
     // cutout question, because a decal that happens to be alpha-tested is still a decal.
-    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_scenery_caster;
+    const bool shadowArmed = !mRdp->shadow_no_cast &&
+                             (mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_scenery_caster);
     const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
     if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
         // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
@@ -5303,6 +5304,16 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // SOH [Enhancement] Cascaded shadow maps: the world-caster bracket rides further down the same
         // sentinel range, so it has to be tested BEFORE the flush -- the flush's own test (<= -1e29) would
         // otherwise swallow both of these.
+        // Tested before everything else: it is a veto, and the values sit past the rest of the range so the
+        // chain below never has to make room for them.
+        if (sizeOrSentinel <= -7.5e30f) {
+            gfx->mRdp->shadow_no_cast = true; // gSPShadowMapCasterOff
+            return false;
+        }
+        if (sizeOrSentinel <= -6.5e30f) {
+            gfx->mRdp->shadow_no_cast = false; // gSPShadowMapCasterOn
+            return false;
+        }
         if (sizeOrSentinel <= -5.5e30f) {
             gfx->RenderShadowMap(); // gSPShadowMapFlush
             return false;

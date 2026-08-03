@@ -2875,6 +2875,20 @@ typedef union Gfx {
 // where he was two frames ago, which while walking is most of a shadow's width. Run after the actors and
 // the pass consumes the frame's own captures; only the room's one-frame wait remains, and that is
 // structural: the receiver is drawn before the caster exists.
+// SOH [Enhancement] Cascaded shadow maps: forbid capture outright for the draws in between, whatever else
+// is armed. Every other marker here GRANTS capture and the renderer decides from render state; this one
+// overrules all of them, and it exists because some geometry is not a question of render state at all.
+//
+// Effects are the case. A sword trail, a particle, a soft sprite: these are light and motion drawn as
+// polygons, and their render modes say whatever suited the artist -- the sword trail declares an opaque
+// zmode, so the translucency test lets it through exactly as Navi's glow did. Chasing which flag happened
+// to be armed when each one drew is a losing game; a veto is decided by where the draw sits in the frame,
+// which is knowledge the game has and the renderer does not.
+//
+// Emitted into BOTH display lists, since effects draw into both.
+#define gSPShadowMapCasterOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -8.0e30f)
+#define gSPShadowMapCasterOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -7.0e30f)
+
 #define gSPShadowMapFlush(pkt) gSPToonShadow(pkt, 0, 0, 0, -6.0e30f)
 #define gSPShadowMapWorldCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -2.0e30f)
 #define gSPShadowMapWorldCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -3.0e30f)
