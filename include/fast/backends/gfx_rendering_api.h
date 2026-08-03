@@ -228,6 +228,16 @@ class GfxRenderingAPI {
         mShadowCullMode = mode;
     }
 
+    // The two biases that were compile-time constants. depthBiasWorld is a flat offset in world units,
+    // divided into each cascade's own depth range on upload; slopeBias multiplies the polygon's own depth
+    // gradient and is handed to the rasterizer. Separate from SetShadowMapParams for the same reason as the
+    // incidence band: that call already takes ten arguments and is made from half a dozen early-exit paths
+    // that have nothing to say about these.
+    virtual void SetShadowMapBias(float depthBiasWorld, float slopeBias) {
+        mShadowDepthBiasWorld = depthBiasWorld;
+        mShadowSlopeBias = slopeBias;
+    }
+
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -255,6 +265,8 @@ class GfxRenderingAPI {
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
     int mShadowCullMode = SHADOW_MAP_DEFAULT_CULL_MODE;
+    float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
+    float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

@@ -1679,7 +1679,9 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
         return mShadowRasterizerState.Get();
     }
 
-    float slope = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
+    // The slope is also the cache key below, so a value changed while the game runs rebuilds the state on
+    // its own -- no extra invalidation needed for this one.
+    float slope = mShadowSlopeBias;
     const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
                                (lightViewProj[8] * lightViewProj[8]));
     if (sx > 1e-9f) {
@@ -2020,7 +2022,7 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         // the same trick the texel size uses, and it keeps one tuning number meaning one physical distance
         // in every cascade instead of drifting by a factor of fifty between the near and far ones.
         const float sz = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
-        mPerShadowCbData.shadow_depth_bias[c] = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD * sz;
+        mPerShadowCbData.shadow_depth_bias[c] = mShadowDepthBiasWorld * sz;
     }
     mShadowCbDirty = true;
 }

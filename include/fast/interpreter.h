@@ -456,7 +456,7 @@ class Interpreter {
                             const float lightDir[3], float blendFraction, float normalOffset, float strength,
                             float filterWidth, float minCasterSize, float debugMode,
                             float edgeHardness, float edgeHardnessFar, float minIncidence, float fullIncidence,
-                            float minHardnessScale, int cullMode) {
+                            float minHardnessScale, int cullMode, float depthBiasWorld, float slopeBias) {
         mShadowMapEnabled = enabled;
         mShadowMapCascadeCount = cascadeCount < 1                       ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
@@ -486,6 +486,7 @@ class Interpreter {
         if (mRapi != nullptr) {
             mRapi->SetShadowMapIncidence(minIncidence, fullIncidence, minHardnessScale);
             mRapi->SetShadowMapCullMode(cullMode);
+            mRapi->SetShadowMapBias(depthBiasWorld, slopeBias);
         }
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
