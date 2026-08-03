@@ -1950,6 +1950,23 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mPerShadowCbData.shadow_filter[1] = mShadowDebug;
     mPerShadowCbData.shadow_filter[2] = mShadowEdgeHardness;
     mPerShadowCbData.shadow_filter[3] = mShadowEdgeHardnessFar;
+    // Guarded rather than trusted: these come straight from user settings, and the shader divides the band
+    // between them with smoothstep, which returns garbage if the two ever cross.
+    {
+        float minInc = mShadowMinIncidence < 0.0f ? 0.0f : (mShadowMinIncidence > 1.0f ? 1.0f : mShadowMinIncidence);
+        float fullInc =
+            mShadowFullIncidence < 0.0f ? 0.0f : (mShadowFullIncidence > 1.0f ? 1.0f : mShadowFullIncidence);
+        if (fullInc < minInc + 1e-3f) {
+            fullInc = minInc + 1e-3f;
+        }
+        float floorScale = mShadowMinHardnessScale < 0.0f
+                               ? 0.0f
+                               : (mShadowMinHardnessScale > 1.0f ? 1.0f : mShadowMinHardnessScale);
+        mPerShadowCbData.shadow_incidence[0] = minInc;
+        mPerShadowCbData.shadow_incidence[1] = fullInc;
+        mPerShadowCbData.shadow_incidence[2] = floorScale;
+        mPerShadowCbData.shadow_incidence[3] = 0.0f;
+    }
 
     for (int c = 0; c < count; c++) {
         const float* m = &mShadowViewProj[c * 16];
@@ -2210,9 +2227,6 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         // Spliced in rather than uploaded: it is a fixed policy value, and having it as a literal lets the
         // compiler fold the smoothstep that uses it.
-        { "o_shadow_min_incidence", SHADOW_MAP_MIN_INCIDENCE },
-        { "o_shadow_full_incidence", SHADOW_MAP_FULL_INCIDENCE },
-        { "o_shadow_min_hardness_scale", SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },

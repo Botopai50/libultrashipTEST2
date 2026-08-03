@@ -130,6 +130,17 @@ cbuffer PerShadowCB : register(b3) {
     // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
     //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
     float4 shadow_filter;
+    // The incidence band, on SCENERY only (see the note at shadowApply). These decide what happens on a
+    // surface turning edge-on to the light, which is where the shadow map stops being able to resolve a
+    // boundary and starts printing its texel grid as wedges.
+    //   x = incidence at which the shadow is fully applied; below it the term fades out entirely
+    //   y = incidence at which the edge hardening is at full strength
+    //   z = floor the hardening tapers to between the two, as a fraction
+    //   w = unused
+    // In the constant buffer rather than as template symbols so they can be dialled while the game runs:
+    // they are a trade-off with no single right answer -- lifting the shadow earlier hides the wedges and
+    // costs walls their shadow -- and a compile-time symbol makes every trial a rebuild.
+    float4 shadow_incidence;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -753,9 +764,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // core, and neither of those needs a hard edge -- both are contrast, and a ramp keeping most of its
         // width still delivers them. Only the last stretch towards an actual step is what traces the texel
         // boundary into facets, so that is the only part the taper takes away.
-        shadowHardness *= lerp(@{o_shadow_min_hardness_scale}, 1.0,
-                               smoothstep(@{o_shadow_min_incidence}, @{o_shadow_full_incidence},
-                                          shadowIncidence));
+        shadowHardness *= lerp(shadow_incidence.z, 1.0,
+                               smoothstep(shadow_incidence.x, shadow_incidence.y, shadowIncidence));
         // Now remap. What the filter returned is coverage; a narrow ramp centred on half coverage collapses
         // that gradient into an edge. This must come after the taper -- it is the only reader of
         // shadowHardness, so anything written to it below this point would be discarded by the compiler.
@@ -794,7 +804,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // character cannot do that. Its grazing surfaces are small and curved, so the coarsest boundary
         // they can produce is a few pixels across, and it lands where the surface is already turning away
         // from every light in the room. Trading a ring of wrong brightness for that is a bad bargain.
-        float shadowApply = smoothstep(0.0, @{o_shadow_min_incidence}, shadowIncidence);
+        float shadowApply = smoothstep(0.0, shadow_incidence.x, shadowIncidence);
         shadowApply = (input.worldPos.w > 0.5) ? shadowApply : 1.0;
         [branch]
         if (shadow_filter.y > 1.5) {

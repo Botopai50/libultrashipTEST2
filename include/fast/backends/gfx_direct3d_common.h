@@ -47,6 +47,9 @@ struct PerShadowCB {
     float shadow_params[4];
     // x = PCF kernel radius in texels, y = debug mode, z = edge hardness, w = hardness in the far cascade.
     float shadow_filter[4];
+    // x = incidence at which a scenery receiver takes the shadow in full, y = incidence at which the edge
+    // hardening reaches full strength, z = the floor that hardening tapers to between the two, w unused.
+    float shadow_incidence[4];
 };
 
 struct PerDrawCB {

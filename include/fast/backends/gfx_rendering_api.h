@@ -209,6 +209,16 @@ class GfxRenderingAPI {
         mShadowEdgeHardnessFar = edgeHardnessFar;
     }
 
+    // The incidence band that governs what a SCENERY receiver does as it turns edge-on to the light. Its own
+    // entry point rather than three more arguments on the call above, which already takes ten and is invoked
+    // from half a dozen early-exit paths in the cascade fit -- every one of which would have to grow with it
+    // for no reason, since none of them has anything to say about this.
+    virtual void SetShadowMapIncidence(float minIncidence, float fullIncidence, float minHardnessScale) {
+        mShadowMinIncidence = minIncidence;
+        mShadowFullIncidence = fullIncidence;
+        mShadowMinHardnessScale = minHardnessScale;
+    }
+
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -232,6 +242,9 @@ class GfxRenderingAPI {
     float mShadowDebug = 0.0f;
     float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
+    float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
+    float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
+    float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
