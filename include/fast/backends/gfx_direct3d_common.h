@@ -153,7 +153,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool SupportsShadowMap() override;
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
     void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) override;
-    void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) override;
+    void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) override;
     bool SupportsShadowMapAlphaCasters() override;
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
@@ -196,7 +196,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // buffer the actor upload would clobber the world contents on every frame, forcing the room mesh --
     // the largest list by far -- to be re-uploaded forever. Kept apart, the world buffer is written once
     // per room and then only bound and drawn.
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb[SHADOW_MAP_LAYERS];
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowCasterVb[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS];
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerState;
     // Per-cascade copies of that state, differing only in the slope-scaled bias. The rasterizer takes one
     // slope value per state rather than per draw, and the slope's effect is measured in texels -- so the
@@ -206,13 +206,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_CASCADES];
     float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_CASCADES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
-    size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS] = {}; // capacity of each buffer, in vertices
+    size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
     // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
     // the next cascade nor for the next frame. The interpreter guarantees the pointer identity is
     // meaningful: a layer whose contents change gets a fresh push into a cleared vector, and the world
     // cache is only ever swapped wholesale when it is genuinely rebuilt.
-    const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS] = {};
-    size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS] = {};
+    const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     int mShadowCurrentLayer = 0; // layer named by the most recent ShadowMapBeginCascade
     // SOH [Enhancement] Alpha-cutout caster pipeline: a second vertex shader (position + uv), pixel shader
     // (sample and clip) and layout, used for foliage so the depth map records the leaf instead of the quad.

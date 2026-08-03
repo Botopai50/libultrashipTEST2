@@ -152,7 +152,10 @@ class GfxRenderingAPI {
     // Submit caster geometry into the cascade opened by ShadowMapBeginCascade: `vertexCount` vertices of
     // 3 floats each (world-space xyz), as a plain triangle list. Depth-only -- no textures, no combiner,
     // no lighting -- which is why casters can be fed in raw rather than through the normal draw path.
-    virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) {
+    // `slot` selects which of the layer's caster lists this is (see SHADOW_MAP_CASTER_SLOTS). Each slot
+    // keeps its own buffer, so the world layer's cached room mesh is not disturbed by the per-frame scenery
+    // list drawn beside it.
+    virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0) {
     }
 
     // Alpha-cutout casters, in two parts because the geometry is uploaded once but drawn once per material.

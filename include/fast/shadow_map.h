@@ -36,6 +36,23 @@
 #define SHADOW_MAP_LAYER_ACTORS 1
 #define SHADOW_MAP_MAX_SLICES (SHADOW_MAP_MAX_CASCADES * SHADOW_MAP_LAYERS)
 
+// How many independent caster lists a single layer may draw. Two, and only the world layer uses the second.
+//
+// The world layer holds the room mesh, which is cached: it is uploaded once and then only bound and drawn,
+// which is what keeps a large room from re-uploading its whole mesh in every cascade of every frame. But
+// scenery that the game spawns as an ACTOR belongs in that same layer -- a gate's shadow should fall on
+// everything, the way a wall's does -- and an actor can move, so it cannot go in a cache keyed on geometry
+// that only notices when the geometry itself changes. The Hyrule Castle gate slides open; cached, its
+// shadow would stay shut.
+//
+// So the layer draws two lists: the cached room, and a per-frame one for scenery actors. They need separate
+// buffers rather than separate calls into one, because the "already holds this list" check is what the
+// caching is made of -- alternating two lists through a single buffer would defeat it on every cascade and
+// hand back exactly the cost the cache exists to avoid.
+#define SHADOW_MAP_CASTER_SLOTS 2
+#define SHADOW_MAP_CASTER_SLOT_MAIN 0    // the room mesh in the world layer; characters in the actor layer
+#define SHADOW_MAP_CASTER_SLOT_SCENERY 1 // scenery actors, world layer only, rebuilt every frame
+
 // Per-cascade square resolution bounds. 4096 is the largest the near cascade is ever asked for, and
 // anything under 256 produces texels so large that the bias needed to hide the acne swallows the
 // shadow itself.

@@ -1421,8 +1421,10 @@ bool Interpreter::ShadowCasterIsAlphaTested(int tile, TextureCacheKey* outKey) {
 }
 
 void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& key, struct LoadedVertex* const v[3],
-                                             float texWidth, float texHeight) {
-    ShadowAlphaCasters& dst = mShadowAlphaCasters[layer];
+                                             float texWidth, float texHeight, ShadowAlphaCasters* into) {
+    // `into` overrides the per-layer list. Only the scenery bucket uses it: that geometry is drawn into the
+    // world layer's slices but kept in its own per-frame list, so it cannot share the layer's.
+    ShadowAlphaCasters& dst = (into != nullptr) ? *into : mShadowAlphaCasters[layer];
     if (dst.verts.size() >= kShadowMapCasterBudgetFloats) {
         return;
     }
@@ -1745,7 +1747,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float shadowTexW = 1.0f, shadowTexH = 1.0f;
     // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
     // cutout question, because a decal that happens to be alpha-tested is still a decal.
-    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster;
+    const bool shadowArmed = mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_scenery_caster;
     const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
     if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
         // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
@@ -1795,6 +1797,24 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mShadowVerts.push_back(v_arr[si]->wx);
                 mShadowVerts.push_back(v_arr[si]->wy);
                 mShadowVerts.push_back(v_arr[si]->wz);
+            }
+        }
+    } else if (mShadowMapEnabled && mRdp->shadow_scenery_caster && !is_rect && !shadowCasterExcluded) {
+        // Scenery the game spawns as an actor: a gate, a fence, a tree. It is drawn into the WORLD layer,
+        // because everything samples that layer and a gate's shadow belongs on the player the way a wall's
+        // does -- but into its own per-frame list rather than the cache beside the room mesh, because the
+        // cache notices when geometry CHANGES and not when it MOVES, and the castle gate slides open.
+        //
+        // Ungated by mShadowWorldCapture for the same reason: that flag exists to skip re-walking a cached
+        // list, and there is no cache here to skip.
+        if (shadowAlphaCaster) {
+            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH,
+                                       &mShadowAlphaScenery);
+        } else if (mShadowSceneryCasters.size() < kShadowMapCasterBudgetFloats) {
+            for (int si = 0; si < 3; si++) {
+                mShadowSceneryCasters.push_back(v_arr[si]->wx);
+                mShadowSceneryCasters.push_back(v_arr[si]->wy);
+                mShadowSceneryCasters.push_back(v_arr[si]->wz);
             }
         }
     } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
@@ -3254,6 +3274,12 @@ void Interpreter::RenderShadowMap() {
 
         mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS]);
         mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].clear();
+        // Scenery actors roll exactly like characters. They are drawn in the world layer, but they are not
+        // in its cache and must not be: a gate that opens has to be recaptured where it now stands.
+        mShadowSceneryReady.swap(mShadowSceneryCasters);
+        mShadowSceneryCasters.clear();
+        mShadowAlphaSceneryReady.swap(mShadowAlphaScenery);
+        mShadowAlphaScenery.clear();
         mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS]);
         mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].clear();
         // The object mark indexes into the list that was just emptied, so it has to come back to the start
@@ -3279,7 +3305,8 @@ void Interpreter::RenderShadowMap() {
         return;
     }
     if (mShadowMapWorldCache.size() + mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() +
-            mShadowAlphaWorldCache.verts.size() + mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts.size() <
+            mShadowSceneryReady.size() + mShadowAlphaWorldCache.verts.size() +
+            mShadowAlphaSceneryReady.verts.size() + mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts.size() <
         9) {
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
                                   mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
@@ -3500,6 +3527,7 @@ void Interpreter::RenderShadowMap() {
     // Texture ids are resolved once per frame, not once per cascade: the lookup is the same for all eight
     // slices, and a range whose texture has been evicted must be skipped consistently across them.
     ResolveShadowAlphaTextures(mShadowAlphaWorldCache);
+    ResolveShadowAlphaTextures(mShadowAlphaSceneryReady);
     ResolveShadowAlphaTextures(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
 
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
@@ -3510,16 +3538,33 @@ void Interpreter::RenderShadowMap() {
             (l == SHADOW_MAP_LAYER_WORLD) ? mShadowMapWorldCache : mShadowMapCastersReady[l];
         const ShadowAlphaCasters& alpha =
             (l == SHADOW_MAP_LAYER_WORLD) ? mShadowAlphaWorldCache : mShadowAlphaReady[l];
+        // Scenery actors ride in the world layer's slices from their own buffer slot. Separate slots is what
+        // keeps the two lists from evicting each other: the cached room mesh stays uploaded across cascades
+        // and frames while the scenery list beside it is replaced every frame.
+        const bool sceneryHere = (l == SHADOW_MAP_LAYER_WORLD);
         for (int c = 0; c < mShadowMapCascadeCount; c++) {
             mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16]);
             if (casters.size() >= 9) {
-                mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3);
+                mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3, SHADOW_MAP_CASTER_SLOT_MAIN);
+            }
+            if (sceneryHere && mShadowSceneryReady.size() >= 9) {
+                mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,
+                                            SHADOW_MAP_CASTER_SLOT_SCENERY);
             }
             // Alpha-cutout casters second, so the one big opaque batch keeps the fast path to itself and the
             // pipeline switch happens once per cascade rather than being interleaved.
             if (alpha.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
                 for (const ShadowAlphaRange& r : alpha.ranges) {
+                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3) {
+                        mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
+                    }
+                }
+            }
+            if (sceneryHere && mShadowAlphaSceneryReady.VertexCount() >= 3) {
+                mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
+                                                  mShadowAlphaSceneryReady.VertexCount());
+                for (const ShadowAlphaRange& r : mShadowAlphaSceneryReady.ranges) {
                     if (r.textureId != UINT32_MAX && r.vertexCount >= 3) {
                         mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
                     }
@@ -3538,10 +3583,11 @@ void Interpreter::RenderShadowMap() {
         static int sCensusFrames = 0;
         if (++sCensusFrames >= 60) {
             sCensusFrames = 0;
-            SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), actors {} tris (+{} "
-                        "cutout in {} batches)",
+            SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), scenery {} tris (+{} "
+                        "cutout in {} batches), actors {} tris (+{} cutout in {} batches)",
                         mShadowMapWorldCache.size() / 9, mShadowAlphaWorldCache.VertexCount() / 3,
-                        mShadowAlphaWorldCache.ranges.size(),
+                        mShadowAlphaWorldCache.ranges.size(), mShadowSceneryReady.size() / 9,
+                        mShadowAlphaSceneryReady.VertexCount() / 3, mShadowAlphaSceneryReady.ranges.size(),
                         mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS].size() / 9,
                         mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].VertexCount() / 3,
                         mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].ranges.size());
@@ -5282,12 +5328,10 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // carries the cutout permission the world flag deliberately does not (see the RDP field).
         if (sizeOrSentinel <= -1.3e30f) {
             gfx->mRdp->shadow_scenery_caster = true; // gSPShadowMapSceneryCasterBegin
-            gfx->mRdp->shadow_world_caster = true;
             return false;
         }
         if (sizeOrSentinel <= -1.1e30f) {
             gfx->mRdp->shadow_scenery_caster = false; // gSPShadowMapSceneryCasterEnd
-            gfx->mRdp->shadow_world_caster = false;
             return false;
         }
         // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires

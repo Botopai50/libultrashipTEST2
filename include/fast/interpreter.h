@@ -501,6 +501,10 @@ class Interpreter {
                 mShadowAlphaReady[l].clear();
             }
             mShadowAlphaWorldCache.clear();
+            mShadowSceneryCasters.clear();
+            mShadowSceneryReady.clear();
+            mShadowAlphaScenery.clear();
+            mShadowAlphaSceneryReady.clear();
             mShadowWorldKeyAccum = 0;
             mShadowWorldKeyCached = 0;
             mShadowWorldCapture = true;
@@ -756,7 +760,21 @@ class Interpreter {
     // not changed. Consecutive triangles almost always share a texture, so this keeps the range count near
     // the material count rather than near the triangle count.
     void CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& key, struct LoadedVertex* const v[3],
-                                    float texWidth, float texHeight);
+                                    float texWidth, float texHeight, ShadowAlphaCasters* into = nullptr);
+
+    // SOH [Enhancement] Cascaded shadow maps: scenery that the game spawns as an ACTOR -- a gate, a fence, a
+    // tree. It belongs in the WORLD layer, because everything samples that layer and a gate's shadow should
+    // fall on the player the way a wall's does. But it cannot live in the cache beside the room mesh: the
+    // cache is keyed on which geometry is drawn, not on where it is, and an actor moves. The Hyrule Castle
+    // gate slides open; cached, its shadow would stay shut.
+    //
+    // So it is double-buffered per frame exactly like the character layer, and drawn into the world layer's
+    // slices from their own buffer slot (SHADOW_MAP_CASTER_SLOT_SCENERY) so the cached room mesh beside it is
+    // never evicted.
+    std::vector<float> mShadowSceneryCasters; // filling this frame
+    std::vector<float> mShadowSceneryReady;   // what the pass draws
+    ShadowAlphaCasters mShadowAlphaScenery;
+    ShadowAlphaCasters mShadowAlphaSceneryReady;
 
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)

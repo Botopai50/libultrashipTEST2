@@ -1746,8 +1746,15 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // the separate capture vector, so its data pointer necessarily changes whenever its contents do.
         // Keeping the record alive across passes is the whole point -- an unchanged room mesh then costs one
         // bind and one draw per cascade, with no upload at all.
-        mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS] = nullptr;
-        mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS] = 0;
+        mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] =
+            nullptr;
+        mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] = 0;
+        // The world layer's SCENERY slot is double-buffered per frame exactly like the actor layer, so it
+        // gets the same treatment. Only that layer's MAIN slot -- the cached room mesh -- keeps its record
+        // across passes, which is the whole reason the slots are separate.
+        mShadowLastCasterPtr[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] =
+            nullptr;
+        mShadowLastCasterCount[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] = 0;
         // The alpha list gets no such exemption: it shares one buffer between the two layers, so whatever it
         // holds is overwritten within the pass anyway, and the actor half is double-buffered exactly like the
         // opaque one. Forget it wholesale rather than reason about which half is safe.
@@ -1791,13 +1798,17 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }
 
-void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount) {
+void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) {
     if (!mShadowPassActive || worldXyz == nullptr || vertexCount < 3) {
         return;
     }
     vertexCount -= vertexCount % 3; // whole triangles only
 
-    const int layer = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
+    // One buffer per (layer, slot). The slot is what lets the world layer draw its cached room mesh and a
+    // per-frame scenery list in the same cascade without either one evicting the other's upload.
+    const int layer = layerIndex * SHADOW_MAP_CASTER_SLOTS + slotIndex;
     const UINT stride = 3 * sizeof(float);
     const UINT offset = 0;
 
