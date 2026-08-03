@@ -222,12 +222,6 @@ class GfxRenderingAPI {
         mShadowMinHardnessScale = minHardnessScale;
     }
 
-    // Which facings the depth pass records (SHADOW_MAP_CULL_*). Nothing in the sampling path reads this; it
-    // only reaches the rasterizer state the caster draws use.
-    virtual void SetShadowMapCullMode(int mode) {
-        mShadowCullMode = mode;
-    }
-
     // The two biases that were compile-time constants. depthBiasWorld is a flat offset in world units,
     // divided into each cascade's own depth range on upload; slopeBias multiplies the polygon's own depth
     // gradient and is handed to the rasterizer. Separate from SetShadowMapParams for the same reason as the
@@ -264,7 +258,6 @@ class GfxRenderingAPI {
     float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
-    int mShadowCullMode = SHADOW_MAP_DEFAULT_CULL_MODE;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
     int8_t mCurrentDepthTest = 0;

@@ -1698,19 +1698,16 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
         slope = 0.0f;
     }
 
-    // Front-face culling records only the far side of a caster, so the surface the light strikes is not in
-    // the map to be compared against itself. The cull mode is part of the cache key, not just the slope --
-    // these states are rebuilt only when their key changes, so a mode changed at runtime would otherwise sit
-    // behind whatever was already built and appear to do nothing.
-    const D3D11_CULL_MODE cull = (mShadowCullMode == SHADOW_MAP_CULL_FRONT)  ? D3D11_CULL_FRONT
-                                 : (mShadowCullMode == SHADOW_MAP_CULL_BACK) ? D3D11_CULL_BACK
-                                                                             : D3D11_CULL_NONE;
-    if (mShadowRasterizerCascade[cascadeIndex] == nullptr || mShadowRasterizerCascadeSlope[cascadeIndex] != slope ||
-        mShadowRasterizerCascadeCull[cascadeIndex] != cull) {
+    // Both facings recorded. Front-face culling was tried here and removed: it does remove self-shadowing
+    // acne at the source, by storing only the far side of a caster so the lit surface is never in the map to
+    // be compared against itself -- but it needs the caster to HAVE a far side, and this game's scenery is
+    // largely modelled from one side only. Those surfaces have nothing left once their front is culled and
+    // stop casting entirely.
+    if (mShadowRasterizerCascade[cascadeIndex] == nullptr || mShadowRasterizerCascadeSlope[cascadeIndex] != slope) {
         D3D11_RASTERIZER_DESC rast_desc;
         ZeroMemory(&rast_desc, sizeof(rast_desc));
         rast_desc.FillMode = D3D11_FILL_SOLID;
-        rast_desc.CullMode = cull;
+        rast_desc.CullMode = D3D11_CULL_NONE;
         rast_desc.DepthClipEnable = FALSE;
         rast_desc.DepthBias = 0;
         rast_desc.SlopeScaledDepthBias = slope;
@@ -1723,7 +1720,6 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
         }
         mShadowRasterizerCascade[cascadeIndex] = built;
         mShadowRasterizerCascadeSlope[cascadeIndex] = slope;
-        mShadowRasterizerCascadeCull[cascadeIndex] = cull;
     }
     return mShadowRasterizerCascade[cascadeIndex].Get();
 }

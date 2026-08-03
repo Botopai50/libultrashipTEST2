@@ -456,7 +456,7 @@ class Interpreter {
                             const float lightDir[3], float blendFraction, float normalOffset, float strength,
                             float filterWidth, float minCasterSize, float debugMode,
                             float edgeHardness, float edgeHardnessFar, float minIncidence, float fullIncidence,
-                            float minHardnessScale, int cullMode, float depthBiasWorld, float slopeBias) {
+                            float minHardnessScale, float depthBiasWorld, float slopeBias) {
         mShadowMapEnabled = enabled;
         mShadowMapCascadeCount = cascadeCount < 1                       ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
@@ -485,7 +485,6 @@ class Interpreter {
         // a copy that could drift out of step with the one the constant buffer holds.
         if (mRapi != nullptr) {
             mRapi->SetShadowMapIncidence(minIncidence, fullIncidence, minHardnessScale);
-            mRapi->SetShadowMapCullMode(cullMode);
             mRapi->SetShadowMapBias(depthBiasWorld, slopeBias);
         }
         if (!enabled) {
