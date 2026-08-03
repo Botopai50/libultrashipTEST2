@@ -222,6 +222,12 @@ class GfxRenderingAPI {
         mShadowMinHardnessScale = minHardnessScale;
     }
 
+    // Which facings the depth pass records (SHADOW_MAP_CULL_*). Nothing in the sampling path reads this; it
+    // only reaches the rasterizer state the caster draws use.
+    virtual void SetShadowMapCullMode(int mode) {
+        mShadowCullMode = mode;
+    }
+
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -248,6 +254,7 @@ class GfxRenderingAPI {
     float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
+    int mShadowCullMode = SHADOW_MAP_DEFAULT_CULL_MODE;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

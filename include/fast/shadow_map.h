@@ -105,6 +105,23 @@
 // the lines of constant depth in the map run horizontally across such a wall.
 #define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
 
+// Which faces the depth pass keeps. Front-face culling records only the BACK of each caster, so the surface
+// the light actually strikes is not in the map at all and cannot be compared against itself -- self-shadowing
+// acne stops being something the biases have to hide, because the geometry that caused it was never stored.
+//
+// It assumes CLOSED casters, and that is the whole question here. The technique works by storing the far
+// side of a solid, so a receiver's own front face sits safely in front of the recorded depth. A surface with
+// no far side -- a wall modelled from one side only, a terrain plane, a billboard -- has nothing left once
+// its front is culled, and casts NOTHING. This game's scenery is largely built that way, which is why the
+// default is off and this is a switch rather than a rewrite of the bias.
+//
+// Off is exactly the behaviour that existed before it was a setting: both facings recorded, which is also
+// the only correct answer for open geometry.
+#define SHADOW_MAP_CULL_NONE 0
+#define SHADOW_MAP_CULL_FRONT 1
+#define SHADOW_MAP_CULL_BACK 2
+#define SHADOW_MAP_DEFAULT_CULL_MODE SHADOW_MAP_CULL_NONE
+
 // Ceiling on what that slope term may displace a receiver by, in WORLD units.
 //
 // The rasterizer takes one slope value per state, not per draw, so this cannot be capped inside the shader

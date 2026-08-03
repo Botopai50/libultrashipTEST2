@@ -205,6 +205,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // hysteresis makes rare; null means "use the shared state above".
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_CASCADES];
     float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_CASCADES] = {};
+    // Part of the same cache key as the slope: a cull mode changed while the game runs has to force these
+    // states to be rebuilt, or it would sit behind the ones already built and look like it did nothing.
+    D3D11_CULL_MODE mShadowRasterizerCascadeCull[SHADOW_MAP_MAX_CASCADES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
     // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
