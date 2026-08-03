@@ -58,7 +58,7 @@
 // shadow itself.
 #define SHADOW_MAP_MIN_RESOLUTION 256
 #define SHADOW_MAP_MAX_RESOLUTION 4096
-#define SHADOW_MAP_DEFAULT_RESOLUTION 2048
+#define SHADOW_MAP_DEFAULT_RESOLUTION 4096
 
 // Default split distances (world units from the camera) for the four cascades. These bound the far
 // plane of each cascade's ortho projection; the near plane of cascade N is the far plane of N-1.
@@ -67,8 +67,8 @@
 // which the application captures casters at all. These values are the range; the cascade count selects how
 // much of it is used, so lowering the count shortens the shadowed range with it.
 #define SHADOW_MAP_DEFAULT_SPLIT_0 150.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_1 350.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_2 1500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_1 500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_2 2500.0f
 #define SHADOW_MAP_DEFAULT_SPLIT_3 6000.0f
 
 // Fraction of a cascade's range over which it cross-fades into the next one. The shader samples both
@@ -88,10 +88,12 @@
 // Expressed in world units and divided by each cascade's own depth range at upload time, one value means
 // the same physical offset everywhere. The slope term stays with the rasterizer, where being relative to
 // the polygon's own gradient is exactly what it should be.
-// 1.0 rather than 2.0: the normal-offset term below now does real work on the room mesh (the shader
-// recovers a face normal from screen derivatives where no vertex normal exists), so the constant term no
-// longer has to carry the whole load, and every unit of it is peter panning.
-#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 1.0f
+// 4.0, and carrying the whole load: the normal offset below is off in the tuned configuration, so this and
+// the slope term are the only two left. That is a deliberate trade and not an oversight -- the offset moves
+// the sample sideways, which fixes acne on curved and grazing surfaces more cheaply than this does, but it
+// also creeps shadows away from the corners where two surfaces meet. Paying for it here instead costs
+// detachment along the light ray, which at this scale reads as a soft contact rather than a gap.
+#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 4.0f
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
 // texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
 // light and large on one edge-on to it, which is where depth runs away across a texel and acne appears.
@@ -149,12 +151,13 @@
 // The shader scales this by the sine of the angle between the surface and the light, so it is the offset at
 // a fully grazing angle, not everywhere. That is where acne lives; a surface square to the light needs
 // nothing and now pays nothing.
-// 3.0 rather than 2.0: the offset costs nothing on the surfaces where its cost was visible, so it can afford
-// to be larger on the ones where it does the work. It remains the primary defence against self-shadowing,
-// having replaced both the front-face culling that caused peter panning and half of the constant bias that
-// did the same -- and now most of the slope bias too, which had to be capped per cascade to stop it
-// detaching distant shadows.
-#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 3.0f
+// Zero in the tuned configuration, which is a choice and not a fallback. Sideways is the cheapest direction
+// to move a sample -- it leaves the light ray and so buys acne removal without detachment -- but it moves the
+// sample off the surface in world space, and where two surfaces meet that pulls the shadow out of the corner.
+// The constant bias absorbs the work instead: it detaches, but it detaches evenly, and an even offset reads
+// as a soft contact where a missing corner reads as a mistake. Raise this if acne returns on curved
+// geometry; the corners are what it costs.
+#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 0.0f
 
 // Ceiling on that push, in WORLD units, applied per cascade before the shader sees it.
 //
@@ -163,9 +166,8 @@
 // towards the light before comparing. The shadow lifts off whatever cast it, by more the further away the
 // receiver is, because the cascade it lands in is coarser. That is peter panning that grows with distance.
 //
-// 3.0 is under a tenth of a character's height, so the detachment stays below what the eye reads as a gap,
-// and it only starts binding partway through the third cascade -- the near cascades keep tracking their
-// texel exactly as before.
+// The ceiling only matters when the offset is on. Off, as the tuned configuration has it, nothing here
+// binds: the shader multiplies by an offset of zero and the sample stays exactly on the surface.
 #define SHADOW_MAP_MAX_NORMAL_OFFSET_WORLD 3.0f
 
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
@@ -195,7 +197,7 @@
 // So sharper distant shadows are not available from the filter. That is a texel problem, and both cures are
 // priced: halve Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
 // Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
-#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.4f
+#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.6f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
 // Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at
@@ -300,7 +302,7 @@
 //
 // 0.75: clearly an edge, with the ramp still wide enough to carry some antialiasing. 0 leaves the filtered
 // gradient exactly as it was; 1 is very nearly binary.
-#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.75f
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.6f
 
 // Edge hardness in the FURTHEST cascade, ramped to from the value above across the cascade ladder.
 //
@@ -317,7 +319,7 @@
 //
 // 1.0, a near-binary edge in the last cascade: 5.2 world units of transition down to 1.05. Set it equal to
 // SHADOW_MAP_DEFAULT_EDGE_HARDNESS for the old uniform behaviour.
-#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR 1.0f
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR 0.6f
 
 // How squarely the light must strike a surface for the shadow map to be trusted on it, as the cosine of
 // the angle between the surface normal and the light. Below this the shadow term is faded out entirely.

@@ -130,16 +130,17 @@ cbuffer PerShadowCB : register(b3) {
     // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
     //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
     float4 shadow_filter;
-    // The incidence band, on SCENERY only (see the note at shadowApply). These decide what happens on a
-    // surface turning edge-on to the light, which is where the shadow map stops being able to resolve a
-    // boundary and starts printing its texel grid as wedges.
-    //   x = incidence at which the shadow is fully applied; below it the term fades out entirely
-    //   y = incidence at which the edge hardening is at full strength
-    //   z = floor the hardening tapers to between the two, as a fraction
+    // The incidence band, which now shapes the edge HARDENING only. It used to gate whether the shadow was
+    // applied at all; that fell to the tuned configuration, since a wall keeping its shadow is worth more
+    // than a boundary that is slightly rough. What remains is a taper: the threshold is only as trustworthy
+    // as the contour it traces, and that contour coarsens as a surface turns edge-on to the light, so the
+    // hardening eases off over this band rather than drawing a hard line through a coarse one.
+    //   x = incidence below which the hardening is at its floor
+    //   y = incidence at which the hardening is at full strength
+    //   z = that floor, as a fraction of the configured hardness
     //   w = unused
-    // In the constant buffer rather than as template symbols so they can be dialled while the game runs:
-    // they are a trade-off with no single right answer -- lifting the shadow earlier hides the wedges and
-    // costs walls their shadow -- and a compile-time symbol makes every trial a rebuild.
+    // In the constant buffer rather than as template symbols so they can be dialled while the game runs --
+    // a compile-time symbol makes every trial a rebuild.
     float4 shadow_incidence;
 }
 
@@ -776,41 +777,25 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
         // are combined -- this is the only way to tell which without guessing.
-        // On SCENERY, stop applying the shadow at all as the surface turns edge-on to the light.
+        // The grazing falloff that used to live here is gone. It stopped applying the shadow at all as a
+        // scenery surface turned edge-on to the light, on the argument that the map has no resolution left
+        // along the direction such a surface recedes, so its shadow boundary quantises into steps that no
+        // bias can reach.
         //
-        // Not a softening: this declines to use a number that carries no information. On a surface nearly
-        // parallel to the light the map has almost no resolution along the direction that surface recedes,
-        // so the shadow BOUNDARY quantises into steps of one texel divided by the sine of the angle -- under
-        // two world units at sixty degrees, seventeen at five, forty-two at two, which is a character's
-        // whole height. Those steps are the teeth, and no bias touches them because nothing is being
-        // mis-compared: the boundary is being drawn at a resolution that does not exist.
+        // The reasoning was sound and the cure was worse. What it bought was a wall keeping a ragged
+        // boundary instead of a spiky one; what it cost was that wall losing its shadow outright, and the
+        // shadowed-to-unshadowed transition landing in a band forty degrees wide around edge-on -- which on
+        // anything curved is a ring of lit surface sitting between the lit part and the shadowed part.
+        // Removed at the tuned configuration's request: with the blur widened and the hardening eased, the
+        // steps it was hiding no longer read as teeth, and a wall keeping its shadow is worth more than a
+        // boundary that is slightly rough.
         //
-        // Scenery only, and the "physics" argument that used to be written here is why. It said a surface
-        // edge-on to the light receives almost no light and can therefore carry almost no shadow, so
-        // illumination and map resolution reach zero together. That is true of a renderer whose shading
-        // light IS this light. It is not true of this one: the cel relight runs off a per-actor key, and
-        // with cel shading off the surface is lit by the room's own lamps, neither of which has anything to
-        // do with the global sun the cascades are built from. A surface edge-on to the sun can be fully lit
-        // by a torch, and lifting its shadow leaves it fully lit inside a shadow.
-        //
-        // Which is a band, not a speckle, and it sits exactly at the terminator -- the falloff spans forty
-        // degrees around edge-on, so on anything curved it is a wide ring of unshadowed surface between the
-        // lit part and the shadowed part. It was invisible until the normal became trustworthy: fed the
-        // screen-derivative normal, the incidence was noise and the band was scattered into the speckle
-        // instead of drawn as a ring.
-        //
-        // A wall keeps it, because that is the geometry the falloff was written for and the one it earns
-        // its keep on: flat, broad, and capable of quantising a shadow boundary into steps metres long. A
-        // character cannot do that. Its grazing surfaces are small and curved, so the coarsest boundary
-        // they can produce is a few pixels across, and it lands where the surface is already turning away
-        // from every light in the room. Trading a ring of wrong brightness for that is a bad bargain.
-        float shadowApply = smoothstep(0.0, shadow_incidence.x, shadowIncidence);
-        shadowApply = (input.worldPos.w > 0.5) ? shadowApply : 1.0;
+        // Its measurements survive in shadow_incidence, which now serves only the hardness taper above.
         [branch]
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowActorLit, 1.0 - shadowWorldLit, 0.0);
         } else {
-            texel.rgb *= lerp(1.0, lerp(1.0 - shadow_params.w, 1.0, shadowLit), shadowApply);
+            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }
     @end
 
