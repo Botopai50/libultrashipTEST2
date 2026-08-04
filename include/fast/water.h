@@ -67,12 +67,12 @@
 // through it and rough water can blur what it reflects, both of which are then selected by sampling a higher
 // mip rather than by running a blur pass. Four levels reach 1/8 scale, which is as diffuse as either use
 // needs.
-#define WATER_SCENE_COLOR_MIPS 4
 //
 // Mip 0 is full resolution rather than half, and that is deliberate: the one place the copy is read almost
 // undistorted is the shoreline, where the water is thin and the refraction offset goes to zero, and a
 // half-resolution base shows up there as a soft doubled edge against the sand. The chain provides every
 // reduced scale anyway, so nothing is gained by starting lower -- only the sharp case is lost.
+#define WATER_SCENE_COLOR_MIPS 4
 
 // Linear depth is stored at FULL resolution and in 32-bit float, and both halves of that matter. The
 // thickness signal drives the foam line and the shoreline colour ramp, and those are read at pixel accuracy
