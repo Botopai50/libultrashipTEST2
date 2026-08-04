@@ -2220,30 +2220,59 @@ bool GfxRenderingAPIDX11::CreateWaterPipeline() {
         return false;
     }
 
-    struct {
+    // The multisample variant is OPTIONAL and it is compiled against a later profile than the rest. Both of
+    // those are the same fact seen twice: an unsized Texture2DMS does not exist in shader model 4.0, only
+    // from 4.1 -- and 4.1 needs feature level 10.1, which is exactly the level below which this backend
+    // forces MSAA off anyway (see UpdateFramebufferParameters). So wherever a multisampled frame can occur,
+    // the profile that can read it is available; where it is not available, no multisampled frame can occur
+    // and the shader has nothing to do.
+    //
+    // Optional matters more than the profile. It was required, and one failure returned false for the whole
+    // pipeline -- so a shader for a mode the user was not even running took the entire feature down with it,
+    // silently, leaving the water untouched and the diagnostic blank. The alpha-cutout casters in the shadow
+    // map are built the same careful way and for the same reason.
+    struct PixelShaderBuild {
         const char* source;
         const char* entry;
         bool msaa;
+        const char* profile;
         ID3D11PixelShader** out;
         const char* what;
-    } pixelShaders[] = {
-        { kWaterLinearDepthPsSource, "PSMain", false, mWaterLinearDepthPs.GetAddressOf(), "depth linearise" },
-        { kWaterLinearDepthPsSource, "PSMain", true, mWaterLinearDepthMsPs.GetAddressOf(), "depth linearise (MSAA)" },
-        { kWaterDebugPsSource, "PSColor", false, mWaterBlitPs.GetAddressOf(), "debug colour blit" },
-        { kWaterDebugPsSource, "PSDepth", false, mWaterDepthViewPs.GetAddressOf(), "debug depth view" },
+        bool required;
     };
-    for (const auto& ps : pixelShaders) {
+    const bool msaaCapable = mFeatureLevel >= D3D_FEATURE_LEVEL_10_1;
+    const PixelShaderBuild pixelShaders[] = {
+        { kWaterLinearDepthPsSource, "PSMain", false, "ps_4_0", mWaterLinearDepthPs.GetAddressOf(),
+          "depth linearise", true },
+        { kWaterLinearDepthPsSource, "PSMain", true, "ps_4_1", mWaterLinearDepthMsPs.GetAddressOf(),
+          "depth linearise (MSAA)", false },
+        { kWaterDebugPsSource, "PSColor", false, "ps_4_0", mWaterBlitPs.GetAddressOf(), "debug colour blit", true },
+        { kWaterDebugPsSource, "PSDepth", false, "ps_4_0", mWaterDepthViewPs.GetAddressOf(), "debug depth view",
+          true },
+    };
+    for (const PixelShaderBuild& ps : pixelShaders) {
+        if (ps.msaa && !msaaCapable) {
+            continue; // this device cannot produce a multisampled frame for it to read
+        }
         const D3D_SHADER_MACRO macros[] = { { "WATER_MSAA", ps.msaa ? "1" : "0" }, { nullptr, nullptr } };
-        hr = mD3dCompile(ps.source, strlen(ps.source), nullptr, macros, nullptr, ps.entry, "ps_4_0", compile_flags, 0,
-                         blob.ReleaseAndGetAddressOf(), error_blob.ReleaseAndGetAddressOf());
-        if (FAILED(hr)) {
+        hr = mD3dCompile(ps.source, strlen(ps.source), nullptr, macros, nullptr, ps.entry, ps.profile, compile_flags,
+                         0, blob.ReleaseAndGetAddressOf(), error_blob.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hr)) {
+            hr = mDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, ps.out);
+            if (FAILED(hr)) {
+                SPDLOG_ERROR("Water: could not create the {} pixel shader.", ps.what);
+            }
+        } else {
             SPDLOG_ERROR("Water: {} pixel shader failed to compile: {}", ps.what,
                          error_blob ? (const char*)error_blob->GetBufferPointer() : "no error blob");
-            return false;
         }
-        if (FAILED(mDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, ps.out))) {
-            SPDLOG_ERROR("Water: could not create the {} pixel shader.", ps.what);
-            return false;
+        if (FAILED(hr)) {
+            if (ps.required) {
+                return false;
+            }
+            // Logged above, and loudly on purpose: this is the difference between the water working with
+            // MSAA on and the water quietly not appearing while MSAA is on.
+            *ps.out = nullptr;
         }
     }
 
@@ -2471,6 +2500,18 @@ void GfxRenderingAPIDX11::WaterCaptureScene(int fbId) {
 
     D3D11_TEXTURE2D_DESC srcDesc;
     tex.texture->GetDesc(&srcDesc);
+    if (srcDesc.SampleDesc.Count > 1 && mWaterLinearDepthMsPs == nullptr) {
+        // A multisampled frame with no shader able to read its depth. Reported once rather than every frame,
+        // and the water is left alone: without depth there is no thickness, and thickness is the signal the
+        // whole material is built on.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            SPDLOG_WARN("Water: MSAA is on but the multisample depth shader is unavailable; the water material "
+                        "is inactive. Turn MSAA off to use it.");
+        }
+        return;
+    }
     if (!CreateWaterTargets((int)srcDesc.Width, (int)srcDesc.Height, srcDesc.Format)) {
         return;
     }
