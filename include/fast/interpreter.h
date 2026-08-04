@@ -453,6 +453,32 @@ class Interpreter {
         mShadowEdgeSoftness = edgeSoftness;
         mShadowShowVolume = showVolume;
     }
+    // SOH [Enhancement] Water (see fast/water.h): frame-global policy pushed by the game. As with the
+    // shadow map, `enabled` must already account for the backend's capability -- the interpreter does not
+    // second-guess it. Quality is WATER_QUALITY_*; passing WATER_QUALITY_OFF is the same as disabling.
+    // `time` is pushed by the game rather than accumulated here, and that is deliberate: the frame
+    // interpolator re-runs the same display list several times per game frame, so a clock ticking inside the
+    // renderer would make the water scroll at the interpolated rate while everything it sits next to moves at
+    // the game's. The game owns the only counter that means "one step of the world".
+    void SetWaterParams(bool enabled, int quality, int debugView, float time) {
+        mWaterTime = time;
+        mWaterEnabled = enabled && quality != WATER_QUALITY_OFF;
+        mWaterQuality = quality < WATER_QUALITY_OFF               ? WATER_QUALITY_OFF
+                        : (quality >= WATER_QUALITY_COUNT ? WATER_QUALITY_HIGH : quality);
+        mWaterDebugView = debugView < WATER_DEBUG_OFF                ? WATER_DEBUG_OFF
+                          : (debugView >= WATER_DEBUG_COUNT ? WATER_DEBUG_OFF : debugView);
+    }
+
+    // SOH [Enhancement] Water: rebuild the frame's camera context from the current projection and hand it to
+    // the backend. Called once per frame, before anything can capture, because every capture and every water
+    // draw in the frame has to agree about where the eye is.
+    void UpdateWaterFrameParams();
+
+    // SOH [Enhancement] Water: take the scene copy the water material will read. Driven by a display-list
+    // marker rather than by a fixed point in the frame, because a room can interleave several bodies of
+    // water with other translucent geometry and each has to refract what was drawn behind IT.
+    void CaptureWaterScene();
+
     // SOH [Enhancement] Cascaded shadow maps: frame-global policy pushed by the game. `enabled` must
     // already account for the backend's capability -- the interpreter does not second-guess it, it just
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
@@ -786,6 +812,15 @@ class Interpreter {
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
     uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from
     bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
+    // SOH [Enhancement] Water (see fast/water.h). The camera context is rebuilt once per frame in
+    // UpdateWaterFrameParams and pushed to the backend; nothing here is read per draw.
+    bool mWaterEnabled = false; // app-pushed: water mode selected AND backend capable
+    int mWaterQuality = WATER_DEFAULT_QUALITY;
+    int mWaterDebugView = WATER_DEBUG_OFF;
+    // Monotonic seconds the water material scrolls by, pushed by the game (see SetWaterParams).
+    float mWaterTime = 0.0f;
+    WaterFrameParams mWaterFrame{};
+
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;

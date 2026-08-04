@@ -7,6 +7,7 @@
 #include "imconfig.h"
 #include "fast/toon_shading.h"
 #include "fast/shadow_map.h"
+#include "fast/water.h"
 
 namespace Fast {
 struct ShaderProgram;
@@ -232,6 +233,50 @@ class GfxRenderingAPI {
         mShadowSlopeBias = slopeBias;
     }
 
+    // SOH [Enhancement] Breath of the Wild-style water (see fast/water.h). As with the shadow map,
+    // everything below is a no-op by default and only Direct3D 11 overrides it. The application MUST
+    // consult SupportsWater() before suppressing the original water draw, or an unsupported backend ends
+    // up with no water at all instead of the water it started with.
+
+    // Whether this backend implements the capture passes. Checked once per frame by the application.
+    virtual bool SupportsWater() {
+        return false;
+    }
+
+    // Allocate (or resize) the scene-capture resources for a target of this size. Safe to call every frame:
+    // implementations reallocate only when the size actually changes. Returns false if the resources could
+    // not be created, in which case the caller must treat the water material as unavailable this frame and
+    // let the original draw through.
+    virtual bool WaterConfigure(int width, int height) {
+        return false;
+    }
+
+    // Take the frame's scene copy: resolve the colour of the target currently being drawn into a sampleable
+    // texture and build its mip chain, and linearise its depth into world-unit ray distances.
+    //
+    // Called immediately BEFORE the group of water surfaces that will read it, not once per frame, because a
+    // room can interleave several bodies of water with other translucent geometry and each body has to refract
+    // what was drawn behind it rather than what happened to be in the buffer at the top of the frame. One
+    // capture per contiguous run of translucent draws, not one per surface -- the copy is the expensive part.
+    //
+    // `fbId` is the framebuffer the frame is currently drawing into, since that is what has to be copied and
+    // the backend does not otherwise track it.
+    virtual void WaterCaptureScene(int fbId) {
+    }
+
+    // Per-frame camera, projection and tuning (see WaterFrameParams). Pushed once per frame before any water
+    // draw. Stored on the backend, exactly like the toon and shadow parameters, so every per-draw uniform
+    // path can reach it.
+    virtual void SetWaterFrameParams(const WaterFrameParams& params) {
+        mWaterParams = params;
+    }
+
+    // Draw the F0 diagnostic overlay (WATER_DEBUG_*) into the current target: thumbnails of the captured
+    // colour and of the linearised depth. Called at the end of the frame, after the game's own drawing, so
+    // it sits on top of everything.
+    virtual void WaterDebugDraw() {
+    }
+
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -260,6 +305,9 @@ class GfxRenderingAPI {
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
+    // SOH [Enhancement] Water: the frame's camera and tuning, pushed by SetWaterFrameParams. quality ==
+    // WATER_QUALITY_OFF is the state every backend that does not implement the passes stays in forever.
+    WaterFrameParams mWaterParams{};
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

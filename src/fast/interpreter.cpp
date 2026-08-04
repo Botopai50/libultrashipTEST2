@@ -3232,6 +3232,125 @@ static bool ShadowUnproject(const float invVp[4][4], float x, float y, float z, 
     return true;
 }
 
+// SOH [Enhancement] Breath of the Wild-style water (see fast/water.h).
+//
+// Rebuild the frame's camera context from the current projection. Everything the material does -- thickness,
+// the reflected ray, the refraction offset, the caustic projection -- is anchored to the eye, so it is
+// recovered once and shared, rather than each layer approximating it for itself.
+void Interpreter::UpdateWaterFrameParams() {
+    mWaterFrame = WaterFrameParams{};
+    mWaterFrame.quality = mWaterEnabled ? mWaterQuality : WATER_QUALITY_OFF;
+    mWaterFrame.debugView = mWaterDebugView;
+    mWaterFrame.time = mWaterTime;
+    mWaterFrame.screenWidth = (int)mCurDimensions.width;
+    mWaterFrame.screenHeight = (int)mCurDimensions.height;
+
+    // Same aspect correction the cascade fit makes. Every transformed vertex has its clip x divided by this,
+    // so the screen edge is not at matrix NDC +/-1; anything reconstructing a world position FROM a pixel has
+    // to undo it. Derived from the function itself so the two can never disagree, including the framebuffer
+    // case where it is the identity.
+    const float adj = AdjXForAspectRatio(1.0f);
+    mWaterFrame.ndcXScale = (std::fabs(adj) > 1e-6f) ? (1.0f / adj) : 1.0f;
+
+    float invVp[4][4];
+    if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
+        if (mRapi != nullptr) {
+            mWaterFrame.quality = WATER_QUALITY_OFF;
+            mRapi->SetWaterFrameParams(mWaterFrame);
+        }
+        return;
+    }
+    memcpy(mWaterFrame.viewProj, mRsp->P_matrix, sizeof(mWaterFrame.viewProj));
+    memcpy(mWaterFrame.invViewProj, invVp, sizeof(mWaterFrame.invViewProj));
+
+    // Two rays down the view volume. The first is the view axis; the second is offset sideways so the two
+    // are not parallel and their meeting point is the eye.
+    //
+    // Recovered rather than assumed to be the near-plane centre, which is what the cascade fit uses. That
+    // approximation is harmless there -- a cascade is hundreds of units across and the near plane is about
+    // ten from the eye -- but thickness is a DIFFERENCE of distances measured from this point, so a constant
+    // error in it biases the shoreline over the whole image at once, and the shoreline is where the foam and
+    // the colour ramp live.
+    float axisNear[3], axisFar[3], offNear[3], offFar[3];
+    const float offX = mWaterFrame.ndcXScale * 0.5f;
+    if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, axisNear) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, axisFar) ||
+        !ShadowUnproject(invVp, offX, 0.0f, 0.0f, offNear) || !ShadowUnproject(invVp, offX, 0.0f, 1.0f, offFar)) {
+        if (mRapi != nullptr) {
+            mWaterFrame.quality = WATER_QUALITY_OFF;
+            mRapi->SetWaterFrameParams(mWaterFrame);
+        }
+        return;
+    }
+
+    float a[3], b[3], w0[3];
+    for (int i = 0; i < 3; i++) {
+        a[i] = axisFar[i] - axisNear[i];
+        b[i] = offFar[i] - offNear[i];
+        w0[i] = axisNear[i] - offNear[i];
+    }
+    const float A = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+    const float B = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const float C = b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
+    const float D = a[0] * w0[0] + a[1] * w0[1] + a[2] * w0[2];
+    const float E = b[0] * w0[0] + b[1] * w0[1] + b[2] * w0[2];
+    const float denom = A * C - B * B;
+
+    if (std::fabs(denom) > 1e-6f * (A * C + 1.0f)) {
+        const float sc = (B * E - C * D) / denom;
+        const float tc = (A * E - B * D) / denom;
+        // Averaging the two closest points instead of taking one: for a true perspective projection the
+        // lines meet exactly and the two agree, so the average costs nothing and is the well-behaved answer
+        // when floating point says they merely come close.
+        for (int i = 0; i < 3; i++) {
+            mWaterFrame.camPos[i] = 0.5f * ((axisNear[i] + sc * a[i]) + (offNear[i] + tc * b[i]));
+        }
+    } else {
+        // Parallel rays: an orthographic projection, where there is no single eye. The near-plane point is
+        // then the right answer for everything that follows.
+        for (int i = 0; i < 3; i++) {
+            mWaterFrame.camPos[i] = axisNear[i];
+        }
+    }
+
+    const float axisLen = std::sqrt(A);
+    if (axisLen > 1e-6f) {
+        for (int i = 0; i < 3; i++) {
+            mWaterFrame.camDir[i] = a[i] / axisLen;
+        }
+    }
+    // Near and far as the eye actually sees them: the distance along the view axis to each plane's centre.
+    mWaterFrame.nearPlane = 0.0f;
+    mWaterFrame.farPlane = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        mWaterFrame.nearPlane += (axisNear[i] - mWaterFrame.camPos[i]) * mWaterFrame.camDir[i];
+        mWaterFrame.farPlane += (axisFar[i] - mWaterFrame.camPos[i]) * mWaterFrame.camDir[i];
+    }
+
+    if (mRapi != nullptr) {
+        mRapi->SetWaterFrameParams(mWaterFrame);
+    }
+}
+
+// SOH [Enhancement] Water: take the scene capture at this point in the display list (gSPWaterCapture).
+//
+// The camera context is rebuilt here rather than at the top of the frame because this is the first moment the
+// projection is guaranteed to be the one the water will be drawn with -- the game sets its matrices as it
+// goes, and a context gathered before that describes a camera that no longer exists.
+void Interpreter::CaptureWaterScene() {
+    if (!mWaterEnabled || mRapi == nullptr) {
+        return;
+    }
+    UpdateWaterFrameParams();
+    if (mWaterFrame.quality == WATER_QUALITY_OFF) {
+        return; // the projection could not be inverted; nothing downstream can work from it
+    }
+    const int fb = mRendersToFb ? mGameFb : 0;
+    if (!mRapi->WaterConfigure((int)mCurDimensions.width, (int)mCurDimensions.height)) {
+        return;
+    }
+    mRapi->WaterCaptureScene(fb);
+}
+
 // SOH [Enhancement] Cascaded shadow maps: render last frame's casters into the cascade array.
 //
 // Each cascade is an orthographic box centred on a point along the view axis, sized by that cascade's
@@ -5306,6 +5425,12 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // otherwise swallow both of these.
         // Tested before everything else: it is a veto, and the values sit past the rest of the range so the
         // chain below never has to make room for them.
+        // SOH [Enhancement] Water: past the veto range on purpose, so it is answered before the shadow chain
+        // below rather than by squeezing a value in between two of theirs.
+        if (sizeOrSentinel <= -8.5e30f) {
+            gfx->CaptureWaterScene(); // gSPWaterCapture
+            return false;
+        }
         if (sizeOrSentinel <= -7.5e30f) {
             gfx->mRdp->shadow_no_cast = true; // gSPShadowMapCasterOff
             return false;
@@ -6185,6 +6310,15 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+
+    // SOH [Enhancement] Water: the F0 diagnostic overlay, drawn here because this is the last moment the
+    // frame's own target is still bound -- after this the game buffer is blitted to the window and the
+    // thumbnails would land on the wrong surface. A no-op unless the debug view is on and something was
+    // actually captured this frame.
+    if (mWaterEnabled && mWaterDebugView != WATER_DEBUG_OFF) {
+        mRapi->WaterDebugDraw();
+    }
+
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
