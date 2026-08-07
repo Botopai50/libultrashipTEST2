@@ -1511,7 +1511,9 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // shadow moved, appeared and vanished as the camera turned, with nothing in the scene moving.
         // Unlit geometry is not rare here either: tree canopies, billboards and much of the room mesh draw
         // with lighting off, and they all cast.
-        if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled) {
+        // ... and by the water identification, which is a purely geometric test against the scene's water
+        // boxes and therefore needs the same world positions.
+        if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled || mWaterEnabled) {
             float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
             d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
@@ -1844,6 +1846,38 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     // if (rand()%2) return;
+
+    // SOH [Enhancement] Water (F1): is this the surface of one of the scene's water bodies?
+    //
+    // Placed here, after the shadow captures and before the clip test, for two reasons. After the captures
+    // because water must not become a shadow caster and this is the first point where skipping it cannot
+    // leave a half-recorded caster behind. Before the clip test because an off-screen surface is still part
+    // of the body of water and the census should count it.
+    //
+    // The interception is a plain early return rather than a deferred list. The design document describes
+    // registering a descriptor, suppressing the draw and reinserting it at the recorded position in the
+    // translucent sequence -- that shape is for a renderer that batches. This one is immediate: it executes
+    // commands in the order they appear, so drawing the replacement HERE, where the original triangle was,
+    // IS the original position, exactly. It also makes the document's sixth risk -- breaking translucent
+    // ordering -- impossible by construction instead of something to be tested for.
+    if (mWaterEnabled && !is_rect && !mWaterBoxes.empty()) {
+        const float wa[3] = { v1->wx, v1->wy, v1->wz };
+        const float wb[3] = { v2->wx, v2->wy, v2->wz };
+        const float wc[3] = { v3->wx, v3->wy, v3->wz };
+        const int box = WaterSurfaceBoxIndex(wa, wb, wc);
+        if (box >= 0) {
+            mWaterTrisIdentified++;
+            if (box < 64) {
+                mWaterBoxesHit |= (1ull << box);
+            }
+            if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
+                // F1's whole deliverable: the surface vanishing proves the identification found it AND that
+                // the draw can be taken out of the frame cleanly, which is what F3 will put its own material
+                // into. Until then the original water is drawn as it always was.
+                return;
+            }
+        }
+    }
 
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
@@ -3329,6 +3363,64 @@ void Interpreter::UpdateWaterFrameParams() {
     if (mRapi != nullptr) {
         mRapi->SetWaterFrameParams(mWaterFrame);
     }
+}
+
+// SOH [Enhancement] Water: is this triangle a water SURFACE, and if so which body of water's?
+//
+// Three conditions, all required, described in fast/water.h. The order below is the cheap-first order: most
+// triangles in a frame fail the height test against the first box and never reach the cross product.
+//
+// Note what is NOT consulted: the render mode, the texture, the vertex colour. Every one of those describes
+// the Fire Temple's lava as accurately as it describes Lake Hylia, and a false positive there is the worst
+// failure this feature has. A water box is authored data meaning "the player swims here", and lava has none.
+int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const float c[3]) const {
+    if (mWaterBoxes.empty()) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < mWaterBoxes.size(); i++) {
+        const WaterBoxDesc& box = mWaterBoxes[i];
+
+        // Height first: it rejects the lake bed, the sky and every wall in one comparison per vertex, and it
+        // is the test most triangles fail.
+        if (std::fabs(a[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
+            std::fabs(b[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
+            std::fabs(c[1] - box.ySurface) > WATER_SURFACE_TOLERANCE) {
+            continue;
+        }
+
+        // Then the footprint. The margin is there because the drawn surface routinely overshoots its
+        // collision box a little at the shoreline, and a hard edge would leave a rim of original water
+        // around every lake.
+        const float x0 = box.xMin - WATER_BOX_XZ_MARGIN;
+        const float x1 = box.xMin + box.xLength + WATER_BOX_XZ_MARGIN;
+        const float z0 = box.zMin - WATER_BOX_XZ_MARGIN;
+        const float z1 = box.zMin + box.zLength + WATER_BOX_XZ_MARGIN;
+        if (a[0] < x0 || a[0] > x1 || b[0] < x0 || b[0] > x1 || c[0] < x0 || c[0] > x1 || a[2] < z0 ||
+            a[2] > z1 || b[2] < z0 || b[2] > z1 || c[2] < z0 || c[2] > z1) {
+            continue;
+        }
+
+        // Finally the orientation. This is what separates a lake's surface from the waterfall pouring into
+        // it and from the glass-like walls of a water column -- both are inside the box, both are at the
+        // box's height for part of their span, and neither is a surface. They are F15's material, not this
+        // one's, and taking them here would replace a falling sheet of water with a flat horizontal lake.
+        const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+        const float e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+        const float nx = e1[1] * e2[2] - e1[2] * e2[1];
+        const float ny = e1[2] * e2[0] - e1[0] * e2[2];
+        const float nz = e1[0] * e2[1] - e1[1] * e2[0];
+        const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (len < 1e-6f) {
+            continue; // degenerate; no orientation to speak of
+        }
+        if (std::fabs(ny / len) < WATER_MIN_SURFACE_NORMAL_Y) {
+            continue;
+        }
+
+        return (int)i;
+    }
+    return -1;
 }
 
 // SOH [Enhancement] Water: take the scene capture at this point in the display list (gSPWaterCapture).

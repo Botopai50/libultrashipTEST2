@@ -90,13 +90,60 @@
 #define WATER_DEPTH_SKY_SENTINEL 1.0e9f
 
 // ---------------------------------------------------------------------------------------------------------
-// Debug views (F0). The menu exposes these as a slider, the way the shadow map's cascade view is exposed.
+// F1 -- identifying which triangles are a water surface.
+//
+// The design document assumes the fork already answers this and only needs the answer routed differently.
+// It does not: what exists is the COLLISION side (the game's water boxes, which the collision viewer draws
+// and WaterBox_GetSurface1 queries), and nothing at all connecting that to the draw calls. So the bridge is
+// built here, and it is built from the collision data rather than from render state.
+//
+// That choice is the one that keeps lava out. A render-state heuristic -- "translucent, scrolling texture,
+// blue-ish vertex colour" -- describes the Fire Temple's lava as exactly as it describes Lake Hylia, and a
+// false positive there is the worst failure this feature can have (design document 7, first row). A water
+// box is authored data that says "the player swims here"; lava has none.
+//
+// The test per triangle is the conjunction of three things, and each one is load-bearing:
+//   1. all three vertices lie within a box's XZ rectangle (grown by WATER_BOX_XZ_MARGIN),
+//   2. all three sit within WATER_SURFACE_TOLERANCE of that box's surface height,
+//   3. the triangle is close to horizontal.
+// The third is what separates the lake's surface from the waterfall pouring into it and from the glass-like
+// side walls of a water column -- both of which are inside the box and at the wrong orientation. They are
+// F15's problem, not this one's.
+// ---------------------------------------------------------------------------------------------------------
+
+// How far, in world units, a vertex may sit from the box's stated surface height and still count. Generous
+// on purpose: the authored water polygon and the authored collision box are two separate pieces of data and
+// they do not agree to the unit, and some scenes tilt the drawn surface slightly. Too tight loses patches of
+// a lake; too loose starts claiming the lake bed, which is why it is nothing like the box's depth.
+#define WATER_SURFACE_TOLERANCE 12.0f
+
+// How far outside the box's XZ rectangle a vertex may sit. Drawn water routinely overshoots its collision
+// box by a little at the shoreline, and a hard edge there would leave a rim of original water around every
+// lake.
+#define WATER_BOX_XZ_MARGIN 24.0f
+
+// Minimum |normal.y| for the triangle to count as a surface rather than a wall or a fall. cos(35 degrees);
+// real lake surfaces are authored flat, so this only has to be loose enough for the slight tilts some
+// scenes use.
+#define WATER_MIN_SURFACE_NORMAL_Y 0.819f
+
+// Ceiling on how many boxes one frame may carry. Scenes hold a handful; the cap exists so a malformed
+// collision header costs a missing box rather than an unbounded copy.
+#define WATER_MAX_BOXES 64
+
+// ---------------------------------------------------------------------------------------------------------
+// Debug views (F0/F1). The menu exposes these as a combobox, the way the shadow map's cascade view is.
 // ---------------------------------------------------------------------------------------------------------
 #define WATER_DEBUG_OFF 0
-#define WATER_DEBUG_SCENE_COLOR 1 // the captured colour copy, drawn in the corner
+#define WATER_DEBUG_SCENE_COLOR 1  // the captured colour copy, drawn in the corner
 #define WATER_DEBUG_LINEAR_DEPTH 2 // linear depth as greyscale, scaled by WATER_DEBUG_DEPTH_SCALE
-#define WATER_DEBUG_BOTH 3         // both thumbnails plus the numeric near/far readout
-#define WATER_DEBUG_COUNT 4
+#define WATER_DEBUG_BOTH 3         // both thumbnails
+// F1: skip drawing every triangle identified as a water surface. The surface vanishing is what proves BOTH
+// halves at once -- that the identification found it, and that the suppression can take it out of the frame
+// cleanly for the new material to be put in its place. A magenta tint would only have proved the first, and
+// would have needed a shader to say it.
+#define WATER_DEBUG_HIDE_SURFACES 4
+#define WATER_DEBUG_COUNT 5
 
 // World distance that maps to white in the greyscale depth view. Hyrule Field is a few thousand units across,
 // so this shows the whole visible range without the near field being crushed to black.
@@ -108,8 +155,27 @@
 #ifdef __cplusplus
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace Fast {
+
+// One of the scene's water boxes, as the game knows it: an axis-aligned XZ rectangle with a surface height.
+//
+// Pushed by the game each frame rather than read by the renderer, because deciding WHICH boxes are active is
+// game knowledge that the renderer has no business duplicating -- the room filter packed into the box's
+// property bits, the hard-coded extra box Zora's Domain needs so the player can pass under the waterfall, and
+// the guard for a collision header that has not finished loading. All three live in z_bgcheck.c and all
+// three would have been silently wrong here.
+struct WaterBoxDesc {
+    float xMin = 0.0f;
+    float zMin = 0.0f;
+    float xLength = 0.0f;
+    float zLength = 0.0f;
+    float ySurface = 0.0f;
+    // Stable across frames for the same body of water, so a mesh cache (F2) and an appearance profile (F16)
+    // can be keyed by it. Scene number in the high bits, box index in the low ones.
+    uint32_t id = 0;
+};
 
 // Everything the water material needs to know about the camera and the frame, gathered once and pushed to
 // the backend in one call.

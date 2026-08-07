@@ -461,12 +461,54 @@ class Interpreter {
     // renderer would make the water scroll at the interpolated rate while everything it sits next to moves at
     // the game's. The game owns the only counter that means "one step of the world".
     void SetWaterParams(bool enabled, int quality, int debugView, float time) {
+        // Roll the identification census forward. Published here, at the game frame boundary, so a reader
+        // always sees one complete frame's worth rather than however much of the current one has run.
+        mWaterTrisLastFrame = mWaterTrisIdentified;
+        mWaterBoxesHitLastFrame = mWaterBoxesHit;
+        mWaterTrisIdentified = 0;
+        mWaterBoxesHit = 0;
         mWaterTime = time;
         mWaterEnabled = enabled && quality != WATER_QUALITY_OFF;
         mWaterQuality = quality < WATER_QUALITY_OFF               ? WATER_QUALITY_OFF
                         : (quality >= WATER_QUALITY_COUNT ? WATER_QUALITY_HIGH : quality);
         mWaterDebugView = debugView < WATER_DEBUG_OFF                ? WATER_DEBUG_OFF
                           : (debugView >= WATER_DEBUG_COUNT ? WATER_DEBUG_OFF : debugView);
+    }
+
+    // SOH [Enhancement] Water: the scene's active water boxes for this frame (see WaterBoxDesc). Replaced
+    // wholesale each frame; an empty list means no water can be identified, which is the correct state for
+    // every scene without any. Pushed by the game because deciding which boxes are ACTIVE is game knowledge
+    // -- the room filter in the property bits, Zora's Domain's hard-coded extra box, the not-yet-loaded
+    // collision header -- and duplicating those rules here would mean getting them subtly wrong.
+    void SetWaterBoxes(const WaterBoxDesc* boxes, int count) {
+        mWaterBoxes.clear();
+        if (boxes == nullptr || count <= 0) {
+            return;
+        }
+        const int n = count > WATER_MAX_BOXES ? WATER_MAX_BOXES : count;
+        mWaterBoxes.assign(boxes, boxes + n);
+    }
+
+    // SOH [Enhancement] Water: last complete frame's identification census -- how many triangles were taken
+    // as a water surface, how many of the scene's boxes they came from, and how many boxes the scene has.
+    // Displayed in the menu. The shadow map's caster census is what finally named the environment particle
+    // swarm after four wrong guesses about where it was drawn; this exists so the same question about water
+    // ("is it finding this lake at all, and how much of it?") is answered by the code that decides rather
+    // than by staring at a screenshot.
+    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut) const {
+        if (trisOut != nullptr) {
+            *trisOut = mWaterTrisLastFrame;
+        }
+        if (boxesHitOut != nullptr) {
+            int hit = 0;
+            for (uint64_t m = mWaterBoxesHitLastFrame; m != 0; m &= m - 1) {
+                hit++;
+            }
+            *boxesHitOut = hit;
+        }
+        if (boxesTotalOut != nullptr) {
+            *boxesTotalOut = (int)mWaterBoxes.size();
+        }
     }
 
     // SOH [Enhancement] Water: rebuild the frame's camera context from the current projection and hand it to
@@ -820,6 +862,19 @@ class Interpreter {
     // Monotonic seconds the water material scrolls by, pushed by the game (see SetWaterParams).
     float mWaterTime = 0.0f;
     WaterFrameParams mWaterFrame{};
+    std::vector<WaterBoxDesc> mWaterBoxes;
+    // How many triangles this frame were identified as a water surface, and how many distinct boxes they
+    // came from. Reported to the menu so a scene can be checked without a screenshot, in the same spirit as
+    // the shadow map's caster census -- which is what finally named the environment particle swarm after
+    // four wrong guesses about where it was drawn.
+    int mWaterTrisIdentified = 0;
+    uint64_t mWaterBoxesHit = 0; // bitmask over mWaterBoxes
+    int mWaterTrisLastFrame = 0;
+    uint64_t mWaterBoxesHitLastFrame = 0;
+
+    // Which water box, if any, this triangle's three world-space vertices form a surface of. -1 for none.
+    // Defined in the .cpp beside the rest of the water code.
+    int WaterSurfaceBoxIndex(const float a[3], const float b[3], const float c[3]) const;
 
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
