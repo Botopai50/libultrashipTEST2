@@ -1870,6 +1870,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (box < 64) {
                 mWaterBoxesHit |= (1ull << box);
             }
+            // What the accepted geometry is drawn AS. Recorded here rather than tested on, because whether
+            // the render mode can separate a water surface from a stone ledge at water level is exactly the
+            // thing this codebase has twice punished me for reasoning about instead of measuring.
+            if ((mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU) {
+                mWaterAcceptedXlu++;
+            } else {
+                mWaterAcceptedOpa++;
+            }
             if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
                 // F1's whole deliverable: the surface vanishing proves the identification found it AND that
                 // the draw can be taken out of the frame cleanly, which is what F3 will put its own material
@@ -3378,33 +3386,48 @@ int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const 
         return -1;
     }
 
+    // Containment is decided on the CENTROID, not on all three vertices, and that change is the whole fix
+    // for surfaces that vanished only in part.
+    //
+    // Water polygons in this game are big -- a moat is a handful of long triangles, not a mesh -- so a
+    // triangle routinely straddles the edge of its own collision box. Requiring every vertex inside then
+    // rejects exactly the triangles at the boundary while accepting the ones in the middle, which is not a
+    // near miss: it is half the surface removed and half left standing, with a hard straight edge between
+    // them. Screenshots of the castle moat showed precisely that.
+    //
+    // The centroid cannot be fooled in the other direction either, because the tilt test below still has to
+    // pass and a water surface triangle is flat: a large triangle whose centre happens to fall in a small
+    // box is admitted only if it is also horizontal and at the box's exact height.
+    const float cx = (a[0] + b[0] + c[0]) * (1.0f / 3.0f);
+    const float cy = (a[1] + b[1] + c[1]) * (1.0f / 3.0f);
+    const float cz = (a[2] + b[2] + c[2]) * (1.0f / 3.0f);
+
     for (size_t i = 0; i < mWaterBoxes.size(); i++) {
         const WaterBoxDesc& box = mWaterBoxes[i];
 
-        // Height first: it rejects the lake bed, the sky and every wall in one comparison per vertex, and it
-        // is the test most triangles fail.
-        if (std::fabs(a[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
-            std::fabs(b[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
-            std::fabs(c[1] - box.ySurface) > WATER_SURFACE_TOLERANCE) {
-            continue;
-        }
-
-        // Then the footprint. The margin is there because the drawn surface routinely overshoots its
-        // collision box a little at the shoreline, and a hard edge would leave a rim of original water
-        // around every lake.
         const float x0 = box.xMin - WATER_BOX_XZ_MARGIN;
         const float x1 = box.xMin + box.xLength + WATER_BOX_XZ_MARGIN;
         const float z0 = box.zMin - WATER_BOX_XZ_MARGIN;
         const float z1 = box.zMin + box.zLength + WATER_BOX_XZ_MARGIN;
-        if (a[0] < x0 || a[0] > x1 || b[0] < x0 || b[0] > x1 || c[0] < x0 || c[0] > x1 || a[2] < z0 ||
-            a[2] > z1 || b[2] < z0 || b[2] > z1 || c[2] < z0 || c[2] > z1) {
+        if (cx < x0 || cx > x1 || cz < z0 || cz > z1) {
+            continue;
+        }
+        // Past the footprint, so everything below is a CANDIDATE: it is in the right place, and what remains
+        // is whether it is the right kind of thing. Counted per reason so a scene where nothing is found can
+        // say which condition turned it away instead of leaving it to be guessed at.
+        mWaterCandidates++;
+
+        // Height. Measured on the centroid for the same reason as the footprint, plus a flatness check so a
+        // steeply sloped triangle whose middle happens to sit at water level cannot pass.
+        if (std::fabs(cy - box.ySurface) > WATER_SURFACE_TOLERANCE) {
+            mWaterRejectHeight++;
             continue;
         }
 
-        // Finally the orientation. This is what separates a lake's surface from the waterfall pouring into
-        // it and from the glass-like walls of a water column -- both are inside the box, both are at the
-        // box's height for part of their span, and neither is a surface. They are F15's material, not this
-        // one's, and taking them here would replace a falling sheet of water with a flat horizontal lake.
+        // Orientation. This is what separates a lake's surface from the waterfall pouring into it and from
+        // the glass-like walls of a water column -- both are inside the box, both are at the box's height
+        // for part of their span, and neither is a surface. They are F15's material, and taking them here
+        // would replace a falling sheet of water with a flat horizontal lake.
         const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
         const float e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
         const float nx = e1[1] * e2[2] - e1[2] * e2[1];
@@ -3412,9 +3435,11 @@ int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const 
         const float nz = e1[0] * e2[1] - e1[1] * e2[0];
         const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
         if (len < 1e-6f) {
+            mWaterRejectTilt++;
             continue; // degenerate; no orientation to speak of
         }
         if (std::fabs(ny / len) < WATER_MIN_SURFACE_NORMAL_Y) {
+            mWaterRejectTilt++;
             continue;
         }
 

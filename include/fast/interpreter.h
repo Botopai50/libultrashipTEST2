@@ -465,8 +465,18 @@ class Interpreter {
         // always sees one complete frame's worth rather than however much of the current one has run.
         mWaterTrisLastFrame = mWaterTrisIdentified;
         mWaterBoxesHitLastFrame = mWaterBoxesHit;
+        mWaterCandidatesLastFrame = mWaterCandidates;
+        mWaterRejectHeightLastFrame = mWaterRejectHeight;
+        mWaterRejectTiltLastFrame = mWaterRejectTilt;
+        mWaterAcceptedXluLastFrame = mWaterAcceptedXlu;
+        mWaterAcceptedOpaLastFrame = mWaterAcceptedOpa;
         mWaterTrisIdentified = 0;
         mWaterBoxesHit = 0;
+        mWaterCandidates = 0;
+        mWaterRejectHeight = 0;
+        mWaterRejectTilt = 0;
+        mWaterAcceptedXlu = 0;
+        mWaterAcceptedOpa = 0;
         mWaterTime = time;
         mWaterEnabled = enabled && quality != WATER_QUALITY_OFF;
         mWaterQuality = quality < WATER_QUALITY_OFF               ? WATER_QUALITY_OFF
@@ -495,7 +505,16 @@ class Interpreter {
     // swarm after four wrong guesses about where it was drawn; this exists so the same question about water
     // ("is it finding this lake at all, and how much of it?") is answered by the code that decides rather
     // than by staring at a screenshot.
-    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut) const {
+    // `breakdownOut`, when given, receives five numbers: candidates (centroid landed in a box's footprint),
+    // rejected on height, rejected on tilt, accepted-and-translucent, accepted-and-not.
+    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut, int breakdownOut[5] = nullptr) const {
+        if (breakdownOut != nullptr) {
+            breakdownOut[0] = mWaterCandidatesLastFrame;
+            breakdownOut[1] = mWaterRejectHeightLastFrame;
+            breakdownOut[2] = mWaterRejectTiltLastFrame;
+            breakdownOut[3] = mWaterAcceptedXluLastFrame;
+            breakdownOut[4] = mWaterAcceptedOpaLastFrame;
+        }
         if (trisOut != nullptr) {
             *trisOut = mWaterTrisLastFrame;
         }
@@ -871,6 +890,27 @@ class Interpreter {
     uint64_t mWaterBoxesHit = 0; // bitmask over mWaterBoxes
     int mWaterTrisLastFrame = 0;
     uint64_t mWaterBoxesHitLastFrame = 0;
+    // Why candidates were turned away, and what the accepted ones were drawn as. Mutable because the test
+    // itself is const -- it answers a question about geometry and must stay side-effect free as far as the
+    // caller is concerned; these are pure instrumentation.
+    //
+    // The zmode split is the one that decides the open question. Three symptoms were reported at once --
+    // surfaces vanishing that are not water, surfaces vanishing only in part, scenes where nothing vanished
+    // -- and the part-vanishing is explained and fixed (centroid containment). The other two both turn on
+    // whether the render mode can tell a water surface from a stone ledge sitting at exactly water level,
+    // and this codebase has already proved twice that the answer cannot be reasoned out: the room's
+    // TRANSLUCENT pass declares an opaque zmode, and Navi's glow is alpha-blended while declaring itself
+    // opaque. So the counts are gathered and read rather than assumed.
+    mutable int mWaterCandidates = 0;   // centroid inside some box's footprint
+    mutable int mWaterRejectHeight = 0; // ... but not at its surface height
+    mutable int mWaterRejectTilt = 0;   // ... and not horizontal
+    int mWaterAcceptedXlu = 0;          // accepted and drawn with ZMODE_XLU
+    int mWaterAcceptedOpa = 0;          // accepted and drawn with any other zmode
+    int mWaterCandidatesLastFrame = 0;
+    int mWaterRejectHeightLastFrame = 0;
+    int mWaterRejectTiltLastFrame = 0;
+    int mWaterAcceptedXluLastFrame = 0;
+    int mWaterAcceptedOpaLastFrame = 0;
 
     // Which water box, if any, this triangle's three world-space vertices form a surface of. -1 for none.
     // Defined in the .cpp beside the rest of the water code.
