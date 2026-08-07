@@ -1866,23 +1866,39 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         const float wc[3] = { v3->wx, v3->wy, v3->wz };
         const int box = WaterSurfaceBoxIndex(wa, wb, wc);
         if (box >= 0) {
-            mWaterTrisIdentified++;
-            if (box < 64) {
-                mWaterBoxesHit |= (1ull << box);
-            }
-            // What the accepted geometry is drawn AS. Recorded here rather than tested on, because whether
-            // the render mode can separate a water surface from a stone ledge at water level is exactly the
-            // thing this codebase has twice punished me for reasoning about instead of measuring.
-            if ((mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU) {
+            // Geometry passes the box test and is flat at the water's height -- but so is a flat patch of
+            // shore, and the shore is by definition at the water's height. What actually separates them is
+            // that a water surface is SEE-THROUGH: the pond in the screenshot shows its own bed and the
+            // grass edges through it, and the grass beside it shows nothing through anything.
+            //
+            // Safe to require here in a way it would never be on its own. Render mode alone describes lava
+            // as well as it describes a lake, which is why identification is anchored to the collision box
+            // first; asking about the render mode only AFTER a water box has already claimed the triangle
+            // adds precision without reopening that door, because lava has no box to be claimed by.
+            //
+            // Counted both ways before the rejection, so the menu can show how much real water this costs in
+            // any scene where it costs some -- the room's translucent pass declares an opaque zmode, and
+            // Navi's glow is alpha-blended while declaring itself opaque, so it is entirely possible some
+            // scene draws its water in a mode this turns away. That shows up as a number rather than as a
+            // lake that quietly stops being found.
+            const bool translucent = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
+            if (translucent) {
                 mWaterAcceptedXlu++;
+                mWaterTrisIdentified++;
+                if (box < 64) {
+                    mWaterBoxesHit |= (1ull << box);
+                }
+                if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
+                    // F1's whole deliverable: the surface vanishing proves the identification found it AND
+                    // that the draw can be taken out of the frame cleanly, which is what F3 will put its own
+                    // material into. Until then the original water is drawn as it always was.
+                    return;
+                }
             } else {
+                // Counted, and then left alone. NOT returned: this is ordinary geometry that merely happens
+                // to sit flat inside a water box at the water's height -- the shore, a submerged ledge, a
+                // stone lip -- and it has to go on being drawn exactly as before.
                 mWaterAcceptedOpa++;
-            }
-            if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
-                // F1's whole deliverable: the surface vanishing proves the identification found it AND that
-                // the draw can be taken out of the frame cleanly, which is what F3 will put its own material
-                // into. Until then the original water is drawn as it always was.
-                return;
             }
         }
     }
@@ -3417,9 +3433,18 @@ int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const 
         // say which condition turned it away instead of leaving it to be guessed at.
         mWaterCandidates++;
 
-        // Height. Measured on the centroid for the same reason as the footprint, plus a flatness check so a
-        // steeply sloped triangle whose middle happens to sit at water level cannot pass.
-        if (std::fabs(cy - box.ySurface) > WATER_SURFACE_TOLERANCE) {
+        // Height, on ALL THREE vertices. The footprint moved to the centroid to fix surfaces vanishing in
+        // part; moving the height with it was a mistake, and an expensive one -- a shore slopes through the
+        // water line, so a sloping grass triangle straddling it has its MIDDLE at exactly water level while
+        // its corners are well above and below. Centroid height accepted the entire shoreline, which is why
+        // the ground Link was standing on vanished with the pond and why one pond reported a thousand
+        // surface triangles.
+        //
+        // Per-vertex is the right test because it is really a flatness test: a drawn water surface is dead
+        // flat at the box's height, and nothing that slopes through that height can satisfy it.
+        if (std::fabs(a[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
+            std::fabs(b[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
+            std::fabs(c[1] - box.ySurface) > WATER_SURFACE_TOLERANCE) {
             mWaterRejectHeight++;
             continue;
         }
