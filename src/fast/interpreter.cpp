@@ -1922,6 +1922,16 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         // Copied out before drawing: the re-entry below writes into the scratch vertex slots
                         // and, through the combiner, can reach a great deal of state -- but not this vector,
                         // because mWaterSubdividing stops it subdividing again.
+                        // Close the batch in flight before re-entering. The vertex buffer accumulates with
+                        // the CURRENT shader's stride, and the water variant carries an attribute the
+                        // geometry around it does not (the world position), so sub-triangles appended
+                        // mid-batch write at a different stride than the batch was started with and
+                        // misalign every vertex after them. That is not a water bug when it happens -- it
+                        // is terrain arriving garbled, which is exactly what the depth capture was showing.
+                        //
+                        // The shadow volumes re-enter this same function and flush first for the same
+                        // reason; not copying that was the omission.
+                        Flush();
                         mWaterSubdividing = true;
                         for (size_t i = 0; i + 2 < mWaterSubVerts.size(); i += 3) {
                             mRsp->loaded_vertices[MAX_VERTICES + 0] = mWaterSubVerts[i + 0];
@@ -1930,6 +1940,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                             GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
                         }
                         mWaterSubdividing = false;
+                        // And close the sub-triangles' own batch, so the draw that follows starts from the
+                        // state it set up rather than inheriting the water variant's.
+                        Flush();
                         return; // the pieces have been drawn; the original must not be drawn over them
                     }
                 }
