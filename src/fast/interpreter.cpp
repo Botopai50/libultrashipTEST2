@@ -1916,7 +1916,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     const int level = WaterSubdivisionLevel(wa, wb, wc);
                     if (level > 0) {
                         mWaterSubVerts.clear();
+                        mWaterCurrentBox = box; // the waves damp against this box's edge
                         WaterSubdivide(*v1, *v2, *v3, level);
+                        mWaterCurrentBox = -1;
                         // Copied out before drawing: the re-entry below writes into the scratch vertex slots
                         // and, through the combiner, can reach a great deal of state -- but not this vector,
                         // because mWaterSubdividing stops it subdividing again.
@@ -3535,6 +3537,100 @@ int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const 
     return -1;
 }
 
+// SOH [Enhancement] Water (F4): displace one vertex by the Gerstner sum and give it the analytic normal.
+//
+// On the CPU because Fast3D transforms vertices here and its vertex shader is a passthrough -- there is no
+// vertex stage to displace in. So the world position moves and the clip position is rebuilt from it, which
+// is the same arithmetic GfxSpVertex already did.
+//
+// Gerstner rather than a sine because it also moves the vertex HORIZONTALLY, along the direction of travel:
+// that gathers vertices at the crests and spreads them in the troughs, which is what makes sharp peaks and
+// wide flat valleys instead of a corrugated sheet.
+//
+// The normal comes from the analytic derivatives of the same waves, not from differencing the displaced
+// vertices. Differencing gives one normal per facet, so a coarse mesh reads as facets no matter how good the
+// waves are -- and the normal is what every later phase is a function of.
+void Interpreter::WaterApplyWaves(LoadedVertex& v) const {
+    static const float kWaves[WATER_WAVE_COUNT][4] = WATER_WAVES;
+
+    // Amplitude damped to nothing near the shoreline, so a crest cannot rise through it and open a gap
+    // against the sand.
+    //
+    // Measured as distance to the claimed water box's edge, which the design document calls the FALLBACK
+    // (2.2.3) -- it knows the outline and nothing about the submerged terrain. Its preferred signal is water
+    // thickness, and that lives in the depth target, which this code cannot read: the displacement happens
+    // on the CPU because Fast3D has no vertex stage, and the depth target is a GPU resource. The better
+    // signal arrives with F5, which moves the damping into the material where the texture is in reach.
+    float shore = 1.0f;
+    if (mWaterCurrentBox >= 0 && (size_t)mWaterCurrentBox < mWaterBoxes.size()) {
+        const WaterBoxDesc& box = mWaterBoxes[mWaterCurrentBox];
+        const float dx = std::min(v.wx - box.xMin, (box.xMin + box.xLength) - v.wx);
+        const float dz = std::min(v.wz - box.zMin, (box.zMin + box.zLength) - v.wz);
+        shore = std::min(dx, dz) / WATER_WAVE_SHORE_DEPTH;
+    }
+    shore = shore < 0.0f ? 0.0f : (shore > 1.0f ? 1.0f : shore);
+    shore = shore * shore * (3.0f - 2.0f * shore); // smoothstep: no crease where the damping begins
+
+    const float x0 = v.wx, z0 = v.wz;
+    float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+    // Normal accumulates as the horizontal slope; the vertical component is added at the end.
+    float nx = 0.0f, nz = 0.0f;
+
+    for (int i = 0; i < WATER_WAVE_COUNT; i++) {
+        const float dirX = kWaves[i][0], dirZ = kWaves[i][1];
+        const float wavelength = kWaves[i][2];
+        const float amplitude = kWaves[i][3] * shore;
+        const float len = std::sqrt(dirX * dirX + dirZ * dirZ);
+        if (len < 1e-6f || wavelength < 1e-3f) {
+            continue;
+        }
+        const float ux = dirX / len, uz = dirZ / len;
+        const float k = 6.2831853f / wavelength;              // spatial frequency
+        const float speed = std::sqrt(9.81f / k) * WATER_WAVE_SPEED; // deep-water dispersion
+        const float phase = k * (ux * x0 + uz * z0) - speed * k * mWaterTime;
+        const float sinP = std::sin(phase), cosP = std::cos(phase);
+        const float q = WATER_WAVE_STEEPNESS / (k * amplitude * WATER_WAVE_COUNT + 1e-6f);
+
+        dx += q * amplitude * ux * cosP;
+        dz += q * amplitude * uz * cosP;
+        dy += amplitude * sinP;
+
+        nx += ux * k * amplitude * cosP;
+        nz += uz * k * amplitude * cosP;
+    }
+
+    v.wx = x0 + dx;
+    v.wy += dy;
+    v.wz = z0 + dz;
+
+    const float ny = 1.0f;
+    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    v.nx = -nx / nlen;
+    v.ny = ny / nlen;
+    v.nz = -nz / nlen;
+
+    // Rebuild the clip position from the moved world position. Same transform GfxSpVertex applies, including
+    // the aspect-ratio adjustment on x -- omit that and the waves would shear sideways on a widescreen
+    // window while the unmoved surface around them did not.
+    const float(*p)[4] = mRsp->P_matrix;
+    const float wx = v.wx, wy = v.wy, wz = v.wz;
+    v.x = wx * p[0][0] + wy * p[1][0] + wz * p[2][0] + p[3][0];
+    v.y = wx * p[0][1] + wy * p[1][1] + wz * p[2][1] + p[3][1];
+    v.z = wx * p[0][2] + wy * p[1][2] + wz * p[2][2] + p[3][2];
+    v.w = wx * p[0][3] + wy * p[1][3] + wz * p[2][3] + p[3][3];
+    v.x = AdjXForAspectRatio(v.x);
+
+    // Clip flags follow the new position, or a displaced vertex keeps the trivial-reject answer computed for
+    // where it used to be.
+    v.clip_rej = 0;
+    if (v.x < -v.w) v.clip_rej |= 1;
+    if (v.x > v.w) v.clip_rej |= 2;
+    if (v.y < -v.w) v.clip_rej |= 4;
+    if (v.y > v.w) v.clip_rej |= 8;
+    if (v.z < -v.w) v.clip_rej |= 16;
+    if (v.z > v.w) v.clip_rej |= 32;
+}
+
 // SOH [Enhancement] Water (F2): how many times to split this triangle, from its longest world-space edge.
 //
 // A lake in this game is a handful of enormous triangles, and waves displace VERTICES -- a surface with four
@@ -3596,9 +3692,19 @@ static LoadedVertex WaterMidpoint(const LoadedVertex& p, const LoadedVertex& q) 
 // for free and neither a gap against the terrain nor an overflow past it is possible.
 void Interpreter::WaterSubdivide(const LoadedVertex& a, const LoadedVertex& b, const LoadedVertex& c, int level) {
     if (level <= 0) {
-        mWaterSubVerts.push_back(a);
-        mWaterSubVerts.push_back(b);
-        mWaterSubVerts.push_back(c);
+        // F4: the waves are applied at the LEAVES, once per final vertex, rather than at every level of the
+        // recursion. Displacing a parent and then splitting it would interpolate the wave between corners
+        // instead of evaluating it, which is the facetted result the analytic normal exists to avoid.
+        //
+        LoadedVertex va = a, vb = b, vc = c;
+        if (mWaterQuality >= WATER_QUALITY_MEDIUM) {
+            WaterApplyWaves(va);
+            WaterApplyWaves(vb);
+            WaterApplyWaves(vc);
+        }
+        mWaterSubVerts.push_back(va);
+        mWaterSubVerts.push_back(vb);
+        mWaterSubVerts.push_back(vc);
         return;
     }
     const LoadedVertex ab = WaterMidpoint(a, b);
