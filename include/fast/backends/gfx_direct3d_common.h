@@ -152,7 +152,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // implements the depth pass.
     bool SupportsShadowMap() override;
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
-    void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) override;
+    bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
+                               uint64_t contentKey) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) override;
     bool SupportsShadowMapAlphaCasters() override;
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
@@ -179,6 +180,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool CreateShadowMapPipeline();
     bool CreateShadowMapTargets(int cascadeCount, int resolution);
     ID3D11RasterizerState* ShadowRasterizerForCascade(int cascadeIndex, const float lightViewProj[16]);
+    void ShadowMapInvalidateOpenSlice();
+    void ShadowMapBindForReading();
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -214,6 +217,18 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     int mShadowCurrentLayer = 0; // layer named by the most recent ShadowMapBeginCascade
+    int mShadowCurrentSlice = -1; // slice it opened, so a failed upload can drop that slice's record
+    // What each slice was last filled with, so a slice whose casters and matrix are both unchanged is left
+    // alone instead of being cleared and redrawn. A depth map is a pure function of those two plus the
+    // rasterizer state (the slope bias differs per cascade and follows a user setting), so the raster state
+    // object is part of the record -- a changed setting builds a new state, and the pointer moves with it.
+    //
+    // Every entry is dropped whenever the cascade array is (re)built: the new texture holds nothing, and a
+    // record claiming otherwise would leave a slice permanently empty.
+    float mShadowSliceMatrix[SHADOW_MAP_MAX_SLICES][16] = {};
+    uint64_t mShadowSliceKey[SHADOW_MAP_MAX_SLICES] = {};
+    const void* mShadowSliceRasterState[SHADOW_MAP_MAX_SLICES] = {};
+    bool mShadowSliceValid[SHADOW_MAP_MAX_SLICES] = {};
     // SOH [Enhancement] Alpha-cutout caster pipeline: a second vertex shader (position + uv), pixel shader
     // (sample and clip) and layout, used for foliage so the depth map records the leaf instead of the quad.
     // Optional -- if any of it fails to build, mShadowAlphaPipelineReady stays false and foliage simply keeps

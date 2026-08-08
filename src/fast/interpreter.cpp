@@ -1434,16 +1434,84 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
     if (dst.ranges.empty() || !(dst.ranges.back().key == key)) {
         dst.ranges.push_back({ key, 0u, (uint32_t)(dst.verts.size() / 5), 0u });
     }
+    // Built into a local and inserted once, for the same reason the opaque path does (see
+    // ShadowAppendTriangle): fifteen push_backs per triangle is fifteen capacity checks.
+    float tri[15];
     for (int si = 0; si < 3; si++) {
         float u, w;
         ShadowCasterTexcoord(mRdp->first_tile_index, v[si], texWidth, texHeight, &u, &w);
-        dst.verts.push_back(v[si]->wx);
-        dst.verts.push_back(v[si]->wy);
-        dst.verts.push_back(v[si]->wz);
-        dst.verts.push_back(u);
-        dst.verts.push_back(w);
+        float* o = &tri[si * 5];
+        o[0] = v[si]->wx;
+        o[1] = v[si]->wy;
+        o[2] = v[si]->wz;
+        o[3] = u;
+        o[4] = w;
     }
+    dst.verts.insert(dst.verts.end(), tri, tri + 15);
     dst.ranges.back().vertexCount += 3;
+}
+
+// 64-bit FNV-1a, eight bytes at a time. Only ever asked one question -- "is this the same data as last
+// frame?" -- so speed matters and cryptographic strength does not; a 64-bit digest makes a false match
+// vanishingly unlikely, and the cost of one would be a single frame of stale shadow map.
+uint64_t Interpreter::ShadowHashBytes(uint64_t seed, const void* data, size_t bytes) {
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = seed;
+    size_t i = 0;
+    for (; i + 8 <= bytes; i += 8) {
+        uint64_t chunk;
+        memcpy(&chunk, p + i, sizeof(chunk)); // the lists are float/struct arrays; no alignment assumption
+        h = (h ^ chunk) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < bytes; i++) {
+        h = (h ^ (uint64_t)p[i]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
+// What this layer is about to submit, as one value. Two frames that produce the same key would rasterise
+// the same depth map, so the backend can leave the slice it already has (see ShadowMapBeginCascade).
+//
+// Everything the depth pass reads has to be in here. That is: the opaque caster positions, the cutout
+// caster positions AND their uvs, and each cutout range's RESOLVED texture id -- the id is what the pass
+// binds, and a texture evicted and re-imported between frames changes the picture without moving a single
+// vertex. The matrix is compared separately by the backend, which is also what covers the camera moving.
+uint64_t Interpreter::ShadowMapLayerContentKey(int layer) const {
+    uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t)layer;
+
+    auto mixFloats = [&h](const std::vector<float>& v) {
+        const uint64_t n = (uint64_t)v.size();
+        h = ShadowHashBytes(h, &n, sizeof(n)); // length first: two lists cannot alias by being prefixes
+        if (!v.empty()) {
+            h = ShadowHashBytes(h, v.data(), v.size() * sizeof(float));
+        }
+    };
+    auto mixAlphaRanges = [&h](const ShadowAlphaCasters& a) {
+        const uint64_t n = (uint64_t)a.ranges.size();
+        h = ShadowHashBytes(h, &n, sizeof(n));
+        for (const ShadowAlphaRange& r : a.ranges) {
+            const uint32_t fields[3] = { r.textureId, r.firstVertex, r.vertexCount };
+            h = ShadowHashBytes(h, fields, sizeof(fields));
+        }
+    };
+
+    if (layer == SHADOW_MAP_LAYER_WORLD) {
+        // The room mesh and its cutout half are the cache, and the cache is only ever replaced wholesale --
+        // so the generation counter identifies both without walking either. This is the point of the
+        // counter: these are by far the largest lists in the frame.
+        h = ShadowHashBytes(h, &mShadowWorldCacheGeneration, sizeof(mShadowWorldCacheGeneration));
+        mixAlphaRanges(mShadowAlphaWorldCache); // resolved ids still move under a stable cache
+        // Scenery actors are rebuilt every frame because they can move, so they are hashed for real.
+        mixFloats(mShadowSceneryReady);
+        mixFloats(mShadowAlphaSceneryReady.verts);
+        mixAlphaRanges(mShadowAlphaSceneryReady);
+    } else {
+        mixFloats(mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS]);
+        mixFloats(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts);
+        mixAlphaRanges(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
+    }
+    return h;
 }
 
 void Interpreter::ResolveShadowAlphaTextures(ShadowAlphaCasters& set) {
@@ -1728,6 +1796,15 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
+// One captured triangle, nine floats, appended in a single go. Written as a bulk insert rather than nine
+// push_backs because this runs per triangle on every caster in the scene: push_back re-checks the capacity
+// and re-reads the end pointer each time, and the room mesh alone is tens of thousands of triangles per
+// rebuild. Same bytes in the same order either way.
+static inline void ShadowAppendTriangle(std::vector<float>& dst, struct LoadedVertex* const v[3]) {
+    const float tri[9] = { v[0]->wx, v[0]->wy, v[0]->wz, v[1]->wx, v[1]->wy, v[1]->wz, v[2]->wx, v[2]->wy, v[2]->wz };
+    dst.insert(dst.end(), tri, tri + 9);
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
@@ -1742,104 +1819,101 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // SOH [Enhancement] Cascaded shadow maps: alpha-cutout materials take a separate path in both layers.
     // Resolved here, before either capture, because the answer and the texture key come from RDP state that
     // the combiner setup further down would have moved on from.
-    TextureCacheKey shadowAlphaKey{};
-    bool shadowAlphaCaster = false;
-    float shadowTexW = 1.0f, shadowTexH = 1.0f;
-    // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
-    // cutout question, because a decal that happens to be alpha-tested is still a decal.
-    const bool shadowArmed = !mRdp->shadow_no_cast &&
-                             (mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_scenery_caster);
-    const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
-    if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
-        // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
-        // this geometry to go, and diverting it there anyway would mean foliage casts NOTHING rather than
-        // casting its quad. Falling back to the opaque list is worse looking and strictly better than a
-        // missing shadow.
-        shadowAlphaCaster = ShadowCasterIsAlphaTested(mRdp->first_tile_index, &shadowAlphaKey);
-        if (shadowAlphaCaster) {
-            ShadowCasterTexSize(mRdp->first_tile_index, &shadowTexW, &shadowTexH);
+    // One test in front of the whole capture block, because this is the hottest function in the renderer and
+    // every triangle in the game passes through it -- including the overwhelming majority of frames and
+    // draws where no shadow system is armed at all. Nothing below can do anything without one of these
+    // three: the stencil path needs toon_shadow, and all three shadow-map paths need the shadow map on plus
+    // one of its brackets open. Everything the block computes is derived state with no side effects, so
+    // skipping it is exactly equivalent to running it and reaching no branch.
+    const bool shadowCaptureActive =
+        mRdp->toon_shadow || (mShadowMapEnabled && (mRdp->shadow_world_caster || mRdp->shadow_scenery_caster));
+    if (shadowCaptureActive) {
+        TextureCacheKey shadowAlphaKey{};
+        bool shadowAlphaCaster = false;
+        float shadowTexW = 1.0f, shadowTexH = 1.0f;
+        // Geometry the shadow map must never record at all (decals, translucent overlays). Checked before the
+        // cutout question, because a decal that happens to be alpha-tested is still a decal.
+        const bool shadowArmed =
+            !mRdp->shadow_no_cast && (mRdp->toon_shadow || mRdp->shadow_world_caster || mRdp->shadow_scenery_caster);
+        const bool shadowCasterExcluded = mShadowMapEnabled && shadowArmed && ShadowCasterExcludedByRenderMode();
+        if (mShadowMapEnabled && mShadowAlphaSupported && !shadowCasterExcluded && !is_rect && shadowArmed) {
+            // mShadowAlphaSupported: when the backend could not build its cutout pipeline there is nowhere for
+            // this geometry to go, and diverting it there anyway would mean foliage casts NOTHING rather than
+            // casting its quad. Falling back to the opaque list is worse looking and strictly better than a
+            // missing shadow.
+            shadowAlphaCaster = ShadowCasterIsAlphaTested(mRdp->first_tile_index, &shadowAlphaKey);
+            if (shadowAlphaCaster) {
+                ShadowCasterTexSize(mRdp->first_tile_index, &shadowTexW, &shadowTexH);
+            }
         }
-    }
 
-    // The stencil volumes need a lit surface (they cast along a per-vertex-normal key), but a shadow MAP
-    // only needs the geometry: unlit geometry blocks light exactly as well as lit geometry does. Tree
-    // canopies, billboards and most scenery props draw with lighting off, and requiring it here is why a
-    // tree cast from its trunk and not from its leaves. The requirement stays exactly as it was whenever
-    // the shadow map is off, so the stencil mode is untouched.
-    const bool armedCaster = mRdp->toon_shadow && !is_rect;
-    const bool casterLit = (mRsp->geometry_mode & G_LIGHTING) != 0;
-    if (armedCaster && (mShadowMapEnabled ? !shadowCasterExcluded : casterLit)) {
-        // Every armed triangle grows the object's bounding box, whichever list it lands in. The box is what
-        // the size gate in FlushToonShadow judges the object by, so measuring only the opaque half would
-        // shrink a mostly-cutout actor below the threshold and drop its whole shadow -- and which half of a
-        // skeletal actor is cutout changes with the animation, which is a shadow that flickers as it walks.
-        for (int si = 0; si < 3; si++) {
-            const float p[3] = { v_arr[si]->wx, v_arr[si]->wy, v_arr[si]->wz };
-            for (int a = 0; a < 3; a++) {
-                if (!mShadowObjectHasVerts || p[a] < mShadowObjectMin[a]) {
-                    mShadowObjectMin[a] = p[a];
-                }
-                if (!mShadowObjectHasVerts || p[a] > mShadowObjectMax[a]) {
-                    mShadowObjectMax[a] = p[a];
-                }
-            }
-            mShadowObjectHasVerts = true;
-        }
-        if (shadowAlphaCaster) {
-            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
-        } else if (shadowCasterExcluded) {
-            // Nothing: not a caster, and the stencil path is not running (see ShadowCasterExcludedByRenderMode).
-        } else if (mShadowMapEnabled || casterLit) {
-            // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
-            // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
-            // map needs the object's bounding box before it can decide the object is worth casting at all
-            // (see FlushToonShadow).
+        // The stencil volumes need a lit surface (they cast along a per-vertex-normal key), but a shadow MAP
+        // only needs the geometry: unlit geometry blocks light exactly as well as lit geometry does. Tree
+        // canopies, billboards and most scenery props draw with lighting off, and requiring it here is why a
+        // tree cast from its trunk and not from its leaves. The requirement stays exactly as it was whenever
+        // the shadow map is off, so the stencil mode is untouched.
+        const bool armedCaster = mRdp->toon_shadow && !is_rect;
+        const bool casterLit = (mRsp->geometry_mode & G_LIGHTING) != 0;
+        if (armedCaster && (mShadowMapEnabled ? !shadowCasterExcluded : casterLit)) {
+            // Every armed triangle grows the object's bounding box, whichever list it lands in. The box is what
+            // the size gate in FlushToonShadow judges the object by, so measuring only the opaque half would
+            // shrink a mostly-cutout actor below the threshold and drop its whole shadow -- and which half of a
+            // skeletal actor is cutout changes with the animation, which is a shadow that flickers as it walks.
             for (int si = 0; si < 3; si++) {
-                mShadowVerts.push_back(v_arr[si]->wx);
-                mShadowVerts.push_back(v_arr[si]->wy);
-                mShadowVerts.push_back(v_arr[si]->wz);
+                const float p[3] = { v_arr[si]->wx, v_arr[si]->wy, v_arr[si]->wz };
+                for (int a = 0; a < 3; a++) {
+                    if (!mShadowObjectHasVerts || p[a] < mShadowObjectMin[a]) {
+                        mShadowObjectMin[a] = p[a];
+                    }
+                    if (!mShadowObjectHasVerts || p[a] > mShadowObjectMax[a]) {
+                        mShadowObjectMax[a] = p[a];
+                    }
+                }
+                mShadowObjectHasVerts = true;
             }
-        }
-    } else if (mShadowMapEnabled && mRdp->shadow_scenery_caster && !is_rect && !shadowCasterExcluded) {
-        // Scenery the game spawns as an actor: a gate, a fence, a tree. It is drawn into the WORLD layer,
-        // because everything samples that layer and a gate's shadow belongs on the player the way a wall's
-        // does -- but into its own per-frame list rather than the cache beside the room mesh, because the
-        // cache notices when geometry CHANGES and not when it MOVES, and the castle gate slides open.
-        //
-        // Ungated by mShadowWorldCapture for the same reason: that flag exists to skip re-walking a cached
-        // list, and there is no cache here to skip.
-        if (shadowAlphaCaster) {
-            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH,
-                                       &mShadowAlphaScenery);
-        } else if (mShadowSceneryCasters.size() < kShadowMapCasterBudgetFloats) {
-            for (int si = 0; si < 3; si++) {
-                mShadowSceneryCasters.push_back(v_arr[si]->wx);
-                mShadowSceneryCasters.push_back(v_arr[si]->wy);
-                mShadowSceneryCasters.push_back(v_arr[si]->wz);
+            if (shadowAlphaCaster) {
+                CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
+            } else if (shadowCasterExcluded) {
+                // Nothing: not a caster, and the stencil path is not running (see ShadowCasterExcludedByRenderMode).
+            } else if (mShadowMapEnabled || casterLit) {
+                // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
+                // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
+                // map needs the object's bounding box before it can decide the object is worth casting at all
+                // (see FlushToonShadow).
+                ShadowAppendTriangle(mShadowVerts, v_arr);
             }
-        }
-    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
-               !shadowCasterExcluded && shadowAlphaCaster) {
-        CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
-    } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
-               !shadowCasterExcluded &&
-               mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
-        // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
-        // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the stencil path --
-        // the room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
-        // mShadowWorldCapture gates this to the frames that actually rebuild the cache; on every other frame
-        // the room mesh costs nothing here and the cached list is reused as-is.
-        //
-        // Scenery actors arrive here too, through the same bracket (gSPShadowMapSceneryCasterBegin). A tree
-        // belongs in this layer and not the actor one: everything samples this layer, so its shadow lands on
-        // the player standing under it, which the actor layer -- the one characters skip so they cannot
-        // shadow each other -- can never do. Caching them alongside the room mesh is right for the same
-        // reason it is right for the room: they do not move.
-        std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_WORLD];
-        for (int si = 0; si < 3; si++) {
-            dst.push_back(v_arr[si]->wx);
-            dst.push_back(v_arr[si]->wy);
-            dst.push_back(v_arr[si]->wz);
+        } else if (mShadowMapEnabled && mRdp->shadow_scenery_caster && !is_rect && !shadowCasterExcluded) {
+            // Scenery the game spawns as an actor: a gate, a fence, a tree. It is drawn into the WORLD layer,
+            // because everything samples that layer and a gate's shadow belongs on the player the way a wall's
+            // does -- but into its own per-frame list rather than the cache beside the room mesh, because the
+            // cache notices when geometry CHANGES and not when it MOVES, and the castle gate slides open.
+            //
+            // Ungated by mShadowWorldCapture for the same reason: that flag exists to skip re-walking a cached
+            // list, and there is no cache here to skip.
+            if (shadowAlphaCaster) {
+                CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH,
+                                           &mShadowAlphaScenery);
+            } else if (mShadowSceneryCasters.size() < kShadowMapCasterBudgetFloats) {
+                ShadowAppendTriangle(mShadowSceneryCasters, v_arr);
+            }
+        } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
+                   !shadowCasterExcluded && shadowAlphaCaster) {
+            CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_WORLD, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
+        } else if (mShadowMapEnabled && mRdp->shadow_world_caster && mShadowWorldCapture && !is_rect &&
+                   !shadowCasterExcluded &&
+                   mShadowMapCasters[SHADOW_MAP_LAYER_WORLD].size() < kShadowMapCasterBudgetFloats) {
+            // SOH [Enhancement] Cascaded shadow maps: world geometry inside a gSPShadowMapWorldCaster bracket.
+            // This is what lets the scene shadow itself. No G_LIGHTING requirement, unlike the stencil path --
+            // the room mesh is often drawn unlit, and a wall still blocks light whether or not it is being shaded.
+            // mShadowWorldCapture gates this to the frames that actually rebuild the cache; on every other frame
+            // the room mesh costs nothing here and the cached list is reused as-is.
+            //
+            // Scenery actors arrive here too, through the same bracket (gSPShadowMapSceneryCasterBegin). A tree
+            // belongs in this layer and not the actor one: everything samples this layer, so its shadow lands on
+            // the player standing under it, which the actor layer -- the one characters skip so they cannot
+            // shadow each other -- can never do. Caching them alongside the room mesh is right for the same
+            // reason it is right for the room: they do not move.
+            ShadowAppendTriangle(mShadowMapCasters[SHADOW_MAP_LAYER_WORLD], v_arr);
         }
     }
 
@@ -3258,6 +3332,9 @@ void Interpreter::RenderShadowMap() {
                 mShadowAlphaWorldCache.swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_WORLD]);
                 mShadowWorldKeyCached = mShadowWorldKeyAccum;
                 mShadowWorldCapture = false;
+                // The one place the cached lists change. Everything downstream reads the counter instead of
+                // the megabytes behind it (see ShadowMapLayerContentKey).
+                mShadowWorldCacheGeneration++;
             } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
                 // Different geometry ran this frame than the cache was built from. The frame is already past
                 // the point where it could have been captured, so arm the rebuild for the next one -- the
@@ -3531,6 +3608,13 @@ void Interpreter::RenderShadowMap() {
     ResolveShadowAlphaTextures(mShadowAlphaSceneryReady);
     ResolveShadowAlphaTextures(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
 
+    // One summary of each layer's caster geometry, computed after the ids above are resolved because they
+    // are part of what gets drawn. Handed to the backend so a slice whose casters AND matrix are both
+    // unchanged is left holding the image it already has instead of being cleared and redrawn -- which for
+    // the world layer, in a room where only the camera moves, is every cascade every frame.
+    const uint64_t layerContentKeys[SHADOW_MAP_LAYERS] = { ShadowMapLayerContentKey(SHADOW_MAP_LAYER_WORLD),
+                                                           ShadowMapLayerContentKey(SHADOW_MAP_LAYER_ACTORS) };
+
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
         // The world layer draws from the cache, which usually holds the same vector contents as last frame --
         // so on top of skipping the capture, the backend's "same list as the previous call" check also skips
@@ -3544,7 +3628,12 @@ void Interpreter::RenderShadowMap() {
         // and frames while the scenery list beside it is replaced every frame.
         const bool sceneryHere = (l == SHADOW_MAP_LAYER_WORLD);
         for (int c = 0; c < mShadowMapCascadeCount; c++) {
-            mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16]);
+            // False means this slice already holds exactly what the calls below would draw into it. Nothing
+            // may be submitted then -- the backend has not cleared it, has not set the depth pipeline up,
+            // and is not the render target.
+            if (!mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16], layerContentKeys[l])) {
+                continue;
+            }
             if (casters.size() >= 9) {
                 mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3, SHADOW_MAP_CASTER_SLOT_MAIN);
             }

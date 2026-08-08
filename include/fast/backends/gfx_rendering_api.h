@@ -146,7 +146,18 @@ class GfxRenderingAPI {
     // Begin depth-only rendering into one cascade of one layer (SHADOW_MAP_LAYER_WORLD or _ACTORS -- see
     // fast/shadow_map.h for why casters are split). lightViewProj is row-major, the same convention the
     // interpreter already uses for its own matrices. Clears that slice's depth to far before drawing.
-    virtual void ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) {
+    //
+    // `contentKey` identifies the caster geometry the caller is about to submit into this slice. A depth
+    // map is a pure function of that geometry and the matrix, so when both match what the slice was last
+    // filled with, the slice ALREADY holds the exact image this frame would redraw -- and the answer is
+    // false, meaning "leave it alone and skip the draws". The caller must then submit nothing for this
+    // slice. True means the slice was cleared and the pipeline set, exactly as before.
+    //
+    // The saving is the whole slice: at the default 4096 square that is a 32 MB depth clear plus every
+    // caster re-rasterised, per cascade, and the world layer's geometry is static for long stretches.
+    virtual bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
+                                       uint64_t contentKey) {
+        return false; // no depth pass in this backend, so there is nothing to draw into
     }
 
     // Submit caster geometry into the cascade opened by ShadowMapBeginCascade: `vertexCount` vertices of

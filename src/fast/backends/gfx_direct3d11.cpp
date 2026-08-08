@@ -1577,6 +1577,10 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     // Drop the old array first so the driver can reuse its memory for the new one.
     for (int i = 0; i < SHADOW_MAP_MAX_SLICES; i++) {
         mShadowMapDsv[i].Reset();
+        // Whatever each slice held goes with the texture. Leaving the records behind would let the
+        // reuse check below match against contents that no longer exist, and that slice would then
+        // never be drawn at all.
+        mShadowSliceValid[i] = false;
     }
     mShadowMapSrv.Reset();
     mShadowMapTexture.Reset();
@@ -1724,18 +1728,33 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
     return mShadowRasterizerCascade[cascadeIndex].Get();
 }
 
-void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16]) {
+bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
+                                                uint64_t contentKey) {
     if (!mShadowPipelineReady || mShadowMapTexture == nullptr || lightViewProj == nullptr) {
-        return;
+        return false;
     }
     if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
-        return;
+        return false;
     }
     if (layer < 0 || layer >= SHADOW_MAP_LAYERS) {
-        return;
+        return false;
     }
     // Layer L, cascade C lives in slice L*cascadeCount + C (see fast/shadow_map.h).
     const int slice = layer * mShadowCascadeCount + cascadeIndex;
+
+    // Resolved before the reuse test rather than after: the slope bias this cascade rasterises with is
+    // part of what its depth map contains, and it follows a user setting. Building it here is free -- the
+    // state objects are cached and this is the same call the draw path was going to make anyway.
+    ID3D11RasterizerState* rasterState = ShadowRasterizerForCascade(cascadeIndex, lightViewProj);
+
+    // Nothing that decides this slice's contents has moved, so the slice still holds exactly the image
+    // this call would redraw. Skip the clear, the state setup and every caster draw behind it.
+    if (mShadowSliceValid[slice] && mShadowSliceKey[slice] == contentKey &&
+        mShadowSliceRasterState[slice] == rasterState &&
+        memcmp(mShadowSliceMatrix[slice], lightViewProj, 16 * sizeof(float)) == 0) {
+        mShadowCurrentSlice = -1; // nothing is open, so nothing may be invalidated by a stray submit
+        return false;
+    }
 
     if (!mShadowPassActive) {
         // Remember the viewport once for the whole pass, not per cascade.
@@ -1770,6 +1789,13 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mShadowPassActive = true;
     }
     mShadowCurrentLayer = layer;
+    mShadowCurrentSlice = slice;
+    // Claimed before the draws, and dropped again by any of them that cannot complete (see
+    // ShadowMapDrawCasters): a half-filled slice must not be mistaken for a finished one next frame.
+    mShadowSliceValid[slice] = true;
+    mShadowSliceKey[slice] = contentKey;
+    mShadowSliceRasterState[slice] = rasterState;
+    memcpy(mShadowSliceMatrix[slice], lightViewProj, 16 * sizeof(float));
     // Everything below re-establishes the OPAQUE pipeline, so any alpha binding from the previous cascade is
     // gone by the time this returns.
     mShadowAlphaBound = false;
@@ -1800,9 +1826,18 @@ void GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     mContext->VSSetShader(mShadowDepthVs.Get(), nullptr, 0);
     mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
     mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
-    mContext->RSSetState(ShadowRasterizerForCascade(cascadeIndex, lightViewProj));
+    mContext->RSSetState(rasterState);
     mContext->OMSetDepthStencilState(mShadowDepthStencilState.Get(), 0);
     mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    return true;
+}
+
+// Drop the record of what the open slice holds. Called from the submit paths when they cannot complete, so
+// a slice that ends up with only part of its casters is redrawn next frame rather than reused.
+void GfxRenderingAPIDX11::ShadowMapInvalidateOpenSlice() {
+    if (mShadowCurrentSlice >= 0 && mShadowCurrentSlice < SHADOW_MAP_MAX_SLICES) {
+        mShadowSliceValid[mShadowCurrentSlice] = false;
+    }
 }
 
 void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) {
@@ -1849,6 +1884,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
         ComPtr<ID3D11Buffer> grown;
         if (FAILED(mDevice->CreateBuffer(&vb_desc, nullptr, grown.GetAddressOf()))) {
             SPDLOG_ERROR("Shadow map: could not grow the caster buffer to {} vertices.", capacity);
+            ShadowMapInvalidateOpenSlice(); // these casters never reached the slice
             return;
         }
         mShadowCasterVb[layer] = grown;
@@ -1861,6 +1897,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
     if (FAILED(mContext->Map(mShadowCasterVb[layer].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        ShadowMapInvalidateOpenSlice();
         return;
     }
     memcpy(ms.pData, worldXyz, vertexCount * 3 * sizeof(float));
@@ -1901,6 +1938,7 @@ void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t
         ComPtr<ID3D11Buffer> grown;
         if (FAILED(mDevice->CreateBuffer(&vb_desc, nullptr, grown.GetAddressOf()))) {
             SPDLOG_ERROR("Shadow map: could not grow the alpha caster buffer to {} vertices.", capacity);
+            ShadowMapInvalidateOpenSlice();
             return;
         }
         mShadowAlphaVb = grown;
@@ -1912,6 +1950,7 @@ void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
     if (FAILED(mContext->Map(mShadowAlphaVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        ShadowMapInvalidateOpenSlice();
         return;
     }
     memcpy(ms.pData, xyzUv, vertexCount * 5 * sizeof(float));
@@ -1925,9 +1964,14 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
         return;
     }
     if (firstVertex + vertexCount > mShadowAlphaLastCount) {
+        ShadowMapInvalidateOpenSlice();
         return; // range does not lie inside what was uploaded
     }
     if (textureId >= mTextures.size() || mTextures[textureId].resource_view == nullptr) {
+        // The caller resolved this id against the texture cache and cannot see that the backend has since
+        // dropped the texture, so the slice's content key does not describe what actually got drawn. Drop
+        // the record rather than reuse a slice that is missing a material.
+        ShadowMapInvalidateOpenSlice();
         return;
     }
     vertexCount -= vertexCount % 3;
@@ -2024,11 +2068,17 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
 }
 
 void GfxRenderingAPIDX11::ShadowMapEndPass() {
+    // The cascade array has to be handed to the main pass whether or not anything was drawn into it this
+    // frame. A frame in which every slice was reused (see ShadowMapBeginCascade) opens no pass at all, and
+    // the maps it is reusing are just as valid as freshly drawn ones -- returning early here would leave
+    // the shader sampling whatever happened to be bound and the shadows would vanish while nothing moved.
     if (!mShadowPassActive) {
+        ShadowMapBindForReading();
         return;
     }
     mShadowPassActive = false;
     mShadowAlphaBound = false;
+    mShadowCurrentSlice = -1;
 
     // Put back the frame's render target and viewport.
     if (mCurrentFramebuffer >= 0 && (size_t)mCurrentFramebuffer < mFrameBuffers.size()) {
@@ -2053,7 +2103,11 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mLastDepthMask = -1;
     mLastZmodeDecal = -1;
 
-    // Hand the finished cascades to the main pass, past the combiner's own texture slots.
+    ShadowMapBindForReading();
+}
+
+// Hand the cascades to the main pass, past the combiner's own texture slots.
+void GfxRenderingAPIDX11::ShadowMapBindForReading() {
     if (mShadowMapSrv != nullptr) {
         mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, mShadowMapSrv.GetAddressOf());
         mContext->PSSetSamplers(SHADER_MAX_TEXTURES, 1, mShadowMapSampler.GetAddressOf());

@@ -502,6 +502,7 @@ class Interpreter {
             // Same reasoning for the cached world layer, plus: force a rebuild on the next enable, since
             // nothing accumulated a signature while the mode was off.
             mShadowMapWorldCache.clear();
+            mShadowWorldCacheGeneration++; // the cache changed, so the slices built from it are stale
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
                 mShadowAlphaCasters[l].clear();
                 mShadowAlphaReady[l].clear();
@@ -755,6 +756,18 @@ class Interpreter {
     // cascade. Ranges whose texture has since been evicted are marked unresolved and skipped -- a missing
     // leaf shadow beats reinstating the solid rectangle this whole path exists to remove.
     void ResolveShadowAlphaTextures(ShadowAlphaCasters& set);
+    // A depth map is a pure function of the geometry drawn into it and the matrix it was drawn with, so a
+    // layer whose casters have not moved since the last frame produces a slice that is already correct.
+    // These summarise "what this layer is about to submit" into one value the backend can compare against
+    // what each of its slices was last filled with (see GfxRenderingAPI::ShadowMapBeginCascade).
+    //
+    // Walking the lists to hash them is far cheaper than the alternative: a slice costs a full-resolution
+    // depth clear plus every caster re-rasterised, once per cascade, and the world layer in particular is
+    // static for long stretches -- a room whose only movement is the camera re-renders four identical
+    // cascades every frame otherwise. The big list, the cached room mesh, is not walked at all: it is only
+    // ever replaced wholesale, so a counter bumped at each replacement identifies it exactly.
+    static uint64_t ShadowHashBytes(uint64_t seed, const void* data, size_t bytes);
+    uint64_t ShadowMapLayerContentKey(int layer) const;
     // Tile geometry and texture coordinates for the caster capture, which runs before the combiner setup
     // that normally derives them (see the definitions for why they are duplicated rather than shared).
     void ShadowCasterTexSize(int tile, float* outWidth, float* outHeight);
@@ -785,6 +798,11 @@ class Interpreter {
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
     uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from
+    // Bumped every time the cached world lists are replaced. It stands in for hashing the room mesh in
+    // ShadowMapLayerContentKey: the cache is only ever swapped wholesale, so a generation that has not
+    // moved means contents that have not changed -- and that is the one list large enough that walking it
+    // per frame would be worth avoiding.
+    uint64_t mShadowWorldCacheGeneration = 0;
     bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
