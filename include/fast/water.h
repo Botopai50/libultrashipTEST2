@@ -212,47 +212,6 @@
 #define WATER_MAX_SUBDIVISION_LEVEL 3
 
 // ---------------------------------------------------------------------------------------------------------
-// F4 -- Gerstner waves. Design document 2.2.
-//
-// Computed on the CPU, beside the subdivision, and that is forced rather than chosen: Fast3D transforms
-// vertices on the CPU and its vertex shader is a passthrough, so there is no vertex stage to displace in.
-// The waves therefore move the world position and the clip position is rebuilt from it, which is exactly
-// what the transform above already did.
-//
-// A Gerstner wave differs from a sine by also moving the vertex HORIZONTALLY, along the direction of travel.
-// That gathers vertices at the crests and spreads them in the troughs, which is what produces sharp peaks
-// and wide flat valleys -- the signature of real water, and the reason the document names it specifically.
-//
-// Amplitudes are deliberately small. The displacement is visual only; collision stays on the original plane,
-// so a swimmer would visibly sit inside a crest that rose too far. The document caps the total around 8
-// units for open water, and these sum to well under that.
-// ---------------------------------------------------------------------------------------------------------
-
-// Four waves: two long, one medium, one short. Each is { direction x, direction z, wavelength, amplitude }.
-// Directions are spread through about 60 degrees around the dominant one, as 2.2.2 asks -- parallel waves
-// read as corrugation rather than as water.
-#define WATER_WAVE_COUNT 4
-#define WATER_WAVES                                                                                        \
-    { { 1.00f, 0.15f, 1400.0f, 2.6f },                                                                     \
-      { 0.80f, 0.60f, 900.0f, 1.9f },                                                                      \
-      { 0.55f, -0.84f, 340.0f, 0.9f },                                                                     \
-      { 0.95f, -0.30f, 120.0f, 0.35f } }
-
-// Phase speed as a multiple of the natural deep-water speed. Below 1 the surface reads as syrup, above it
-// as a fast-forward; this is the value that looks like water at OoT's scale.
-#define WATER_WAVE_SPEED 0.55f
-
-// How sharply the crests are gathered, 0 = plain sine, 1 = cusped. Past about 0.7 a wave folds through
-// itself and the surface self-intersects, so this stays well clear of it.
-#define WATER_WAVE_STEEPNESS 0.45f
-
-// Wave amplitude is damped to nothing as the water thins, so a crest cannot rise through the shoreline and
-// leave a gap against the sand. Measured in world units of THICKNESS, which the design document (2.2.3)
-// prefers over distance-to-edge precisely because it knows about the submerged terrain and not merely the
-// outline. Full amplitude by this depth, zero at nothing.
-#define WATER_WAVE_SHORE_DEPTH 140.0f
-
-// ---------------------------------------------------------------------------------------------------------
 // Debug views (F0/F1). The menu exposes these as a combobox, the way the shadow map's cascade view is.
 // ---------------------------------------------------------------------------------------------------------
 #define WATER_DEBUG_OFF 0
