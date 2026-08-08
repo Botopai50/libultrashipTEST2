@@ -179,9 +179,7 @@ float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
-float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, uint cascade, float texelUv,
-                       float sliceBase) {
-    float slice = sliceBase + (float)cascade;
+float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, float slice, float texelUv) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
@@ -214,7 +212,7 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, uint ca
 // Redistributing the cascade splits was checked first and does not help: the far cascade's radius comes
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
-float SampleShadowPCF16(float2 uv, float2 grad, float z, uint cascade, float texelUv, float sliceBase) {
+float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texelUv) {
     // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
     // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
     // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
@@ -222,10 +220,10 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, uint cascade, float tex
     // quads overlap instead, which only costs redundancy, so this is safe to turn down for a tighter
     // penumbra and must not be turned above 1.0.
     float d = texelUv * min(shadow_filter.x, 1.0);
-    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, z, cascade, texelUv, sliceBase);
-    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, z, cascade, texelUv, sliceBase);
+    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, z, slice, texelUv);
     return sum * 0.25;
 }
 
@@ -256,21 +254,34 @@ float ShadowSplitAt(uint c) {
 // Compare one cascade. The per-cascade values arrive by value rather than being looked up, which is what
 // keeps the caller's selection on literal indices (see the note above). `slice` is only ever a texture
 // coordinate, and those may be dynamic.
-float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld, float texelUv,
-                       float depthBias, uint slice, float sliceBase) {
+// One cascade lookup, split into the half that must run in uniform control flow and the half that must not.
+//
+// The projection below ends in screen-space derivatives, and those are gradient instructions: they read
+// across the pixel quad, so they are only defined where every pixel of the quad executes them. The sixteen
+// texture fetches that follow carry no such requirement -- SampleLevel takes an explicit LOD -- so once they
+// are separated they can sit behind a real branch.
+//
+// Welded together, they could not. The cross-fade partner's entire kernel had to be evaluated for every
+// pixel and then multiplied by a blend weight that is zero outside a band covering a tenth of a cascade's
+// range: sixteen fetches per layer, thrown away on the large majority of the screen. Splitting is what lets
+// ShadowLit skip them instead, and it also removes a latent hazard -- derivatives taken inside flow control
+// that is not uniform have undefined results, which is what the old shape asked for.
+struct ShadowProjection {
+    float2 uv;
+    float2 grad;
+    float z;      // ndc depth with the constant bias already subtracted
+    float texelUv;
+    float slice;  // texture-array slice, this layer's offset included
+    float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
+};
+
+ShadowProjection ShadowProject(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld,
+                               float texelUv, float depthBias, uint cascade, float sliceBase) {
     // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
     // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
     // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
     // striped self-shadowing (acne). normalWs always arrives unit length -- the caller resolves the vertex
     // normal or a recovered face normal before this point -- so the term is always live.
-    // Single return from a pre-initialized local (see ShadowSplitAt): 1.0 is also the right answer for
-    // every rejected case, since a point this cascade cannot see is a point it knows nothing occluding.
-    //
-    // That silence is exactly what makes a mis-sized cascade impossible to diagnose: a receiver outside the
-    // footprint looks identical to one that nothing occludes, so a shadow that stops at the cascade edge
-    // reads as a shadow that was never cast. The debug flag inverts the rejected case to "fully occluded",
-    // which draws the footprint boundary on screen.
-    float lit = shadow_filter.y > 0.5 ? 0.0 : 1.0;
     // Orient the normal to face the light before pushing along it. The offset only helps if it moves the
     // sample OFF the surface towards the light; pushed the other way it drives the sample into the geometry
     // and makes the self-shadowing worse than no offset at all. That sign is not something the caller can
@@ -328,8 +339,29 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
     // constant and normal-offset terms are the right tools.
     grad = clamp(grad, -3.2, 3.2);
 
-    if (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) {
-        lit = SampleShadowPCF16(uv, grad, ndc.z - depthBias, slice, texelUv, sliceBase);
+    ShadowProjection o;
+    o.uv = uv;
+    o.grad = grad;
+    o.z = ndc.z - depthBias;
+    o.texelUv = texelUv;
+    o.slice = sliceBase + (float)cascade;
+    o.inside = (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) ? 1.0 : 0.0;
+    return o;
+}
+
+// The fetches. Nothing here reads across the pixel quad, so the caller may skip it per pixel.
+//
+// Single return from a pre-initialized local (see ShadowSplitAt): 1.0 is also the right answer for every
+// rejected case, since a point this cascade cannot see is a point it knows nothing occluding.
+//
+// That silence is exactly what makes a mis-sized cascade impossible to diagnose: a receiver outside the
+// footprint looks identical to one that nothing occludes, so a shadow that stops at the cascade edge reads
+// as a shadow that was never cast. The debug flag inverts the rejected case to "fully occluded", which draws
+// the footprint boundary on screen.
+float ShadowSample(ShadowProjection p) {
+    float lit = shadow_filter.y > 0.5 ? 0.0 : 1.0;
+    if (p.inside > 0.5) {
+        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv);
     }
     return lit;
 }
@@ -337,20 +369,23 @@ float ShadowLitCascade(float3 worldPos, float3 normalWs, float4x4 viewProj, floa
 // Dispatch to one cascade with literal indices. The chain covers SHADOW_MAP_MAX_CASCADES entries; if that
 // ever grows, this grows with it.
 //
-// It SELECTS the cascade's constants and then samples once, rather than branching around four separate
-// calls to ShadowLitCascade. That distinction is the difference between a shader that compiles in
-// milliseconds and one that does not. ShadowLitCascade has no callable form -- ps_4_0 inlines everything --
-// so a four-arm dispatch pasted its sixteen-tap filter in four times; ShadowLit calls this twice (the
-// cascade and its cross-fade partner) and PSMain calls ShadowLit twice (the world layer and the actor
-// layer), which multiplied out to 256 inlined texture-fetch sites in every receiver shader. FXC at
-// optimisation level 2 takes a long time over that, and it runs SYNCHRONOUSLY inside a frame the first time
-// each material is drawn -- which is exactly the hitch felt as new geometry rotates into view. Selecting
-// first cuts it to 64 sites with identical output: only one arm's fetches ever executed anyway.
+// It SELECTS the cascade's constants and then projects once, rather than branching around four separate
+// projections. That distinction is the difference between a shader that compiles in milliseconds and one
+// that does not: nothing here has a callable form -- ps_4_0 inlines everything -- so a four-arm dispatch
+// pasted the whole lookup in four times; ShadowLit calls this twice (the cascade and its cross-fade
+// partner) and PSMain calls ShadowLit twice (the world layer and the actor layer), which multiplied out to
+// 256 inlined texture-fetch sites in every receiver shader. FXC at optimisation level 2 takes a long time
+// over that, and it runs SYNCHRONOUSLY inside a frame the first time each material is drawn -- which is
+// exactly the hitch felt as new geometry rotates into view. Selecting first cuts it to 64 sites with
+// identical output: only one arm's fetches ever executed anyway.
+//
+// The split into ShadowProject/ShadowSample does not reopen that: it moves the fetches out of this function
+// rather than duplicating them, so the site count is what it was.
 //
 // Each branch moves four registers' worth of constants, so there is nothing left worth a real branch;
 // flattening to conditional moves is cheaper than the jump. Every index stays literal -- see ShadowSplitAt
 // for why a computed one cannot be used here.
-float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBase) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelWorld = shadow_texel_world.x;
     float texelUv = shadow_texel_uv.x;
@@ -371,8 +406,8 @@ float ShadowLitAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBas
         texelUv = shadow_texel_uv.w;
         depthBias = shadow_depth_bias.w;
     }
-    // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowLitCascade.
-    return ShadowLitCascade(worldPos, normalWs, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
+    // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowProject.
+    return ShadowProject(worldPos, normalWs, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
 }
 
 // Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
@@ -420,7 +455,15 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBa
         }
         cascade = min(cascade, count - 1);
 
-        lit = ShadowLitAt(worldPos, normalWs, cascade, sliceBase);
+        // BOTH projections are built here, unconditionally, because both contain screen-space derivatives
+        // and those are only defined where every pixel of the quad reaches them. The partner is clamped to
+        // the last cascade so it is always a valid lookup to build; whether it is ever SAMPLED is decided
+        // below. Building one that goes unused costs a matrix multiply and a few derivatives -- which is
+        // what the fetches behind it used to cost as well, and those were the expensive half.
+        ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, cascade, sliceBase);
+        ShadowProjection partner = ShadowProjectAt(worldPos, normalWs, min(cascade + 1, count - 1), sliceBase);
+
+        lit = ShadowSample(primary);
 
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -431,9 +474,15 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBa
             float farEdge = ShadowSplitAt(cascade);
             float nearEdge = (cascade == 0) ? 0.0 : ShadowSplitAt(cascade - 1);
             float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
+            // [branch] and it now means something: with the derivatives hoisted out, what is left inside is
+            // sixteen fetches and nothing that reads across the quad, so the pixels outside the band -- the
+            // large majority of the screen -- genuinely skip them instead of computing a kernel and then
+            // multiplying it by a weight of zero. The result is unchanged either way: lerp(lit, x, 0) is
+            // exactly lit.
+            [branch]
             if (viewDepth > bandStart) {
                 float t = smoothstep(bandStart, farEdge, viewDepth);
-                lit = lerp(lit, ShadowLitAt(worldPos, normalWs, cascade + 1, sliceBase), t);
+                lit = lerp(lit, ShadowSample(partner), t);
             }
         }
     }
