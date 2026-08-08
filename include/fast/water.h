@@ -132,6 +132,42 @@
 #define WATER_MAX_BOXES 64
 
 // ---------------------------------------------------------------------------------------------------------
+// F3 -- thickness, absorption and scattering. Design document 2.4 and Annex A.
+//
+// Absorption is stated as HALF-LIGHT DISTANCES, in world units: how far light of that channel travels before
+// half of it is gone. The shader wants an extinction coefficient, which is ln(2) divided by these -- the
+// conversion happens once on upload rather than in the material.
+//
+// Per channel and exponential rather than a lerp between two colours, because that is what makes water read
+// as a volume: red dies first, then green, blue travels furthest, so one curve gives the lake bed in
+// near-natural colour at the shore, a green-turquoise in the middle distance and a deep petrol blue where the
+// column is long. Two interpolated colours cannot produce that progression at all.
+//
+// Link is roughly 60-70 units tall, so 120 units of red is about two Links of water.
+// ---------------------------------------------------------------------------------------------------------
+#define WATER_DEFAULT_HALF_LIGHT_R 120.0f
+#define WATER_DEFAULT_HALF_LIGHT_G 400.0f
+#define WATER_DEFAULT_HALF_LIGHT_B 900.0f
+
+// The colour water returns by scattering, and the thickness over which it reaches full strength. Without
+// this term absorption alone drives deep water to black; with it, deep water is the milky turquoise the
+// design describes.
+#define WATER_DEFAULT_SCATTER_R 0.06f
+#define WATER_DEFAULT_SCATTER_G 0.32f
+#define WATER_DEFAULT_SCATTER_B 0.34f
+#define WATER_DEFAULT_SCATTER_SATURATION 600.0f
+
+// Gain on the original surface's own luminance before it modulates the scattering. The N64 water polygon is
+// drawn with the room's vertex colours and environment tint, so its brightness already carries time of day
+// and cave darkness; this scales that reading into a sensible 0..1 multiplier. Above 1 because the original
+// water is usually a fairly dark blue.
+#define WATER_DEFAULT_AMBIENT_GAIN 2.5f
+
+// Thickness over which the surface fades in at the very shoreline, so the waterline meets the sand as a soft
+// edge rather than a cut (design document 2.19, item 11).
+#define WATER_DEFAULT_SHORE_FADE 18.0f
+
+// ---------------------------------------------------------------------------------------------------------
 // Debug views (F0/F1). The menu exposes these as a combobox, the way the shadow map's cascade view is.
 // ---------------------------------------------------------------------------------------------------------
 #define WATER_DEBUG_OFF 0

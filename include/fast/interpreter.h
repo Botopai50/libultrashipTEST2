@@ -91,16 +91,22 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     USE_SHADER,
     TOON,       // SOH [Enhancement] toon-lighting variant. Bit 17.
-    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18; the loaded-shader id
-                // packs ABOVE it (interpreter.cpp shifts shader.id by 19). Adding an opt here without
-                // bumping that shift would overlap the id and corrupt shader selection for every draw.
-                // shader_id1 is 32 bits, so the id keeps the 13 bits from 19 up -- far more than the
-                // handful of loaded shaders that exist, but the ceiling to watch as opts grow.
+    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18.
                 //
                 // Whether a receiver also takes the ACTOR caster layer deliberately does NOT live here.
                 // It rides in the world-position attribute's w instead, because every option bit multiplies
                 // the number of shader variants, and each new variant is a shader compiled in the middle of
                 // a frame -- which is felt as the game hitching the first time a shadow appears.
+    WATER,      // SOH [Enhancement] Breath of the Wild-style water material. Bit 19; the loaded-shader id
+                // packs ABOVE it (interpreter.cpp shifts shader.id by 20). Adding an opt here without
+                // bumping that shift would overlap the id and corrupt shader selection for every draw in
+                // the game. shader_id1 is 32 bits, so the id keeps the 12 bits from 20 up -- far more than
+                // the handful of loaded shaders that exist, but the ceiling to watch as opts grow.
+                //
+                // One bit, not several. Quality level, debug view and every tuning number ride in the
+                // constant buffer instead: an option bit multiplies the number of shader variants, and each
+                // new variant is a shader compiled in the middle of a frame, felt as the game hitching the
+                // first time water comes into view. The same reasoning that kept the shadow map to one bit.
     MAX
 };
 
@@ -133,6 +139,7 @@ struct CCFeatures {
     bool opt_grayscale;
     bool opt_toon;       // SOH [Enhancement] toon lighting
     bool opt_shadow_map; // SOH [Enhancement] cascaded shadow maps: this draw receives shadow
+    bool opt_water;      // SOH [Enhancement] water: this draw IS a water surface
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];

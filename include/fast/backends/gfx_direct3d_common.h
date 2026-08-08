@@ -52,6 +52,15 @@ struct PerShadowCB {
     float shadow_incidence[4];
 };
 
+// SOH [Enhancement] Water material (register b4). Matches the PerWaterCB cbuffer in default.shader.hlsl
+// field for field; see fast/water.h for what each number means and the shader for how they compose.
+struct PerWaterCB {
+    float water_camera[4];     // xyz = eye in world space, w = 1 / capture width
+    float water_extinction[4]; // rgb = per-channel extinction in 1/world-unit, a = 1 / capture height
+    float water_scatter[4];    // rgb = scattered colour, a = thickness at which it saturates
+    float water_misc[4];       // x = sky sentinel, y = ambient gain, z = deep mip, w = shoreline fade
+};
+
 struct PerDrawCB {
     struct Texture {
         uint32_t width;
@@ -96,6 +105,7 @@ struct ShaderProgramD3D11 {
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false;       // SOH [Enhancement] toon lighting variant
     bool opt_shadow_map = false; // SOH [Enhancement] cascaded shadow-map receiver variant
+    bool opt_water = false;      // SOH [Enhancement] BOTW-style water material variant
 };
 
 class GfxWindowBackendDXGI;
@@ -313,6 +323,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb;   // SOH [Enhancement] toon lighting (register b2)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerShadowCb; // SOH [Enhancement] shadow cascades (register b3)
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerWaterCb;  // SOH [Enhancement] water material (register b4)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -332,6 +343,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerToonCB mPerToonCbData;     // SOH [Enhancement] toon lighting
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
     bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
+    PerWaterCB mPerWaterCbData{}; // SOH [Enhancement] water material
+    bool mWaterCbDirty = true;    // re-upload the water CB only when the frame's values changed
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 

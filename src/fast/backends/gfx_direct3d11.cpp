@@ -307,6 +307,13 @@ void GfxRenderingAPIDX11::Init() {
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerShadowCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create shadow-cascade constant buffer.");
 
+    // SOH [Enhancement] Water material constant buffer (register b4). Created unconditionally for the same
+    // reason as the one above: it is 64 bytes, and only the water shader variant ever reads it.
+    static_assert(sizeof(PerWaterCB) % 16 == 0, "constant buffers must be a multiple of 16 bytes");
+    constant_buffer_desc.ByteWidth = sizeof(PerWaterCB);
+    ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerWaterCb.GetAddressOf()),
+                  mWindowBackend->GetWindowHandle(), "Failed to create water-material constant buffer.");
+
     // Create compute shader that can be used to retrieve depth buffer values
 
     const char* shader_source = R"(
@@ -490,7 +497,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         };
     }
     // SOH [Enhancement] Cascaded shadow maps: receiver world position (order must match the vbo packing).
-    if (cc_features.opt_shadow_map) {
+    // The water material rides the same attribute -- it needs the surface's distance from the eye, which is
+    // one half of the thickness everything in it is built on.
+    if (cc_features.opt_shadow_map || cc_features.opt_water) {
         ied[ied_index++] = { "WORLDPOS",
                              0,
                              DXGI_FORMAT_R32G32B32A32_FLOAT, // xyz world position, w the receiver kind
@@ -537,6 +546,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->numFloats = numFloats;
     prg->opt_toon = cc_features.opt_toon;             // SOH [Enhancement] toon lighting
     prg->opt_shadow_map = cc_features.opt_shadow_map; // SOH [Enhancement] cascaded shadow maps
+    prg->opt_water = cc_features.opt_water;           // SOH [Enhancement] BOTW-style water material
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];
     prg->usedTextures[2] = cc_features.used_masks[0];
@@ -842,6 +852,26 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->Map(mPerToonCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &toon_ms);
         memcpy(toon_ms.pData, &mPerToonCbData, sizeof(PerToonCB));
         mContext->Unmap(mPerToonCb.Get(), 0);
+    }
+
+    // SOH [Enhancement] Water: the capture and every tuning number are frame-global, so this uploads once
+    // per frame on the first water draw and then only binds. The two textures are bound per draw because
+    // the combiner's own SetTexture calls walk over the low slots freely and there is no cheap way to know
+    // they have not disturbed these.
+    if (mShaderProgram->opt_water) {
+        if (mWaterCbDirty) {
+            D3D11_MAPPED_SUBRESOURCE water_ms;
+            ZeroMemory(&water_ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+            if (SUCCEEDED(mContext->Map(mPerWaterCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &water_ms))) {
+                memcpy(water_ms.pData, &mPerWaterCbData, sizeof(PerWaterCB));
+                mContext->Unmap(mPerWaterCb.Get(), 0);
+                mWaterCbDirty = false;
+            }
+        }
+        mContext->PSSetConstantBuffers(4, 1, mPerWaterCb.GetAddressOf());
+        ID3D11ShaderResourceView* waterSrvs[2] = { mWaterSceneColorSrv.Get(), mWaterLinearDepthSrv.Get() };
+        mContext->PSSetShaderResources(7, 2, waterSrvs);
+        mContext->PSSetSamplers(7, 1, mWaterSampler.GetAddressOf());
     }
 
     // SOH [Enhancement] Cascaded shadow maps: the cascade transforms are frame-global, so upload them once
@@ -2568,6 +2598,38 @@ void GfxRenderingAPIDX11::WaterCaptureScene(int fbId) {
     mLastZmodeDecal = -1;
     mRenderTargetHeight = mTextures[fb.texture_id].height;
 
+    // Everything the material reads, refreshed with the capture it reads it alongside. Kept together on
+    // purpose: the eye position and the capture's dimensions have to describe the SAME image, and filling
+    // them from two places is how they drift apart by a frame.
+    {
+        PerWaterCB& cb = mPerWaterCbData;
+        cb.water_camera[0] = mWaterParams.camPos[0];
+        cb.water_camera[1] = mWaterParams.camPos[1];
+        cb.water_camera[2] = mWaterParams.camPos[2];
+        cb.water_camera[3] = mWaterWidth > 0 ? 1.0f / (float)mWaterWidth : 0.0f;
+
+        // Half-light distance to extinction coefficient. Done here, once per frame, rather than in the
+        // material: it is a logarithm per channel that would otherwise run per pixel of every water surface
+        // to produce the same three numbers.
+        const float kLn2 = 0.6931472f;
+        cb.water_extinction[0] = kLn2 / WATER_DEFAULT_HALF_LIGHT_R;
+        cb.water_extinction[1] = kLn2 / WATER_DEFAULT_HALF_LIGHT_G;
+        cb.water_extinction[2] = kLn2 / WATER_DEFAULT_HALF_LIGHT_B;
+        cb.water_extinction[3] = mWaterHeight > 0 ? 1.0f / (float)mWaterHeight : 0.0f;
+
+        cb.water_scatter[0] = WATER_DEFAULT_SCATTER_R;
+        cb.water_scatter[1] = WATER_DEFAULT_SCATTER_G;
+        cb.water_scatter[2] = WATER_DEFAULT_SCATTER_B;
+        cb.water_scatter[3] = WATER_DEFAULT_SCATTER_SATURATION;
+
+        cb.water_misc[0] = WATER_DEPTH_SKY_SENTINEL;
+        cb.water_misc[1] = WATER_DEFAULT_AMBIENT_GAIN;
+        cb.water_misc[2] = 0.0f; // deep-water mip; F5 selects it from thickness
+        cb.water_misc[3] = WATER_DEFAULT_SHORE_FADE;
+
+        mWaterCbDirty = true;
+    }
+
     mWaterCaptured = true;
 }
 
@@ -2837,6 +2899,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_grayscale", cc_features.opt_grayscale },
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
+        { "o_water", cc_features.opt_water },           // SOH [Enhancement] BOTW-style water material
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         // Spliced in rather than uploaded: it is a fixed policy value, and having it as a literal lets the
         // compiler fold the smoothstep that uses it.

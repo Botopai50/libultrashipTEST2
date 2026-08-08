@@ -1860,6 +1860,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // commands in the order they appear, so drawing the replacement HERE, where the original triangle was,
     // IS the original position, exactly. It also makes the document's sixth risk -- breaking translucent
     // ordering -- impossible by construction instead of something to be tested for.
+    bool waterSurface = false;
     if (mWaterEnabled && !is_rect && !mWaterBoxes.empty()) {
         const float wa[3] = { v1->wx, v1->wy, v1->wz };
         const float wb[3] = { v2->wx, v2->wy, v2->wz };
@@ -1889,11 +1890,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     mWaterBoxesHit |= (1ull << box);
                 }
                 if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
-                    // F1's whole deliverable: the surface vanishing proves the identification found it AND
-                    // that the draw can be taken out of the frame cleanly, which is what F3 will put its own
-                    // material into. Until then the original water is drawn as it always was.
+                    // F1's deliverable: the surface vanishing proves the identification found it AND that
+                    // the draw can be taken out of the frame cleanly, which is where the material goes.
                     return;
                 }
+                // F3: this triangle takes the water material. A single flag rather than a return, because
+                // the geometry, the matrices and the combiner setup below are all still exactly what this
+                // surface needs -- what changes is only how the fragment arrives at its colour, and that is
+                // a shader variant. Consumed a few hundred lines down where the shader is selected.
+                waterSurface = mWaterQuality != WATER_QUALITY_OFF;
             } else {
                 // Counted, and then left alone. NOT returned: this is ordinary geometry that merely happens
                 // to sit flat inside a water box at the water's height -- the shore, a submerged ledge, a
@@ -2049,6 +2054,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_shadow_map) {
         cc_options |= SHADER_OPT(SHADOW_MAP);
     }
+    if (waterSurface) {
+        cc_options |= SHADER_OPT(WATER);
+    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -2064,9 +2072,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
         // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
-        // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
-        // wrong shader for every draw in the game.
-        cc_options |= (shader.id << 19);
+        // SHADOW_MAP, 19->20 for WATER. Keep in lockstep with the decode in gfx_cc_get_features -- a
+        // mismatch selects the wrong shader for every draw in the game.
+        cc_options |= (shader.id << 20);
     }
 
     ColorCombinerKey key;
@@ -2282,7 +2290,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // project into each cascade. The cascade matrices are uniforms, not per-vertex. Order here must
         // match the input-layout element order in every backend and the PSInput field order in the shader
         // -- these three are one implicit contract, and a mismatch shifts every attribute after it.
-        if (use_shadow_map) {
+        // The water material rides the same attribute, for a different half of the same idea: it needs how
+        // far the surface is from the eye, which with the linearised scene depth gives the thickness the
+        // whole material is built on.
+        if (use_shadow_map || waterSurface) {
             mBufVbo[mBufVboLen++] = v_arr[i]->wx;
             mBufVbo[mBufVboLen++] = v_arr[i]->wy;
             mBufVbo[mBufVboLen++] = v_arr[i]->wz;
@@ -6696,6 +6707,8 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
     // SOH [Enhancement] cascaded shadow maps: this draw samples the cascade array
     cc_features->opt_shadow_map = (shader_id1 & SHADER_OPT(SHADOW_MAP)) != 0;
+    // SOH [Enhancement] Water: this draw IS a water surface and takes the water material
+    cc_features->opt_water = (shader_id1 & SHADER_OPT(WATER)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -6703,9 +6716,11 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->clamp[1][1] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_T);
 
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
-        // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP. Must match the encode in
-        // the ColorCombinerKey build; a mismatch silently selects the wrong shader for every draw.
-        cc_features->shader_id = (shader_id1 >> 19) & 0x1FFF;
+        // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP, 19->20 for WATER. Must
+        // match the encode in the ColorCombinerKey build; a mismatch silently selects the wrong shader for
+        // every draw. The mask narrows with the shift: 12 bits from 20 up, still far more than the handful
+        // of loaded shaders that exist.
+        cc_features->shader_id = (shader_id1 >> 20) & 0xFFF;
     }
 
     cc_features->usedTextures[0] = false;
