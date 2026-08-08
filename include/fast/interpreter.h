@@ -471,7 +471,7 @@ class Interpreter {
     // interpolator re-runs the same display list several times per game frame, so a clock ticking inside the
     // renderer would make the water scroll at the interpolated rate while everything it sits next to moves at
     // the game's. The game owns the only counter that means "one step of the world".
-    void SetWaterParams(bool enabled, int quality, int debugView, float time) {
+    void SetWaterParams(bool enabled, int quality, int debugView, float time, float coverageGain) {
         // Roll the identification census forward. Published here, at the game frame boundary, so a reader
         // always sees one complete frame's worth rather than however much of the current one has run.
         mWaterTrisLastFrame = mWaterTrisIdentified;
@@ -491,6 +491,7 @@ class Interpreter {
         mWaterAcceptedXlu = 0;
         mWaterAcceptedOpa = 0;
         mWaterTime = time;
+        mWaterCoverageGain = coverageGain;
         mWaterEnabled = enabled && quality != WATER_QUALITY_OFF;
         mWaterQuality = quality < WATER_QUALITY_OFF               ? WATER_QUALITY_OFF
                         : (quality >= WATER_QUALITY_COUNT ? WATER_QUALITY_HIGH : quality);
@@ -899,6 +900,7 @@ class Interpreter {
     int mWaterDebugView = WATER_DEBUG_OFF;
     // Monotonic seconds the water material scrolls by, pushed by the game (see SetWaterParams).
     float mWaterTime = 0.0f;
+    float mWaterCoverageGain = WATER_DEFAULT_COVERAGE_GAIN;
     WaterFrameParams mWaterFrame{};
     std::vector<WaterBoxDesc> mWaterBoxes;
     // How many triangles this frame were identified as a water surface, and how many distinct boxes they

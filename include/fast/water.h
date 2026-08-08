@@ -270,6 +270,12 @@ struct WaterFrameParams {
     int screenWidth = 0;
     int screenHeight = 0;
 
+    // How much of a claimed surface the material may replace, as a gain on that surface's own alpha (see
+    // WATER_DEFAULT_COVERAGE_GAIN). Exposed as a slider rather than fixed, because the quantity it has to be
+    // set against -- the alpha the combiner actually produces for a water surface -- is not something the
+    // renderer can read back, and guessing it a build at a time is the slow way to find one number.
+    float coverageGain = WATER_DEFAULT_COVERAGE_GAIN;
+
     // Quality level in force this frame (WATER_QUALITY_*). Pushed with the rest so the backend can size its
     // resources and skip work without reaching back into the application's config.
     int quality = WATER_DEFAULT_QUALITY;

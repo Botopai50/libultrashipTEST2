@@ -3313,6 +3313,7 @@ void Interpreter::UpdateWaterFrameParams() {
     mWaterFrame.quality = mWaterEnabled ? mWaterQuality : WATER_QUALITY_OFF;
     mWaterFrame.debugView = mWaterDebugView;
     mWaterFrame.time = mWaterTime;
+    mWaterFrame.coverageGain = mWaterCoverageGain;
     mWaterFrame.screenWidth = (int)mCurDimensions.width;
     mWaterFrame.screenHeight = (int)mCurDimensions.height;
 
