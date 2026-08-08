@@ -377,6 +377,10 @@ struct RDP {
     // them, for geometry whose exclusion is not a render-state question -- effects, which are light drawn as
     // polygons and declare whatever mode suited the artist.
     bool shadow_no_cast;
+    // SOH [Enhancement] Water: these draws are never a water SURFACE, whatever their geometry says. Set by
+    // gSPWaterSurfaceOff around the effect passes -- the ripples drawn around a swimming player are flat,
+    // translucent and exactly at the water's height, so nothing geometric can turn them away.
+    bool water_no_surface;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;

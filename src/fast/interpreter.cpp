@@ -1861,7 +1861,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // IS the original position, exactly. It also makes the document's sixth risk -- breaking translucent
     // ordering -- impossible by construction instead of something to be tested for.
     bool waterSurface = false;
-    if (mWaterEnabled && !is_rect && !mWaterBoxes.empty()) {
+    if (mWaterEnabled && !is_rect && !mWaterBoxes.empty() && !mRdp->water_no_surface) {
         const float wa[3] = { v1->wx, v1->wy, v1->wz };
         const float wb[3] = { v2->wx, v2->wy, v2->wz };
         const float wc[3] = { v3->wx, v3->wy, v3->wz };
@@ -5621,6 +5621,14 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         }
         if (sizeOrSentinel <= -1.1e30f) {
             gfx->mRdp->shadow_scenery_caster = false; // gSPShadowMapSceneryCasterEnd
+            return false;
+        }
+        if (sizeOrSentinel <= -1.08e30f) {
+            gfx->mRdp->water_no_surface = true; // gSPWaterSurfaceOff
+            return false;
+        }
+        if (sizeOrSentinel <= -1.05e30f) {
+            gfx->mRdp->water_no_surface = false; // gSPWaterSurfaceOn
             return false;
         }
         // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires

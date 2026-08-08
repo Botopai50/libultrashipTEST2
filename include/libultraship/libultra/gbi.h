@@ -2935,6 +2935,20 @@ typedef union Gfx {
 // for it.
 #define gSPWaterCapture(pkt) gSPToonShadow(pkt, 0, 0, 0, -9.0e30f)
 
+// SOH [Enhancement] Water: forbid the following draws from being taken as a water SURFACE, whatever their
+// geometry says.
+//
+// The identification is geometric -- flat, translucent, inside a water box at its surface height -- and the
+// ripples the game draws around a swimming player satisfy every one of those, because they ARE at the water
+// surface. Taken as surfaces they get the material, which composes an opaque colour and discards the ripple
+// texture's own alpha; instead of a thin ring the whole quad fills in, and overlapping rings pile up into a
+// bright stair-stepped block around the player.
+//
+// Same class of thing as the shadow-caster veto, emitted in the same place and for the same reason: an
+// effect is not part of the world, and no amount of looking at its geometry will say so.
+#define gSPWaterSurfaceOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.08e30f)
+#define gSPWaterSurfaceOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.05e30f)
+
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \
