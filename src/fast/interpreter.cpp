@@ -1932,10 +1932,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                     }
                 }
             } else {
-                // Counted, and then left alone. NOT returned: this is ordinary geometry that merely happens
-                // to sit flat inside a water box at the water's height -- the shore, a submerged ledge, a
-                // stone lip -- and it has to go on being drawn exactly as before.
                 mWaterAcceptedOpa++;
+                // A SECOND layer of the same surface. This is the fix for the original texture appearing and
+                // disappearing as the camera turns, with nothing in the scene moving.
+                //
+                // The game draws water as more than one coplanar layer -- a base plane and an animated
+                // detail pass over it. One of them satisfies the translucency test and takes the material;
+                // the other does not and kept its original appearance, and being coplanar the two then
+                // fought over the depth buffer. Which one won changed with the viewing angle, so the N64
+                // texture flickered in and out, and different polygons resolved differently across the
+                // screen, which is the patchwork of tones.
+                //
+                // Once a box's surface has been claimed this frame, further flat geometry at that exact
+                // height inside the same box is DISCARDED rather than drawn. That is what F1 was supposed
+                // to mean by suppressing the original draw, and what it never actually did: it only
+                // replaced the material on the triangles it claimed, and left the rival layer to draw over
+                // the top of them.
+                //
+                // Height-matched to the claimed surface, not just box-matched, so a genuinely separate
+                // opaque thing sitting inside the box -- a submerged ledge, a stone lip -- is untouched.
+                if (box < 64 && (mWaterBoxesHit & (1ull << box)) != 0) {
+                    return;
+                }
             }
         }
     }
