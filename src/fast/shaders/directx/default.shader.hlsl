@@ -893,26 +893,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // edge instead of a cut (2.19, item 11).
         float waterAlpha = saturate(thickness / max(water_misc.w, 0.001));
 
-        // How much of this surface the material is entitled to replace, from how much the ORIGINAL draw
-        // covered. This is the fix for a whole class of mistakes rather than for one of them.
-        //
-        // The identification is geometric, so anything flat and translucent sitting at the water's height
-        // is claimed: the ripples around a swimming player, the mist at the foot of Zora's waterfall. Each
-        // of those really is at the water surface -- that is where ripples and spray belong -- so no
-        // geometric test can turn them away. What separates them from water is that they barely cover
-        // anything, and the original draw already says so in its own alpha.
-        //
-        // Composing over that alpha instead of discarding it means a mistake degrades into a faint tint
-        // rather than into a solid slab, and it does so for the next such surface as well as for the two
-        // already found. The gain is what keeps real water at full strength despite being drawn
-        // semi-transparent itself.
         @if(o_alpha)
-            float waterCoverage = saturate(texel.a * water_misc.z);
-            texel = float4(lerp(texel.rgb, waterColor, waterCoverage),
-                           lerp(texel.a, waterAlpha, waterCoverage));
+            texel = float4(waterColor, waterAlpha);
         @else
-            // No alpha channel in this combiner at all: the draw is opaque, so it covers everything and the
-            // material takes it in full.
             texel = waterColor;
         @end
     }
