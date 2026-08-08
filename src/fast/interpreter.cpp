@@ -1861,11 +1861,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // IS the original position, exactly. It also makes the document's sixth risk -- breaking translucent
     // ordering -- impossible by construction instead of something to be tested for.
     bool waterSurface = false;
-    if (mWaterSubdividing) {
-        // A fragment of a surface already identified. It takes the material without being re-tested, which
-        // is both cheaper and what keeps the census counting one lake rather than sixty-four pieces of one.
-        waterSurface = true;
-    } else if (mWaterEnabled && !is_rect && !mWaterBoxes.empty() && !mRdp->water_no_surface) {
+    if (mWaterEnabled && !is_rect && !mWaterBoxes.empty() && !mRdp->water_no_surface) {
         const float wa[3] = { v1->wx, v1->wy, v1->wz };
         const float wb[3] = { v2->wx, v2->wy, v2->wz };
         const float wc[3] = { v3->wx, v3->wy, v3->wz };
@@ -1906,45 +1902,42 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 // a shader variant. Consumed a few hundred lines down where the shader is selected.
                 waterSurface = mWaterQuality != WATER_QUALITY_OFF;
 
-                // F2: a lake is a handful of enormous triangles, and waves displace VERTICES -- so before
-                // the surface can be given any shape it has to be given some. Split it and feed the pieces
-                // back through this same path, which is what keeps them getting the identical combiner,
-                // matrices and render state the original would have had.
+                // F4: give the surface its waves.
                 //
-                // Only from MEDIUM up, because LOW has no waves for the vertices to serve (see water.h).
+                // No re-entry. An earlier version subdivided here and fed the pieces back through
+                // GfxSpTri1, which looked safe because the shadow volumes re-enter that function too --
+                // but they do it from a TOP-LEVEL function with nothing of their own in flight, while
+                // this did it from inside GfxSpTri1 with the parent call half-finished. The nested calls
+                // resolve their own combiner and shader and move the RDP state the parent is standing on,
+                // and the parent then returns into a pipeline that is no longer the one it set up. What
+                // reached the screen was ordinary terrain arriving garbled, which the depth target
+                // reported as nothing-drawn. Flushing around it did not help, because the shared state is
+                // the problem and not the buffer.
+                //
+                // So the vertices are displaced in place and the draw proceeds normally: one triangle in,
+                // one triangle out. The cost is that the waves have only the polygon's own corners to
+                // move, so a lake gets long smooth swells instead of fine detail -- a real loss, and the
+                // honest way to pay for it is a tessellation pass that runs OUTSIDE this function, which
+                // is what F2 has to become.
+                //
+                // Copies into the scratch slots rather than the loaded vertices themselves: those are
+                // shared between the triangles of a strip, so displacing one in place would move it again
+                // for every neighbour that references it.
                 if (waterSurface && mWaterQuality >= WATER_QUALITY_MEDIUM) {
-                    const int level = WaterSubdivisionLevel(wa, wb, wc);
-                    if (level > 0) {
-                        mWaterSubVerts.clear();
-                        mWaterCurrentBox = box; // the waves damp against this box's edge
-                        WaterSubdivide(*v1, *v2, *v3, level);
-                        mWaterCurrentBox = -1;
-                        // Copied out before drawing: the re-entry below writes into the scratch vertex slots
-                        // and, through the combiner, can reach a great deal of state -- but not this vector,
-                        // because mWaterSubdividing stops it subdividing again.
-                        // Close the batch in flight before re-entering. The vertex buffer accumulates with
-                        // the CURRENT shader's stride, and the water variant carries an attribute the
-                        // geometry around it does not (the world position), so sub-triangles appended
-                        // mid-batch write at a different stride than the batch was started with and
-                        // misalign every vertex after them. That is not a water bug when it happens -- it
-                        // is terrain arriving garbled, which is exactly what the depth capture was showing.
-                        //
-                        // The shadow volumes re-enter this same function and flush first for the same
-                        // reason; not copying that was the omission.
-                        Flush();
-                        mWaterSubdividing = true;
-                        for (size_t i = 0; i + 2 < mWaterSubVerts.size(); i += 3) {
-                            mRsp->loaded_vertices[MAX_VERTICES + 0] = mWaterSubVerts[i + 0];
-                            mRsp->loaded_vertices[MAX_VERTICES + 1] = mWaterSubVerts[i + 1];
-                            mRsp->loaded_vertices[MAX_VERTICES + 2] = mWaterSubVerts[i + 2];
-                            GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
-                        }
-                        mWaterSubdividing = false;
-                        // And close the sub-triangles' own batch, so the draw that follows starts from the
-                        // state it set up rather than inheriting the water variant's.
-                        Flush();
-                        return; // the pieces have been drawn; the original must not be drawn over them
-                    }
+                    mWaterCurrentBox = box;
+                    LoadedVertex* ws1 = &mRsp->loaded_vertices[MAX_VERTICES + 0];
+                    LoadedVertex* ws2 = &mRsp->loaded_vertices[MAX_VERTICES + 1];
+                    LoadedVertex* ws3 = &mRsp->loaded_vertices[MAX_VERTICES + 2];
+                    *ws1 = *v1;
+                    *ws2 = *v2;
+                    *ws3 = *v3;
+                    WaterApplyWaves(*ws1);
+                    WaterApplyWaves(*ws2);
+                    WaterApplyWaves(*ws3);
+                    mWaterCurrentBox = -1;
+                    v1 = ws1;
+                    v2 = ws2;
+                    v3 = ws3;
                 }
             } else {
                 mWaterAcceptedOpa++;
@@ -3659,94 +3652,6 @@ void Interpreter::WaterApplyWaves(LoadedVertex& v) const {
     if (v.z > v.w) {
         v.clip_rej |= 32; // CLIP_FAR
     }
-}
-
-// SOH [Enhancement] Water (F2): how many times to split this triangle, from its longest world-space edge.
-//
-// A lake in this game is a handful of enormous triangles, and waves displace VERTICES -- a surface with four
-// of them cannot be given any shape at all. Splitting by the longest edge rather than by area means a long
-// thin river polygon gets subdivided along its length, which is where the waves have to run.
-int Interpreter::WaterSubdivisionLevel(const float a[3], const float b[3], const float c[3]) const {
-    auto edge = [](const float p[3], const float q[3]) {
-        const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
-        return dx * dx + dy * dy + dz * dz;
-    };
-    float longest = edge(a, b);
-    longest = std::max(longest, edge(b, c));
-    longest = std::max(longest, edge(c, a));
-    longest = std::sqrt(longest);
-
-    int level = 0;
-    float span = longest;
-    while (span > WATER_TESSELLATION_SPACING && level < WATER_MAX_SUBDIVISION_LEVEL) {
-        span *= 0.5f;
-        level++;
-    }
-    return level;
-}
-
-// One midpoint. Every attribute is averaged, including the clip-space position: the surface is planar, so
-// the geometry that comes out is exact rather than approximate. Texture coordinates and vertex colour are
-// averaged linearly rather than perspective-correctly, which is a small and deliberate inaccuracy -- the
-// water material reads the original texel only for its alpha and its brightness, neither of which survives
-// as detail, and doing it properly would mean carrying 1/w through a split that exists to make geometry.
-static LoadedVertex WaterMidpoint(const LoadedVertex& p, const LoadedVertex& q) {
-    LoadedVertex m = p;
-    m.x = 0.5f * (p.x + q.x);
-    m.y = 0.5f * (p.y + q.y);
-    m.z = 0.5f * (p.z + q.z);
-    m.w = 0.5f * (p.w + q.w);
-    m.u = 0.5f * (p.u + q.u);
-    m.v = 0.5f * (p.v + q.v);
-    m.wx = 0.5f * (p.wx + q.wx);
-    m.wy = 0.5f * (p.wy + q.wy);
-    m.wz = 0.5f * (p.wz + q.wz);
-    m.nx = 0.5f * (p.nx + q.nx);
-    m.ny = 0.5f * (p.ny + q.ny);
-    m.nz = 0.5f * (p.nz + q.nz);
-    m.color.r = (uint8_t)(((int)p.color.r + (int)q.color.r) >> 1);
-    m.color.g = (uint8_t)(((int)p.color.g + (int)q.color.g) >> 1);
-    m.color.b = (uint8_t)(((int)p.color.b + (int)q.color.b) >> 1);
-    m.color.a = (uint8_t)(((int)p.color.a + (int)q.color.a) >> 1);
-    // The clip flags are recomputed by nobody, so a midpoint has to inherit the CONJUNCTION: a vertex is
-    // only trivially rejectable against a plane if both of its parents were, and taking either parent's
-    // flags alone would let a sub-triangle be culled on the strength of a corner it does not have.
-    m.clip_rej = p.clip_rej & q.clip_rej;
-    return m;
-}
-
-// Recursive four-way split. Appends whole triangles to mWaterSubVerts at the bottom of the recursion.
-//
-// Midpoint subdivision rather than a generated grid clipped to the outline (design document F2, steps 1-3):
-// the boundary of the subdivided triangle IS the boundary of the original, so the exact shoreline is kept
-// for free and neither a gap against the terrain nor an overflow past it is possible.
-void Interpreter::WaterSubdivide(const LoadedVertex& a, const LoadedVertex& b, const LoadedVertex& c, int level) {
-    if (level <= 0) {
-        // F4: the waves are applied at the LEAVES, once per final vertex, rather than at every level of the
-        // recursion. Displacing a parent and then splitting it would interpolate the wave between corners
-        // instead of evaluating it, which is the facetted result the analytic normal exists to avoid.
-        //
-        LoadedVertex va = a, vb = b, vc = c;
-        if (mWaterQuality >= WATER_QUALITY_MEDIUM) {
-            WaterApplyWaves(va);
-            WaterApplyWaves(vb);
-            WaterApplyWaves(vc);
-        }
-        mWaterSubVerts.push_back(va);
-        mWaterSubVerts.push_back(vb);
-        mWaterSubVerts.push_back(vc);
-        return;
-    }
-    const LoadedVertex ab = WaterMidpoint(a, b);
-    const LoadedVertex bc = WaterMidpoint(b, c);
-    const LoadedVertex ca = WaterMidpoint(c, a);
-    // Corner triangles keep the parent's winding, and the middle one is wound to match -- the software
-    // backface cull further down reads winding in screen space, so a flipped middle would drop out of every
-    // surface as a hole.
-    WaterSubdivide(a, ab, ca, level - 1);
-    WaterSubdivide(ab, b, bc, level - 1);
-    WaterSubdivide(ca, bc, c, level - 1);
-    WaterSubdivide(ab, bc, ca, level - 1);
 }
 
 // SOH [Enhancement] Water: take the scene capture at this point in the display list (gSPWaterCapture).
