@@ -1511,9 +1511,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         // shadow moved, appeared and vanished as the camera turned, with nothing in the scene moving.
         // Unlit geometry is not rare here either: tree canopies, billboards and much of the room mesh draw
         // with lighting off, and they all cast.
-        // ... and by the water identification, which is a purely geometric test against the scene's water
-        // boxes and therefore needs the same world positions.
-        if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled || mWaterEnabled) {
+        if (mRdp->toon || mRdp->toon_shadow || mShadowMapEnabled) {
             float(*mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
             d->wx = v->ob[0] * mv[0][0] + v->ob[1] * mv[1][0] + v->ob[2] * mv[2][0] + mv[3][0];
             d->wy = v->ob[0] * mv[0][1] + v->ob[1] * mv[1][1] + v->ob[2] * mv[2][1] + mv[3][1];
@@ -1847,117 +1845,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // if (rand()%2) return;
 
-    // SOH [Enhancement] Water (F1): is this the surface of one of the scene's water bodies?
-    //
-    // Placed here, after the shadow captures and before the clip test, for two reasons. After the captures
-    // because water must not become a shadow caster and this is the first point where skipping it cannot
-    // leave a half-recorded caster behind. Before the clip test because an off-screen surface is still part
-    // of the body of water and the census should count it.
-    //
-    // The interception is a plain early return rather than a deferred list. The design document describes
-    // registering a descriptor, suppressing the draw and reinserting it at the recorded position in the
-    // translucent sequence -- that shape is for a renderer that batches. This one is immediate: it executes
-    // commands in the order they appear, so drawing the replacement HERE, where the original triangle was,
-    // IS the original position, exactly. It also makes the document's sixth risk -- breaking translucent
-    // ordering -- impossible by construction instead of something to be tested for.
-    bool waterSurface = false;
-    if (mWaterEnabled && !is_rect && !mWaterBoxes.empty() && !mRdp->water_no_surface) {
-        const float wa[3] = { v1->wx, v1->wy, v1->wz };
-        const float wb[3] = { v2->wx, v2->wy, v2->wz };
-        const float wc[3] = { v3->wx, v3->wy, v3->wz };
-        const int box = WaterSurfaceBoxIndex(wa, wb, wc);
-        if (box >= 0) {
-            // Geometry passes the box test and is flat at the water's height -- but so is a flat patch of
-            // shore, and the shore is by definition at the water's height. What actually separates them is
-            // that a water surface is SEE-THROUGH: the pond in the screenshot shows its own bed and the
-            // grass edges through it, and the grass beside it shows nothing through anything.
-            //
-            // Safe to require here in a way it would never be on its own. Render mode alone describes lava
-            // as well as it describes a lake, which is why identification is anchored to the collision box
-            // first; asking about the render mode only AFTER a water box has already claimed the triangle
-            // adds precision without reopening that door, because lava has no box to be claimed by.
-            //
-            // Counted both ways before the rejection, so the menu can show how much real water this costs in
-            // any scene where it costs some -- the room's translucent pass declares an opaque zmode, and
-            // Navi's glow is alpha-blended while declaring itself opaque, so it is entirely possible some
-            // scene draws its water in a mode this turns away. That shows up as a number rather than as a
-            // lake that quietly stops being found.
-            const bool translucent = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
-            if (translucent) {
-                mWaterAcceptedXlu++;
-                mWaterTrisIdentified++;
-                mWaterAlphaSum +=
-                    (v1->color.a + v2->color.a + v3->color.a) * (1.0f / (3.0f * 255.0f));
-                if (box < 64) {
-                    mWaterBoxesHit |= (1ull << box);
-                }
-                if (mWaterDebugView == WATER_DEBUG_HIDE_SURFACES) {
-                    // F1's deliverable: the surface vanishing proves the identification found it AND that
-                    // the draw can be taken out of the frame cleanly, which is where the material goes.
-                    return;
-                }
-                // F3: this triangle takes the water material. A single flag rather than a return, because
-                // the geometry, the matrices and the combiner setup below are all still exactly what this
-                // surface needs -- what changes is only how the fragment arrives at its colour, and that is
-                // a shader variant. Consumed a few hundred lines down where the shader is selected.
-                waterSurface = mWaterQuality != WATER_QUALITY_OFF;
-
-                // F4: give the surface its waves.
-                //
-                // No re-entry. An earlier version subdivided here and fed the pieces back through
-                // GfxSpTri1, which looked safe because the shadow volumes re-enter that function too --
-                // but they do it from a TOP-LEVEL function with nothing of their own in flight, while
-                // this did it from inside GfxSpTri1 with the parent call half-finished. The nested calls
-                // resolve their own combiner and shader and move the RDP state the parent is standing on,
-                // and the parent then returns into a pipeline that is no longer the one it set up. What
-                // reached the screen was ordinary terrain arriving garbled, which the depth target
-                // reported as nothing-drawn. Flushing around it did not help, because the shared state is
-                // the problem and not the buffer.
-                //
-                // So the vertices are displaced in place and the draw proceeds normally: one triangle in,
-                // one triangle out. The cost is that the waves have only the polygon's own corners to
-                // move, so a lake gets long smooth swells instead of fine detail -- a real loss, and the
-                // honest way to pay for it is a tessellation pass that runs OUTSIDE this function, which
-                // is what F2 has to become.
-                //
-                // Copies into the scratch slots rather than the loaded vertices themselves: those are
-                // shared between the triangles of a strip, so displacing one in place would move it again
-                // for every neighbour that references it.
-                if (waterSurface && mWaterQuality >= WATER_QUALITY_MEDIUM) {
-                    mWaterCurrentBox = box;
-                    LoadedVertex* ws1 = &mRsp->loaded_vertices[MAX_VERTICES + 0];
-                    LoadedVertex* ws2 = &mRsp->loaded_vertices[MAX_VERTICES + 1];
-                    LoadedVertex* ws3 = &mRsp->loaded_vertices[MAX_VERTICES + 2];
-                    *ws1 = *v1;
-                    *ws2 = *v2;
-                    *ws3 = *v3;
-                    WaterApplyWaves(*ws1);
-                    WaterApplyWaves(*ws2);
-                    WaterApplyWaves(*ws3);
-                    mWaterCurrentBox = -1;
-                    v1 = ws1;
-                    v2 = ws2;
-                    v3 = ws3;
-                }
-            } else {
-                mWaterAcceptedOpa++;
-                // Left alone. This is ordinary geometry that merely happens to sit flat inside a water
-                // box at the water's height -- the shore, a submerged ledge, the lake bed where it rises to
-                // meet the surface -- and it has to go on being drawn exactly as before.
-                //
-                // It was DISCARDED here for a while, to kill a rival coplanar water layer that was fighting
-                // the new material over the depth buffer. The condition could not tell that layer from
-                // ground: everything at a lake's edge is flat and at the lake's height, because that is what
-                // an edge is. So terrain stopped being drawn, stopped writing depth, and the depth capture
-                // came back as the nothing-drawn sentinel across it -- which is what "magenta over terrain"
-                // was, through five wrong diagnoses that all blamed the waves.
-                //
-                // The rival layer is a real problem and needs a real discriminator, not a rule that catches
-                // the ground with it.
-            }
-        }
-    }
-
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
         return;
@@ -2104,9 +1991,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (use_shadow_map) {
         cc_options |= SHADER_OPT(SHADOW_MAP);
     }
-    if (waterSurface) {
-        cc_options |= SHADER_OPT(WATER);
-    }
     if (mRdp->loaded_texture[0].masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
@@ -2122,9 +2006,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (shader.enabled) {
         cc_options |= SHADER_OPT(USE_SHADER);
         // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
-        // SHADOW_MAP, 19->20 for WATER. Keep in lockstep with the decode in gfx_cc_get_features -- a
-        // mismatch selects the wrong shader for every draw in the game.
-        cc_options |= (shader.id << 20);
+        // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
+        // wrong shader for every draw in the game.
+        cc_options |= (shader.id << 19);
     }
 
     ColorCombinerKey key;
@@ -2340,10 +2224,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // project into each cascade. The cascade matrices are uniforms, not per-vertex. Order here must
         // match the input-layout element order in every backend and the PSInput field order in the shader
         // -- these three are one implicit contract, and a mismatch shifts every attribute after it.
-        // The water material rides the same attribute, for a different half of the same idea: it needs how
-        // far the surface is from the eye, which with the linearised scene depth gives the thickness the
-        // whole material is built on.
-        if (use_shadow_map || waterSurface) {
+        if (use_shadow_map) {
             mBufVbo[mBufVboLen++] = v_arr[i]->wx;
             mBufVbo[mBufVboLen++] = v_arr[i]->wy;
             mBufVbo[mBufVboLen++] = v_arr[i]->wz;
@@ -3349,321 +3230,6 @@ static bool ShadowUnproject(const float invVp[4][4], float x, float y, float z, 
         out[i] = (x * invVp[0][i] + y * invVp[1][i] + z * invVp[2][i] + invVp[3][i]) / w;
     }
     return true;
-}
-
-// SOH [Enhancement] Breath of the Wild-style water (see fast/water.h).
-//
-// Rebuild the frame's camera context from the current projection. Everything the material does -- thickness,
-// the reflected ray, the refraction offset, the caustic projection -- is anchored to the eye, so it is
-// recovered once and shared, rather than each layer approximating it for itself.
-void Interpreter::UpdateWaterFrameParams() {
-    mWaterFrame = WaterFrameParams{};
-    mWaterFrame.quality = mWaterEnabled ? mWaterQuality : WATER_QUALITY_OFF;
-    mWaterFrame.debugView = mWaterDebugView;
-    mWaterFrame.time = mWaterTime;
-    mWaterFrame.coverageGain = mWaterCoverageGain;
-    mWaterFrame.screenWidth = (int)mCurDimensions.width;
-    mWaterFrame.screenHeight = (int)mCurDimensions.height;
-
-    // Same aspect correction the cascade fit makes. Every transformed vertex has its clip x divided by this,
-    // so the screen edge is not at matrix NDC +/-1; anything reconstructing a world position FROM a pixel has
-    // to undo it. Derived from the function itself so the two can never disagree, including the framebuffer
-    // case where it is the identity.
-    const float adj = AdjXForAspectRatio(1.0f);
-    mWaterFrame.ndcXScale = (std::fabs(adj) > 1e-6f) ? (1.0f / adj) : 1.0f;
-
-    float invVp[4][4];
-    if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
-        if (mRapi != nullptr) {
-            mWaterFrame.quality = WATER_QUALITY_OFF;
-            mRapi->SetWaterFrameParams(mWaterFrame);
-        }
-        return;
-    }
-    memcpy(mWaterFrame.viewProj, mRsp->P_matrix, sizeof(mWaterFrame.viewProj));
-    memcpy(mWaterFrame.invViewProj, invVp, sizeof(mWaterFrame.invViewProj));
-
-    // Two rays down the view volume. The first is the view axis; the second is offset sideways so the two
-    // are not parallel and their meeting point is the eye.
-    //
-    // Recovered rather than assumed to be the near-plane centre, which is what the cascade fit uses. That
-    // approximation is harmless there -- a cascade is hundreds of units across and the near plane is about
-    // ten from the eye -- but thickness is a DIFFERENCE of distances measured from this point, so a constant
-    // error in it biases the shoreline over the whole image at once, and the shoreline is where the foam and
-    // the colour ramp live.
-    float axisNear[3], axisFar[3], offNear[3], offFar[3];
-    const float offX = mWaterFrame.ndcXScale * 0.5f;
-    if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, axisNear) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, axisFar) ||
-        !ShadowUnproject(invVp, offX, 0.0f, 0.0f, offNear) || !ShadowUnproject(invVp, offX, 0.0f, 1.0f, offFar)) {
-        if (mRapi != nullptr) {
-            mWaterFrame.quality = WATER_QUALITY_OFF;
-            mRapi->SetWaterFrameParams(mWaterFrame);
-        }
-        return;
-    }
-
-    float a[3], b[3], w0[3];
-    for (int i = 0; i < 3; i++) {
-        a[i] = axisFar[i] - axisNear[i];
-        b[i] = offFar[i] - offNear[i];
-        w0[i] = axisNear[i] - offNear[i];
-    }
-    const float A = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
-    const float B = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    const float C = b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
-    const float D = a[0] * w0[0] + a[1] * w0[1] + a[2] * w0[2];
-    const float E = b[0] * w0[0] + b[1] * w0[1] + b[2] * w0[2];
-    const float denom = A * C - B * B;
-
-    if (std::fabs(denom) > 1e-6f * (A * C + 1.0f)) {
-        const float sc = (B * E - C * D) / denom;
-        const float tc = (A * E - B * D) / denom;
-        // Averaging the two closest points instead of taking one: for a true perspective projection the
-        // lines meet exactly and the two agree, so the average costs nothing and is the well-behaved answer
-        // when floating point says they merely come close.
-        for (int i = 0; i < 3; i++) {
-            mWaterFrame.camPos[i] = 0.5f * ((axisNear[i] + sc * a[i]) + (offNear[i] + tc * b[i]));
-        }
-    } else {
-        // Parallel rays: an orthographic projection, where there is no single eye. The near-plane point is
-        // then the right answer for everything that follows.
-        for (int i = 0; i < 3; i++) {
-            mWaterFrame.camPos[i] = axisNear[i];
-        }
-    }
-
-    const float axisLen = std::sqrt(A);
-    if (axisLen > 1e-6f) {
-        for (int i = 0; i < 3; i++) {
-            mWaterFrame.camDir[i] = a[i] / axisLen;
-        }
-    }
-    // Near and far as the eye actually sees them: the distance along the view axis to each plane's centre.
-    mWaterFrame.nearPlane = 0.0f;
-    mWaterFrame.farPlane = 0.0f;
-    for (int i = 0; i < 3; i++) {
-        mWaterFrame.nearPlane += (axisNear[i] - mWaterFrame.camPos[i]) * mWaterFrame.camDir[i];
-        mWaterFrame.farPlane += (axisFar[i] - mWaterFrame.camPos[i]) * mWaterFrame.camDir[i];
-    }
-
-    if (mRapi != nullptr) {
-        mRapi->SetWaterFrameParams(mWaterFrame);
-    }
-}
-
-// SOH [Enhancement] Water: is this triangle a water SURFACE, and if so which body of water's?
-//
-// Three conditions, all required, described in fast/water.h. The order below is the cheap-first order: most
-// triangles in a frame fail the height test against the first box and never reach the cross product.
-//
-// Note what is NOT consulted: the render mode, the texture, the vertex colour. Every one of those describes
-// the Fire Temple's lava as accurately as it describes Lake Hylia, and a false positive there is the worst
-// failure this feature has. A water box is authored data meaning "the player swims here", and lava has none.
-int Interpreter::WaterSurfaceBoxIndex(const float a[3], const float b[3], const float c[3]) const {
-    if (mWaterBoxes.empty()) {
-        return -1;
-    }
-
-    // Containment is decided on the CENTROID, not on all three vertices, and that change is the whole fix
-    // for surfaces that vanished only in part.
-    //
-    // Water polygons in this game are big -- a moat is a handful of long triangles, not a mesh -- so a
-    // triangle routinely straddles the edge of its own collision box. Requiring every vertex inside then
-    // rejects exactly the triangles at the boundary while accepting the ones in the middle, which is not a
-    // near miss: it is half the surface removed and half left standing, with a hard straight edge between
-    // them. Screenshots of the castle moat showed precisely that.
-    //
-    // The centroid cannot be fooled in the other direction either, because the tilt test below still has to
-    // pass and a water surface triangle is flat: a large triangle whose centre happens to fall in a small
-    // box is admitted only if it is also horizontal and at the box's exact height.
-    const float cx = (a[0] + b[0] + c[0]) * (1.0f / 3.0f);
-    const float cy = (a[1] + b[1] + c[1]) * (1.0f / 3.0f);
-    const float cz = (a[2] + b[2] + c[2]) * (1.0f / 3.0f);
-
-    for (size_t i = 0; i < mWaterBoxes.size(); i++) {
-        const WaterBoxDesc& box = mWaterBoxes[i];
-
-        const float x0 = box.xMin - WATER_BOX_XZ_MARGIN;
-        const float x1 = box.xMin + box.xLength + WATER_BOX_XZ_MARGIN;
-        const float z0 = box.zMin - WATER_BOX_XZ_MARGIN;
-        const float z1 = box.zMin + box.zLength + WATER_BOX_XZ_MARGIN;
-        if (cx < x0 || cx > x1 || cz < z0 || cz > z1) {
-            continue;
-        }
-        // Past the footprint, so everything below is a CANDIDATE: it is in the right place, and what remains
-        // is whether it is the right kind of thing. Counted per reason so a scene where nothing is found can
-        // say which condition turned it away instead of leaving it to be guessed at.
-        mWaterCandidates++;
-
-        // Height, on ALL THREE vertices. The footprint moved to the centroid to fix surfaces vanishing in
-        // part; moving the height with it was a mistake, and an expensive one -- a shore slopes through the
-        // water line, so a sloping grass triangle straddling it has its MIDDLE at exactly water level while
-        // its corners are well above and below. Centroid height accepted the entire shoreline, which is why
-        // the ground Link was standing on vanished with the pond and why one pond reported a thousand
-        // surface triangles.
-        //
-        // Per-vertex is the right test because it is really a flatness test: a drawn water surface is dead
-        // flat at the box's height, and nothing that slopes through that height can satisfy it.
-        if (std::fabs(a[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
-            std::fabs(b[1] - box.ySurface) > WATER_SURFACE_TOLERANCE ||
-            std::fabs(c[1] - box.ySurface) > WATER_SURFACE_TOLERANCE) {
-            mWaterRejectHeight++;
-            continue;
-        }
-
-        // Orientation. This is what separates a lake's surface from the waterfall pouring into it and from
-        // the glass-like walls of a water column -- both are inside the box, both are at the box's height
-        // for part of their span, and neither is a surface. They are F15's material, and taking them here
-        // would replace a falling sheet of water with a flat horizontal lake.
-        const float e1[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
-        const float e2[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
-        const float nx = e1[1] * e2[2] - e1[2] * e2[1];
-        const float ny = e1[2] * e2[0] - e1[0] * e2[2];
-        const float nz = e1[0] * e2[1] - e1[1] * e2[0];
-        const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-        if (len < 1e-6f) {
-            mWaterRejectTilt++;
-            continue; // degenerate; no orientation to speak of
-        }
-        if (std::fabs(ny / len) < WATER_MIN_SURFACE_NORMAL_Y) {
-            mWaterRejectTilt++;
-            continue;
-        }
-
-        return (int)i;
-    }
-    return -1;
-}
-
-// SOH [Enhancement] Water (F4): displace one vertex by the Gerstner sum and give it the analytic normal.
-//
-// On the CPU because Fast3D transforms vertices here and its vertex shader is a passthrough -- there is no
-// vertex stage to displace in. So the world position moves and the clip position is rebuilt from it, which
-// is the same arithmetic GfxSpVertex already did.
-//
-// Gerstner rather than a sine because it also moves the vertex HORIZONTALLY, along the direction of travel:
-// that gathers vertices at the crests and spreads them in the troughs, which is what makes sharp peaks and
-// wide flat valleys instead of a corrugated sheet.
-//
-// The normal comes from the analytic derivatives of the same waves, not from differencing the displaced
-// vertices. Differencing gives one normal per facet, so a coarse mesh reads as facets no matter how good the
-// waves are -- and the normal is what every later phase is a function of.
-void Interpreter::WaterApplyWaves(LoadedVertex& v) const {
-    static const float kWaves[WATER_WAVE_COUNT][4] = WATER_WAVES;
-
-    // Amplitude damped to nothing near the shoreline, so a crest cannot rise through it and open a gap
-    // against the sand.
-    //
-    // Measured as distance to the claimed water box's edge, which the design document calls the FALLBACK
-    // (2.2.3) -- it knows the outline and nothing about the submerged terrain. Its preferred signal is water
-    // thickness, and that lives in the depth target, which this code cannot read: the displacement happens
-    // on the CPU because Fast3D has no vertex stage, and the depth target is a GPU resource. The better
-    // signal arrives with F5, which moves the damping into the material where the texture is in reach.
-    float shore = 1.0f;
-    if (mWaterCurrentBox >= 0 && (size_t)mWaterCurrentBox < mWaterBoxes.size()) {
-        const WaterBoxDesc& box = mWaterBoxes[mWaterCurrentBox];
-        const float dx = std::min(v.wx - box.xMin, (box.xMin + box.xLength) - v.wx);
-        const float dz = std::min(v.wz - box.zMin, (box.zMin + box.zLength) - v.wz);
-        shore = std::min(dx, dz) / WATER_WAVE_SHORE_DEPTH;
-    }
-    shore = shore < 0.0f ? 0.0f : (shore > 1.0f ? 1.0f : shore);
-    shore = shore * shore * (3.0f - 2.0f * shore); // smoothstep: no crease where the damping begins
-
-    const float x0 = v.wx, z0 = v.wz;
-    float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-    // Normal accumulates as the horizontal slope; the vertical component is added at the end.
-    float nx = 0.0f, nz = 0.0f;
-
-    for (int i = 0; i < WATER_WAVE_COUNT; i++) {
-        const float dirX = kWaves[i][0], dirZ = kWaves[i][1];
-        const float wavelength = kWaves[i][2];
-        const float amplitude = kWaves[i][3] * shore;
-        const float len = std::sqrt(dirX * dirX + dirZ * dirZ);
-        if (len < 1e-6f || wavelength < 1e-3f) {
-            continue;
-        }
-        const float ux = dirX / len, uz = dirZ / len;
-        const float k = 6.2831853f / wavelength;              // spatial frequency
-        const float speed = std::sqrt(9.81f / k) * WATER_WAVE_SPEED; // deep-water dispersion
-        const float phase = k * (ux * x0 + uz * z0) - speed * k * mWaterTime;
-        const float sinP = std::sin(phase), cosP = std::cos(phase);
-        const float q = WATER_WAVE_STEEPNESS / (k * amplitude * WATER_WAVE_COUNT + 1e-6f);
-
-        dx += q * amplitude * ux * cosP;
-        dz += q * amplitude * uz * cosP;
-        dy += amplitude * sinP;
-
-        nx += ux * k * amplitude * cosP;
-        nz += uz * k * amplitude * cosP;
-    }
-
-    v.wx = x0 + dx;
-    v.wy += dy;
-    v.wz = z0 + dz;
-
-    const float ny = 1.0f;
-    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
-    v.nx = -nx / nlen;
-    v.ny = ny / nlen;
-    v.nz = -nz / nlen;
-
-    // Rebuild the clip position from the moved world position. Same transform GfxSpVertex applies, including
-    // the aspect-ratio adjustment on x -- omit that and the waves would shear sideways on a widescreen
-    // window while the unmoved surface around them did not.
-    const float(*p)[4] = mRsp->P_matrix;
-    const float wx = v.wx, wy = v.wy, wz = v.wz;
-    v.x = wx * p[0][0] + wy * p[1][0] + wz * p[2][0] + p[3][0];
-    v.y = wx * p[0][1] + wy * p[1][1] + wz * p[2][1] + p[3][1];
-    v.z = wx * p[0][2] + wy * p[1][2] + wz * p[2][2] + p[3][2];
-    v.w = wx * p[0][3] + wy * p[1][3] + wz * p[2][3] + p[3][3];
-    v.x = AdjXForAspectRatio(v.x);
-
-    // Clip flags follow the new position, or a displaced vertex keeps the trivial-reject answer computed for
-    // where it used to be.
-    //
-    // Identical to GfxSpVertex's own test, INCLUDING the near-plane check it deliberately leaves commented
-    // out. Reintroducing that check is what broke the first attempt at this phase: behind the eye w is
-    // negative, so z < -w holds, and with all three vertices carrying the bit whole triangles were rejected
-    // -- which removed large blocks of ordinary scenery, not only water. Reimplementing a rule the engine
-    // already had was the mistake, the same one avoided in F1 by reusing the game's own water-box lookup
-    // rather than rewriting it.
-    v.clip_rej = 0;
-    if (v.x < -v.w) {
-        v.clip_rej |= 1; // CLIP_LEFT
-    }
-    if (v.x > v.w) {
-        v.clip_rej |= 2; // CLIP_RIGHT
-    }
-    if (v.y < -v.w) {
-        v.clip_rej |= 4; // CLIP_BOTTOM
-    }
-    if (v.y > v.w) {
-        v.clip_rej |= 8; // CLIP_TOP
-    }
-    // No CLIP_NEAR here, matching GfxSpVertex.
-    if (v.z > v.w) {
-        v.clip_rej |= 32; // CLIP_FAR
-    }
-}
-
-// SOH [Enhancement] Water: take the scene capture at this point in the display list (gSPWaterCapture).
-//
-// The camera context is rebuilt here rather than at the top of the frame because this is the first moment the
-// projection is guaranteed to be the one the water will be drawn with -- the game sets its matrices as it
-// goes, and a context gathered before that describes a camera that no longer exists.
-void Interpreter::CaptureWaterScene() {
-    if (!mWaterEnabled || mRapi == nullptr) {
-        return;
-    }
-    UpdateWaterFrameParams();
-    if (mWaterFrame.quality == WATER_QUALITY_OFF) {
-        return; // the projection could not be inverted; nothing downstream can work from it
-    }
-    const int fb = mRendersToFb ? mGameFb : 0;
-    if (!mRapi->WaterConfigure((int)mCurDimensions.width, (int)mCurDimensions.height)) {
-        return;
-    }
-    mRapi->WaterCaptureScene(fb);
 }
 
 // SOH [Enhancement] Cascaded shadow maps: render last frame's casters into the cascade array.
@@ -5740,12 +5306,6 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // otherwise swallow both of these.
         // Tested before everything else: it is a veto, and the values sit past the rest of the range so the
         // chain below never has to make room for them.
-        // SOH [Enhancement] Water: past the veto range on purpose, so it is answered before the shadow chain
-        // below rather than by squeezing a value in between two of theirs.
-        if (sizeOrSentinel <= -8.5e30f) {
-            gfx->CaptureWaterScene(); // gSPWaterCapture
-            return false;
-        }
         if (sizeOrSentinel <= -7.5e30f) {
             gfx->mRdp->shadow_no_cast = true; // gSPShadowMapCasterOff
             return false;
@@ -5783,14 +5343,6 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         }
         if (sizeOrSentinel <= -1.1e30f) {
             gfx->mRdp->shadow_scenery_caster = false; // gSPShadowMapSceneryCasterEnd
-            return false;
-        }
-        if (sizeOrSentinel <= -1.08e30f) {
-            gfx->mRdp->water_no_surface = true; // gSPWaterSurfaceOff
-            return false;
-        }
-        if (sizeOrSentinel <= -1.05e30f) {
-            gfx->mRdp->water_no_surface = false; // gSPWaterSurfaceOn
             return false;
         }
         // Stencil volumes only. The shadow map used to share this hook, but it must not: this fires
@@ -6633,15 +6185,6 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
-
-    // SOH [Enhancement] Water: the F0 diagnostic overlay, drawn here because this is the last moment the
-    // frame's own target is still bound -- after this the game buffer is blitted to the window and the
-    // thumbnails would land on the wrong surface. A no-op unless the debug view is on and something was
-    // actually captured this frame.
-    if (mWaterEnabled && mWaterDebugView != WATER_DEBUG_OFF) {
-        mRapi->WaterDebugDraw();
-    }
-
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 
@@ -6877,8 +6420,6 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->opt_toon = (shader_id1 & SHADER_OPT(TOON)) != 0; // SOH [Enhancement] toon lighting
     // SOH [Enhancement] cascaded shadow maps: this draw samples the cascade array
     cc_features->opt_shadow_map = (shader_id1 & SHADER_OPT(SHADOW_MAP)) != 0;
-    // SOH [Enhancement] Water: this draw IS a water surface and takes the water material
-    cc_features->opt_water = (shader_id1 & SHADER_OPT(WATER)) != 0;
 
     cc_features->clamp[0][0] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_S);
     cc_features->clamp[0][1] = shader_id1 & SHADER_OPT(TEXEL0_CLAMP_T);
@@ -6886,11 +6427,9 @@ void gfx_cc_get_features(uint64_t shader_id0, uint32_t shader_id1, struct CCFeat
     cc_features->clamp[1][1] = shader_id1 & SHADER_OPT(TEXEL1_CLAMP_T);
 
     if (shader_id1 & SHADER_OPT(USE_SHADER)) {
-        // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP, 19->20 for WATER. Must
-        // match the encode in the ColorCombinerKey build; a mismatch silently selects the wrong shader for
-        // every draw. The mask narrows with the shift: 12 bits from 20 up, still far more than the handful
-        // of loaded shaders that exist.
-        cc_features->shader_id = (shader_id1 >> 20) & 0xFFF;
+        // SOH [Enhancement] 17->18 for the TOON opt bit, 18->19 for SHADOW_MAP. Must match the encode in
+        // the ColorCombinerKey build; a mismatch silently selects the wrong shader for every draw.
+        cc_features->shader_id = (shader_id1 >> 19) & 0x1FFF;
     }
 
     cc_features->usedTextures[0] = false;

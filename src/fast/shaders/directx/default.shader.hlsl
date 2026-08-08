@@ -40,10 +40,8 @@ float4 grayscale : GRAYSCALE;
 float3 normal : NORMAL;
 @{update_floats(3)}
 @end
-@if(o_shadow_map || o_water)
+@if(o_shadow_map)
 // xyz is the world position; w is 1 for scenery and 0 for a character (see the note in ShaderOpts).
-// The water material needs the same attribute for a different reason: how far the surface is from the eye,
-// which is one half of the thickness the whole material is built on.
 float4 worldPos : WORLDPOS;
 @{update_floats(4)}
 @end
@@ -78,50 +76,6 @@ cbuffer PerFrameCB : register(b0) {
     uint noise_frame;
     float noise_scale;
 }
-
-// SOH [Enhancement] Breath of the Wild-style water (see fast/water.h). Binds past the shadow map's slot for
-// the same reason it binds past the combiner's: t0..t5 are the combiner's own texels, masks and blends, t6
-// is the cascade array. The cbuffer takes b4 (b0 per-frame, b1 per-draw, b2 toon, b3 shadow). Only the water
-// variant declares any of this.
-@if(o_water)
-// The frame as it was drawn immediately before the water: what shows THROUGH the surface. Full resolution
-// with a mip chain, so deep water can blur what it reveals by choosing a mip rather than by running a blur.
-Texture2D g_waterScene : register(t7);
-// The same image's depth, linearised to the DISTANCE FROM THE EYE ALONG THE VIEW RAY in world units. That
-// choice is what makes thickness a subtraction here instead of a projection inversion: the surface's own
-// distance comes straight from its world position, and the difference of the two is exactly how far the
-// light travelled through water. It is also the physically right measure, which is why water reads deeper
-// looking along it than looking straight down into it.
-Texture2D<float> g_waterDepth : register(t8);
-SamplerState g_waterSampler : register(s7);
-
-cbuffer PerWaterCB : register(b4) {
-    // xyz = eye in world space. w = one over the scene copy's width, for turning a pixel into a lookup.
-    float4 water_camera;
-    // rgb = extinction per colour channel, in 1/world-unit; a = one over the copy's height.
-    //
-    // Per channel and exponential, not a lerp between two colours. Red dies first, then green, and blue
-    // travels furthest -- so the same one curve gives the lake bed in near-natural colour at the shore, a
-    // green-turquoise in the middle distance, and a deep petrol blue where the column is long. A two-colour
-    // interpolation cannot produce that progression at all; it is what makes water read as a VOLUME rather
-    // than as a tinted pane.
-    float4 water_extinction;
-    // rgb = the colour the water scatters back, a = the thickness at which that colour saturates.
-    //
-    // Absorption alone drives deep water to black. Real water also returns light, and this term is what
-    // makes the deep parts a milky turquoise instead of a hole. It grows with thickness and levels off.
-    float4 water_scatter;
-    // x = sky sentinel: the value the depth target holds where nothing was drawn. Water in front of it must
-    //     read as infinitely thick rather than as zero thickness -- a deep horizon rather than a bright band
-    //     across it.
-    // y = gain applied to the surface's own original brightness before it modulates the scattering (see the
-    //     composition below).
-    // z = mip to sample the scene copy at for the deepest water.
-    // w = thickness over which the surface fades in at the very shoreline, so the waterline is not a hard
-    //     cut against the sand.
-    float4 water_misc;
-}
-@end
 
 // SOH [Enhancement] Toon lighting. Its own cbuffer (b2 — the first free slot at this LUS base) so
 // PerFrameCB stays frame-global; only the toon pixel shader declares/reads it. Layout matches the
@@ -542,7 +496,7 @@ PSInput VSMain(
 @if(o_toon || o_shadow_map)
     , float3 normal : NORMAL
 @end
-@if(o_shadow_map || o_water)
+@if(o_shadow_map)
     , float4 worldPos : WORLDPOS
 @end
 @for(i in 0..o_inputs)
@@ -582,7 +536,7 @@ PSInput VSMain(
         result.normal = normal;
     @end
 
-    @if(o_shadow_map || o_water)
+    @if(o_shadow_map)
         result.worldPos = worldPos;
     @end
 
@@ -843,62 +797,6 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         } else {
             texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }
-    @end
-
-    @if(o_water)
-    {
-        // ------------------------------------------------------------------------------------------
-        // Breath of the Wild-style water, phase F3: thickness, absorption, scattering.
-        //
-        // Everything else the material will eventually do -- waves, refraction offset, reflection,
-        // specular, foam -- layers on top of this. What is here is the part that makes water read as a
-        // volume of a certain depth rather than as a coloured sheet, and it is entirely a function of one
-        // number: how far the view ray travels inside it.
-        // ------------------------------------------------------------------------------------------
-        float2 waterUv = input.position.xy * float2(water_camera.w, water_extinction.a);
-
-        float sceneDist = g_waterDepth.SampleLevel(g_waterSampler, waterUv, 0);
-        float surfaceDist = length(input.worldPos.xyz - water_camera.xyz);
-
-        // Nothing was drawn behind this pixel: the sky is there. Treat the column as effectively unbounded
-        // so the horizon saturates to the deep colour, rather than as zero thickness, which would put a
-        // bright band across it (design document 2.4.4). The sentinel is compared loosely because it is
-        // far past any real distance and nothing legitimate can approach it.
-        float thickness = (sceneDist >= water_misc.x * 0.5) ? water_scatter.a * 8.0
-                                                            : max(sceneDist - surfaceDist, 0.0);
-
-        // What shows through, before the water acts on it. No refraction offset yet -- that is F5, and it
-        // needs the surface normal, which does not exist until F4.
-        float3 behind = g_waterScene.SampleLevel(g_waterSampler, waterUv, 0.0).rgb;
-
-        // Absorption. exp(-k * d) per channel, with k in 1/world-unit.
-        float3 transmitted = behind * exp(-water_extinction.rgb * thickness);
-
-        // Scattering, saturating with thickness.
-        //
-        // Modulated by the ORIGINAL surface's own brightness, which is a shortcut worth stating rather
-        // than hiding: the N64 water polygon is drawn with the room's vertex colours and environment tint,
-        // so it is already dark inside a cave, orange at sunset and dim at night. Reading its luminance
-        // gets the ambient response the design asks for (2.4.3) and the per-scene tone it asks for (2.4.5)
-        // out of one value, with no new state pushed from the game -- and because it comes from the drawn
-        // texture rather than from a constant, it keeps working under texture packs (1.4).
-        float waterAmbient = saturate(dot(texel.rgb, float3(0.299, 0.587, 0.114)) * water_misc.y);
-        float3 scattered = water_scatter.rgb * waterAmbient * (1.0 - exp(-thickness / max(water_scatter.a, 1.0)));
-
-        float3 waterColor = transmitted + scattered;
-
-        // The composed colour already contains what is behind the surface, so it lands on the frame as-is
-        // rather than being blended over that same background a second time. Alpha goes to one -- except in
-        // the last few units at the shoreline, where it eases off so the waterline meets the sand as a soft
-        // edge instead of a cut (2.19, item 11).
-        float waterAlpha = saturate(thickness / max(water_misc.w, 0.001));
-
-        @if(o_alpha)
-            texel = float4(waterColor, waterAlpha);
-        @else
-            texel = waterColor;
-        @end
-    }
     @end
 
     @if(o_fog)

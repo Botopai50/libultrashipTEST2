@@ -91,22 +91,16 @@ enum class ShaderOpts {
     TEXEL1_BLEND,
     USE_SHADER,
     TOON,       // SOH [Enhancement] toon-lighting variant. Bit 17.
-    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18.
+    SHADOW_MAP, // SOH [Enhancement] cascaded shadow-map receiver variant. Bit 18; the loaded-shader id
+                // packs ABOVE it (interpreter.cpp shifts shader.id by 19). Adding an opt here without
+                // bumping that shift would overlap the id and corrupt shader selection for every draw.
+                // shader_id1 is 32 bits, so the id keeps the 13 bits from 19 up -- far more than the
+                // handful of loaded shaders that exist, but the ceiling to watch as opts grow.
                 //
                 // Whether a receiver also takes the ACTOR caster layer deliberately does NOT live here.
                 // It rides in the world-position attribute's w instead, because every option bit multiplies
                 // the number of shader variants, and each new variant is a shader compiled in the middle of
                 // a frame -- which is felt as the game hitching the first time a shadow appears.
-    WATER,      // SOH [Enhancement] Breath of the Wild-style water material. Bit 19; the loaded-shader id
-                // packs ABOVE it (interpreter.cpp shifts shader.id by 20). Adding an opt here without
-                // bumping that shift would overlap the id and corrupt shader selection for every draw in
-                // the game. shader_id1 is 32 bits, so the id keeps the 12 bits from 20 up -- far more than
-                // the handful of loaded shaders that exist, but the ceiling to watch as opts grow.
-                //
-                // One bit, not several. Quality level, debug view and every tuning number ride in the
-                // constant buffer instead: an option bit multiplies the number of shader variants, and each
-                // new variant is a shader compiled in the middle of a frame, felt as the game hitching the
-                // first time water comes into view. The same reasoning that kept the shadow map to one bit.
     MAX
 };
 
@@ -139,7 +133,6 @@ struct CCFeatures {
     bool opt_grayscale;
     bool opt_toon;       // SOH [Enhancement] toon lighting
     bool opt_shadow_map; // SOH [Enhancement] cascaded shadow maps: this draw receives shadow
-    bool opt_water;      // SOH [Enhancement] water: this draw IS a water surface
     bool usedTextures[2];
     bool used_masks[2];
     bool used_blend[2];
@@ -377,10 +370,6 @@ struct RDP {
     // them, for geometry whose exclusion is not a render-state question -- effects, which are light drawn as
     // polygons and declare whatever mode suited the artist.
     bool shadow_no_cast;
-    // SOH [Enhancement] Water: these draws are never a water SURFACE, whatever their geometry says. Set by
-    // gSPWaterSurfaceOff around the effect passes -- the ripples drawn around a swimming player are flat,
-    // translucent and exactly at the water's height, so nothing geometric can turn them away.
-    bool water_no_surface;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
@@ -464,102 +453,6 @@ class Interpreter {
         mShadowEdgeSoftness = edgeSoftness;
         mShadowShowVolume = showVolume;
     }
-    // SOH [Enhancement] Water (see fast/water.h): frame-global policy pushed by the game. As with the
-    // shadow map, `enabled` must already account for the backend's capability -- the interpreter does not
-    // second-guess it. Quality is WATER_QUALITY_*; passing WATER_QUALITY_OFF is the same as disabling.
-    // `time` is pushed by the game rather than accumulated here, and that is deliberate: the frame
-    // interpolator re-runs the same display list several times per game frame, so a clock ticking inside the
-    // renderer would make the water scroll at the interpolated rate while everything it sits next to moves at
-    // the game's. The game owns the only counter that means "one step of the world".
-    void SetWaterParams(bool enabled, int quality, int debugView, float time, float coverageGain) {
-        // Roll the identification census forward. Published here, at the game frame boundary, so a reader
-        // always sees one complete frame's worth rather than however much of the current one has run.
-        mWaterTrisLastFrame = mWaterTrisIdentified;
-        mWaterBoxesHitLastFrame = mWaterBoxesHit;
-        mWaterCandidatesLastFrame = mWaterCandidates;
-        mWaterRejectHeightLastFrame = mWaterRejectHeight;
-        mWaterRejectTiltLastFrame = mWaterRejectTilt;
-        mWaterAcceptedXluLastFrame = mWaterAcceptedXlu;
-        mWaterAcceptedOpaLastFrame = mWaterAcceptedOpa;
-        mWaterAlphaSumLastFrame = mWaterAlphaSum;
-        mWaterAlphaSum = 0.0f;
-        mWaterTrisIdentified = 0;
-        mWaterBoxesHit = 0;
-        mWaterCandidates = 0;
-        mWaterRejectHeight = 0;
-        mWaterRejectTilt = 0;
-        mWaterAcceptedXlu = 0;
-        mWaterAcceptedOpa = 0;
-        mWaterTime = time;
-        mWaterCoverageGain = coverageGain;
-        mWaterEnabled = enabled && quality != WATER_QUALITY_OFF;
-        mWaterQuality = quality < WATER_QUALITY_OFF               ? WATER_QUALITY_OFF
-                        : (quality >= WATER_QUALITY_COUNT ? WATER_QUALITY_HIGH : quality);
-        mWaterDebugView = debugView < WATER_DEBUG_OFF                ? WATER_DEBUG_OFF
-                          : (debugView >= WATER_DEBUG_COUNT ? WATER_DEBUG_OFF : debugView);
-    }
-
-    // SOH [Enhancement] Water: the scene's active water boxes for this frame (see WaterBoxDesc). Replaced
-    // wholesale each frame; an empty list means no water can be identified, which is the correct state for
-    // every scene without any. Pushed by the game because deciding which boxes are ACTIVE is game knowledge
-    // -- the room filter in the property bits, Zora's Domain's hard-coded extra box, the not-yet-loaded
-    // collision header -- and duplicating those rules here would mean getting them subtly wrong.
-    void SetWaterBoxes(const WaterBoxDesc* boxes, int count) {
-        mWaterBoxes.clear();
-        if (boxes == nullptr || count <= 0) {
-            return;
-        }
-        const int n = count > WATER_MAX_BOXES ? WATER_MAX_BOXES : count;
-        mWaterBoxes.assign(boxes, boxes + n);
-    }
-
-    // SOH [Enhancement] Water: last complete frame's identification census -- how many triangles were taken
-    // as a water surface, how many of the scene's boxes they came from, and how many boxes the scene has.
-    // Displayed in the menu. The shadow map's caster census is what finally named the environment particle
-    // swarm after four wrong guesses about where it was drawn; this exists so the same question about water
-    // ("is it finding this lake at all, and how much of it?") is answered by the code that decides rather
-    // than by staring at a screenshot.
-    // `breakdownOut`, when given, receives five numbers: candidates (centroid landed in a box's footprint),
-    // rejected on height, rejected on tilt, accepted-and-translucent, accepted-and-not.
-    // `avgAlphaOut`, when given, receives the mean vertex alpha of the accepted triangles: the measurement
-    // that calibrates how much of a claimed surface the material may replace.
-    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut, int breakdownOut[5] = nullptr,
-                        float* avgAlphaOut = nullptr) const {
-        if (avgAlphaOut != nullptr) {
-            *avgAlphaOut = mWaterTrisLastFrame > 0 ? mWaterAlphaSumLastFrame / (float)mWaterTrisLastFrame : 0.0f;
-        }
-        if (breakdownOut != nullptr) {
-            breakdownOut[0] = mWaterCandidatesLastFrame;
-            breakdownOut[1] = mWaterRejectHeightLastFrame;
-            breakdownOut[2] = mWaterRejectTiltLastFrame;
-            breakdownOut[3] = mWaterAcceptedXluLastFrame;
-            breakdownOut[4] = mWaterAcceptedOpaLastFrame;
-        }
-        if (trisOut != nullptr) {
-            *trisOut = mWaterTrisLastFrame;
-        }
-        if (boxesHitOut != nullptr) {
-            int hit = 0;
-            for (uint64_t m = mWaterBoxesHitLastFrame; m != 0; m &= m - 1) {
-                hit++;
-            }
-            *boxesHitOut = hit;
-        }
-        if (boxesTotalOut != nullptr) {
-            *boxesTotalOut = (int)mWaterBoxes.size();
-        }
-    }
-
-    // SOH [Enhancement] Water: rebuild the frame's camera context from the current projection and hand it to
-    // the backend. Called once per frame, before anything can capture, because every capture and every water
-    // draw in the frame has to agree about where the eye is.
-    void UpdateWaterFrameParams();
-
-    // SOH [Enhancement] Water: take the scene copy the water material will read. Driven by a display-list
-    // marker rather than by a fixed point in the frame, because a room can interleave several bodies of
-    // water with other translucent geometry and each has to refract what was drawn behind IT.
-    void CaptureWaterScene();
-
     // SOH [Enhancement] Cascaded shadow maps: frame-global policy pushed by the game. `enabled` must
     // already account for the backend's capability -- the interpreter does not second-guess it, it just
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
@@ -893,63 +786,6 @@ class Interpreter {
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
     uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from
     bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
-    // SOH [Enhancement] Water (see fast/water.h). The camera context is rebuilt once per frame in
-    // UpdateWaterFrameParams and pushed to the backend; nothing here is read per draw.
-    bool mWaterEnabled = false; // app-pushed: water mode selected AND backend capable
-    int mWaterQuality = WATER_DEFAULT_QUALITY;
-    int mWaterDebugView = WATER_DEBUG_OFF;
-    // Monotonic seconds the water material scrolls by, pushed by the game (see SetWaterParams).
-    float mWaterTime = 0.0f;
-    float mWaterCoverageGain = WATER_DEFAULT_COVERAGE_GAIN;
-    WaterFrameParams mWaterFrame{};
-    std::vector<WaterBoxDesc> mWaterBoxes;
-    // How many triangles this frame were identified as a water surface, and how many distinct boxes they
-    // came from. Reported to the menu so a scene can be checked without a screenshot, in the same spirit as
-    // the shadow map's caster census -- which is what finally named the environment particle swarm after
-    // four wrong guesses about where it was drawn.
-    int mWaterTrisIdentified = 0;
-    uint64_t mWaterBoxesHit = 0; // bitmask over mWaterBoxes
-    int mWaterTrisLastFrame = 0;
-    uint64_t mWaterBoxesHitLastFrame = 0;
-    // Why candidates were turned away, and what the accepted ones were drawn as. Mutable because the test
-    // itself is const -- it answers a question about geometry and must stay side-effect free as far as the
-    // caller is concerned; these are pure instrumentation.
-    //
-    // The zmode split is the one that decides the open question. Three symptoms were reported at once --
-    // surfaces vanishing that are not water, surfaces vanishing only in part, scenes where nothing vanished
-    // -- and the part-vanishing is explained and fixed (centroid containment). The other two both turn on
-    // whether the render mode can tell a water surface from a stone ledge sitting at exactly water level,
-    // and this codebase has already proved twice that the answer cannot be reasoned out: the room's
-    // TRANSLUCENT pass declares an opaque zmode, and Navi's glow is alpha-blended while declaring itself
-    // opaque. So the counts are gathered and read rather than assumed.
-    mutable int mWaterCandidates = 0;   // centroid inside some box's footprint
-    mutable int mWaterRejectHeight = 0; // ... but not at its surface height
-    mutable int mWaterRejectTilt = 0;   // ... and not horizontal
-    int mWaterAcceptedXlu = 0;          // accepted and drawn with ZMODE_XLU
-    int mWaterAcceptedOpa = 0;          // accepted and drawn with any other zmode
-    // Summed vertex alpha over accepted triangles. The material now scales what it may replace by how much
-    // the original draw covered, and the gain that keeps real water at full strength has to be set against
-    // the alpha real water is actually drawn with -- which is a number only the running game has.
-    float mWaterAlphaSum = 0.0f;
-    int mWaterCandidatesLastFrame = 0;
-    int mWaterRejectHeightLastFrame = 0;
-    int mWaterRejectTiltLastFrame = 0;
-    int mWaterAcceptedXluLastFrame = 0;
-    int mWaterAcceptedOpaLastFrame = 0;
-    float mWaterAlphaSumLastFrame = 0.0f;
-
-    // Which water box, if any, this triangle's three world-space vertices form a surface of. -1 for none.
-    // Defined in the .cpp beside the rest of the water code.
-    int WaterSurfaceBoxIndex(const float a[3], const float b[3], const float c[3]) const;
-
-    // SOH [Enhancement] Water (F4): move this vertex by the Gerstner sum and give it the analytic surface
-    // normal. On the CPU because Fast3D transforms vertices here and its vertex shader is a passthrough, so
-    // there is no vertex stage to displace in. `thickness` damps the amplitude toward the shoreline.
-    void WaterApplyWaves(LoadedVertex& v) const;
-    // Which box the surface being subdivided belongs to, so the wave damping can measure how near the edge
-    // of it a vertex is. -1 when nothing is being subdivided.
-    int mWaterCurrentBox = -1;
-
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;

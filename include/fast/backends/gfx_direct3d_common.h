@@ -52,15 +52,6 @@ struct PerShadowCB {
     float shadow_incidence[4];
 };
 
-// SOH [Enhancement] Water material (register b4). Matches the PerWaterCB cbuffer in default.shader.hlsl
-// field for field; see fast/water.h for what each number means and the shader for how they compose.
-struct PerWaterCB {
-    float water_camera[4];     // xyz = eye in world space, w = 1 / capture width
-    float water_extinction[4]; // rgb = per-channel extinction in 1/world-unit, a = 1 / capture height
-    float water_scatter[4];    // rgb = scattered colour, a = thickness at which it saturates
-    float water_misc[4];       // x = sky sentinel, y = ambient gain, z = deep mip, w = shoreline fade
-};
-
 struct PerDrawCB {
     struct Texture {
         uint32_t width;
@@ -105,7 +96,6 @@ struct ShaderProgramD3D11 {
     bool usedTextures[SHADER_MAX_TEXTURES];
     bool opt_toon = false;       // SOH [Enhancement] toon lighting variant
     bool opt_shadow_map = false; // SOH [Enhancement] cascaded shadow-map receiver variant
-    bool opt_water = false;      // SOH [Enhancement] BOTW-style water material variant
 };
 
 class GfxWindowBackendDXGI;
@@ -172,13 +162,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
                             float normalOffset, float strength, float filterWidth, float debugMode,
                             float edgeHardness, float edgeHardnessFar) override;
 
-    // SOH [Enhancement] Breath of the Wild-style water (see fast/water.h). As with the shadow map, this is
-    // the only backend that implements the passes.
-    bool SupportsWater() override;
-    bool WaterConfigure(int width, int height) override;
-    void WaterCaptureScene(int fbId) override;
-    void WaterDebugDraw() override;
-
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
     Microsoft::WRL::ComPtr<ID3D11Device> mDevice;
@@ -196,15 +179,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool CreateShadowMapPipeline();
     bool CreateShadowMapTargets(int cascadeCount, int resolution);
     ID3D11RasterizerState* ShadowRasterizerForCascade(int cascadeIndex, const float lightViewProj[16]);
-
-    // SOH [Enhancement] Water: the screen-space pipeline shared by every capture and debug pass -- one
-    // vertex shader that builds a full-screen triangle from SV_VertexID (so none of these passes needs a
-    // vertex buffer, an input layout or a draw-state dance), plus the pixel shaders that consume it.
-    // Built once, lazily; failure is not fatal and simply leaves the water feature unavailable.
-    bool CreateWaterPipeline();
-    bool CreateWaterTargets(int width, int height, DXGI_FORMAT colorFormat);
-    void WaterFullscreenPass(ID3D11RenderTargetView* rtv, ID3D11PixelShader* ps, ID3D11ShaderResourceView* const* srvs,
-                             UINT srvCount, UINT width, UINT height);
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -262,46 +236,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Viewport to put back when the depth pass ends: the pass overwrites it with the cascade's square
     // one, and the interpreter does not necessarily re-issue SetViewport before the next draw.
     D3D11_VIEWPORT mShadowSavedViewport = {};
-
-    // SOH [Enhancement] Water (see fast/water.h).
-    //
-    // Two targets. The colour copy is a full-resolution mip chain: what shows THROUGH the water and what
-    // reflects OFF it are both read blurred, and picking a mip is how that blur is obtained, so the chain is
-    // the whole point of the resource. Its format is copied from whatever the frame is actually drawing
-    // into rather than assumed, because the game renders either to an offscreen R8G8B8A8 target or straight
-    // to the swapchain's back buffer, and those need not agree.
-    //
-    // The depth copy is R32F and full resolution, holding the DISTANCE FROM THE EYE ALONG THE VIEW RAY in
-    // world units -- not view-space Z and not a normalised depth. Thickness is then a plain subtraction in
-    // the material with no projection algebra, which is both cheaper and the correct measure: it is how far
-    // the light actually travelled through water, which is why water looks deeper looking along it than
-    // straight down into it.
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> mWaterSceneColorTex;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mWaterSceneColorSrv;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mWaterSceneColorRtv; // mip 0 only, for GenerateMips
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> mWaterLinearDepthTex;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mWaterLinearDepthSrv;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mWaterLinearDepthRtv;
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> mWaterFullscreenVs;
-    // Two linearise shaders because the depth buffer is a Texture2DMS when MSAA is on and a Texture2D when
-    // it is not, and HLSL has no way to spell both with one binding. The multisample variant reads sample 0
-    // rather than averaging: depth is not a colour, and the average of two depths across a silhouette edge
-    // is a distance at which no geometry exists.
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mWaterLinearDepthPs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mWaterLinearDepthMsPs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mWaterBlitPs;      // colour thumbnail (debug)
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mWaterDepthViewPs; // depth thumbnail (debug)
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mWaterCb;
-    Microsoft::WRL::ComPtr<ID3D11SamplerState> mWaterSampler;
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mWaterRasterizerState;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mWaterDepthStencilState;
-    Microsoft::WRL::ComPtr<ID3D11BlendState> mWaterBlendState;
-    int mWaterWidth = 0;
-    int mWaterHeight = 0;
-    DXGI_FORMAT mWaterColorFormat = DXGI_FORMAT_UNKNOWN;
-    bool mWaterPipelineReady = false;
-    bool mWaterPipelineFailed = false; // creation already failed once; do not retry every frame
-    bool mWaterCaptured = false;       // a capture happened this frame, so the debug view has something to show
     UINT mShadowSavedViewportCount = 0;
 
     HMODULE mDX11Module;
@@ -323,7 +257,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb;   // SOH [Enhancement] toon lighting (register b2)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerShadowCb; // SOH [Enhancement] shadow cascades (register b3)
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerWaterCb;  // SOH [Enhancement] water material (register b4)
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -343,8 +276,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerToonCB mPerToonCbData;     // SOH [Enhancement] toon lighting
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
     bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
-    PerWaterCB mPerWaterCbData{}; // SOH [Enhancement] water material
-    bool mWaterCbDirty = true;    // re-upload the water CB only when the frame's values changed
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 

@@ -2920,35 +2920,6 @@ typedef union Gfx {
 #define gSPShadowMapSceneryCasterBegin(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.4e30f)
 #define gSPShadowMapSceneryCasterEnd(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.2e30f)
 
-// SOH [Enhancement] Breath of the Wild-style water (see fast/water.h): take the scene capture the water
-// material reads -- a copy of the colour drawn so far, with its mip chain, and the depth of that same image
-// linearised into world-unit distances.
-//
-// A display-list marker rather than a fixed point in the renderer's frame, and that is the whole design. What
-// the water refracts is whatever was drawn BEFORE it, so the capture has to happen at the position in the
-// translucent stream where the water sits -- and a room can hold several bodies of water at different heights
-// with other translucent geometry between them (the Water Temple, Zora's Domain). One marker per contiguous
-// run of water, not one per surface: the copy is the expensive part, and surfaces drawn back to back all
-// refract the same image.
-//
-// Rides past the veto range of the shadow markers above so the chain that reads them never has to make room
-// for it.
-#define gSPWaterCapture(pkt) gSPToonShadow(pkt, 0, 0, 0, -9.0e30f)
-
-// SOH [Enhancement] Water: forbid the following draws from being taken as a water SURFACE, whatever their
-// geometry says.
-//
-// The identification is geometric -- flat, translucent, inside a water box at its surface height -- and the
-// ripples the game draws around a swimming player satisfy every one of those, because they ARE at the water
-// surface. Taken as surfaces they get the material, which composes an opaque colour and discards the ripple
-// texture's own alpha; instead of a thin ring the whole quad fills in, and overlapping rings pile up into a
-// bright stair-stepped block around the player.
-//
-// Same class of thing as the shadow-caster veto, emitted in the same place and for the same reason: an
-// effect is not part of the world, and no amount of looking at its geometry will say so.
-#define gSPWaterSurfaceOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.08e30f)
-#define gSPWaterSurfaceOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -1.05e30f)
-
 // SOH [Enhancement] World light casting: set the stencil mode for the following draws (see StencilMode).
 #define gSPStencil(pkt, mode)                        \
     {                                                \
