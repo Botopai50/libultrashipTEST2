@@ -154,7 +154,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
                                uint64_t contentKey) override;
-    void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) override;
+    void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
+                              size_t drawCount) override;
     bool SupportsShadowMapAlphaCasters() override;
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;

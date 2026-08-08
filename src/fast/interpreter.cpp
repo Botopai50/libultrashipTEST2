@@ -1470,6 +1470,38 @@ uint64_t Interpreter::ShadowHashBytes(uint64_t seed, const void* data, size_t by
     return h;
 }
 
+// Box the cached world list, one span at a time. Runs once per cache rebuild -- which is once per room, not
+// once per frame -- so a single walk of the list here buys a cull test in every cascade of every frame until
+// the room changes.
+void Interpreter::BuildShadowWorldChunks() {
+    mShadowWorldChunks.clear();
+    const std::vector<float>& v = mShadowMapWorldCache;
+    const size_t total = (v.size() / 9) * 9; // whole triangles only, same rule the draw path uses
+    if (total == 0) {
+        return;
+    }
+    const size_t chunkFloats = kShadowChunkTriangles * 9;
+    mShadowWorldChunks.reserve((total + chunkFloats - 1) / chunkFloats);
+    for (size_t base = 0; base < total; base += chunkFloats) {
+        const size_t end = std::min(base + chunkFloats, total);
+        ShadowCasterChunk chunk;
+        chunk.firstVertex = (uint32_t)(base / 3);
+        chunk.vertexCount = (uint32_t)((end - base) / 3);
+        for (int a = 0; a < 3; a++) {
+            chunk.min[a] = std::numeric_limits<float>::max();
+            chunk.max[a] = -std::numeric_limits<float>::max();
+        }
+        for (size_t i = base; i < end; i += 3) {
+            for (int a = 0; a < 3; a++) {
+                const float p = v[i + a];
+                chunk.min[a] = std::min(chunk.min[a], p);
+                chunk.max[a] = std::max(chunk.max[a], p);
+            }
+        }
+        mShadowWorldChunks.push_back(chunk);
+    }
+}
+
 // What this layer is about to submit, as one value. Two frames that produce the same key would rasterise
 // the same depth map, so the backend can leave the slice it already has (see ShadowMapBeginCascade).
 //
@@ -3335,6 +3367,7 @@ void Interpreter::RenderShadowMap() {
                 // The one place the cached lists change. Everything downstream reads the counter instead of
                 // the megabytes behind it (see ShadowMapLayerContentKey).
                 mShadowWorldCacheGeneration++;
+                BuildShadowWorldChunks(); // the spans index into the list that was just swapped in
             } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
                 // Different geometry ran this frame than the cache was built from. The frame is already past
                 // the point where it could have been captured, so arm the rebuild for the next one -- the
@@ -3615,6 +3648,37 @@ void Interpreter::RenderShadowMap() {
     const uint64_t layerContentKeys[SHADOW_MAP_LAYERS] = { ShadowMapLayerContentKey(SHADOW_MAP_LAYER_WORLD),
                                                            ShadowMapLayerContentKey(SHADOW_MAP_LAYER_ACTORS) };
 
+    // Can any part of this span land inside the cascade's footprint? Standard conservative box-against-slab
+    // test: the box's centre projects to a point and its half-extents project to a radius, so the span is
+    // rejected only when the whole box sits off one side. Erring towards keeping a span is harmless; erring
+    // the other way would drop a caster, so nothing here may be tightened into an exact test.
+    //
+    // ONLY the two lateral axes are tested, never depth. The depth pass runs with depth clipping disabled on
+    // purpose -- a caster above the cascade's slice still has to occlude, and clipping it away is exactly the
+    // shadow the slice exists to record. The lateral test carries no such caveat: the rasterizer discards
+    // anything outside the viewport whatever its depth, so a span entirely off to one side contributes
+    // nothing and skipping it changes no pixel.
+    //
+    // The matrix is row-vector (world * M), so the x column is m[0], m[4], m[8] and the translation m[12].
+    // w is exactly 1 -- the projection is orthographic by construction -- so clip xy IS ndc xy.
+    auto chunkVisible = [](const ShadowCasterChunk& ch, const float* m) {
+        const float cx = (ch.min[0] + ch.max[0]) * 0.5f;
+        const float cy = (ch.min[1] + ch.max[1]) * 0.5f;
+        const float cz = (ch.min[2] + ch.max[2]) * 0.5f;
+        const float hx = (ch.max[0] - ch.min[0]) * 0.5f;
+        const float hy = (ch.max[1] - ch.min[1]) * 0.5f;
+        const float hz = (ch.max[2] - ch.min[2]) * 0.5f;
+        for (int axis = 0; axis < 2; axis++) {
+            const float a0 = m[0 + axis], a1 = m[4 + axis], a2 = m[8 + axis];
+            const float centre = (cx * a0) + (cy * a1) + (cz * a2) + m[12 + axis];
+            const float radius = (hx * std::fabs(a0)) + (hy * std::fabs(a1)) + (hz * std::fabs(a2));
+            if (centre - radius > 1.0f || centre + radius < -1.0f) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
         // The world layer draws from the cache, which usually holds the same vector contents as last frame --
         // so on top of skipping the capture, the backend's "same list as the previous call" check also skips
@@ -3635,7 +3699,32 @@ void Interpreter::RenderShadowMap() {
                 continue;
             }
             if (casters.size() >= 9) {
-                mRapi->ShadowMapDrawCasters(casters.data(), casters.size() / 3, SHADOW_MAP_CASTER_SLOT_MAIN);
+                const size_t casterVerts = casters.size() / 3;
+                if (l == SHADOW_MAP_LAYER_WORLD && !mShadowWorldChunks.empty()) {
+                    // Adjacent surviving spans are merged into one draw, so a cascade that keeps everything
+                    // still issues exactly one call -- the cull can cost draw calls only where it is also
+                    // saving whole spans of geometry.
+                    const float* m = &matrices[c * 16];
+                    size_t runFirst = 0, runCount = 0;
+                    for (const ShadowCasterChunk& ch : mShadowWorldChunks) {
+                        if (chunkVisible(ch, m)) {
+                            if (runCount == 0) {
+                                runFirst = ch.firstVertex;
+                            }
+                            runCount += ch.vertexCount;
+                        } else if (runCount != 0) {
+                            mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN,
+                                                        runFirst, runCount);
+                            runCount = 0;
+                        }
+                    }
+                    if (runCount != 0) {
+                        mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst,
+                                                    runCount);
+                    }
+                } else {
+                    mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN);
+                }
             }
             if (sceneryHere && mShadowSceneryReady.size() >= 9) {
                 mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,

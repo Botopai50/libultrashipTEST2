@@ -166,7 +166,14 @@ class GfxRenderingAPI {
     // `slot` selects which of the layer's caster lists this is (see SHADOW_MAP_CASTER_SLOTS). Each slot
     // keeps its own buffer, so the world layer's cached room mesh is not disturbed by the per-frame scenery
     // list drawn beside it.
-    virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0) {
+    //
+    // `firstVertex`/`drawCount` name a sub-range of that list to draw; drawCount 0 means "to the end", so
+    // the two-argument form still draws everything. The list uploaded is always the WHOLE list -- the range
+    // selects what is drawn from it, never what is uploaded. That split is the point: a caller can hand over
+    // one big list once and then, per cascade, draw only the parts of it that cascade can actually see,
+    // without giving up the upload caching that keeps a static room mesh resident on the GPU.
+    virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0, size_t firstVertex = 0,
+                                      size_t drawCount = 0) {
     }
 
     // Alpha-cutout casters, in two parts because the geometry is uploaded once but drawn once per material.

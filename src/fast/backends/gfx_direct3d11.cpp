@@ -1840,11 +1840,27 @@ void GfxRenderingAPIDX11::ShadowMapInvalidateOpenSlice() {
     }
 }
 
-void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot) {
+void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
+                                               size_t drawCount) {
     if (!mShadowPassActive || worldXyz == nullptr || vertexCount < 3) {
         return;
     }
     vertexCount -= vertexCount % 3; // whole triangles only
+
+    // The sub-range to draw out of the uploaded list. Clamped rather than trusted, and rounded to whole
+    // triangles the same way the list itself is: a caller that names a range running past the end must lose
+    // the overhang, not read whatever the buffer happens to hold past it.
+    if (firstVertex >= vertexCount) {
+        return;
+    }
+    const size_t maxDraw = vertexCount - firstVertex;
+    if (drawCount == 0 || drawCount > maxDraw) {
+        drawCount = maxDraw;
+    }
+    drawCount -= drawCount % 3;
+    if (drawCount < 3) {
+        return;
+    }
 
     const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
     const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
@@ -1861,7 +1877,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
         mShadowCasterVb[layer] != nullptr) {
         // The other layer may have bound its own buffer since, so rebind -- it is a state change, not a copy.
         mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
-        mContext->Draw((UINT)vertexCount, 0);
+        mContext->Draw((UINT)drawCount, (UINT)firstVertex);
         return;
     }
 
@@ -1904,7 +1920,9 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     mContext->Unmap(mShadowCasterVb[layer].Get(), 0);
 
     mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
-    mContext->Draw((UINT)vertexCount, 0);
+    mContext->Draw((UINT)drawCount, (UINT)firstVertex);
+    // Records the whole uploaded list, not the range drawn: the next call for this slot compares against
+    // what the BUFFER holds, and it holds all of it however little of it was just drawn.
     mShadowLastCasterPtr[layer] = worldXyz;
     mShadowLastCasterCount[layer] = vertexCount;
 }

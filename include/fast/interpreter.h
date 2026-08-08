@@ -502,6 +502,7 @@ class Interpreter {
             // Same reasoning for the cached world layer, plus: force a rebuild on the next enable, since
             // nothing accumulated a signature while the mode was off.
             mShadowMapWorldCache.clear();
+            mShadowWorldChunks.clear();    // they index into the list that just went away
             mShadowWorldCacheGeneration++; // the cache changed, so the slices built from it are stale
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
                 mShadowAlphaCasters[l].clear();
@@ -794,6 +795,30 @@ class Interpreter {
     std::vector<float> mShadowSceneryReady;   // what the pass draws
     ShadowAlphaCasters mShadowAlphaScenery;
     ShadowAlphaCasters mShadowAlphaSceneryReady;
+
+    // SOH [Enhancement] Cascaded shadow maps: the cached world list cut into fixed spans, each with the
+    // bounding box of the geometry inside it, so a cascade can draw only the spans it can actually see.
+    //
+    // The near cascade covers a sphere a hundred-odd world units across while the room mesh spans thousands,
+    // and it was being submitted whole into every cascade -- the entire scene re-transformed four times over
+    // to have almost all of it land outside the viewport and be thrown away. The spans are contiguous vertex
+    // ranges into the one uploaded buffer, so skipping them costs no extra upload and no extra buffer: it is
+    // the same draw call with a smaller range, or no draw call at all.
+    //
+    // Only the world cache gets this. The scenery and character lists are small, and they are rebuilt every
+    // frame, so boxing them would cost more than it saved.
+    struct ShadowCasterChunk {
+        float min[3];
+        float max[3];
+        uint32_t firstVertex;
+        uint32_t vertexCount;
+    };
+    // Triangles per span. The trade is granularity against per-cascade test count and draw-call count: too
+    // large and every span straddles the cascade so nothing is culled, too small and the boxes stop being
+    // worth the calls that test them. 512 puts a typical room in the low tens of spans.
+    static constexpr size_t kShadowChunkTriangles = 512;
+    std::vector<ShadowCasterChunk> mShadowWorldChunks;
+    void BuildShadowWorldChunks();
 
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
