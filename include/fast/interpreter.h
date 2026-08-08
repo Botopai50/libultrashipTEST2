@@ -956,6 +956,14 @@ class Interpreter {
     // split again -- and so the census counts the surface once rather than once per fragment of it.
     bool mWaterSubdividing = false;
 
+    // SOH [Enhancement] Water (F4): move this vertex by the Gerstner sum and give it the analytic surface
+    // normal. On the CPU because Fast3D transforms vertices here and its vertex shader is a passthrough, so
+    // there is no vertex stage to displace in. `thickness` damps the amplitude toward the shoreline.
+    void WaterApplyWaves(LoadedVertex& v) const;
+    // Which box the surface being subdivided belongs to, so the wave damping can measure how near the edge
+    // of it a vertex is. -1 when nothing is being subdivided.
+    int mWaterCurrentBox = -1;
+
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
