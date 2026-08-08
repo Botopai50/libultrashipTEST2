@@ -88,24 +88,39 @@
 // Expressed in world units and divided by each cascade's own depth range at upload time, one value means
 // the same physical offset everywhere. The slope term stays with the rasterizer, where being relative to
 // the polygon's own gradient is exactly what it should be.
-// 4.0, and carrying the whole load: the normal offset below is off in the tuned configuration, so this and
-// the slope term are the only two left. That is a deliberate trade and not an oversight -- the offset moves
-// the sample sideways, which fixes acne on curved and grazing surfaces more cheaply than this does, but it
-// also creeps shadows away from the corners where two surfaces meet. Paying for it here instead costs
-// detachment along the light ray, which at this scale reads as a soft contact rather than a gap.
-#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 4.0f
+// 0.05, which is very nearly nothing -- the player is about 60 world units tall, so this is a thousandth of
+// his height. It reads as a token margin rather than a working part, and that is the point: what removes
+// acne now is the receiver plane bias in the shader, which compares each tap against the depth the
+// receiver's OWN plane would have at that tap instead of at the kernel's centre. That correction is exact
+// for a flat receiver and needs no margin, so it does not detach anything -- which is what left this term
+// with nothing to do.
+//
+// It was 4.0, from before the plane bias existed, when this and the slope term were carrying the whole load
+// between them (the normal offset is off in the tuned configuration). Every one of those units was also a
+// unit of shadow sliding away from whatever cast it along the light ray, so cutting it back is bought
+// contact, not lost protection. What remains covers the cases the plane correction cannot reach on its own:
+// a silhouette, where the derivative straddles two surfaces and the correction is clamped.
+#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 0.05f
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
 // texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
 // light and large on one edge-on to it, which is where depth runs away across a texel and acne appears.
 // Being relative to the TEXEL is the part that misbehaved, since a texel of the far cascade is several
 // world units, and that is now handled per cascade by the ceiling below.
 //
-// 4.0, back where it started. It was halved to 2.0 to fight peter panning before the per-cascade ceiling
-// existed, which was the wrong instrument: halving it globally took the bias away from the near and middle
-// cascades, where the panning was never the problem and the acne is. On a castle wall -- a vertical surface
-// with the light coming from above, so nearly edge-on to it -- that showed up as horizontal bars, because
-// the lines of constant depth in the map run horizontally across such a wall.
-#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 4.0f
+// 1.0: one polygon gradient across one texel, which is the least this term can be and still mean anything.
+// It has been 4.0 and, before that, 2.0 -- both from the era when the biases here were the only defence
+// against acne. The receiver plane bias in the shader took that job over, and it does it without displacing
+// anything, so the two rasterizer-side terms are now a backstop rather than the mechanism.
+//
+// Kept above zero rather than switched off, because the two do not overlap completely: the plane correction
+// is recovered from screen-space derivatives, and at a silhouette -- where the pixel quad straddles two
+// surfaces -- it is meaningless and gets clamped. This is what covers that, and being relative to the
+// polygon's own gradient it costs almost nothing on the surfaces facing the light, where a shadow's contact
+// point is read most closely.
+//
+// The per-cascade ceiling below still applies and now binds even less than before: at a quarter of the old
+// multiplier, a texel would have to be four times coarser to reach it.
+#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 1.0f
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is
