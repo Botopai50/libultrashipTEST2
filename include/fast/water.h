@@ -181,6 +181,37 @@
 #define WATER_DEFAULT_SHORE_FADE 18.0f
 
 // ---------------------------------------------------------------------------------------------------------
+// F2 -- tessellation.
+//
+// A lake in this game is a handful of enormous triangles. Nothing so far has needed more, because absorption
+// is per pixel -- but waves displace VERTICES, and a surface with four of them cannot be given any shape at
+// all. This is the phase that exists so F4 has something to move.
+//
+// The design document builds the mesh the other way round: project the surface, generate a regular grid over
+// its outline, then clip the grid back to that outline (F2, steps 1-3). That is right for a renderer holding
+// the whole mesh at once. This one is immediate and sees a triangle at a time, so it SUBDIVIDES each claimed
+// triangle in place instead -- recursively, at the edge midpoints. The outline is then preserved exactly, for
+// free: the boundary of the subdivided triangle IS the boundary of the original. No gap can open against the
+// terrain and nothing can overflow it, which are the two risks the document's clipping step exists to manage.
+//
+// The per-vertex distance-to-edge attribute of step 4 is skipped for the same kind of reason. It exists to
+// damp wave amplitude at the shore, and the document itself (2.2.3) prefers damping by water THICKNESS,
+// calling edge distance the fallback that "knows nothing about the submerged terrain beyond the outline".
+// Thickness is already available at full resolution from F0 and readable in the vertex stage, so the better
+// option is simply taken.
+// ---------------------------------------------------------------------------------------------------------
+
+// Target world-unit length for a tessellated edge. Link is about 65 units tall, so this is roughly half his
+// height: fine enough for the wave scales the design calls for (the shortest is 60-150 units long, which
+// wants several vertices across it) without turning one lake polygon into thousands.
+#define WATER_TESSELLATION_SPACING 40.0f
+
+// Ceiling on how many times a triangle may be split in four. Each level multiplies the triangle count by
+// four, so 3 is 64 sub-triangles from one -- the cap that keeps a pathological polygon costing a coarse
+// surface rather than an unbounded one, which is the budget rule of F2 step 7 expressed as a depth.
+#define WATER_MAX_SUBDIVISION_LEVEL 3
+
+// ---------------------------------------------------------------------------------------------------------
 // Debug views (F0/F1). The menu exposes these as a combobox, the way the shadow map's cascade view is.
 // ---------------------------------------------------------------------------------------------------------
 #define WATER_DEBUG_OFF 0

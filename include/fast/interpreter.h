@@ -942,6 +942,20 @@ class Interpreter {
     // Defined in the .cpp beside the rest of the water code.
     int WaterSurfaceBoxIndex(const float a[3], const float b[3], const float c[3]) const;
 
+    // SOH [Enhancement] Water (F2): split a claimed surface triangle into a grid fine enough for waves to
+    // shape. Recursive four-way split at the edge midpoints, which preserves the original outline exactly --
+    // the boundary of the subdivided triangle IS the boundary of the original, so no gap can open against
+    // the terrain and nothing can overflow it.
+    void WaterSubdivide(const LoadedVertex& a, const LoadedVertex& b, const LoadedVertex& c, int level);
+    // How many times this triangle should be split, from its longest world-space edge.
+    int WaterSubdivisionLevel(const float a[3], const float b[3], const float c[3]) const;
+    // Sub-triangles produced by the split, three vertices each. A member rather than a local so the
+    // allocation is reused; safe because the re-entry that draws them cannot itself subdivide.
+    std::vector<LoadedVertex> mWaterSubVerts;
+    // Set while the sub-triangles are being fed back through the draw path, so they are drawn rather than
+    // split again -- and so the census counts the surface once rather than once per fragment of it.
+    bool mWaterSubdividing = false;
+
     bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
