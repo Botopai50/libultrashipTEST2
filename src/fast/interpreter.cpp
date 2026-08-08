@@ -1886,6 +1886,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if (translucent) {
                 mWaterAcceptedXlu++;
                 mWaterTrisIdentified++;
+                mWaterAlphaSum +=
+                    (v1->color.a + v2->color.a + v3->color.a) * (1.0f / (3.0f * 255.0f));
                 if (box < 64) {
                     mWaterBoxesHit |= (1ull << box);
                 }

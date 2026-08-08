@@ -163,6 +163,19 @@
 // water is usually a fairly dark blue.
 #define WATER_DEFAULT_AMBIENT_GAIN 2.5f
 
+// Gain applied to a claimed surface's OWN alpha to decide how much of it the material may replace.
+//
+// The identification is geometric, so anything flat and translucent at the water's height is claimed --
+// including the ripples around a swimming player and the mist at the foot of a waterfall, both of which
+// genuinely are at the water surface. What separates them from water is that they barely cover anything,
+// and the original draw states that in its alpha. Composing over it turns a misidentification into a faint
+// tint instead of a solid slab, for surfaces not yet discovered as well as the two that were.
+//
+// The gain exists because water itself is drawn semi-transparent: at this value anything at roughly half
+// alpha or above takes the material in full, while a near-transparent haze keeps almost all of its own
+// appearance.
+#define WATER_DEFAULT_COVERAGE_GAIN 2.2f
+
 // Thickness over which the surface fades in at the very shoreline, so the waterline meets the sand as a soft
 // edge rather than a cut (design document 2.19, item 11).
 #define WATER_DEFAULT_SHORE_FADE 18.0f

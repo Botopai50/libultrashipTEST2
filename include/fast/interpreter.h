@@ -481,6 +481,8 @@ class Interpreter {
         mWaterRejectTiltLastFrame = mWaterRejectTilt;
         mWaterAcceptedXluLastFrame = mWaterAcceptedXlu;
         mWaterAcceptedOpaLastFrame = mWaterAcceptedOpa;
+        mWaterAlphaSumLastFrame = mWaterAlphaSum;
+        mWaterAlphaSum = 0.0f;
         mWaterTrisIdentified = 0;
         mWaterBoxesHit = 0;
         mWaterCandidates = 0;
@@ -518,7 +520,13 @@ class Interpreter {
     // than by staring at a screenshot.
     // `breakdownOut`, when given, receives five numbers: candidates (centroid landed in a box's footprint),
     // rejected on height, rejected on tilt, accepted-and-translucent, accepted-and-not.
-    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut, int breakdownOut[5] = nullptr) const {
+    // `avgAlphaOut`, when given, receives the mean vertex alpha of the accepted triangles: the measurement
+    // that calibrates how much of a claimed surface the material may replace.
+    void GetWaterCensus(int* trisOut, int* boxesHitOut, int* boxesTotalOut, int breakdownOut[5] = nullptr,
+                        float* avgAlphaOut = nullptr) const {
+        if (avgAlphaOut != nullptr) {
+            *avgAlphaOut = mWaterTrisLastFrame > 0 ? mWaterAlphaSumLastFrame / (float)mWaterTrisLastFrame : 0.0f;
+        }
         if (breakdownOut != nullptr) {
             breakdownOut[0] = mWaterCandidatesLastFrame;
             breakdownOut[1] = mWaterRejectHeightLastFrame;
@@ -917,11 +925,16 @@ class Interpreter {
     mutable int mWaterRejectTilt = 0;   // ... and not horizontal
     int mWaterAcceptedXlu = 0;          // accepted and drawn with ZMODE_XLU
     int mWaterAcceptedOpa = 0;          // accepted and drawn with any other zmode
+    // Summed vertex alpha over accepted triangles. The material now scales what it may replace by how much
+    // the original draw covered, and the gain that keeps real water at full strength has to be set against
+    // the alpha real water is actually drawn with -- which is a number only the running game has.
+    float mWaterAlphaSum = 0.0f;
     int mWaterCandidatesLastFrame = 0;
     int mWaterRejectHeightLastFrame = 0;
     int mWaterRejectTiltLastFrame = 0;
     int mWaterAcceptedXluLastFrame = 0;
     int mWaterAcceptedOpaLastFrame = 0;
+    float mWaterAlphaSumLastFrame = 0.0f;
 
     // Which water box, if any, this triangle's three world-space vertices form a surface of. -1 for none.
     // Defined in the .cpp beside the rest of the water code.

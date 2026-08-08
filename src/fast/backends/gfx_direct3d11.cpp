@@ -2624,7 +2624,7 @@ void GfxRenderingAPIDX11::WaterCaptureScene(int fbId) {
 
         cb.water_misc[0] = WATER_DEPTH_SKY_SENTINEL;
         cb.water_misc[1] = WATER_DEFAULT_AMBIENT_GAIN;
-        cb.water_misc[2] = 0.0f; // deep-water mip; F5 selects it from thickness
+        cb.water_misc[2] = WATER_DEFAULT_COVERAGE_GAIN;
         cb.water_misc[3] = WATER_DEFAULT_SHORE_FADE;
 
         mWaterCbDirty = true;
