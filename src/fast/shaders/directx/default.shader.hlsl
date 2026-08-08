@@ -438,10 +438,21 @@ float ShadowLadderFraction(float viewDepth) {
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
 // Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
 // moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
-float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBase) {
+// Returns both caster layers at once: x is the world layer, y the actor layer.
+//
+// They are one call rather than two because everything except the slice they read is the same for both. The
+// cascade choice, the normal-offset push, the matrix multiply, the screen-space derivatives and the receiver
+// plane gradient are all functions of the receiver, not of which layer is being asked about -- so computing
+// them twice was computing them twice identically. Layer L, cascade C is slice L*count + C, and that is the
+// whole of the difference: the actor lookup is the world lookup with the layer stride added to its slice.
+//
+// `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
+// projection, which has to run for the world layer regardless. So a character pays nothing for the actor
+// half it skips, exactly as before, while scenery stops paying twice for the half they share.
+float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride, bool wantActors) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
-    // rendered this frame (count == 0).
-    float lit = 1.0;
+    // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
+    float2 lit = float2(1.0, 1.0);
     uint count = (uint)shadow_params.x;
     if (count > 0) {
         // First cascade whose far split still covers this depth; the last one catches everything beyond.
@@ -460,10 +471,19 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBa
         // the last cascade so it is always a valid lookup to build; whether it is ever SAMPLED is decided
         // below. Building one that goes unused costs a matrix multiply and a few derivatives -- which is
         // what the fetches behind it used to cost as well, and those were the expensive half.
-        ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, cascade, sliceBase);
-        ShadowProjection partner = ShadowProjectAt(worldPos, normalWs, min(cascade + 1, count - 1), sliceBase);
+        ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, cascade, 0.0);
+        ShadowProjection partner = ShadowProjectAt(worldPos, normalWs, min(cascade + 1, count - 1), 0.0);
 
-        lit = ShadowSample(primary);
+        lit.x = ShadowSample(primary);
+        // The same projection, read one layer further along the array. Adding the stride to the finished
+        // slice is the same number the second lookup used to build from scratch -- the slice is
+        // sliceBase + cascade either way, and both terms are small exact integers.
+        [branch]
+        if (wantActors) {
+            ShadowProjection actors = primary;
+            actors.slice += layerStride;
+            lit.y = ShadowSample(actors);
+        }
 
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -482,7 +502,13 @@ float ShadowLit(float3 worldPos, float3 normalWs, float viewDepth, float sliceBa
             [branch]
             if (viewDepth > bandStart) {
                 float t = smoothstep(bandStart, farEdge, viewDepth);
-                lit = lerp(lit, ShadowSample(partner), t);
+                lit.x = lerp(lit.x, ShadowSample(partner), t);
+                [branch]
+                if (wantActors) {
+                    ShadowProjection actorPartner = partner;
+                    actorPartner.slice += layerStride;
+                    lit.y = lerp(lit.y, ShadowSample(actorPartner), t);
+                }
             }
         }
     }
@@ -773,16 +799,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
         // character is shadowed by the world but never by another character (or by itself) -- the
         // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.
-        float shadowWorldLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, 0.0);
         // Scenery also takes the actor caster layer; a character does not, so it is never shadowed by
-        // another character or by itself. [branch] because the value is constant across a draw call, so the
-        // character case genuinely skips the second set of taps rather than computing and discarding them.
-        float shadowActorLit = 1.0;
-        [branch]
-        if (input.worldPos.w > 0.5) {
-            shadowActorLit = ShadowLit(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x);
-        }
-        float shadowLit = min(shadowWorldLit, shadowActorLit);
+        // another character or by itself. That choice is constant across a draw call and is passed in, so
+        // the character case genuinely skips the second set of taps rather than computing and discarding
+        // them -- while the projection the two layers share is built once either way.
+        float2 shadowLayers =
+            ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
+        float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // Harden the edge. What the filter returns is COVERAGE -- how much of the kernel is occluded -- and
         // shading with it directly spreads that ramp across the whole kernel, which is the blur. Remapping
         // it through a narrow ramp centred on half coverage collapses the gradient into an edge instead.
