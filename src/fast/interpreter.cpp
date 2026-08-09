@@ -3431,6 +3431,54 @@ void Interpreter::RenderShadowMap() {
     if (!mShadowMapEnabled) {
         return;
     }
+
+    // SOH [Enhancement] World box around everything the ACTOR layer will draw, handed to the backend for the
+    // receiver shader.
+    //
+    // That layer holds the characters and nothing else -- a handful of small objects somewhere on the map --
+    // while EVERY scenery pixel on screen was sampling it, sixteen fetches deep, to be told it was lit. The
+    // shader can skip the whole kernel wherever no part of this box lies behind the receiver along the light,
+    // which over a room is nearly all of it. Skipping is exact and not an approximation: a lookup that lands
+    // where no actor was drawn reads the cleared depth and returns "lit", which is the value the skip
+    // substitutes.
+    //
+    // Measured here rather than accumulated during capture because the capture path can roll an object back
+    // out of the list after its vertices are in (the per-object size gate), and a box grown incrementally
+    // cannot un-grow. This walks only the actor layer, which is the small one.
+    //
+    // Computed before the early exits below so that every SetShadowMapParams path -- including the ones that
+    // report no cascades -- carries a box matching the frame it belongs to.
+    {
+        // Same sentinel the backend starts from (see GfxRenderingAPI::mShadowActorBoundsMin): large enough
+        // that no world coordinate reaches it, small enough that the shader's own margin cannot flip the
+        // comparison or overflow the arithmetic it feeds.
+        float actorMin[3] = { 1e30f, 1e30f, 1e30f };
+        float actorMax[3] = { -1e30f, -1e30f, -1e30f };
+        const std::vector<float>& actorTris = mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS];
+        for (size_t i = 0; i + 2 < actorTris.size(); i += 3) {
+            for (int a = 0; a < 3; a++) {
+                actorMin[a] = std::min(actorMin[a], actorTris[i + a]);
+                actorMax[a] = std::max(actorMax[a], actorTris[i + a]);
+            }
+        }
+        // The cutout ranges already measured themselves as they were captured, so their boxes just get
+        // unioned in. Ranges whose texture has since been evicted are included even though the pass will skip
+        // them: over-covering only costs a kernel that could have been skipped, while under-covering would
+        // drop a shadow.
+        for (const ShadowAlphaRange& r : mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].ranges) {
+            if (r.vertexCount < 3) {
+                continue;
+            }
+            for (int a = 0; a < 3; a++) {
+                actorMin[a] = std::min(actorMin[a], r.min[a]);
+                actorMax[a] = std::max(actorMax[a], r.max[a]);
+            }
+        }
+        // Left inverted when the layer is empty, which is a box every test fails -- so "no characters this
+        // frame" needs no flag of its own.
+        mRapi->SetShadowMapActorBounds(actorMin, actorMax);
+    }
+
     // Refreshed here rather than read per triangle: the cutout pipeline is built lazily inside
     // ShadowMapConfigure below, so the answer only becomes true after the first successful configure, and
     // the captures it governs all happen after this point in the frame.

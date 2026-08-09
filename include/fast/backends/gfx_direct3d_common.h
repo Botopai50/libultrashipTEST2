@@ -53,6 +53,10 @@ struct PerShadowCB {
     // x = incidence at which a scenery receiver takes the shadow in full, y = incidence at which the edge
     // hardening reaches full strength, z = the floor that hardening tapers to between the two, w unused.
     float shadow_incidence[4];
+    // World-space bounds of the ACTOR caster layer, xyz used and w ignored. An empty layer is sent as an
+    // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
+    float shadow_actor_min[4];
+    float shadow_actor_max[4];
 };
 
 struct PerDrawCB {

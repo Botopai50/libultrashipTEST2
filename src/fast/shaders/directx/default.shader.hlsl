@@ -142,6 +142,12 @@ cbuffer PerShadowCB : register(b3) {
     // In the constant buffer rather than as template symbols so they can be dialled while the game runs --
     // a compile-time symbol makes every trial a rebuild.
     float4 shadow_incidence;
+    // World-space bounds of the ACTOR caster layer. Everything in that layer is inside this box, so a
+    // receiver with no part of the box behind it along the light cannot be shadowed by it -- see the test in
+    // ShadowLitLayers. An empty layer arrives inverted and fails every test, which is what "no characters"
+    // should do.
+    float4 shadow_actor_min;
+    float4 shadow_actor_max;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -489,6 +495,54 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             t = blend ? smoothstep(bandStart, farEdge, viewDepth) : 0.0;
         }
 
+        // Can the actor layer possibly shadow this point at all?
+        //
+        // That layer holds the characters and nothing else -- a handful of small objects standing somewhere
+        // on the map -- yet every scenery pixel on screen was sampling it sixteen fetches deep to be told it
+        // was lit. Its world bounding box arrives as a uniform, so a receiver with none of that box behind it
+        // along the light can skip the layer's entire kernel. Over a room that is very nearly every scenery
+        // pixel, which halves the shadow cost of all of them.
+        //
+        // The skip is exact, not an approximation. A lookup landing where no actor was drawn reads the
+        // cleared depth and returns "lit", which is precisely the value left in place by not doing it. The
+        // only thing that has to hold is the direction of the error: the box may be grown, never shrunk.
+        bool actorsPossible = false;
+        if (wantActors) {
+            // Everything that can move a lookup off the exact light ray, in world units. The kernel reaches
+            // about three texels from the sample point -- each bilinear quad spans two and sits one texel out
+            // -- and the normal offset pushes the sample up to shadow_params.z texels off the surface before
+            // any of that. Scaled by the LARGEST cascade's texel, because which cascade this pixel lands in
+            // is not decided here for the partner and the unused entries are zero, so the max is both safe
+            // and free.
+            float texelWorld =
+                max(max(shadow_texel_world.x, shadow_texel_world.y), max(shadow_texel_world.z, shadow_texel_world.w));
+            float margin = texelWorld * (3.0 + shadow_params.z);
+            float3 boxLo = shadow_actor_min.xyz - margin;
+            float3 boxHi = shadow_actor_max.xyz + margin;
+            // An empty layer arrives inverted and stays inverted once the margin is applied -- the sentinel
+            // is many orders of magnitude larger -- so this doubles as the "no characters this frame" test.
+            if (all(boxLo <= boxHi)) {
+                // Slab test along the ray from here towards the light. The light TRAVELS along +lightAxis
+                // (see ShadowProject), so anything that can occlude this point lies at -lightAxis from it.
+                //
+                // Zero components are nudged rather than special-cased: a ray parallel to a slab then yields
+                // a huge t of the correct sign, which the min/max below already handle, and never a 0/0.
+                float3 dir = -normalize(shadow_view_proj[0]._13_23_33);
+                float3 safeDir = float3(abs(dir.x) < 1e-6 ? 1e-6 : dir.x, abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
+                                        abs(dir.z) < 1e-6 ? 1e-6 : dir.z);
+                float3 t0 = (boxLo - worldPos) / safeDir;
+                float3 t1 = (boxHi - worldPos) / safeDir;
+                float3 tNear = min(t0, t1);
+                float3 tFar = max(t0, t1);
+                // Entry is clamped at -margin rather than 0: the point actually projected is already pushed
+                // off the surface and the comparison carries a depth bias, both of which slide the effective
+                // origin a little way towards the light.
+                float tEnter = max(max(tNear.x, tNear.y), max(tNear.z, -margin));
+                float tExit = min(min(tFar.x, tFar.y), tFar.z);
+                actorsPossible = tEnter <= tExit;
+            }
+        }
+
         // Four lookups at most -- {this cascade, its cross-fade partner} x {world layer, actor layer} --
         // and they differ in exactly two things: which projection they read and which slice of the array.
         // So they are one loop rather than four pasted copies of a sixteen-tap kernel.
@@ -509,6 +563,9 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             bool isPartner = i >= 2;
             if (isActor && !wantActors) {
                 continue; // a character is never shadowed by the actor layer, itself included
+            }
+            if (isActor && !actorsPossible) {
+                continue; // nothing that layer holds is between this point and the light -- see above
             }
             if (isPartner && !blend) {
                 continue; // outside the band the partner is multiplied by zero, so it is not read

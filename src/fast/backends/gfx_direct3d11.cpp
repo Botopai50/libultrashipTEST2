@@ -2334,6 +2334,12 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_incidence[2] = floorScale;
         mPerShadowCbData.shadow_incidence[3] = 0.0f;
     }
+    for (int i = 0; i < 3; i++) {
+        mPerShadowCbData.shadow_actor_min[i] = mShadowActorBoundsMin[i];
+        mPerShadowCbData.shadow_actor_max[i] = mShadowActorBoundsMax[i];
+    }
+    mPerShadowCbData.shadow_actor_min[3] = 0.0f;
+    mPerShadowCbData.shadow_actor_max[3] = 0.0f;
 
     for (int c = 0; c < count; c++) {
         const float* m = &mShadowViewProj[c * 16];

@@ -259,6 +259,17 @@ class GfxRenderingAPI {
         mShadowMinHardnessScale = minHardnessScale;
     }
 
+    // SOH [Enhancement] World bounds of the ACTOR caster layer, pushed once a frame. Everything that layer
+    // can shadow with lies inside this box, and a receiver with none of it behind them along the light
+    // cannot be shadowed by it -- which is most of a map, most of the time, since the box holds a handful of
+    // characters. The shader uses it to skip that layer's whole kernel.
+    virtual void SetShadowMapActorBounds(const float boundsMin[3], const float boundsMax[3]) {
+        for (int i = 0; i < 3; i++) {
+            mShadowActorBoundsMin[i] = boundsMin[i];
+            mShadowActorBoundsMax[i] = boundsMax[i];
+        }
+    }
+
     // The two biases that were compile-time constants. depthBiasWorld is a flat offset in world units,
     // divided into each cascade's own depth range on upload; slopeBias multiplies the polygon's own depth
     // gradient and is handed to the rasterizer. Separate from SetShadowMapParams for the same reason as the
@@ -292,6 +303,9 @@ class GfxRenderingAPI {
     float mShadowDebug = 0.0f;
     float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
+    // Inverted until a frame says otherwise, so every test against it fails and the actor layer is skipped.
+    float mShadowActorBoundsMin[3] = { 1e30f, 1e30f, 1e30f };
+    float mShadowActorBoundsMax[3] = { -1e30f, -1e30f, -1e30f };
     float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
