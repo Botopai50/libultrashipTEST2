@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <vector>
+#include <fstream>
+#include <filesystem>
 #include <cmath>
 
 #include <map>
@@ -389,6 +391,116 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
     mShaderProgram = (struct ShaderProgramD3D11*)new_prg;
 }
 
+// SOH [Enhancement] Compiled-shader cache on disk.
+//
+// The renderer builds its shaders at run time, one variant per material, and compiles each the first time a
+// draw needs it -- synchronously, inside the frame. That is the hitch felt when new geometry rotates into
+// view, and it is felt worst when the shadow map is switched on, because every receiver in the scene needs a
+// variant it has never needed before and they all arrive at once.
+//
+// Compiling is the expensive part and its result never changes, so it belongs on disk. After the first run
+// the compiler is not invoked at all: the bytecode is read back and handed straight to the device.
+//
+// The key is a hash of the EXPANDED source. That is what makes invalidation automatic and total -- the
+// expansion already encodes the variant, the template and every option that produced it, so editing the
+// shader, adding an option or changing the combiner all produce different text and therefore different
+// keys. There is no version number to remember to bump. Two independent hashes are stored rather than one,
+// with the source length beside them, because a collision would mean running the wrong shader.
+//
+// Entries orphaned by a shader edit are left behind rather than swept: they are a few kilobytes each, and a
+// sweep would have to know which keys are still reachable, which is only knowable after every variant the
+// game can build has been built.
+namespace {
+
+constexpr uint32_t kShaderCacheMagic = 0x53535546; // 'FUSS'
+constexpr uint32_t kShaderCacheVersion = 1;
+
+struct ShaderCacheHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t hashA;
+    uint64_t hashB;
+    uint64_t sourceLength;
+    uint64_t vsSize;
+    uint64_t psSize;
+};
+
+uint64_t ShaderHash(const char* data, size_t len, uint64_t seed) {
+    uint64_t h = seed;
+    for (size_t i = 0; i < len; i++) {
+        h = (h ^ (uint8_t)data[i]) * 0x100000001B3ull;
+        h ^= h >> 31;
+    }
+    return h;
+}
+
+// Empty when the cache directory cannot be established, which switches the cache off rather than failing.
+std::string ShaderCachePath(uint64_t hashA, uint64_t hashB) {
+    try {
+        const std::filesystem::path dir = Ship::Context::GetPathRelativeToAppDirectory("shadercache-dx11");
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            return "";
+        }
+        char name[40];
+        snprintf(name, sizeof(name), "%016llx%016llx.bin", (unsigned long long)hashA, (unsigned long long)hashB);
+        return (dir / name).string();
+    } catch (...) {
+        return "";
+    }
+}
+
+bool ShaderCacheLoad(const std::string& path, uint64_t hashA, uint64_t hashB, size_t sourceLength,
+                     std::vector<uint8_t>& vs, std::vector<uint8_t>& ps) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    ShaderCacheHeader h{};
+    f.read((char*)&h, sizeof(h));
+    // Every field is checked, including the ones the filename already encodes: a truncated write, a stale
+    // format or a name collision must all read as "not cached" and fall through to compiling.
+    if (!f || h.magic != kShaderCacheMagic || h.version != kShaderCacheVersion || h.hashA != hashA ||
+        h.hashB != hashB || h.sourceLength != sourceLength || h.vsSize == 0 || h.psSize == 0 ||
+        h.vsSize > (1u << 24) || h.psSize > (1u << 24)) {
+        return false;
+    }
+    vs.resize((size_t)h.vsSize);
+    ps.resize((size_t)h.psSize);
+    f.read((char*)vs.data(), vs.size());
+    f.read((char*)ps.data(), ps.size());
+    return (bool)f;
+}
+
+void ShaderCacheStore(const std::string& path, uint64_t hashA, uint64_t hashB, size_t sourceLength,
+                      const void* vs, size_t vsSize, const void* ps, size_t psSize) {
+    // Written to a temporary and renamed, so a crash or a second instance mid-write cannot leave a
+    // half-file that later reads as a valid header with a truncated body.
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return;
+        }
+        ShaderCacheHeader h{ kShaderCacheMagic, kShaderCacheVersion, hashA, hashB,
+                             (uint64_t)sourceLength, (uint64_t)vsSize, (uint64_t)psSize };
+        f.write((const char*)&h, sizeof(h));
+        f.write((const char*)vs, vsSize);
+        f.write((const char*)ps, psSize);
+        if (!f) {
+            return;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+    }
+}
+
+} // namespace
+
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint32_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
@@ -410,6 +522,27 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 #else
     UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
+
+    // Try the disk cache before the compiler. The flags are folded into the seed so a debug build never
+    // reads a release build's bytecode.
+    const uint64_t cacheHashA = ShaderHash(buf, len, 0xCBF29CE484222325ull ^ compile_flags);
+    const uint64_t cacheHashB = ShaderHash(buf, len, 0x9E3779B97F4A7C15ull ^ compile_flags);
+    const std::string cachePath = ShaderCachePath(cacheHashA, cacheHashB);
+    std::vector<uint8_t> cachedVs, cachedPs;
+    bool fromCache = !cachePath.empty() && ShaderCacheLoad(cachePath, cacheHashA, cacheHashB, len, cachedVs, cachedPs);
+
+    // Whichever path produced them, the bytecode is used the same way below -- including by the input
+    // layout, which is validated against the vertex shader's signature.
+    const void* vsData = nullptr;
+    const void* psData = nullptr;
+    size_t vsSize = 0, psSize = 0;
+
+    if (fromCache) {
+        vsData = cachedVs.data();
+        vsSize = cachedVs.size();
+        psData = cachedPs.data();
+        psSize = cachedPs.size();
+    } else {
 
     HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
                              vs.GetAddressOf(), error_blob.GetAddressOf());
@@ -435,12 +568,22 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         throw hr;
     }
 
+    vsData = vs->GetBufferPointer();
+    vsSize = vs->GetBufferSize();
+    psData = ps->GetBufferPointer();
+    psSize = ps->GetBufferSize();
+    // Written only after both compiles succeeded, so a failed variant is never cached as though it were
+    // good. A failure to write is not a failure to render: the shader is in hand either way.
+    if (!cachePath.empty()) {
+        ShaderCacheStore(cachePath, cacheHashA, cacheHashB, len, vsData, vsSize, psData, psSize);
+    }
+
+    } // end of the compile path; the cache hit above skipped all of it
+
     struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
 
-    ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
-                                              prg->vertex_shader.GetAddressOf()));
-    ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
-                                             prg->pixel_shader.GetAddressOf()));
+    ThrowIfFailed(mDevice->CreateVertexShader(vsData, vsSize, nullptr, prg->vertex_shader.GetAddressOf()));
+    ThrowIfFailed(mDevice->CreatePixelShader(psData, psSize, nullptr, prg->pixel_shader.GetAddressOf()));
 
     // Input Layout
 
@@ -510,7 +653,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     }
 
-    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs->GetBufferPointer(), vs->GetBufferSize(),
+    // vsData, not vs: on a cache hit the blob was never created and the bytecode lives in the vector.
+    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vsData, vsSize,
                                              prg->input_layout.GetAddressOf()));
 
     // Blend state
