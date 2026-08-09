@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: prism_driver <shader.hlsl> <shaders-root> [options]\n"
                      "  options: any of 't' (toon), 's' (shadow map), 'f' (fog), '2' (two cycle),\n"
+                     "           'a' (alpha threshold), 'n' (noise dither),\n"
                      "           'g' (gathered shadow kernel; needs a 4_1 target)\n";
         return 2;
     }
@@ -89,6 +90,10 @@ int main(int argc, char** argv) {
     // Not a CCFeatures field: it follows the adapter's feature level, not the material. 'g' selects the
     // gathered kernel, which needs Shader Model 4.1 -- validate.sh raises the target profile to match.
     const bool shadowGather = has('g');
+    // The alpha cutoff has two placements -- hoisted above the shading, or left in the tail where the noise
+    // dither can still move alpha under it -- so both need building. Neither was reachable before.
+    cc.opt_alpha_threshold = has('a');
+    cc.opt_noise = has('n');
 
     prism::Processor processor;
     prism::ContextItems ctx = {

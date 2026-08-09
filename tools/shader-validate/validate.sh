@@ -61,7 +61,8 @@ fi
 # instruction. The renderer picks between them from the adapter's feature level, so BOTH have to compile --
 # and each only compiles against its own profile, which is the point of pairing them here.
 fail=0
-for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sg:4_1" "tsg:4_1" "sfg:4_1" "ts2g:4_1"; do
+for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sa:4_0" "san:4_0" \
+             "sg:4_1" "tsg:4_1" "sfg:4_1" "ts2g:4_1" "sag:4_1" "sang:4_1"; do
   opts="${combo%%:*}"
   model="${combo##*:}"
   "$WORK/prism_driver" "$SHADER" "$SHADER_DIR" "$opts" > "$WORK/v.hlsl"

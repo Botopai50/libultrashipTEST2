@@ -930,6 +930,23 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     texel = clamp(texel, 0.0, 1.0);
     // TODO discard if alpha is 0?
 
+    // The alpha cutoff, hoisted to here from the tail of the shader.
+    //
+    // A discarded fragment writes nothing, so everything computed for it is waste -- and what sits between
+    // this point and where the test used to live is the toon relight and the whole shadow lookup, which is
+    // the most expensive thing in the file. Cutout geometry is exactly the geometry that discards a large
+    // part of every quad it draws, so it was paying full price for the parts of a leaf that are not there.
+    // The texture_edge form of the same test has always been above the shadow block; this brings its sibling
+    // into line.
+    //
+    // Hoisting is exact only because nothing in between touches ALPHA: the toon and shadow steps write rgb,
+    // fog preserves alpha on the o_alpha path, and grayscale is rgb only. The ONE exception is the noise
+    // dither, which multiplies alpha by a per-pixel random mask -- so when that is on, the test has to stay
+    // where it was and see the dithered value. That case keeps the original placement below.
+    @if(o_alpha && o_alpha_threshold && !o_noise)
+        if (texel.a < 8.0 / 256.0) discard;
+    @end
+
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.
     @if(o_toon)
@@ -1067,7 +1084,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     @end
 
     @if(o_alpha)
-        @if(o_alpha_threshold)
+        @if(o_alpha_threshold && o_noise)
+            // Only reachable when the dither is on; every other case tested this above, before the shading.
             if (texel.a < 8.0 / 256.0) discard;
         @end
         @if(o_invisible)
