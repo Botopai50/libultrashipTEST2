@@ -2123,6 +2123,18 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     // state objects are cached and this is the same call the draw path was going to make anyway.
     ID3D11RasterizerState* rasterState = ShadowRasterizerForCascade(cascadeIndex, lightViewProj);
 
+    // Nothing is going to be drawn here and nothing was last time either, so the slice is already the map of
+    // nothing this call would produce. That reads identically however it is projected -- every receiver
+    // compares as lit against the cleared far plane wherever it lands -- so unlike a slice with casters in
+    // it, this one survives a MATRIX change too, and the comparison below is deliberately not reached.
+    // Without this, a cascade the characters are nowhere near paid a full-resolution clear and a pipeline
+    // setup every frame to produce the same empty map it already held.
+    if (contentKey == SHADOW_MAP_EMPTY_CONTENT_KEY && mShadowSliceValid[slice] &&
+        mShadowSliceKey[slice] == SHADOW_MAP_EMPTY_CONTENT_KEY) {
+        mShadowCurrentSlice = -1; // nothing is open, so nothing may be invalidated by a stray submit
+        return false;
+    }
+
     // Nothing that decides this slice's contents has moved, so the slice still holds exactly the image
     // this call would redraw. Skip the clear, the state setup and every caster draw behind it.
     if (mShadowSliceValid[slice] && mShadowSliceKey[slice] == contentKey &&
@@ -2163,6 +2175,7 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mShadowAlphaLastPtr = nullptr;
         mShadowAlphaLastCount = 0;
         mShadowPassActive = true;
+        ShadowTimerBegin();
     }
     mShadowCurrentLayer = layer;
     mShadowCurrentSlice = slice;
@@ -2467,6 +2480,92 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mShadowCbDirty = true;
 }
 
+// SOH [Enhancement] Timestamps around the depth pass. See the members in gfx_direct3d_common.h for why.
+//
+// Returns whether a start timestamp was issued, which is the only thing that makes the matching end
+// meaningful: a frame where every slice was reused opens no pass at all and must not be recorded as a
+// zero-millisecond one.
+bool GfxRenderingAPIDX11::ShadowTimerBegin() {
+    if (mShadowDebug < 0.5f || mShadowTimerFailed || mDevice == nullptr) {
+        return false;
+    }
+    const int i = mShadowTimerSlot;
+    if (mShadowTimerDisjoint[i] == nullptr) {
+        D3D11_QUERY_DESC qd;
+        ZeroMemory(&qd, sizeof(qd));
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        HRESULT hr = mDevice->CreateQuery(&qd, mShadowTimerDisjoint[i].GetAddressOf());
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        if (SUCCEEDED(hr)) {
+            hr = mDevice->CreateQuery(&qd, mShadowTimerStart[i].GetAddressOf());
+        }
+        if (SUCCEEDED(hr)) {
+            hr = mDevice->CreateQuery(&qd, mShadowTimerEnd[i].GetAddressOf());
+        }
+        if (FAILED(hr)) {
+            // Not fatal and not worth retrying: timing is a diagnostic, and a device that will not give us
+            // queries still renders shadows perfectly well.
+            SPDLOG_WARN("Shadow map: timestamp queries unavailable; the depth pass will not be timed.");
+            mShadowTimerFailed = true;
+            return false;
+        }
+    }
+    mContext->Begin(mShadowTimerDisjoint[i].Get());
+    mContext->End(mShadowTimerStart[i].Get());
+    mShadowTimerOpen = true;
+    return true;
+}
+
+void GfxRenderingAPIDX11::ShadowTimerEnd() {
+    if (!mShadowTimerOpen) {
+        return;
+    }
+    const int i = mShadowTimerSlot;
+    mContext->End(mShadowTimerEnd[i].Get());
+    mContext->End(mShadowTimerDisjoint[i].Get());
+    mShadowTimerPending[i] = true;
+    mShadowTimerOpen = false;
+    mShadowTimerSlot = (i + 1) % kShadowTimerFrames;
+}
+
+// Reads back whichever frame's queries are old enough to have finished, and reports the average once a
+// second. D3D11_ASYNC_GETDATA_DONOTFLUSH throughout: this must never push the GPU along to get an answer.
+void GfxRenderingAPIDX11::ShadowTimerCollect() {
+    if (mShadowDebug < 0.5f) {
+        return;
+    }
+    // The slot about to be reused is the oldest one outstanding, so that is the one to drain.
+    const int i = mShadowTimerSlot;
+    if (mShadowTimerPending[i]) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        UINT64 t0 = 0, t1 = 0;
+        if (mContext->GetData(mShadowTimerDisjoint[i].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            mContext->GetData(mShadowTimerStart[i].Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            mContext->GetData(mShadowTimerEnd[i].Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+            mShadowTimerPending[i] = false;
+            // Disjoint means the clock changed rate mid-measurement (power management), so the interval is
+            // meaningless and is dropped rather than averaged in.
+            if (!dj.Disjoint && dj.Frequency != 0 && t1 >= t0) {
+                mShadowTimerSumMs += (double)(t1 - t0) * 1000.0 / (double)dj.Frequency;
+                mShadowTimerSamples++;
+            }
+        }
+    }
+    if (++mShadowTimerReported >= 60) {
+        mShadowTimerReported = 0;
+        if (mShadowTimerSamples > 0) {
+            SPDLOG_INFO("Shadow map depth pass: {:.2f} ms on the GPU, averaged over {} of the last 60 frames "
+                        "({} cascades x {} layers at {}px)",
+                        mShadowTimerSumMs / mShadowTimerSamples, mShadowTimerSamples, mShadowCascadeCount,
+                        SHADOW_MAP_LAYERS, mShadowResolution);
+        } else {
+            SPDLOG_INFO("Shadow map depth pass: nothing submitted in the last 60 frames (every slice reused)");
+        }
+        mShadowTimerSumMs = 0.0;
+        mShadowTimerSamples = 0;
+    }
+}
+
 void GfxRenderingAPIDX11::ShadowMapEndPass() {
     // The cascade array has to be handed to the main pass whether or not anything was drawn into it this
     // frame. A frame in which every slice was reused (see ShadowMapBeginCascade) opens no pass at all, and
@@ -2474,9 +2573,11 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     // the shader sampling whatever happened to be bound and the shadows would vanish while nothing moved.
     if (!mShadowPassActive) {
         ShadowMapBindForReading();
+        ShadowTimerCollect(); // a frame that opened no pass still advances the once-a-second report
         return;
     }
     mShadowPassActive = false;
+    ShadowTimerEnd();
     mShadowAlphaBound = false;
     mShadowCurrentSlice = -1;
 
@@ -2504,6 +2605,9 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mLastZmodeDecal = -1;
 
     ShadowMapBindForReading();
+    // After the interval is closed, so this frame's own result is the last thing queued rather than the
+    // first thing waited on.
+    ShadowTimerCollect();
 }
 
 // Hand the cascades to the main pass, past the combiner's own texture slots.

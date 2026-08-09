@@ -272,6 +272,32 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D11_VIEWPORT mShadowSavedViewport = {};
     UINT mShadowSavedViewportCount = 0;
 
+    // SOH [Enhancement] How long the depth pass actually takes on the GPU, in milliseconds.
+    //
+    // Everything the shadow map costs divides into two halves that are invisible from a frame rate: filling
+    // the cascades (this) and sampling them (the receiver shaders). They respond to completely different
+    // work, so tuning without knowing which one dominates is guesswork. This measures the first directly,
+    // which by subtraction bounds the second.
+    //
+    // Timestamps rather than a CPU clock, because the CPU only records that it submitted the pass, not that
+    // the GPU ran it. Results are collected KFrames later so the query is complete by the time it is read --
+    // reading it in the frame that issued it would block the CPU on the GPU and change the thing being
+    // measured. Built and issued only while a shadow debug mode is on; off, none of it exists.
+    static constexpr int kShadowTimerFrames = 4;
+    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerDisjoint[kShadowTimerFrames];
+    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerStart[kShadowTimerFrames];
+    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerEnd[kShadowTimerFrames];
+    bool mShadowTimerPending[kShadowTimerFrames] = {};
+    int mShadowTimerSlot = 0;
+    bool mShadowTimerOpen = false;   // this frame's pass issued a start timestamp
+    bool mShadowTimerFailed = false; // query creation failed once; do not retry every frame
+    double mShadowTimerSumMs = 0.0;
+    int mShadowTimerSamples = 0;
+    int mShadowTimerReported = 0; // frames since the last log line
+    bool ShadowTimerBegin();
+    void ShadowTimerEnd();
+    void ShadowTimerCollect();
+
     HMODULE mDX11Module;
 
     HMODULE mCompilerModule;

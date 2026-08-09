@@ -36,6 +36,19 @@
 #define SHADOW_MAP_LAYER_ACTORS 1
 #define SHADOW_MAP_MAX_SLICES (SHADOW_MAP_MAX_CASCADES * SHADOW_MAP_LAYERS)
 
+// SOH [Enhancement] Content key meaning "nothing will be drawn into this slice at all".
+//
+// A slice with no casters in it holds the clear value everywhere, and a map of nothing but the clear value
+// reads the same however it is projected -- every receiver compares as lit against the far plane wherever it
+// lands. So an empty slice, unlike a drawn one, may be kept across a MATRIX change as well as a content one,
+// and the backend exempts this key from that comparison. The character layer is empty in most cascades most
+// of the time (the characters stand in one place; the cascades cover the whole view), and without this it
+// paid a full-resolution clear and a pipeline setup in each of them every frame.
+//
+// Reserved, so a real key can never collide with it: ShadowMapLayerContentKey moves a hash that lands here
+// off it. Losing one value out of 2^64 costs nothing.
+#define SHADOW_MAP_EMPTY_CONTENT_KEY 0ull
+
 // How many independent caster lists a single layer may draw. Two, and only the world layer uses the second.
 //
 // The world layer holds the room mesh, which is cached: it is uploaded once and then only bound and drawn,

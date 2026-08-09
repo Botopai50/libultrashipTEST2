@@ -99,10 +99,12 @@ cbuffer PerToonCB : register(b2) {
 // b1 per-draw, b2 toon). Only the receiver variant declares any of this.
 @if(o_shadow_map)
 // Declared <float> and read with a plain sampler, then compared in the shader, rather than through a
-// SamplerComparisonState. Hardware comparison sampling would give a filtered 2x2 per fetch for free, but it
-// would not map to the ps_4_0 profile these shaders are compiled against -- the reason the first two
-// attempts at this aborted with "cannot map expression to ps_4_0 instruction set". The element type is
-// explicit because the fetch has to come back as one float, not a float4 to be truncated.
+// SamplerComparisonState. Hardware comparison sampling would fold a filtered 2x2 into every fetch for free,
+// and it is rejected on merit, not for want of a profile: it can only test all four texels of its footprint
+// against ONE depth, and the per-texel depth here is the receiver-plane bias -- the thing that keeps a
+// sixteen-tap kernel free of acne without paying for it in peter panning. Gather (see SampleShadowPCF4) buys
+// back the fetch count without giving any of that up. The element type is explicit because the fetch has to
+// come back as one float, not a float4 to be truncated.
 Texture2DArray<float> g_shadowMap : register(t6);
 SamplerState g_shadowSampler : register(s6);
 
@@ -313,39 +315,55 @@ struct ShadowProjection {
     float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
 };
 
-ShadowProjection ShadowProject(float3 worldPos, float3 normalWs, float4x4 viewProj, float texelWorld,
-                               float texelUv, float depthBias, uint cascade, float sliceBase) {
-    // Push the sample off the surface along its own normal before projecting. A depth-only bias cannot fix
-    // curved surfaces -- it only slides the comparison along the light ray, still inside the same polygon
-    // -- whereas this moves it sideways, out of the geometry casting onto itself. That is what removes the
-    // striped self-shadowing (acne). normalWs always arrives unit length -- the caller resolves the vertex
-    // normal or a recovered face normal before this point -- so the term is always live.
-    // Orient the normal to face the light before pushing along it. The offset only helps if it moves the
-    // sample OFF the surface towards the light; pushed the other way it drives the sample into the geometry
-    // and makes the self-shadowing worse than no offset at all. That sign is not something the caller can
-    // guarantee: a normal recovered from screen-space derivatives comes out either way depending on
-    // triangle winding and which way the screen's y axis runs, and a vertex normal can disagree with the
-    // face it sits on.
-    // The light's own axis is the third column of this cascade's matrix (the projection scales the unit z
-    // axis by 1/(zFar - zNear)), so the test needs no extra uniform. A surface facing the light has a
-    // normal pointing against the direction the light travels.
-    float3 lightAxis = normalize(viewProj._13_23_33);
+// The direction the light travels, which every cascade shares.
+//
+// Each cascade's matrix scales the light's unit z axis by its own 1/(zFar - zNear), so the third column IS
+// that axis times a positive number -- and normalising throws that number away. All four therefore give the
+// same vector, which is why it is taken from cascade 0 here and handed down, rather than recovered inside
+// each projection from the matrix that projection happens to hold. A pixel used to pay for this twice over
+// (once per cascade it looks at) plus once more in PSMain, for three identical results.
+float3 ShadowLightAxis() {
+    return normalize(shadow_view_proj[0]._13_23_33);
+}
+
+// How far, and along what, to push the sample off the surface before projecting it. Cascade-independent for
+// the same reason the axis above is, so it is also computed once per pixel and passed in; only the SIZE of
+// the push varies per cascade, and that is one multiply by texelWorld at the point of use.
+//
+// A depth-only bias cannot fix curved surfaces -- it only slides the comparison along the light ray, still
+// inside the same polygon -- whereas this moves it sideways, out of the geometry casting onto itself. That
+// is what removes the striped self-shadowing (acne). normalWs always arrives unit length -- the caller
+// resolves the vertex normal or a recovered face normal before this point -- so the term is always live.
+//
+// Orient the normal to face the light before pushing along it. The offset only helps if it moves the sample
+// OFF the surface towards the light; pushed the other way it drives the sample into the geometry and makes
+// the self-shadowing worse than no offset at all. That sign is not something the caller can guarantee: a
+// normal recovered from screen-space derivatives comes out either way depending on triangle winding and
+// which way the screen's y axis runs, and a vertex normal can disagree with the face it sits on. A surface
+// facing the light has a normal pointing against the direction the light travels.
+//
+// Scale the push by how obliquely the light strikes this surface, sin of the angle between them.
+//
+// Acne is a grazing-angle artefact: depth changes fast across a texel exactly when the surface is nearly
+// edge-on to the light, and hardly at all when it faces the light square. Applying the same push everywhere
+// therefore spent its whole cost where it bought nothing -- on a floor lit from overhead the offset is pure
+// displacement along the light ray, which is peter panning and nothing else, and it is precisely on such
+// floors that a shadow's contact point is most closely read.
+//
+// sin also has the right shape at the other end: it goes to 1 as the surface turns edge-on, which is where
+// the offset stops displacing along the ray at all and starts sliding sideways off the polygon, which is the
+// only thing that actually removes the stripes. So this is not a trade of one artefact for the other -- it
+// moves the whole budget to the angles that need it.
+float3 ShadowNormalOffset(float3 normalWs, float3 lightAxis) {
     float3 n = dot(normalWs, lightAxis) > 0.0 ? -normalWs : normalWs;
-    // Scale the push by how obliquely the light strikes this surface, sin of the angle between them.
-    //
-    // Acne is a grazing-angle artefact: depth changes fast across a texel exactly when the surface is
-    // nearly edge-on to the light, and hardly at all when it faces the light square. Applying the same
-    // push everywhere therefore spent its whole cost where it bought nothing -- on a floor lit from
-    // overhead the offset is pure displacement along the light ray, which is peter panning and nothing
-    // else, and it is precisely on such floors that a shadow's contact point is most closely read.
-    //
-    // sin also has the right shape at the other end: it goes to 1 as the surface turns edge-on, which is
-    // where the offset stops displacing along the ray at all and starts sliding sideways off the polygon,
-    // which is the only thing that actually removes the stripes. So this is not a trade of one artefact
-    // for the other -- it moves the whole budget to the angles that need it.
     float ndotl = saturate(dot(n, -lightAxis));
     float grazing = sqrt(saturate(1.0 - (ndotl * ndotl)));
-    float3 p = worldPos + n * (shadow_params.z * texelWorld * grazing);
+    return n * (shadow_params.z * grazing);
+}
+
+ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewProj, float texelWorld,
+                               float texelUv, float depthBias, uint cascade, float sliceBase) {
+    float3 p = worldPos + offsetDir * texelWorld;
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     // Projected position and shadow-map coordinate, computed BEFORE any branch on purpose. The screen-space
@@ -423,7 +441,7 @@ float ShadowSample(ShadowProjection p) {
 // Each branch moves four registers' worth of constants, so there is nothing left worth a real branch;
 // flattening to conditional moves is cheaper than the jump. Every index stays literal -- see ShadowSplitAt
 // for why a computed one cannot be used here.
-ShadowProjection ShadowProjectAt(float3 worldPos, float3 normalWs, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade, float sliceBase) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelWorld = shadow_texel_world.x;
     float texelUv = shadow_texel_uv.x;
@@ -445,7 +463,7 @@ ShadowProjection ShadowProjectAt(float3 worldPos, float3 normalWs, uint cascade,
         depthBias = shadow_depth_bias.w;
     }
     // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowProject.
-    return ShadowProject(worldPos, normalWs, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
+    return ShadowProject(worldPos, offsetDir, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
 }
 
 // Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
@@ -504,13 +522,21 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         }
         cascade = min(cascade, count - 1);
 
+        // Everything the two projections agree on, resolved once. The light axis is the same vector for
+        // every cascade and the push along the normal is the same direction; recovering either inside the
+        // projection meant computing it identically twice per pixel -- two normalises, two square roots and
+        // the sign selection -- for one answer. Only the LENGTH of the push is per cascade, and that is a
+        // single multiply by texelWorld at the point of use.
+        float3 lightAxis = ShadowLightAxis();
+        float3 offsetDir = ShadowNormalOffset(normalWs, lightAxis);
+
         // BOTH projections are built here, unconditionally, because both contain screen-space derivatives
         // and those are only defined where every pixel of the quad reaches them. The partner is clamped to
         // the last cascade so it is always a valid lookup to build; whether it is ever SAMPLED is decided
         // below. Building one that goes unused costs a matrix multiply and a few derivatives -- which is
         // what the fetches behind it used to cost as well, and those were the expensive half.
-        ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, cascade, 0.0);
-        ShadowProjection partner = ShadowProjectAt(worldPos, normalWs, min(cascade + 1, count - 1), 0.0);
+        ShadowProjection primary = ShadowProjectAt(worldPos, offsetDir, cascade, 0.0);
+        ShadowProjection partner = ShadowProjectAt(worldPos, offsetDir, min(cascade + 1, count - 1), 0.0);
 
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -559,7 +585,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
                 //
                 // Zero components are nudged rather than special-cased: a ray parallel to a slab then yields
                 // a huge t of the correct sign, which the min/max below already handle, and never a 0/0.
-                float3 dir = -normalize(shadow_view_proj[0]._13_23_33);
+                float3 dir = -lightAxis;
                 float3 safeDir = float3(abs(dir.x) < 1e-6 ? 1e-6 : dir.x, abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
                                         abs(dir.z) < 1e-6 ? 1e-6 : dir.z);
                 float3 t0 = (boxLo - worldPos) / safeDir;
@@ -932,7 +958,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // threshold is allowed to go, and whether the shadow is applied at all -- so it is measured here,
         // before either of them. The light axis is the third column of any cascade's matrix; they share a
         // direction, so cascade 0 will do.
-        float3 shadowLightAxis = normalize(shadow_view_proj[0]._13_23_33);
+        float3 shadowLightAxis = ShadowLightAxis();
         float shadowIncidence = saturate(abs(dot(shadowN, shadowLightAxis)));
         // Harden in proportion to how well the boundary is sampled, rather than by a fixed amount. The
         // threshold is only as trustworthy as the contour it traces, and that contour degrades with

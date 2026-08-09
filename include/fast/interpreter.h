@@ -852,6 +852,10 @@ class Interpreter {
     // large rejected region still ends the draw.
     static constexpr size_t kShadowChunkBridgeTriangles = 2 * kShadowChunkTriangles;
     std::vector<ShadowCasterChunk> mShadowWorldChunks;
+    // Rebuilds since the last census line. Reported rather than inferred: whether the room mesh is being
+    // re-captured every frame or once per room is invisible from the outside and is the difference between
+    // the cache working and the cache being pure overhead.
+    uint32_t mShadowWorldRebuilds = 0;
     void BuildShadowWorldChunks();
 
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes

@@ -1556,7 +1556,10 @@ uint64_t Interpreter::ShadowMapLayerContentKey(int layer) const {
         mixFloats(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts);
         mixAlphaRanges(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
     }
-    return h;
+    // Never hand back the reserved "this slice is empty" key, which carries a weaker reuse rule than a real
+    // one (see SHADOW_MAP_EMPTY_CONTENT_KEY). A hash landing on it would let a slice with casters in it
+    // survive a matrix change, which would freeze that cascade's shadows in place.
+    return h == SHADOW_MAP_EMPTY_CONTENT_KEY ? 1ull : h;
 }
 
 void Interpreter::ResolveShadowAlphaTextures(ShadowAlphaCasters& set) {
@@ -3396,6 +3399,7 @@ void Interpreter::RenderShadowMap() {
                 // the megabytes behind it (see ShadowMapLayerContentKey).
                 mShadowWorldCacheGeneration++;
                 BuildShadowWorldChunks(); // the spans index into the list that was just swapped in
+                mShadowWorldRebuilds++;
             } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
                 // Different geometry ran this frame than the cache was built from. The frame is already past
                 // the point where it could have been captured, so arm the rebuild for the next one -- the
@@ -3795,10 +3799,31 @@ void Interpreter::RenderShadowMap() {
         // and frames while the scenery list beside it is replaced every frame.
         const bool sceneryHere = (l == SHADOW_MAP_LAYER_WORLD);
         for (int c = 0; c < mShadowMapCascadeCount; c++) {
+            // Will anything at all reach this slice? Asked only for the ACTOR layer, which is the one that
+            // is routinely empty -- it holds the characters, standing in one cascade out of four, while the
+            // world layer has the room mesh in it and is empty essentially never. Answering it costs the
+            // same box tests the draws below are about to run; answering it for the world layer would mean
+            // walking every span twice.
+            //
+            // An empty slice is then declared as such, which lets the backend keep the one it already has
+            // even across a matrix change (see SHADOW_MAP_EMPTY_CONTENT_KEY) -- so a cascade the characters
+            // are nowhere near stops paying a full-resolution clear and a pipeline setup every frame.
+            uint64_t contentKey = layerContentKeys[l];
+            if (l == SHADOW_MAP_LAYER_ACTORS) {
+                bool anything = casters.size() >= 9 && boxVisible(actorMin, actorMax, &matrices[c * 16]);
+                for (size_t r = 0; !anything && r < alpha.ranges.size(); r++) {
+                    const ShadowAlphaRange& range = alpha.ranges[r];
+                    anything = range.textureId != UINT32_MAX && range.vertexCount >= 3 &&
+                               boxVisible(range.min, range.max, &matrices[c * 16]);
+                }
+                if (!anything) {
+                    contentKey = SHADOW_MAP_EMPTY_CONTENT_KEY;
+                }
+            }
             // False means this slice already holds exactly what the calls below would draw into it. Nothing
             // may be submitted then -- the backend has not cleared it, has not set the depth pipeline up,
             // and is not the render target.
-            if (!mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16], layerContentKeys[l])) {
+            if (!mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16], contentKey)) {
                 continue;
             }
             if (casters.size() >= 9) {
@@ -3889,6 +3914,14 @@ void Interpreter::RenderShadowMap() {
         static int sCensusFrames = 0;
         if (++sCensusFrames >= 60) {
             sCensusFrames = 0;
+            // How often the room mesh was re-captured, re-boxed and re-uploaded over the last sixty frames.
+            // Steady state is ZERO -- the cache exists so a static room is walked once and then left alone,
+            // and every rebuild is the whole mesh through the capture path again. A number that tracks the
+            // frame count means the signature is not settling, which is a far larger cost than anything the
+            // cascades do and would not otherwise be visible from a frame rate alone.
+            SPDLOG_INFO("Shadow map world cache: {} rebuild(s) in the last 60 frames ({} tris cached, {} spans)",
+                        mShadowWorldRebuilds, mShadowMapWorldCache.size() / 9, mShadowWorldChunks.size());
+            mShadowWorldRebuilds = 0;
             SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), scenery {} tris (+{} "
                         "cutout in {} batches), actors {} tris (+{} cutout in {} batches)",
                         mShadowMapWorldCache.size() / 9, mShadowAlphaWorldCache.VertexCount() / 3,
