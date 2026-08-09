@@ -2138,6 +2138,13 @@ void GfxRenderingAPIDX11::ShadowMapBindForReading() {
     }
 }
 
+// PRISM-HELPERS-BEGIN
+// Everything between this marker and PRISM-HELPERS-END is what the shader preprocessor needs in order to
+// expand the combiner, and nothing else. tools/shader-validate slices it out of this file and compiles it,
+// so that the shader it checks is expanded by THIS code rather than by a copy of it that could drift --
+// which would leave the check quietly validating a shader the game does not build. Keep the markers around
+// exactly the free functions; the region is compiled on its own, so it must not come to depend on anything
+// declared further down.
 #define RAND_NOISE "((random(float3(floor(screenSpace.xy * noise_scale), noise_frame)) + 1.0) / 2.0)"
 
 static const char* prism_shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha,
@@ -2272,6 +2279,7 @@ prism::ContextTypes* update_raw_floats(prism::ContextTypes* _, prism::ContextTyp
     raw_numFloats += std::get<int>(*num);
     return nullptr;
 }
+// PRISM-HELPERS-END
 
 std::optional<std::string> dx_include_fs(const std::string& path) {
     auto init = std::make_shared<Ship::ResourceInitData>();
