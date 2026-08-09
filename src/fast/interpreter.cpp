@@ -2052,8 +2052,23 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // in principle (an arm should shade the torso) and relies on the normal-offset bias to stay clean;
     // actors carry vertex normals, so that bias actually applies to them, unlike the room mesh.
     //
-    // Screen-space rects (UI, backgrounds) stay out: they have no world position to look up with.
-    bool use_shadow_map = mShadowMapEnabled && !is_rect && !mRdp->shadow_no_receive;
+    // Screen-space geometry (UI, backgrounds) stays out: it has no world position to look up with.
+    //
+    // is_rect alone did not cover it. That flag is G_TEXRECT, and most of this game's interface is not drawn
+    // as texrects -- the file-select boxes, the item buttons, the hearts are ordinary quads under a 2D
+    // projection. They were being handed the receiver variant, and the "world position" they carried was the
+    // vertex times a modelview that maps into SCREEN space: a button at (100, 80) on screen claims to be at
+    // world (100, 80, 0). Usually that lands outside every cascade and reads as lit, which costs a
+    // projection per pixel and shows nothing -- but it is not always outside. Stand where a cascade covers
+    // small world coordinates and the interface starts sampling the shadow map and darkening with it.
+    //
+    // The test is whether w depends on z, which is what a perspective divide IS. The 3D scene is drawn
+    // through guPerspective, where that term is the whole point; the interface is drawn through guOrtho,
+    // where it is exactly zero. Reading it off the projection catches every screen-space draw at once
+    // instead of naming them one at a time, and it cannot mistake a scene draw for one: a projection with no
+    // perspective term has no perspective to lose.
+    const bool screenSpaceProjection = std::fabs(mRsp->P_matrix[2][3]) < 1e-6f;
+    bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !mRdp->shadow_no_receive;
     // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
     // characters from shadowing each other (or themselves) while still being shadowed by the world.
     bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
