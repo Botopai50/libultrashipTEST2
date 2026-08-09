@@ -295,13 +295,11 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
 // then cannot prove every path assigned the result, and that unresolved flow is part of what it refuses to
 // map to ps_4_0.
 float ShadowSplitAt(uint c) {
-    float s = shadow_splits.w;
+    float s = shadow_splits.z;
     if (c == 0) {
         s = shadow_splits.x;
     } else if (c == 1) {
         s = shadow_splits.y;
-    } else if (c == 2) {
-        s = shadow_splits.z;
     }
     return s;
 }
@@ -471,11 +469,6 @@ ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade
         texelWorld = shadow_texel_world.z;
         texelUv = shadow_texel_uv.z;
         depthBias = shadow_depth_bias.z;
-    } else if (cascade == 3) {
-        viewProj = shadow_view_proj[3];
-        texelWorld = shadow_texel_world.w;
-        texelUv = shadow_texel_uv.w;
-        depthBias = shadow_depth_bias.w;
     }
     // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowProject.
     return ShadowProject(worldPos, offsetDir, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
@@ -497,9 +490,6 @@ float ShadowLadderFraction(float viewDepth) {
         }
         if (viewDepth > shadow_splits.y) {
             step = 2.0;
-        }
-        if (viewDepth > shadow_splits.z) {
-            step = 3.0;
         }
         band = saturate(step / (float)(count - 1));
     }
@@ -587,8 +577,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             // any of that. Scaled by the LARGEST cascade's texel, because which cascade this pixel lands in
             // is not decided here for the partner and the unused entries are zero, so the max is both safe
             // and free.
-            float texelWorld =
-                max(max(shadow_texel_world.x, shadow_texel_world.y), max(shadow_texel_world.z, shadow_texel_world.w));
+            float texelWorld = max(shadow_texel_world.x, max(shadow_texel_world.y, shadow_texel_world.z));
             float margin = texelWorld * (3.0 + shadow_params.z);
             float3 boxLo = shadow_actor_min.xyz - margin;
             float3 boxHi = shadow_actor_max.xyz + margin;

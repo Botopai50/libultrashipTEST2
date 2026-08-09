@@ -889,7 +889,7 @@ class Interpreter {
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
-                                                        SHADOW_MAP_DEFAULT_SPLIT_2, SHADOW_MAP_DEFAULT_SPLIT_3 };
+                                                        SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels
     float mShadowMapBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowMapNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;

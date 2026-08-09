@@ -38,7 +38,7 @@ if [ ! -s "$WORK/prism_helpers.inc" ]; then
 fi
 
 echo "building the preprocessor..."
-c++ -std=gnu++20 -O1 -I"$PRISM_DIR/src" -I"$PRISM_DIR" -I"$WORK" \
+c++ -std=gnu++20 -O1 -I"$PRISM_DIR/src" -I"$PRISM_DIR" -I"$WORK" -I"$ROOT/include" \
     -o "$WORK/prism_driver" "$HERE/prism_driver.cpp" "$PRISM_LIB"
 
 # Pick a compiler: fxc is the real one and wins whenever it is on PATH.

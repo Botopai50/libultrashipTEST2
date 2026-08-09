@@ -14,9 +14,16 @@
 // whatever shadow system it used before -- selecting this mode must never leave a scene with no shadows.
 
 // Cascade count is a compile-time bound because the shader indexes a fixed-size array of matrices.
-// Four matches the layer split the design calls for (ultra near / world near / world mid / world far);
-// the application may configure fewer at runtime, never more.
-#define SHADOW_MAP_MAX_CASCADES 4
+// Three matches the layer split the design calls for (ultra near / world near / world far); the application
+// may configure fewer at runtime, never more.
+//
+// Three rather than four, and it is a bound rather than only a default because the fourth was measured and
+// found not to earn its place. The depth pass costs per SLICE -- about 0.42 ms each at 4096 -- and a fourth
+// cascade is two of them, for a band whose map is spread over the frustum's lateral width at six thousand
+// units and is coarse no matter where it starts. It also costs on the receiver side, where the shader
+// selects a cascade's constants with a chain of comparisons and every arm is registers moved for every
+// shaded pixel. Bounding it here retires both.
+#define SHADOW_MAP_MAX_CASCADES 3
 
 // How many are actually built unless the application says otherwise.
 //
@@ -26,7 +33,7 @@
 // slices, and slices are what the depth pass costs: measured at roughly 0.42 ms each at 4096, against a pass
 // that was 2.3 ms in a field.
 //
-// What it costs is the band from 1500 to 6000 units, which now falls in one cascade instead of two and comes
+// What it costs is the band beyond the middle split, which now falls in one cascade instead of two and comes
 // out about twice as coarse. What it does not cost is anything close to the camera: the first two bands are
 // untouched, and they are where a shadow's edge is actually read.
 #define SHADOW_MAP_DEFAULT_CASCADES 3
@@ -110,18 +117,14 @@
 // which the application captures casters at all. These values are the range; the cascade count selects how
 // much of it is used, so lowering the count shortens the shadowed range with it.
 //
-// Drawn for THREE cascades (see SHADOW_MAP_DEFAULT_CASCADES), so split 2 is the end of the range and split 3
-// goes unused. The middle band is stretched to 1500 to absorb what the retired cascade used to cover: a
+// Three bands, and split 2 is therefore the end of the range. The middle band is stretched to absorb what
+// the retired fourth cascade used to cover: a
 // cascade's radius is dominated by the frustum's lateral spread at its far edge, so the last band is coarse
 // whatever it starts at, and the way to keep the middle distance sharp is to hand more of it to the band
-// before. At 4096 that band's texel is 0.74 world units, against 3.6 in the last one.
-//
-// Raising the count back to four needs split 3 raised past split 2 with it, or the fourth band is handed a
-// range of nothing and costs two slices to draw it.
+// before. At 4096 the three bands come out at 0.09, 0.74 and 3.6 world units per texel.
 #define SHADOW_MAP_DEFAULT_SPLIT_0 150.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_1 1500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_1 1200.0f
 #define SHADOW_MAP_DEFAULT_SPLIT_2 6000.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_3 6000.0f
 
 // Fraction of a cascade's range over which it cross-fades into the next one. The shader samples both
 // maps across this band and blends with smoothstep, which is what keeps the resolution change from
@@ -252,7 +255,7 @@
 // only rounds each step's corner. Hiding a staircase needs a kernel spanning several texels.
 //
 // So sharper distant shadows are not available from the filter. That is a texel problem, and both cures are
-// priced: halve Graphics.ShadowMap.Split3 to halve the far cascade's texel at the cost of range, or double
+// priced: halve Graphics.ShadowMap.Split2 to halve the far cascade's texel at the cost of range, or double
 // Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
 #define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.6f
 

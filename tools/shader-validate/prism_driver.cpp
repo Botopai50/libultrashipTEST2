@@ -24,7 +24,10 @@
 #include <string>
 #include <vector>
 
-#define SHADOW_MAP_MAX_CASCADES 4
+// Taken from the header the renderer builds against rather than restated, because a copy of this number
+// drifting is exactly the failure this tool exists to catch: the shader indexes an array sized by it, so a
+// stale value here validates a shader the game does not build. The include path is set by validate.sh.
+#include "fast/shadow_map.h"
 #define SHADER_MAX_TEXTURES 6
 
 enum {
