@@ -166,10 +166,18 @@ cbuffer PerShadowCB : register(b3) {
 // `grad` is how fast the receiver's depth changes per unit of shadow-map uv, so this recovers the plane's
 // own depth at the tap and compares like with like. Nothing is displaced: the correction is exact for a
 // flat receiver and needs no margin, which is what makes it free of panning.
-float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z) {
-    float stored = g_shadowMap.SampleLevel(g_shadowSampler, float3(uvTap, slice), 0);
+// The comparison, with the fetch left to the caller. Split out so the gathered kernel below and the
+// fetch-per-texel one run character for character the same arithmetic on the same stored depth -- the whole
+// claim of the gather path is that it changes only HOW the four depths arrive, so the two must not be able
+// to drift apart.
+float ShadowCompare(float2 uvTap, float2 uvCentre, float2 grad, float z, float stored) {
     float zAtTap = z + dot(uvTap - uvCentre, grad);
     return zAtTap <= stored ? 1.0 : 0.0; // 1 = this texel does not occlude
+}
+
+float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z) {
+    float stored = g_shadowMap.SampleLevel(g_shadowSampler, float3(uvTap, slice), 0);
+    return ShadowCompare(uvTap, uvCentre, grad, z, stored);
 }
 
 // Four taps in a quincunx around the centre, written out rather than looped over a local array: a local
@@ -195,10 +203,34 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, float s
     // uvCentre, not uv: every tap in the whole kernel measures its plane correction from the ONE point the
     // receiver's depth was evaluated at, otherwise each 2x2 quad would correct against itself and the
     // sixteen-tap kernel would still disagree with itself across its own width.
+@if(o_shadow_gather)
+    // One instruction for all four depths. Gather returns exactly the 2x2 footprint bilinear filtering
+    // would have used, so this reads the same four texels the four fetches below read -- and every texel is
+    // still compared on its own, against its own point on the receiver plane, and still weighted by hand.
+    // The output is identical; only the number of texture instructions changes, sixteen to four across the
+    // whole kernel.
+    //
+    // That last part is why this is NOT hardware comparison sampling. A comparison sampler would also fold
+    // the four compares and the blend into the fetch, but it can only test all four texels against ONE
+    // depth -- and the per-texel depth is the receiver-plane bias, which is the thing keeping the wide
+    // kernel free of acne without paying for it in peter panning. Gather gives up none of it.
+    //
+    // Sampled at the CENTRE of the quad rather than at a texel, deliberately. The footprint the hardware
+    // picks is decided in fixed point, and asking at a texel centre puts that decision half a texel from a
+    // boundary in each direction -- orders of magnitude more margin than the hardware's sub-texel precision
+    // -- so the four texels are the computed ones and not their neighbours. Component order is Gather's
+    // own: w is (0,0), z is (1,0), x is (0,1), y is (1,1), in texels from the footprint's first corner.
+    float4 gathered = g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
+    float s00 = ShadowCompare(uv00, uvCentre, grad, z, gathered.w);
+    float s10 = ShadowCompare(uv00 + float2(texelUv, 0.0), uvCentre, grad, z, gathered.z);
+    float s01 = ShadowCompare(uv00 + float2(0.0, texelUv), uvCentre, grad, z, gathered.x);
+    float s11 = ShadowCompare(uv00 + float2(texelUv, texelUv), uvCentre, grad, z, gathered.y);
+@else
     float s00 = ShadowTap(uv00, uvCentre, grad, slice, z);
     float s10 = ShadowTap(uv00 + float2(texelUv, 0.0), uvCentre, grad, slice, z);
     float s01 = ShadowTap(uv00 + float2(0.0, texelUv), uvCentre, grad, slice, z);
     float s11 = ShadowTap(uv00 + float2(texelUv, texelUv), uvCentre, grad, slice, z);
+@end
 
     float top = lerp(s00, s10, subTexel.x);
     float bottom = lerp(s01, s11, subTexel.x);

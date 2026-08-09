@@ -52,6 +52,14 @@ Two limits are worth stating plainly, because a check that is trusted past its r
   of vectors, no gradient instructions under non-uniform control flow, and flow the compiler cannot resolve
   producing "cannot map expression to ps_4_0". For a change that goes near those, run it under `fxc`.
 
+  This has been measured, not assumed. Wine's `d3dcompiler_47` **does not enforce profile restrictions at
+  all**: it accepts a dynamically indexed constant-buffer array at `ps_4_0`, which real FXC rejects, and it
+  accepts `Texture2DArray.Gather` at `ps_4_0`, which is a Shader Model 4.1 intrinsic. So a green run here
+  says "this is valid HLSL", not "this is valid at this profile". Anything whose correctness rests on the
+  profile — the gathered shadow kernel does — needs a guarantee elsewhere. That one has two: the emission
+  and the target profile are driven by a single flag so they cannot disagree, and the renderer probes the
+  intrinsic against the real compiler and the real driver at startup before committing to it.
+
 ## Files
 
 - `validate.sh` — slices the helpers, builds the preprocessor, compiles each variant.

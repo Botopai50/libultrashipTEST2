@@ -107,6 +107,59 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
         ThrowIfFailed(mDevice->CreateShaderResourceView(texture.Get(), &srv_desc, srv));
     }
 }
+namespace {
+// SOH [Enhancement] Shader model the scene shaders are built against.
+//
+// Texture2DArray.Gather returns a whole 2x2 texel footprint in ONE instruction, which is what lets the
+// shadow kernel cost four texture instructions instead of sixteen for identical output. It first exists in
+// Shader Model 4.1, and this renderer accepts adapters down to feature level 10_0, which only has 4.0 -- so
+// the shader carries both kernels behind o_shadow_gather and this picks between them.
+//
+// Written exactly once, in Init, straight after the device comes up and before any shader is built; read
+// from the prewarm threads afterwards, which is why it must never move again. Declared up here so the probe
+// below can sit beside it; the profile strings it selects live with the rest of the compile machinery
+// further down.
+bool sShadowGather = false;
+
+// Does this machine actually build and load that kernel?
+//
+// The feature level says Shader Model 4.1 is available and that is the documented home of
+// Texture2DArray.Gather -- but "documented" is not "verified on the machine in front of us", and the cost of
+// being wrong here is not a slower shader. Every receiver shader is compiled at RUNTIME, and a compile
+// failure on that path is unhandled: a dialog, and the process goes down with it. So the question is asked
+// once, up front, by the smallest shader that can ask it, rather than by the first material the player
+// happens to walk past.
+//
+// Both halves are asked. The compiler settles whether the intrinsic exists at this profile;
+// CreatePixelShader settles whether the driver accepts the bytecode it produced. Either one saying no drops
+// the session to the 4.0 kernel, which draws exactly the same picture out of four times the fetches.
+bool ShadowGatherProbe(pD3DCompile compileFn, ID3D11Device* device) {
+    if (compileFn == nullptr || device == nullptr) {
+        return false;
+    }
+    static const char kProbe[] = "Texture2DArray<float> t : register(t0);\n"
+                                 "SamplerState s : register(s0);\n"
+                                 "float4 PSMain(float4 p : SV_POSITION) : SV_TARGET {\n"
+                                 "    return t.Gather(s, float3(p.xy, 0.0));\n"
+                                 "}\n";
+    ComPtr<ID3DBlob> ps, err;
+    if (FAILED(compileFn(kProbe, sizeof(kProbe) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_1", 0, 0,
+                         ps.GetAddressOf(), err.GetAddressOf())) ||
+        ps == nullptr) {
+        SPDLOG_WARN("Shadow map: Texture2DArray.Gather did not compile at ps_4_1 ({}). Using the 4.0 kernel.",
+                    err != nullptr ? (const char*)err->GetBufferPointer() : "(no message)");
+        return false;
+    }
+    ComPtr<ID3D11PixelShader> shader;
+    if (FAILED(
+            device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, shader.GetAddressOf()))) {
+        SPDLOG_WARN("Shadow map: the driver would not load a ps_4_1 gather shader. Using the 4.0 kernel.");
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRenderer) {
 #if DEBUG_D3D
     UINT device_creation_flags = D3D11_CREATE_DEVICE_DEBUG;
@@ -218,6 +271,21 @@ void GfxRenderingAPIDX11::Init() {
     // Create D3D11 mDevice
 
     mWindowBackend->CreateFactoryAndDevice(DEBUG_D3D, 11, this, CreateDeviceFunc);
+
+    // SOH [Enhancement] Which shadow kernel this session gets, settled here and never again.
+    //
+    // It decides the profile every scene shader is compiled against and the seed their disk cache is keyed
+    // by, so it has to be fixed before the first shader is built and must not move while any of them are
+    // alive. This is the earliest point where both things it depends on exist: the device (for its feature
+    // level, and to be asked whether it will load the result) and the compiler.
+    //
+    // Feature level 10_1 is Shader Model 4.1, which is where Texture2DArray.Gather begins. Below it -- or if
+    // the probe says no -- the kernel falls back to fetching its four texels one at a time, for the same
+    // picture at four times the texture instructions.
+    sShadowGather = mFeatureLevel >= D3D_FEATURE_LEVEL_10_1 && ShadowGatherProbe(mD3dCompile, mDevice.Get());
+    SPDLOG_INFO("Shadow map kernel: {} (feature level {:#x})",
+                sShadowGather ? "gathered 2x2 footprints, Shader Model 4.1" : "one fetch per texel, Shader Model 4.0",
+                (unsigned)mFeatureLevel);
 
     // Create the swap chain
     mWindowBackend->CreateSwapChain(mDevice.Get(), [this]() {
@@ -424,6 +492,22 @@ constexpr UINT kShaderCompileFlags = D3DCOMPILE_DEBUG;
 constexpr UINT kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
+// Profile the shaders are compiled against, and the seed their disk cache is keyed by. Both follow
+// sShadowGather: only the shadow kernel needs Shader Model 4.1, but FXC parses the whole file for each entry
+// point, so an intrinsic the profile does not have is an error whether or not that entry point can reach it
+// -- which is exactly how a shadow-only mistake takes down the vertex compile first. And the two builds must
+// never share a cache entry: the SOURCE differs only for shadow variants, but the BYTECODE differs for every
+// one of them, and 4_1 bytecode handed to a 10_0 device fails to create.
+const char* ShaderProfileVs() {
+    return sShadowGather ? "vs_4_1" : "vs_4_0";
+}
+const char* ShaderProfilePs() {
+    return sShadowGather ? "ps_4_1" : "ps_4_0";
+}
+uint64_t ShaderCacheSeed() {
+    return (uint64_t)kShaderCompileFlags ^ (sShadowGather ? 0x9E37u : 0u);
+}
+
 constexpr uint32_t kShaderCacheMagic = 0x53535546; // 'FUSS'
 constexpr uint32_t kShaderCacheVersion = 1;
 
@@ -576,8 +660,8 @@ void GfxRenderingAPIDX11::PrewarmShaderVariants(uint32_t extraOptionBits) {
                 return;
             }
             const std::string& src = mPrewarmSources[i];
-            const uint64_t hashA = ShaderHash(src.data(), src.size(), 0xCBF29CE484222325ull ^ kShaderCompileFlags);
-            const uint64_t hashB = ShaderHash(src.data(), src.size(), 0x9E3779B97F4A7C15ull ^ kShaderCompileFlags);
+            const uint64_t hashA = ShaderHash(src.data(), src.size(), 0xCBF29CE484222325ull ^ ShaderCacheSeed());
+            const uint64_t hashB = ShaderHash(src.data(), src.size(), 0x9E3779B97F4A7C15ull ^ ShaderCacheSeed());
             const std::string path = ShaderCachePath(hashA, hashB);
             if (path.empty()) {
                 mPrewarmRemaining.fetch_sub(1);
@@ -589,9 +673,9 @@ void GfxRenderingAPIDX11::PrewarmShaderVariants(uint32_t extraOptionBits) {
                 continue; // a previous run already paid for this one
             }
             ComPtr<ID3DBlob> vs, ps, err;
-            if (FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+            if (FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "VSMain", ShaderProfileVs(),
                                    kShaderCompileFlags, 0, vs.GetAddressOf(), err.GetAddressOf())) ||
-                FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "PSMain", "ps_4_0",
+                FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "PSMain", ShaderProfilePs(),
                                    kShaderCompileFlags, 0, ps.GetAddressOf(), err.GetAddressOf()))) {
                 // Left for the on-demand path, which reports it properly and takes the process down. Warming
                 // must not be where a broken shader is discovered, and must never be where it is hidden.
@@ -660,10 +744,10 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     UINT compile_flags = kShaderCompileFlags;
 
-    // Try the disk cache before the compiler. The flags are folded into the seed so a debug build never
-    // reads a release build's bytecode.
-    const uint64_t cacheHashA = ShaderHash(buf, len, 0xCBF29CE484222325ull ^ compile_flags);
-    const uint64_t cacheHashB = ShaderHash(buf, len, 0x9E3779B97F4A7C15ull ^ compile_flags);
+    // Try the disk cache before the compiler. The flags and the target profile are folded into the seed so a
+    // debug build never reads a release build's bytecode, and a 4_1 build never reads a 4_0 one's.
+    const uint64_t cacheHashA = ShaderHash(buf, len, 0xCBF29CE484222325ull ^ ShaderCacheSeed());
+    const uint64_t cacheHashB = ShaderHash(buf, len, 0x9E3779B97F4A7C15ull ^ ShaderCacheSeed());
     const std::string cachePath = ShaderCachePath(cacheHashA, cacheHashB);
     std::vector<uint8_t> cachedVs, cachedPs;
     bool fromCache = !cachePath.empty() && ShaderCacheLoad(cachePath, cacheHashA, cacheHashB, len, cachedVs, cachedPs);
@@ -681,22 +765,22 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         psSize = cachedPs.size();
     } else {
 
-    HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
-                             vs.GetAddressOf(), error_blob.GetAddressOf());
+        HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", ShaderProfileVs(), compile_flags, 0,
+                                 vs.GetAddressOf(), error_blob.GetAddressOf());
 
-    if (FAILED(hr)) {
-        // Log before the box. The throw below is unhandled and takes the process with it, and the crash
-        // handler records a stack -- which names this line and tells you nothing about WHY the compile
-        // failed. The compiler's own message is the only thing that does, and it was going solely to a
-        // dialog that vanishes with the process. Anyone reading a log afterwards had a crash with no cause.
-        const char* err = error_blob != nullptr ? (const char*)error_blob->GetBufferPointer() : "(no message)";
-        SPDLOG_CRITICAL("Vertex shader failed to compile (id0 {:#x} id1 {:#x}): {}", shader_id0, shader_id1, err);
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw hr;
+        if (FAILED(hr)) {
+            // Log before the box. The throw below is unhandled and takes the process with it, and the crash
+            // handler records a stack -- which names this line and tells you nothing about WHY the compile
+            // failed. The compiler's own message is the only thing that does, and it was going solely to a
+            // dialog that vanishes with the process. Anyone reading a log afterwards had a crash with no cause.
+            const char* err = error_blob != nullptr ? (const char*)error_blob->GetBufferPointer() : "(no message)";
+            SPDLOG_CRITICAL("Vertex shader failed to compile (id0 {:#x} id1 {:#x}): {}", shader_id0, shader_id1, err);
+            MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
+            throw hr;
     }
 
-    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
-                     error_blob.GetAddressOf());
+    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", ShaderProfilePs(), compile_flags, 0,
+                     ps.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
         const char* err = error_blob != nullptr ? (const char*)error_blob->GetBufferPointer() : "(no message)";
@@ -1778,11 +1862,16 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
         return false;
     }
 
-    // Plain point sampler, not a comparison one: the shader fetches the stored depth and compares it
-    // itself, because hardware comparison sampling does not map to the ps_4_0 profile these shaders are
-    // compiled against. Point filtering is also the correct choice for a hand-rolled comparison -- blending
-    // stored depths and comparing once is not the same as comparing per texel and averaging, and only the
-    // latter produces a real penumbra.
+    // Plain point sampler, not a comparison one. The shader fetches the stored depths and compares them
+    // itself, and that is a choice rather than a limitation now that the profile can be 4_1: a comparison
+    // sampler tests all four texels of its footprint against ONE depth, and the per-texel depth here is the
+    // receiver-plane bias -- the thing that keeps a sixteen-tap kernel free of acne without paying for it in
+    // peter panning. Gather buys back the fetch count without giving that up (see SampleShadowPCF4).
+    //
+    // Point filtering is also the only correct setting for a hand-rolled comparison: blending stored depths
+    // and comparing once is not the same as comparing per texel and averaging, and only the latter produces
+    // a real penumbra. Gather ignores the filter mode entirely -- it always returns the bilinear footprint
+    // -- but it does honour the addressing below, which is why the border still reads as "nothing occludes".
     D3D11_SAMPLER_DESC samp_desc;
     ZeroMemory(&samp_desc, sizeof(samp_desc));
     samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -2616,6 +2705,10 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
+        // Whether the shadow kernel may fetch a 2x2 footprint per instruction. A property of the adapter,
+        // not of the material, so it is the same for every shader in a session -- it selects a kernel, it
+        // does not add a variant. See sShadowGather.
+        { "o_shadow_gather", sShadowGather },
         // Spliced in rather than uploaded: it is a fixed policy value, and having it as a literal lets the
         // compiler fold the smoothstep that uses it.
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },

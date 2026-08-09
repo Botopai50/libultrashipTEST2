@@ -56,18 +56,24 @@ else
   exit 2
 fi
 
+# Every option set is built twice where it makes a difference: the shadow kernel exists in a Shader Model
+# 4.0 form that fetches its four texels one at a time, and a 4.1 form that gathers the 2x2 footprint in one
+# instruction. The renderer picks between them from the adapter's feature level, so BOTH have to compile --
+# and each only compiles against its own profile, which is the point of pairing them here.
 fail=0
-for opts in "" "t" "s" "ts" "sf" "ts2"; do
+for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sg:4_1" "tsg:4_1" "sfg:4_1" "ts2g:4_1"; do
+  opts="${combo%%:*}"
+  model="${combo##*:}"
   "$WORK/prism_driver" "$SHADER" "$SHADER_DIR" "$opts" > "$WORK/v.hlsl"
-  for entry in "VSMain vs_4_0" "PSMain ps_4_0"; do
-    set -- $entry
-    out="$(compile "$WORK/v.hlsl" "$1" "$2" || true)"
+  for entry in VSMain PSMain; do
+    case "$entry" in VSMain) profile="vs_$model" ;; *) profile="ps_$model" ;; esac
+    out="$(compile "$WORK/v.hlsl" "$entry" "$profile" || true)"
     if printf '%s' "$out" | grep -qiE "error|FAILED"; then
-      echo "FAIL  options='${opts:-none}'  $1"
+      echo "FAIL  options='${opts:-none}'  $entry  $profile"
       printf '%s\n' "$out" | grep -iE "error|FAILED" | head -5
       fail=1
     else
-      echo "ok    options='${opts:-none}'  $1"
+      echo "ok    options='${opts:-none}'  $entry  $profile"
     fi
   done
 done
