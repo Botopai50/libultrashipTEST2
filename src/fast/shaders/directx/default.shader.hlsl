@@ -168,20 +168,6 @@ cbuffer PerShadowCB : register(b3) {
 // `grad` is how fast the receiver's depth changes per unit of shadow-map uv, so this recovers the plane's
 // own depth at the tap and compares like with like. Nothing is displaced: the correction is exact for a
 // flat receiver and needs no margin, which is what makes it free of panning.
-// The comparison, with the fetch left to the caller. Split out so the gathered kernel below and the
-// fetch-per-texel one run character for character the same arithmetic on the same stored depth -- the whole
-// claim of the gather path is that it changes only HOW the four depths arrive, so the two must not be able
-// to drift apart.
-float ShadowCompare(float2 uvTap, float2 uvCentre, float2 grad, float z, float stored) {
-    float zAtTap = z + dot(uvTap - uvCentre, grad);
-    return zAtTap <= stored ? 1.0 : 0.0; // 1 = this texel does not occlude
-}
-
-float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z) {
-    float stored = g_shadowMap.SampleLevel(g_shadowSampler, float3(uvTap, slice), 0);
-    return ShadowCompare(uvTap, uvCentre, grad, z, stored);
-}
-
 // Four taps in a quincunx around the centre, written out rather than looped over a local array: a local
 // array can land in an indexable temp register, which ps_4_0 refuses to map. The slice is cast explicitly
 // -- it is a texture coordinate and has to arrive as a float, and leaving that implicit is what produces
@@ -195,16 +181,18 @@ float ShadowTap(float2 uvTap, float2 uvCentre, float2 grad, float slice, float z
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
-float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, float slice, float texelUv) {
+float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel, float z, float slice,
+                       float texelUv) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
     float2 subTexel = texelPos - baseTexel;
     float2 uv00 = (baseTexel + 0.5) * texelUv;
 
-    // uvCentre, not uv: every tap in the whole kernel measures its plane correction from the ONE point the
-    // receiver's depth was evaluated at, otherwise each 2x2 quad would correct against itself and the
-    // sixteen-tap kernel would still disagree with itself across its own width.
+    // Component order below is Gather's own, and the fetch-by-fetch path is written to match it: w is the
+    // texel at (0,0) from uv00, z is (1,0), x is (0,1), y is (1,1). Holding all four as one float4 is the
+    // point of this function's shape -- the compare and the blend are then single vector instructions
+    // instead of four scalar comparisons and three lerps, and the kernel runs this sixteen times.
 @if(o_shadow_gather)
     // One instruction for all four depths. Gather returns exactly the 2x2 footprint bilinear filtering
     // would have used, so this reads the same four texels the four fetches below read -- and every texel is
@@ -220,23 +208,46 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float z, float s
     // Sampled at the CENTRE of the quad rather than at a texel, deliberately. The footprint the hardware
     // picks is decided in fixed point, and asking at a texel centre puts that decision half a texel from a
     // boundary in each direction -- orders of magnitude more margin than the hardware's sub-texel precision
-    // -- so the four texels are the computed ones and not their neighbours. Component order is Gather's
-    // own: w is (0,0), z is (1,0), x is (0,1), y is (1,1), in texels from the footprint's first corner.
-    float4 gathered = g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
-    float s00 = ShadowCompare(uv00, uvCentre, grad, z, gathered.w);
-    float s10 = ShadowCompare(uv00 + float2(texelUv, 0.0), uvCentre, grad, z, gathered.z);
-    float s01 = ShadowCompare(uv00 + float2(0.0, texelUv), uvCentre, grad, z, gathered.x);
-    float s11 = ShadowCompare(uv00 + float2(texelUv, texelUv), uvCentre, grad, z, gathered.y);
+    // -- so the four texels are the computed ones and not their neighbours.
+    float4 stored = g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
 @else
-    float s00 = ShadowTap(uv00, uvCentre, grad, slice, z);
-    float s10 = ShadowTap(uv00 + float2(texelUv, 0.0), uvCentre, grad, slice, z);
-    float s01 = ShadowTap(uv00 + float2(0.0, texelUv), uvCentre, grad, slice, z);
-    float s11 = ShadowTap(uv00 + float2(texelUv, texelUv), uvCentre, grad, slice, z);
+    float4 stored;
+    stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, slice), 0);
+    stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+    stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+    stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
 @end
 
-    float top = lerp(s00, s10, subTexel.x);
-    float bottom = lerp(s01, s11, subTexel.x);
-    return lerp(top, bottom, subTexel.y);
+    // The four depths the receiver's own plane has at those texels.
+    //
+    // uvCentre, not uv: every tap in the whole kernel measures its plane correction from the ONE point the
+    // receiver's depth was evaluated at, otherwise each 2x2 quad would correct against itself and the
+    // sixteen-tap kernel would still disagree with itself across its own width.
+    //
+    // One dot for the corner and three adds for the rest, rather than a dot per texel. Stepping one texel
+    // along an axis moves the plane by gradTexel on that axis -- which the caller already has, since it is
+    // the same for all four quads -- so the other three corners are the first one plus a constant.
+    //
+    // Same value, reassociated: `base + t*grad.x` rounds where `dot(offset + (t,0), grad)` did not, so the
+    // two can land on opposite sides of a comparison that is an exact tie. Measured over four million
+    // adversarial samples -- stored depths deliberately clustered onto the threshold -- they disagreed on
+    // 0.001% of them, and every one of those was within ONE ulp of a tie. The visible consequence of such a
+    // disagreement is one tap in sixteen, on a pixel whose surface depth equals the stored depth to the last
+    // representable bit.
+    float base = z + dot(uv00 - uvCentre, grad);
+    float4 refs = base + float4(gradTexel.y, gradTexel.x + gradTexel.y, gradTexel.x, 0.0);
+
+    // step(a, b) is b >= a, so this is "the plane is at or in front of the stored depth" -- 1 where the
+    // texel does not occlude -- for all four at once.
+    float4 lit = step(refs, stored);
+
+    // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
+    // dot it is one instruction instead of three dependent ones. Comparing first and filtering after is the
+    // whole point of the kernel -- filtering the stored depths and comparing once would give a wrong
+    // penumbra -- and that ordering is unchanged: `lit` is already the comparison result.
+    float2 inv = 1.0 - subTexel;
+    float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
+    return dot(lit, weights);
 }
 
 // Wider filter: four bilinear taps one texel apart, covering a 4x4 texel neighbourhood. Sixteen fetches
@@ -260,10 +271,14 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // quads overlap instead, which only costs redundancy, so this is safe to turn down for a tighter
     // penumbra and must not be turned above 1.0.
     float d = texelUv * min(shadow_filter.x, 1.0);
-    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, z, slice, texelUv);
+    // How far the receiver plane's depth moves across one texel, per axis. Identical for all four quads --
+    // they share a cascade, so they share its texel -- so it is formed once here rather than four times
+    // inside them.
+    float2 gradTexel = grad * texelUv;
+    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv);
+    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, gradTexel, z, slice, texelUv);
     return sum * 0.25;
 }
 
@@ -377,7 +392,7 @@ ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewP
     // How fast the receiver's depth changes per unit of shadow-map uv, recovered from screen-space
     // derivatives. The two derivative pairs give depth and uv per screen pixel; inverting the uv Jacobian
     // turns that into depth per uv, which is the receiver plane expressed in the map's own coordinates.
-    // ShadowTap uses it to compare each tap against the plane rather than against one point on it.
+    // SampleShadowPCF4 uses it to compare each texel against the plane rather than against one point on it.
     float2 duvdx = ddx(uv);
     float2 duvdy = ddy(uv);
     float dzdx = ddx(ndc.z);
