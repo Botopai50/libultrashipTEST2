@@ -2597,10 +2597,13 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
         if (mShadowTimerFrameSamples > 0) {
             const double frameMs = mShadowTimerFrameSumMs / mShadowTimerFrameSamples;
             const double passMs = mShadowTimerSamples > 0 ? mShadowTimerSumMs / mShadowTimerSamples : 0.0;
-            SPDLOG_INFO("Shadow map GPU: frame {:.2f} ms, of which the depth pass is {:.2f} ms ({:.0f}%), over "
-                        "{} of the last 60 frames ({} cascades x {} layers at {}px)",
-                        frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerFrameSamples,
-                        mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
+            // The pass sample count is the interesting one now that cascades can be parked: it is how many
+            // frames had to submit a depth pass at all, and the gap to the frame count is how many got away
+            // with reusing every slice they needed.
+            SPDLOG_INFO("Shadow map GPU: frame {:.2f} ms, of which the depth pass is {:.2f} ms ({:.0f}%); "
+                        "{} of {} timed frames submitted a pass ({} cascades x {} layers at {}px)",
+                        frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerSamples,
+                        mShadowTimerFrameSamples, mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
         } else {
             SPDLOG_INFO("Shadow map GPU: no timing collected in the last 60 frames");
         }

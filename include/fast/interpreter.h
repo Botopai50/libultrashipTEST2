@@ -516,6 +516,11 @@ class Interpreter {
             mShadowMapWorldCache.clear();
             mShadowWorldChunks.clear();    // they index into the list that just went away
             mShadowWorldCacheGeneration++; // the cache changed, so the slices built from it are stale
+            // Unpark the cascades. Holding one across a disable would park it wherever the camera stood at
+            // the moment the mode went off, and the next enable could be a different scene entirely.
+            for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
+                mShadowMapCascadeCenterValid[c] = false;
+            }
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
                 mShadowAlphaCasters[l].clear();
                 mShadowAlphaReady[l].clear();
@@ -898,6 +903,11 @@ class Interpreter {
     // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
     // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
     float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
+    // Where each cascade is currently parked, and whether anything is parked there yet. Held across frames
+    // for as long as the cascade still contains the sphere the frame fits, which is what allows a slice to
+    // be reused while the camera moves -- see the containment test in RenderShadowMap.
+    float mShadowMapCascadeCenter[SHADOW_MAP_MAX_CASCADES][3] = {};
+    bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_CASCADES] = {};
     // Light direction the cascades are currently built around, held across frames for the same reason the
     // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
     // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.

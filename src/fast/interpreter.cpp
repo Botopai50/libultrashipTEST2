@@ -3658,6 +3658,9 @@ void Interpreter::RenderShadowMap() {
         const float halfLen = (farDist - nearDist) * 0.5f;
         const float lateral = std::max(halfAtNear, halfAtFar);
         float radius = std::sqrt(halfLen * halfLen + lateral * lateral);
+        // Kept before the hysteresis below rounds it up. The centre-holding test needs the sphere that
+        // actually HAS to be covered this frame, not the larger one the cascade happens to be.
+        const float radiusFit = radius;
 
         // Hold the radius steady. Rotation-invariance alone is not enough to stop the edges crawling: the
         // fit above is derived from the near/far planes, which the game moves around, so the radius wobbles
@@ -3678,7 +3681,9 @@ void Interpreter::RenderShadowMap() {
             }
             radius = held;
         }
-        float center[3] = { nearC[0] + viewDir[0] * mid, nearC[1] + viewDir[1] * mid, nearC[2] + viewDir[2] * mid };
+        const float centerFit[3] = { nearC[0] + viewDir[0] * mid, nearC[1] + viewDir[1] * mid,
+                                     nearC[2] + viewDir[2] * mid };
+        float center[3] = { centerFit[0], centerFit[1], centerFit[2] };
 
         // Snap the centre to whole texels along the light's own axes (see the note above).
         const float texelWorldSize = (2.0f * radius) / (float)mShadowMapResolution;
@@ -3695,6 +3700,43 @@ void Interpreter::RenderShadowMap() {
             cz = std::floor(cz / texelWorldSize) * texelWorldSize;
             for (int i = 0; i < 3; i++) {
                 center[i] = lx[i] * cx + ly[i] * cy + lz[i] * cz;
+            }
+        }
+
+        // Leave the cascade exactly where it was whenever it still covers what this frame needs covering.
+        //
+        // This is the one thing that lets the depth pass be skipped while the camera MOVES. A slice is
+        // reused only when its matrix is unchanged, and until now the matrix moved every frame the camera
+        // did -- so the whole cascade was cleared and redrawn continuously, which measurement puts at about
+        // three quarters of what the shadow map costs.
+        //
+        // The slack it spends is already paid for. The radius above is quantized UP, so the cascade is
+        // routinely a good deal larger than the sphere it was fitted to; the fitted sphere can therefore
+        // wander inside it for a while before anything stops being covered. Containment is the whole test:
+        // if the fitted sphere sits entirely within the held cascade, that cascade still shows every caster
+        // and every receiver the fitted one would have, so keeping it is not an approximation.
+        //
+        // And keeping it costs no quality at all, because the RADIUS is what sets the texel size and the
+        // radius is not what moves. A held cascade has exactly the texel grid it had before -- indeed
+        // exactly the image, since the matrix is bit-identical and the slice is reused whole.
+        //
+        // The test is a distance between sphere centres, so it does not care that the light's basis may have
+        // turned underneath it; a turn changes the matrix by itself and the slice is redrawn for that reason.
+        {
+            float* heldCenter = mShadowMapCascadeCenter[c];
+            const float dx = heldCenter[0] - centerFit[0];
+            const float dy = heldCenter[1] - centerFit[1];
+            const float dz = heldCenter[2] - centerFit[2];
+            const float drift = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (mShadowMapCascadeCenterValid[c] && drift + radiusFit <= radius) {
+                for (int i = 0; i < 3; i++) {
+                    center[i] = heldCenter[i];
+                }
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    heldCenter[i] = center[i];
+                }
+                mShadowMapCascadeCenterValid[c] = true;
             }
         }
 
