@@ -1428,10 +1428,20 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
     if (dst.verts.size() >= kShadowMapCasterBudgetFloats) {
         return;
     }
-    // Extend the open range when the material has not changed. Draws arrive grouped by material, so this
-    // keeps the range count near the number of materials rather than near the number of triangles -- which
-    // matters because every range is its own draw call in every cascade.
-    if (dst.ranges.empty() || !(dst.ranges.back().key == key)) {
+    // Extend the open range when the material has not changed AND it has not grown past a span's worth of
+    // triangles.
+    //
+    // A range is the unit this path culls by, and one range per material made that unit far too coarse: all
+    // the grass in a field shares a texture and arrives in one batch, so its box covered the field and no
+    // cascade could reject any of it. That is the expensive geometry to get wrong -- unlike the opaque
+    // casters, cutouts run a real pixel shader that samples a texture and clips, and a leaf billboard near
+    // the camera covers a large part of the near cascade's map.
+    //
+    // Splitting does not cost draw calls. Consecutive spans carry the same texture and are contiguous in the
+    // buffer, so the pass merges the surviving ones back into single draws, exactly as it does for the
+    // opaque spans.
+    if (dst.ranges.empty() || !(dst.ranges.back().key == key) ||
+        dst.ranges.back().vertexCount >= kShadowAlphaChunkTriangles * 3) {
         const float inf = std::numeric_limits<float>::max();
         dst.ranges.push_back(
             { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf } });
@@ -3786,6 +3796,51 @@ void Interpreter::RenderShadowMap() {
         return true;
     };
 
+    // Draws one cutout set into the cascade `m`, merging what survives back into as few calls as possible.
+    //
+    // Spans are contiguous in the buffer and consecutive ones usually share a texture, so a run of survivors
+    // is one draw however many spans it spans. A run ends when the texture changes -- a draw binds exactly
+    // one -- or when enough rejected geometry has piled up to be worth a second call rather than drawing it.
+    // Bridging is always correct here for the same reason it is on the opaque path: a rejected span was only
+    // ever rejected as an optimisation, and drawing it puts the same depth in the same place.
+    //
+    // A span whose texture could not be resolved is NOT bridgeable: it has no texture to be drawn with, so
+    // it always breaks the run.
+    auto drawAlphaRanges = [this, &boxVisible](const ShadowAlphaCasters& set, const float* m) {
+        uint32_t runTexture = UINT32_MAX, runFirst = 0, runCount = 0, gapCount = 0;
+        auto flush = [&] {
+            if (runCount >= 3) {
+                mRapi->ShadowMapDrawAlphaRange(runTexture, runFirst, runCount);
+            }
+            runCount = 0;
+            gapCount = 0;
+        };
+        for (const ShadowAlphaRange& r : set.ranges) {
+            const bool drawable = r.textureId != UINT32_MAX && r.vertexCount >= 3;
+            if (drawable && boxVisible(r.min, r.max, m)) {
+                if (runCount != 0 && r.textureId != runTexture) {
+                    flush(); // a draw carries one texture
+                }
+                if (runCount == 0) {
+                    runTexture = r.textureId;
+                    runFirst = r.firstVertex;
+                    gapCount = 0;
+                }
+                runCount += gapCount + r.vertexCount;
+                gapCount = 0;
+            } else if (runCount != 0) {
+                // Only geometry this same draw could legally carry may be bridged over.
+                if (!drawable || r.textureId != runTexture ||
+                    gapCount + r.vertexCount > kShadowAlphaBridgeTriangles * 3) {
+                    flush();
+                } else {
+                    gapCount += r.vertexCount;
+                }
+            }
+        }
+        flush();
+    };
+
     for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
         // The world layer draws from the cache, which usually holds the same vector contents as last frame --
         // so on top of skipping the capture, the backend's "same list as the previous call" check also skips
@@ -3884,22 +3939,12 @@ void Interpreter::RenderShadowMap() {
             // pipeline switch happens once per cascade rather than being interleaved.
             if (alpha.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
-                for (const ShadowAlphaRange& r : alpha.ranges) {
-                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3 &&
-                        boxVisible(r.min, r.max, &matrices[c * 16])) {
-                        mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
-                    }
-                }
+                drawAlphaRanges(alpha, &matrices[c * 16]);
             }
             if (sceneryHere && mShadowAlphaSceneryReady.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
                                                   mShadowAlphaSceneryReady.VertexCount());
-                for (const ShadowAlphaRange& r : mShadowAlphaSceneryReady.ranges) {
-                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3 &&
-                        boxVisible(r.min, r.max, &matrices[c * 16])) {
-                        mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
-                    }
-                }
+                drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16]);
             }
         }
     }

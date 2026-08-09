@@ -851,6 +851,13 @@ class Interpreter {
     // two spans: enough to swallow the isolated rejections that fragment a run, small enough that a genuinely
     // large rejected region still ends the draw.
     static constexpr size_t kShadowChunkBridgeTriangles = 2 * kShadowChunkTriangles;
+    // Same idea for the CUTOUT casters, and finer, because they are worth more per triangle: the opaque
+    // depth pass has no pixel shader at all, while these sample a texture and clip, so a billboard blown up
+    // across the near cascade is far more expensive per texel than a wall is. A material batch on its own
+    // was much too coarse a unit -- one texture covers every blade of grass in a field, so its box covered
+    // the field and nothing was ever rejected.
+    static constexpr uint32_t kShadowAlphaChunkTriangles = 64;
+    static constexpr uint32_t kShadowAlphaBridgeTriangles = 2 * kShadowAlphaChunkTriangles;
     std::vector<ShadowCasterChunk> mShadowWorldChunks;
     // Rebuilds since the last census line. Reported rather than inferred: whether the room mesh is being
     // re-captured every frame or once per room is invisible from the outside and is the difference between

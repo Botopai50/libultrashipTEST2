@@ -1268,6 +1268,7 @@ void GfxRenderingAPIDX11::OnResize() {
 }
 
 void GfxRenderingAPIDX11::StartFrame() {
+    ShadowTimerFrameBegin();
     // Set per-frame constant buffer
     // SOH [Enhancement] mPerToonCb bound at slot b2 for the toon pixel shader and mPerShadowCb at b3 for
     // the shadow-map receiver variant; both are ignored by shaders that do not declare them.
@@ -1282,6 +1283,7 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    ShadowTimerFrameEnd();
     mContext->Flush();
 }
 
@@ -2480,14 +2482,18 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mShadowCbDirty = true;
 }
 
-// SOH [Enhancement] Timestamps around the depth pass. See the members in gfx_direct3d_common.h for why.
+// SOH [Enhancement] GPU timing. See the members in gfx_direct3d_common.h for why it exists at all.
 //
-// Returns whether a start timestamp was issued, which is the only thing that makes the matching end
-// meaningful: a frame where every slice was reused opens no pass at all and must not be recorded as a
-// zero-millisecond one.
-bool GfxRenderingAPIDX11::ShadowTimerBegin() {
+// One disjoint block per frame, with the frame's own interval inside it and the depth pass's interval inside
+// that. Two numbers out of one clock: what the whole frame costs the GPU, and how much of it the cascades
+// cost to fill. The rest of the shadow feature -- the receiver shaders, which no pass boundary can bracket
+// because they run inside ordinary scene draws -- is then had by difference, by reading the frame number
+// with the feature off and again with it on.
+void GfxRenderingAPIDX11::ShadowTimerFrameBegin() {
+    mShadowTimerOpen = false;
+    mShadowTimerFrameOpen = false;
     if (mShadowDebug < 0.5f || mShadowTimerFailed || mDevice == nullptr) {
-        return false;
+        return;
     }
     const int i = mShadowTimerSlot;
     if (mShadowTimerDisjoint[i] == nullptr) {
@@ -2496,22 +2502,32 @@ bool GfxRenderingAPIDX11::ShadowTimerBegin() {
         qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
         HRESULT hr = mDevice->CreateQuery(&qd, mShadowTimerDisjoint[i].GetAddressOf());
         qd.Query = D3D11_QUERY_TIMESTAMP;
-        if (SUCCEEDED(hr)) {
-            hr = mDevice->CreateQuery(&qd, mShadowTimerStart[i].GetAddressOf());
-        }
-        if (SUCCEEDED(hr)) {
-            hr = mDevice->CreateQuery(&qd, mShadowTimerEnd[i].GetAddressOf());
+        ID3D11Query** stamps[4] = { mShadowTimerFrameStart[i].GetAddressOf(), mShadowTimerFrameEnd[i].GetAddressOf(),
+                                    mShadowTimerStart[i].GetAddressOf(), mShadowTimerEnd[i].GetAddressOf() };
+        for (int k = 0; SUCCEEDED(hr) && k < 4; k++) {
+            hr = mDevice->CreateQuery(&qd, stamps[k]);
         }
         if (FAILED(hr)) {
             // Not fatal and not worth retrying: timing is a diagnostic, and a device that will not give us
             // queries still renders shadows perfectly well.
-            SPDLOG_WARN("Shadow map: timestamp queries unavailable; the depth pass will not be timed.");
+            SPDLOG_WARN("Shadow map: timestamp queries unavailable; the GPU will not be timed.");
             mShadowTimerFailed = true;
-            return false;
+            return;
         }
     }
     mContext->Begin(mShadowTimerDisjoint[i].Get());
-    mContext->End(mShadowTimerStart[i].Get());
+    mContext->End(mShadowTimerFrameStart[i].Get());
+    mShadowTimerFrameOpen = true;
+}
+
+// Returns whether a start timestamp was issued, which is the only thing that makes the matching end
+// meaningful: a frame where every slice was reused opens no pass at all and must not be recorded as a
+// zero-millisecond one.
+bool GfxRenderingAPIDX11::ShadowTimerBegin() {
+    if (!mShadowTimerFrameOpen) {
+        return false;
+    }
+    mContext->End(mShadowTimerStart[mShadowTimerSlot].Get());
     mShadowTimerOpen = true;
     return true;
 }
@@ -2520,12 +2536,22 @@ void GfxRenderingAPIDX11::ShadowTimerEnd() {
     if (!mShadowTimerOpen) {
         return;
     }
+    mContext->End(mShadowTimerEnd[mShadowTimerSlot].Get());
+    mShadowTimerOpen = false;
+    mShadowTimerPassIssued[mShadowTimerSlot] = true;
+}
+
+void GfxRenderingAPIDX11::ShadowTimerFrameEnd() {
+    if (!mShadowTimerFrameOpen) {
+        return;
+    }
     const int i = mShadowTimerSlot;
-    mContext->End(mShadowTimerEnd[i].Get());
+    mContext->End(mShadowTimerFrameEnd[i].Get());
     mContext->End(mShadowTimerDisjoint[i].Get());
     mShadowTimerPending[i] = true;
-    mShadowTimerOpen = false;
+    mShadowTimerFrameOpen = false;
     mShadowTimerSlot = (i + 1) % kShadowTimerFrames;
+    ShadowTimerCollect();
 }
 
 // Reads back whichever frame's queries are old enough to have finished, and reports the average once a
@@ -2538,31 +2564,50 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
     const int i = mShadowTimerSlot;
     if (mShadowTimerPending[i]) {
         D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-        UINT64 t0 = 0, t1 = 0;
-        if (mContext->GetData(mShadowTimerDisjoint[i].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
-            mContext->GetData(mShadowTimerStart[i].Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
-            mContext->GetData(mShadowTimerEnd[i].Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+        UINT64 f0 = 0, f1 = 0, t0 = 0, t1 = 0;
+        bool ready =
+            mContext->GetData(mShadowTimerDisjoint[i].Get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            mContext->GetData(mShadowTimerFrameStart[i].Get(), &f0, sizeof(f0), D3D11_ASYNC_GETDATA_DONOTFLUSH) ==
+                S_OK &&
+            mContext->GetData(mShadowTimerFrameEnd[i].Get(), &f1, sizeof(f1), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        if (ready && mShadowTimerPassIssued[i]) {
+            ready =
+                mContext->GetData(mShadowTimerStart[i].Get(), &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH) ==
+                    S_OK &&
+                mContext->GetData(mShadowTimerEnd[i].Get(), &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        }
+        if (ready) {
             mShadowTimerPending[i] = false;
             // Disjoint means the clock changed rate mid-measurement (power management), so the interval is
             // meaningless and is dropped rather than averaged in.
-            if (!dj.Disjoint && dj.Frequency != 0 && t1 >= t0) {
-                mShadowTimerSumMs += (double)(t1 - t0) * 1000.0 / (double)dj.Frequency;
-                mShadowTimerSamples++;
+            if (!dj.Disjoint && dj.Frequency != 0 && f1 >= f0) {
+                const double toMs = 1000.0 / (double)dj.Frequency;
+                mShadowTimerFrameSumMs += (double)(f1 - f0) * toMs;
+                mShadowTimerFrameSamples++;
+                if (mShadowTimerPassIssued[i] && t1 >= t0) {
+                    mShadowTimerSumMs += (double)(t1 - t0) * toMs;
+                    mShadowTimerSamples++;
+                }
             }
+            mShadowTimerPassIssued[i] = false;
         }
     }
     if (++mShadowTimerReported >= 60) {
         mShadowTimerReported = 0;
-        if (mShadowTimerSamples > 0) {
-            SPDLOG_INFO("Shadow map depth pass: {:.2f} ms on the GPU, averaged over {} of the last 60 frames "
-                        "({} cascades x {} layers at {}px)",
-                        mShadowTimerSumMs / mShadowTimerSamples, mShadowTimerSamples, mShadowCascadeCount,
-                        SHADOW_MAP_LAYERS, mShadowResolution);
+        if (mShadowTimerFrameSamples > 0) {
+            const double frameMs = mShadowTimerFrameSumMs / mShadowTimerFrameSamples;
+            const double passMs = mShadowTimerSamples > 0 ? mShadowTimerSumMs / mShadowTimerSamples : 0.0;
+            SPDLOG_INFO("Shadow map GPU: frame {:.2f} ms, of which the depth pass is {:.2f} ms ({:.0f}%), over "
+                        "{} of the last 60 frames ({} cascades x {} layers at {}px)",
+                        frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerFrameSamples,
+                        mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
         } else {
-            SPDLOG_INFO("Shadow map depth pass: nothing submitted in the last 60 frames (every slice reused)");
+            SPDLOG_INFO("Shadow map GPU: no timing collected in the last 60 frames");
         }
         mShadowTimerSumMs = 0.0;
         mShadowTimerSamples = 0;
+        mShadowTimerFrameSumMs = 0.0;
+        mShadowTimerFrameSamples = 0;
     }
 }
 
@@ -2573,7 +2618,6 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     // the shader sampling whatever happened to be bound and the shadows would vanish while nothing moved.
     if (!mShadowPassActive) {
         ShadowMapBindForReading();
-        ShadowTimerCollect(); // a frame that opened no pass still advances the once-a-second report
         return;
     }
     mShadowPassActive = false;
@@ -2605,9 +2649,6 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mLastZmodeDecal = -1;
 
     ShadowMapBindForReading();
-    // After the interval is closed, so this frame's own result is the last thing queued rather than the
-    // first thing waited on.
-    ShadowTimerCollect();
 }
 
 // Hand the cascades to the main pass, past the combiner's own texture slots.

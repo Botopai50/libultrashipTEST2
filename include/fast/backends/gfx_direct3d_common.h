@@ -285,17 +285,27 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // measured. Built and issued only while a shadow debug mode is on; off, none of it exists.
     static constexpr int kShadowTimerFrames = 4;
     Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerDisjoint[kShadowTimerFrames];
+    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerFrameStart[kShadowTimerFrames];
+    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerFrameEnd[kShadowTimerFrames];
     Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerStart[kShadowTimerFrames];
     Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerEnd[kShadowTimerFrames];
     bool mShadowTimerPending[kShadowTimerFrames] = {};
+    // Whether that slot's frame opened a depth pass at all. A frame that reused every slice submits no
+    // pass, so its pass timestamps were never issued and must not be read.
+    bool mShadowTimerPassIssued[kShadowTimerFrames] = {};
     int mShadowTimerSlot = 0;
-    bool mShadowTimerOpen = false;   // this frame's pass issued a start timestamp
-    bool mShadowTimerFailed = false; // query creation failed once; do not retry every frame
+    bool mShadowTimerFrameOpen = false; // this frame is being timed
+    bool mShadowTimerOpen = false;      // and its depth pass issued a start timestamp
+    bool mShadowTimerFailed = false;    // query creation failed once; do not retry every frame
     double mShadowTimerSumMs = 0.0;
     int mShadowTimerSamples = 0;
+    double mShadowTimerFrameSumMs = 0.0;
+    int mShadowTimerFrameSamples = 0;
     int mShadowTimerReported = 0; // frames since the last log line
+    void ShadowTimerFrameBegin();
     bool ShadowTimerBegin();
     void ShadowTimerEnd();
+    void ShadowTimerFrameEnd();
     void ShadowTimerCollect();
 
     HMODULE mDX11Module;
