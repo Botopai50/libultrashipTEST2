@@ -3673,10 +3673,18 @@ void Interpreter::RenderShadowMap() {
         // fit is clearly smaller. It must never end up below the fitted radius or the cascade would clip
         // shadows at its edge.
         if (radius > 1e-4f) {
-            const float step = std::exp2(std::floor(std::log2(radius)) - 3.0f);
-            const float quantized = std::ceil(radius / step) * step;
+            // Built to the fitted sphere PLUS the park margin, so there is always room for the cascade to
+            // stay where it is while the view slides inside it (see SHADOW_MAP_CASCADE_PARK_MARGIN). The
+            // quantisation then rounds that up again; the two stack, and only the margin is guaranteed.
+            //
+            // Cascade 0 asks for no margin and so is fitted exactly as before -- byte for byte the same
+            // matrices it produced before any of this existed.
+            const float margin = (c > 0) ? SHADOW_MAP_CASCADE_PARK_MARGIN : 0.0f;
+            const float target = radius * (1.0f + margin);
+            const float step = std::exp2(std::floor(std::log2(target)) - 3.0f);
+            const float quantized = std::ceil(target / step) * step;
             float& held = mShadowMapCascadeRadius[c];
-            if (held <= 0.0f || radius > held || radius < held - 2.0f * step) {
+            if (held <= 0.0f || target > held || target < held - 2.0f * step) {
                 held = quantized;
             }
             radius = held;

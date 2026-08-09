@@ -49,6 +49,28 @@
 // off it. Losing one value out of 2^64 costs nothing.
 #define SHADOW_MAP_EMPTY_CONTENT_KEY 0ull
 
+// SOH [Enhancement] How much larger than the sphere it was fitted to each cascade is built, as a fraction
+// of its radius. This is what lets a cascade stay PARKED across frames.
+//
+// A slice is redrawn only when its matrix changes, and the matrix changes when the cascade moves. Holding
+// it still is exact -- a cascade that still contains the fitted sphere shows every caster and every receiver
+// the fitted one would -- but it can only be held while there is room to hold it, and the room is exactly
+// this margin. Without it the only slack was whatever the radius quantisation happened to leave, which
+// measured out at 0 to 28 world units against a camera that moves ten per frame: the cascades re-parked
+// every frame and nothing was ever reused.
+//
+// The cost is that the radius sets the texel size, so this widens the penumbra by the same fraction. That
+// is a real change and it is bounded rather than assumed: the kernel is four texels, a texel is 2R/
+// resolution, so the penumbra grows by 4 * 2R * margin / resolution world units -- while a screen pixel at
+// the nearest distance the cascade covers grows in the same proportion, because both scale with distance.
+// At 6%, 1080p and a 60 degree field of view that comes out at 0.55, 0.55 and 0.26 of a SCREEN PIXEL for
+// cascades 1, 2 and 3. Sub-pixel by construction, not by luck.
+//
+// Cascade 0 is deliberately excluded and keeps its exact fit. It covers the ground under the player, where
+// a shadow's contact point is read most closely -- and it is also where the margin buys least, since its
+// radius is small enough that six percent of it is one frame of walking.
+#define SHADOW_MAP_CASCADE_PARK_MARGIN 0.06f
+
 // How many independent caster lists a single layer may draw. Two, and only the world layer uses the second.
 //
 // The world layer holds the room mesh, which is cached: it is uploaded once and then only bound and drawn,
