@@ -3962,7 +3962,11 @@ void Interpreter::RenderShadowMap() {
         // keeps the two lists from evicting each other: the cached room mesh stays uploaded across cascades
         // and frames while the scenery list beside it is replaced every frame.
         const bool sceneryHere = (l == SHADOW_MAP_LAYER_WORLD);
-        for (int c = 0; c < mShadowMapCascadeCount; c++) {
+        // The actor layer stops short of the world layer's last cascade, so those slices do not exist and
+        // must not be asked for (see SHADOW_MAP_ACTOR_CASCADES).
+        const int cascadesHere = (l == SHADOW_MAP_LAYER_ACTORS) ? SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowMapCascadeCount)
+                                                                : mShadowMapCascadeCount;
+        for (int c = 0; c < cascadesHere; c++) {
             // Will anything at all reach this slice? Asked only for the ACTOR layer, which is the one that
             // is routinely empty -- it holds the characters, standing in one cascade out of four, while the
             // world layer has the room mesh in it and is empty essentially never. Answering it costs the

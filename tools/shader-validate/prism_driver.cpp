@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
         { "o_toon", cc.opt_toon },
         { "o_shadow_map", cc.opt_shadow_map },
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
+        { "o_shadow_actor_cascades", SHADOW_MAP_ACTOR_CASCADES },
         { "o_shadow_gather", shadowGather },
         { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc.used_masks, bool, 2) },

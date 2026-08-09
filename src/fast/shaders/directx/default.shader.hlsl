@@ -629,6 +629,13 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             if (isActor && !actorsPossible) {
                 continue; // nothing that layer holds is between this point and the light -- see above
             }
+            // The actor layer is SHORTER than the world layer -- see SHADOW_MAP_ACTOR_CASCADES. Past its
+            // last cascade there is no slice to read, and the answer is the one an empty slice would give.
+            // Asked of the cascade index rather than of the projection, so the skip lands before the struct
+            // copy below rather than after it.
+            if (isActor && (isPartner ? min(cascade + 1, count - 1) : cascade) >= @{o_shadow_actor_cascades}) {
+                continue;
+            }
             if (isPartner && !blend) {
                 continue; // outside the band the partner is multiplied by zero, so it is not read
             }

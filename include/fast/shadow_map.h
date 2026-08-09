@@ -49,7 +49,22 @@
 #define SHADOW_MAP_LAYERS 2
 #define SHADOW_MAP_LAYER_WORLD 0
 #define SHADOW_MAP_LAYER_ACTORS 1
-#define SHADOW_MAP_MAX_SLICES (SHADOW_MAP_MAX_CASCADES * SHADOW_MAP_LAYERS)
+// How many cascades the ACTOR layer gets, which is fewer than the world layer's.
+//
+// That layer costs a full slice per cascade and is redrawn every frame no matter what: its contents are
+// animating characters, so its content key changes every frame and no amount of reuse machinery can park it.
+// At 4096 a slice is about 0.42 ms of clear, and the far one was buying character shadows on ground the
+// player is looking at from over a thousand units away, where a character is a few pixels tall.
+//
+// What it costs is exactly that: past the second band, characters stop casting onto scenery. They still
+// RECEIVE the world layer's shadows at every distance -- this shortens the casting, not the shading.
+#define SHADOW_MAP_ACTOR_CASCADES 2
+
+// Slices are laid out world-layer-first: world cascade C is slice C, actor cascade C is slice
+// cascadeCount + C. The actor half is the shorter one, so the total is not a simple product.
+#define SHADOW_MAP_ACTOR_CASCADES_FOR(count) ((count) < SHADOW_MAP_ACTOR_CASCADES ? (count) : SHADOW_MAP_ACTOR_CASCADES)
+#define SHADOW_MAP_SLICES_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count))
+#define SHADOW_MAP_MAX_SLICES SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)
 
 // SOH [Enhancement] Content key meaning "nothing will be drawn into this slice at all".
 //

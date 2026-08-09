@@ -1973,7 +1973,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     tex_desc.Height = (UINT)resolution;
     tex_desc.MipLevels = 1;
     // Twice the slices: the world layer occupies [0, cascadeCount) and the actor layer the rest.
-    tex_desc.ArraySize = (UINT)(cascadeCount * SHADOW_MAP_LAYERS);
+    tex_desc.ArraySize = (UINT)SHADOW_MAP_SLICES_FOR(cascadeCount);
     tex_desc.Format = DXGI_FORMAT_R16_TYPELESS;
     tex_desc.SampleDesc.Count = 1;
     tex_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -1983,7 +1983,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
         return false;
     }
 
-    const int sliceCount = cascadeCount * SHADOW_MAP_LAYERS;
+    const int sliceCount = SHADOW_MAP_SLICES_FOR(cascadeCount);
     for (int i = 0; i < sliceCount; i++) {
         D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
         ZeroMemory(&dsv_desc, sizeof(dsv_desc));
@@ -2112,6 +2112,11 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         return false;
     }
     if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
+        return false;
+    }
+    // The actor layer is shorter than the world layer, so a cascade the world has may have no actor slice at
+    // all (see SHADOW_MAP_ACTOR_CASCADES). Refusing it here is what keeps the slice index inside the array.
+    if (layer == SHADOW_MAP_LAYER_ACTORS && cascadeIndex >= SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowCascadeCount)) {
         return false;
     }
     if (layer < 0 || layer >= SHADOW_MAP_LAYERS) {
@@ -2613,7 +2618,7 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
                         frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerSamples,
                         mShadowTimerFrameSamples,
                         mShadowSlicesFrames > 0 ? (float)mShadowSlicesDrawn / (float)mShadowSlicesFrames : 0.0f,
-                        mShadowCascadeCount * SHADOW_MAP_LAYERS, mShadowCascadeCount, SHADOW_MAP_LAYERS,
+                        SHADOW_MAP_SLICES_FOR(mShadowCascadeCount), mShadowCascadeCount, SHADOW_MAP_LAYERS,
                         mShadowResolution);
         } else {
             SPDLOG_INFO("Shadow map GPU: no timing collected in the last 60 frames");
@@ -2866,6 +2871,8 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_toon", cc_features.opt_toon },
         { "o_shadow_map", cc_features.opt_shadow_map }, // SOH [Enhancement] cascaded shadow maps
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
+        // How many cascades the actor layer has; beyond it there is no slice to read.
+        { "o_shadow_actor_cascades", SHADOW_MAP_ACTOR_CASCADES },
         // Whether the shadow kernel may fetch a 2x2 footprint per instruction. A property of the adapter,
         // not of the material, so it is the same for every shader in a session -- it selects a kernel, it
         // does not add a variant. See sShadowGather.
