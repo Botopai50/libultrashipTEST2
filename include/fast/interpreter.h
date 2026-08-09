@@ -719,10 +719,19 @@ class Interpreter {
     // draw call per material. Splitting them keeps the overwhelming majority of casters on the one-upload,
     // one-draw path and pays the per-material cost only for the geometry that actually needs it.
     struct ShadowAlphaRange {
-        TextureCacheKey key;          // resolved against the texture cache at pass time, not at capture time
-        uint32_t textureId;           // filled in by ResolveShadowAlphaTextures; 0 means "could not resolve"
-        uint32_t firstVertex;         // into ShadowAlphaCasters::verts
+        TextureCacheKey key;  // resolved against the texture cache at pass time, not at capture time
+        uint32_t textureId;   // filled in by ResolveShadowAlphaTextures; 0 means "could not resolve"
+        uint32_t firstVertex; // into ShadowAlphaCasters::verts
         uint32_t vertexCount;
+        // Bounds of the geometry in this range, grown as it is captured. A range is already a contiguous
+        // span of one material's triangles, so it is the natural unit to cull by -- and unlike the opaque
+        // list it needs no separate spans, because it is cut into them by material already.
+        //
+        // This matters more here than it does for the opaque casters: every range is its own draw call and
+        // its own texture bind, repeated in every cascade. A field of trees is dozens of ranges, and the
+        // near cascade covers almost none of them.
+        float min[3];
+        float max[3];
     };
     struct ShadowAlphaCasters {
         std::vector<float> verts; // 5 floats per vertex: world xyz + uv

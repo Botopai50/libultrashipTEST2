@@ -1432,7 +1432,9 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
     // keeps the range count near the number of materials rather than near the number of triangles -- which
     // matters because every range is its own draw call in every cascade.
     if (dst.ranges.empty() || !(dst.ranges.back().key == key)) {
-        dst.ranges.push_back({ key, 0u, (uint32_t)(dst.verts.size() / 5), 0u });
+        const float inf = std::numeric_limits<float>::max();
+        dst.ranges.push_back(
+            { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf } });
     }
     // Built into a local and inserted once, for the same reason the opaque path does (see
     // ShadowAppendTriangle): fifteen push_backs per triangle is fifteen capacity checks.
@@ -1448,7 +1450,18 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
         o[4] = w;
     }
     dst.verts.insert(dst.verts.end(), tri, tri + 15);
-    dst.ranges.back().vertexCount += 3;
+    ShadowAlphaRange& range = dst.ranges.back();
+    range.vertexCount += 3;
+    // Grow the range's box with this triangle. Done here rather than in a second pass because the vertices
+    // are already in hand and in cache; walking the list again later to measure it would cost more than the
+    // culling saves on a small range.
+    for (int si = 0; si < 3; si++) {
+        const float* o = &tri[si * 5];
+        for (int a = 0; a < 3; a++) {
+            range.min[a] = std::min(range.min[a], o[a]);
+            range.max[a] = std::max(range.max[a], o[a]);
+        }
+    }
 }
 
 // 64-bit FNV-1a, eight bytes at a time. Only ever asked one question -- "is this the same data as last
@@ -3676,13 +3689,13 @@ void Interpreter::RenderShadowMap() {
     //
     // The matrix is row-vector (world * M), so the x column is m[0], m[4], m[8] and the translation m[12].
     // w is exactly 1 -- the projection is orthographic by construction -- so clip xy IS ndc xy.
-    auto chunkVisible = [](const ShadowCasterChunk& ch, const float* m) {
-        const float cx = (ch.min[0] + ch.max[0]) * 0.5f;
-        const float cy = (ch.min[1] + ch.max[1]) * 0.5f;
-        const float cz = (ch.min[2] + ch.max[2]) * 0.5f;
-        const float hx = (ch.max[0] - ch.min[0]) * 0.5f;
-        const float hy = (ch.max[1] - ch.min[1]) * 0.5f;
-        const float hz = (ch.max[2] - ch.min[2]) * 0.5f;
+    auto boxVisible = [](const float* bmin, const float* bmax, const float* m) {
+        const float cx = (bmin[0] + bmax[0]) * 0.5f;
+        const float cy = (bmin[1] + bmax[1]) * 0.5f;
+        const float cz = (bmin[2] + bmax[2]) * 0.5f;
+        const float hx = (bmax[0] - bmin[0]) * 0.5f;
+        const float hy = (bmax[1] - bmin[1]) * 0.5f;
+        const float hz = (bmax[2] - bmin[2]) * 0.5f;
         for (int axis = 0; axis < 2; axis++) {
             const float a0 = m[0 + axis], a1 = m[4 + axis], a2 = m[8 + axis];
             const float centre = (cx * a0) + (cy * a1) + (cz * a2) + m[12 + axis];
@@ -3722,7 +3735,7 @@ void Interpreter::RenderShadowMap() {
                     const float* m = &matrices[c * 16];
                     size_t runFirst = 0, runCount = 0;
                     for (const ShadowCasterChunk& ch : mShadowWorldChunks) {
-                        if (chunkVisible(ch, m)) {
+                        if (boxVisible(ch.min, ch.max, m)) {
                             if (runCount == 0) {
                                 runFirst = ch.firstVertex;
                             }
@@ -3750,7 +3763,8 @@ void Interpreter::RenderShadowMap() {
             if (alpha.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
                 for (const ShadowAlphaRange& r : alpha.ranges) {
-                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3) {
+                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3 &&
+                        boxVisible(r.min, r.max, &matrices[c * 16])) {
                         mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
                     }
                 }
@@ -3759,7 +3773,8 @@ void Interpreter::RenderShadowMap() {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
                                                   mShadowAlphaSceneryReady.VertexCount());
                 for (const ShadowAlphaRange& r : mShadowAlphaSceneryReady.ranges) {
-                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3) {
+                    if (r.textureId != UINT32_MAX && r.vertexCount >= 3 &&
+                        boxVisible(r.min, r.max, &matrices[c * 16])) {
                         mRapi->ShadowMapDrawAlphaRange(r.textureId, r.firstVertex, r.vertexCount);
                     }
                 }
