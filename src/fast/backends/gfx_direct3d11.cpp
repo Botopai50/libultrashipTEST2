@@ -4,6 +4,9 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 #include <cmath>
 
 #include <map>
@@ -412,6 +415,12 @@ void GfxRenderingAPIDX11::LoadShader(struct ShaderProgram* new_prg) {
 // game can build has been built.
 namespace {
 
+#if DEBUG_D3D
+constexpr UINT kShaderCompileFlags = D3DCOMPILE_DEBUG;
+#else
+constexpr UINT kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
 constexpr uint32_t kShaderCacheMagic = 0x53535546; // 'FUSS'
 constexpr uint32_t kShaderCacheVersion = 1;
 
@@ -477,7 +486,8 @@ void ShaderCacheStore(const std::string& path, uint64_t hashA, uint64_t hashB, s
                       const void* vs, size_t vsSize, const void* ps, size_t psSize) {
     // Written to a temporary and renamed, so a crash or a second instance mid-write cannot leave a
     // half-file that later reads as a valid header with a truncated body.
-    const std::string tmp = path + ".tmp";
+    static std::atomic<uint32_t> counter{ 0 };
+    const std::string tmp = path + "." + std::to_string(counter.fetch_add(1)) + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
@@ -501,6 +511,104 @@ void ShaderCacheStore(const std::string& path, uint64_t hashA, uint64_t hashB, s
 
 } // namespace
 
+// SOH [Enhancement] Compile the variants an option turning ON is about to need, several at a time.
+//
+// Shaders are built per material and compiled the first time a draw asks for one, inside the frame that
+// asks. Switching the shadow map on hands every receiver in the scene a variant it has never needed, and
+// they arrive one after another -- so the wait is the sum of them all, on one thread, while the frame is
+// held. The set is knowable in advance, though: it is exactly the variants already in the pool with the new
+// bit set, and each is independent of the others.
+//
+// The threads only compile and write cache entries. They never touch the device, the shader pool or any
+// renderer state, and they are all joined before this returns -- so nothing here outlives the call and
+// nothing races a frame. The main thread takes a share of the work rather than idling.
+//
+// Deliberately best effort. Anything that fails or is skipped -- an unwritable cache, a compile error, a
+// variant the pool did not predict -- is compiled on demand exactly as it was before, and a variant warmed
+// but never drawn costs a cache entry nobody reads.
+void GfxRenderingAPIDX11::PrewarmShaderVariants(uint32_t extraOptionBits) {
+    if (extraOptionBits == 0 || mD3dCompile == nullptr) {
+        return;
+    }
+
+    // The sources are built here rather than in the workers: building one runs the preprocessor against a
+    // template fetched through the resource manager, which is not something to call off the main thread.
+    std::vector<std::string> sources;
+    {
+        std::vector<std::pair<uint64_t, uint32_t>> wanted;
+        for (const auto& entry : mShaderProgramPool) {
+            const uint64_t id0 = entry.first.first;
+            const uint32_t id1 = entry.first.second | extraOptionBits;
+            if (id1 == entry.first.second) {
+                continue; // already a variant with the option set
+            }
+            wanted.emplace_back(id0, id1);
+        }
+        for (const auto& w : wanted) {
+            if (mShaderProgramPool.count(std::make_pair(w.first, w.second)) != 0) {
+                continue; // already compiled this session
+            }
+            CCFeatures cc_features;
+            gfx_cc_get_features(w.first, w.second, &cc_features);
+            size_t numFloats = 0;
+            sources.push_back(gfx_direct3d_common_build_shader(numFloats, cc_features, false,
+                                                               mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode));
+        }
+    }
+    if (sources.empty()) {
+        return;
+    }
+
+    std::atomic<size_t> next{ 0 };
+    std::atomic<uint32_t> compiled{ 0 };
+    auto work = [this, &sources, &next, &compiled]() {
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= sources.size()) {
+                return;
+            }
+            const std::string& src = sources[i];
+            const uint64_t hashA = ShaderHash(src.data(), src.size(), 0xCBF29CE484222325ull ^ kShaderCompileFlags);
+            const uint64_t hashB = ShaderHash(src.data(), src.size(), 0x9E3779B97F4A7C15ull ^ kShaderCompileFlags);
+            const std::string path = ShaderCachePath(hashA, hashB);
+            if (path.empty()) {
+                continue;
+            }
+            std::vector<uint8_t> haveVs, havePs;
+            if (ShaderCacheLoad(path, hashA, hashB, src.size(), haveVs, havePs)) {
+                continue; // a previous run already paid for this one
+            }
+            ComPtr<ID3DBlob> vs, ps, err;
+            if (FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+                                   kShaderCompileFlags, 0, vs.GetAddressOf(), err.GetAddressOf())) ||
+                FAILED(mD3dCompile(src.data(), src.size(), nullptr, nullptr, nullptr, "PSMain", "ps_4_0",
+                                   kShaderCompileFlags, 0, ps.GetAddressOf(), err.GetAddressOf()))) {
+                // Left for the on-demand path, which reports it properly and takes the process down. Warming
+                // must not be where a broken shader is discovered, and must never be where it is hidden.
+                continue;
+            }
+            ShaderCacheStore(path, hashA, hashB, src.size(), vs->GetBufferPointer(), vs->GetBufferSize(),
+                             ps->GetBufferPointer(), ps->GetBufferSize());
+            compiled.fetch_add(1);
+        }
+    };
+
+    unsigned int threads = std::thread::hardware_concurrency();
+    threads = threads == 0 ? 2u : (threads > 8u ? 8u : threads);
+    threads = (unsigned int)std::min<size_t>(threads, sources.size());
+
+    std::vector<std::thread> pool;
+    pool.reserve(threads - 1);
+    for (unsigned int t = 1; t < threads; t++) {
+        pool.emplace_back(work);
+    }
+    work();
+    for (std::thread& t : pool) {
+        t.join();
+    }
+    SPDLOG_INFO("Shader prewarm: {} of {} variants compiled on {} threads", compiled.load(), sources.size(), threads);
+}
+
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint32_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
@@ -517,11 +625,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     ComPtr<ID3DBlob> vs, ps;
     ComPtr<ID3DBlob> error_blob;
 
-#if DEBUG_D3D
-    UINT compile_flags = D3DCOMPILE_DEBUG;
-#else
-    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
-#endif
+    UINT compile_flags = kShaderCompileFlags;
 
     // Try the disk cache before the compiler. The flags are folded into the seed so a debug build never
     // reads a release build's bytecode.

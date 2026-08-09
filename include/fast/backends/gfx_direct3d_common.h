@@ -150,6 +150,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     // SOH [Enhancement] Cascaded shadow maps (see fast/shadow_map.h). This is the only backend that
     // implements the depth pass.
+    void PrewarmShaderVariants(uint32_t extraOptionBits) override;
     bool SupportsShadowMap() override;
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],

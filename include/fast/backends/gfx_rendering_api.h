@@ -129,6 +129,17 @@ class GfxRenderingAPI {
     // behave exactly as it did before. The application MUST consult SupportsShadowMap() before hiding
     // whatever shadows it was drawing, or an unsupported backend ends up with no shadows at all.
 
+    // SOH [Enhancement] Compile the shader variants that turning an option ON will need, ahead of the draws
+    // that need them, and in parallel. Shaders are built per material and compiled the first time a draw
+    // asks for one, synchronously, inside the frame -- so switching the shadow map on makes every receiver
+    // in the scene queue up behind a compiler, one at a time. Given the bit that was added to their ids, a
+    // backend can derive the whole set from the variants it already holds and get ahead of it.
+    //
+    // Best effort by definition: it warms a cache, it does not create anything the renderer then depends on,
+    // and a variant it fails or declines to prepare is simply compiled on demand exactly as before.
+    virtual void PrewarmShaderVariants(uint32_t extraOptionBits) {
+    }
+
     // Whether this backend can render the depth pass. Checked once per frame by the application.
     virtual bool SupportsShadowMap() {
         return false;

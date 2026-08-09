@@ -462,6 +462,12 @@ class Interpreter {
                             float filterWidth, float minCasterSize, float debugMode,
                             float edgeHardness, float edgeHardnessFar, float minIncidence, float fullIncidence,
                             float minHardnessScale, float depthBiasWorld, float slopeBias) {
+        // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
+        // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
+        // it. Asked only on the transition, and only of a backend that wants to act on it.
+        if (enabled && !mShadowMapEnabled && mRapi != nullptr) {
+            mRapi->PrewarmShaderVariants((uint32_t)SHADER_OPT(SHADOW_MAP));
+        }
         mShadowMapEnabled = enabled;
         mShadowMapCascadeCount = cascadeCount < 1                       ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
