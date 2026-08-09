@@ -2100,7 +2100,31 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // instead of naming them one at a time, and it cannot mistake a scene draw for one: a projection with no
     // perspective term has no perspective to lose.
     const bool screenSpaceProjection = std::fabs(mRsp->P_matrix[2][3]) < 1e-6f;
-    bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !mRdp->shadow_no_receive;
+    // Translucent surfaces do not take the shadow either.
+    //
+    // They are the wrong place to spend it. A see-through surface reads mostly as what is behind it, so
+    // darkening it moves the picture very little -- while these are precisely the draws that pile up: a fire,
+    // a splash, a magic effect is dozens of overlapping quads, and every one of those layers was running the
+    // full cascade lookup for a contribution the blender then multiplies by a small alpha. The cost is
+    // proportional to the overdraw, which is the highest in the frame, and the benefit is proportional to
+    // opacity, which is the lowest.
+    //
+    // The zmode field alone, and nothing else, for the same reason the CASTER test settled on it (see
+    // ShadowCasterRejected): FORCE_BL marks a blend as unconditional rather than coverage-driven, but plenty
+    // of visually solid geometry sets it while staying in ZMODE_OPA, and excluding those would drop the
+    // shadow off solid walls. Every genuinely translucent surface mode carries ZMODE_XLU anyway.
+    //
+    // Alpha-tested cutouts are NOT caught by this and must not be: grass and canopies are opaque where they
+    // are opaque, they draw in ZMODE_OPA, and they go on receiving exactly as before.
+    const bool translucentSurface = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
+    // And neither does a draw whose colour the blender throws away. `invisible` means the blend is
+    // memory-only -- the source term is multiplied by zero -- so the pixel shader's rgb never reaches the
+    // framebuffer, and shading it is work with no possible output. Dropping the option rather than
+    // discarding in the shader is deliberate: a discard would also suppress the DEPTH write, which these
+    // draws still perform and which something downstream may be relying on. This changes what is computed,
+    // not what is written.
+    bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !translucentSurface &&
+                          !invisible && !mRdp->shadow_no_receive;
     // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
     // characters from shadowing each other (or themselves) while still being shadowed by the world.
     bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
