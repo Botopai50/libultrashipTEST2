@@ -415,7 +415,12 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        // Log before the box. The throw below is unhandled and takes the process with it, and the crash
+        // handler records a stack -- which names this line and tells you nothing about WHY the compile
+        // failed. The compiler's own message is the only thing that does, and it was going solely to a
+        // dialog that vanishes with the process. Anyone reading a log afterwards had a crash with no cause.
+        const char* err = error_blob != nullptr ? (const char*)error_blob->GetBufferPointer() : "(no message)";
+        SPDLOG_CRITICAL("Vertex shader failed to compile (id0 {:#x} id1 {:#x}): {}", shader_id0, shader_id1, err);
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
@@ -424,7 +429,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                      error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
+        const char* err = error_blob != nullptr ? (const char*)error_blob->GetBufferPointer() : "(no message)";
+        SPDLOG_CRITICAL("Pixel shader failed to compile (id0 {:#x} id1 {:#x}): {}", shader_id0, shader_id1, err);
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
