@@ -836,8 +836,21 @@ class Interpreter {
     };
     // Triangles per span. The trade is granularity against per-cascade test count and draw-call count: too
     // large and every span straddles the cascade so nothing is culled, too small and the boxes stop being
-    // worth the calls that test them. 512 puts a typical room in the low tens of spans.
-    static constexpr size_t kShadowChunkTriangles = 512;
+    // worth the calls that test them.
+    //
+    // 128 rather than the 512 this started at. A span's box is the union of everything in it, so a coarse
+    // span reaches across the room and overlaps the near cascade even when only a few of its triangles do --
+    // and the near cascade is the one with the most to gain, since it covers a hundred-odd units of a mesh
+    // that spans thousands. Quartering the span quarters that over-reach, and it costs almost nothing at the
+    // other end: the tests are a handful of multiplies each, and surviving spans are merged back into runs
+    // before they are drawn, so four times the spans does NOT mean four times the draw calls -- geometry
+    // arrives in submission order, which is spatially coherent, so the survivors stay in a few long runs.
+    static constexpr size_t kShadowChunkTriangles = 128;
+    // How much rejected geometry is worth drawing to avoid splitting one draw call into two. This is what
+    // decouples the span size from the draw-call count -- see the bridging loop in RenderShadowMap. Sized at
+    // two spans: enough to swallow the isolated rejections that fragment a run, small enough that a genuinely
+    // large rejected region still ends the draw.
+    static constexpr size_t kShadowChunkBridgeTriangles = 2 * kShadowChunkTriangles;
     std::vector<ShadowCasterChunk> mShadowWorldChunks;
     void BuildShadowWorldChunks();
 

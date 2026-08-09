@@ -3448,35 +3448,49 @@ void Interpreter::RenderShadowMap() {
     //
     // Computed before the early exits below so that every SetShadowMapParams path -- including the ones that
     // report no cascades -- carries a box matching the frame it belongs to.
+    //
+    // The same two boxes then cull those lists per cascade further down. Neither list is chunked the way the
+    // cached room mesh is -- both are small and rebuilt every frame, so one box each is the right granularity
+    // -- but until now neither was tested at all, and both were re-submitted into all four cascades.
+    //
+    // Sentinel is the one the backend starts from (see GfxRenderingAPI::mShadowActorBoundsMin): large enough
+    // that no world coordinate reaches it, small enough that the shader's own margin cannot flip the
+    // comparison or overflow the arithmetic it feeds. An empty list keeps it and fails every test.
+    float actorMin[3] = { 1e30f, 1e30f, 1e30f };
+    float actorMax[3] = { -1e30f, -1e30f, -1e30f };
+    float sceneryMin[3] = { 1e30f, 1e30f, 1e30f };
+    float sceneryMax[3] = { -1e30f, -1e30f, -1e30f };
     {
-        // Same sentinel the backend starts from (see GfxRenderingAPI::mShadowActorBoundsMin): large enough
-        // that no world coordinate reaches it, small enough that the shader's own margin cannot flip the
-        // comparison or overflow the arithmetic it feeds.
-        float actorMin[3] = { 1e30f, 1e30f, 1e30f };
-        float actorMax[3] = { -1e30f, -1e30f, -1e30f };
-        const std::vector<float>& actorTris = mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS];
-        for (size_t i = 0; i + 2 < actorTris.size(); i += 3) {
-            for (int a = 0; a < 3; a++) {
-                actorMin[a] = std::min(actorMin[a], actorTris[i + a]);
-                actorMax[a] = std::max(actorMax[a], actorTris[i + a]);
+        auto growBox = [](const std::vector<float>& verts, size_t stride, float* boxMin, float* boxMax) {
+            for (size_t i = 0; i + 2 < verts.size(); i += stride) {
+                for (int a = 0; a < 3; a++) {
+                    boxMin[a] = std::min(boxMin[a], verts[i + a]);
+                    boxMax[a] = std::max(boxMax[a], verts[i + a]);
+                }
             }
-        }
-        // The cutout ranges already measured themselves as they were captured, so their boxes just get
-        // unioned in. Ranges whose texture has since been evicted are included even though the pass will skip
-        // them: over-covering only costs a kernel that could have been skipped, while under-covering would
-        // drop a shadow.
+        };
+        growBox(mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS], 3, actorMin, actorMax);
+        growBox(mShadowSceneryReady, 3, sceneryMin, sceneryMax);
+
+        // The box the SHADER is given also has to cover the layer's cutout casters, which the per-cascade
+        // draw cull does not: the cutout ranges carry their own boxes and are tested one by one already. So
+        // the union is built here and the opaque box above is left alone for the draws to use.
+        //
+        // Those ranges measured themselves as they were captured. Ones whose texture has since been evicted
+        // are included even though the pass will skip them: over-covering only costs a kernel that could have
+        // been skipped, while under-covering would drop a shadow.
+        float shaderMin[3] = { actorMin[0], actorMin[1], actorMin[2] };
+        float shaderMax[3] = { actorMax[0], actorMax[1], actorMax[2] };
         for (const ShadowAlphaRange& r : mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].ranges) {
             if (r.vertexCount < 3) {
                 continue;
             }
             for (int a = 0; a < 3; a++) {
-                actorMin[a] = std::min(actorMin[a], r.min[a]);
-                actorMax[a] = std::max(actorMax[a], r.max[a]);
+                shaderMin[a] = std::min(shaderMin[a], r.min[a]);
+                shaderMax[a] = std::max(shaderMax[a], r.max[a]);
             }
         }
-        // Left inverted when the layer is empty, which is a box every test fails -- so "no characters this
-        // frame" needs no flag of its own.
-        mRapi->SetShadowMapActorBounds(actorMin, actorMax);
+        mRapi->SetShadowMapActorBounds(shaderMin, shaderMax);
     }
 
     // Refreshed here rather than read per triangle: the cutout pipeline is built lazily inside
@@ -3729,14 +3743,24 @@ void Interpreter::RenderShadowMap() {
     // rejected only when the whole box sits off one side. Erring towards keeping a span is harmless; erring
     // the other way would drop a caster, so nothing here may be tightened into an exact test.
     //
-    // ONLY the two lateral axes are tested, never depth. The depth pass runs with depth clipping disabled on
-    // purpose -- a caster above the cascade's slice still has to occlude, and clipping it away is exactly the
-    // shadow the slice exists to record. The lateral test carries no such caveat: the rasterizer discards
-    // anything outside the viewport whatever its depth, so a span entirely off to one side contributes
-    // nothing and skipping it changes no pixel.
+    // The two lateral axes are tested on BOTH sides: the rasterizer discards anything outside the viewport
+    // whatever its depth, so a span entirely off to one side contributes nothing and skipping it changes no
+    // pixel.
+    //
+    // The depth axis is tested on ONE side only, and the asymmetry is not an oversight.
+    //   NEAR side (in front of the cascade, towards the light): never tested. The depth pass runs with depth
+    //     clipping disabled on purpose -- a caster above the cascade's slice still has to occlude, and
+    //     clipping it away is exactly the shadow the slice exists to record.
+    //   FAR side (past the cascade's far plane, away from the light): safe to reject, and free, since the
+    //     projection of the box onto that axis is already being computed. The viewport clamps such a span to
+    //     depth 1.0, the depth test is LESS, and the slice was cleared to 1.0 -- so it fails the test and
+    //     writes nothing. The texel keeps the clear value either way, and every receiver the cascade covers
+    //     has ndc z <= 1.0, which reads as lit against it. Drawing the span and skipping it therefore leave
+    //     the map bit-identical.
     //
     // The matrix is row-vector (world * M), so the x column is m[0], m[4], m[8] and the translation m[12].
-    // w is exactly 1 -- the projection is orthographic by construction -- so clip xy IS ndc xy.
+    // w is exactly 1 -- the projection is orthographic by construction -- so clip xyz IS ndc xyz. Depth runs
+    // 0 to 1 (the matrix is built for that convention directly, above), the lateral axes -1 to 1.
     auto boxVisible = [](const float* bmin, const float* bmax, const float* m) {
         const float cx = (bmin[0] + bmax[0]) * 0.5f;
         const float cy = (bmin[1] + bmax[1]) * 0.5f;
@@ -3744,11 +3768,14 @@ void Interpreter::RenderShadowMap() {
         const float hx = (bmax[0] - bmin[0]) * 0.5f;
         const float hy = (bmax[1] - bmin[1]) * 0.5f;
         const float hz = (bmax[2] - bmin[2]) * 0.5f;
-        for (int axis = 0; axis < 2; axis++) {
+        for (int axis = 0; axis < 3; axis++) {
             const float a0 = m[0 + axis], a1 = m[4 + axis], a2 = m[8 + axis];
             const float centre = (cx * a0) + (cy * a1) + (cz * a2) + m[12 + axis];
             const float radius = (hx * std::fabs(a0)) + (hy * std::fabs(a1)) + (hz * std::fabs(a2));
-            if (centre - radius > 1.0f || centre + radius < -1.0f) {
+            if (centre - radius > 1.0f) {
+                return false;
+            }
+            if (axis < 2 && centre + radius < -1.0f) {
                 return false;
             }
         }
@@ -3780,29 +3807,51 @@ void Interpreter::RenderShadowMap() {
                     // Adjacent surviving spans are merged into one draw, so a cascade that keeps everything
                     // still issues exactly one call -- the cull can cost draw calls only where it is also
                     // saving whole spans of geometry.
+                    //
+                    // Short rejected runs are BRIDGED rather than split around, which is what makes a fine
+                    // span size safe. Splitting on every rejection ties the draw-call count to how finely the
+                    // spans interleave, and a mesh whose submission order alternates across the cascade edge
+                    // would pay one call per span -- trading a rasterisation saving for a more expensive CPU
+                    // one. A draw call costs far more than pushing a couple of hundred extra triangles
+                    // through a pass with no pixel shader, so a gap smaller than that is simply drawn.
+                    // Drawing it is always correct: the spans are contiguous in the buffer, and a rejected
+                    // span was only ever rejected as an optimisation.
                     const float* m = &matrices[c * 16];
-                    size_t runFirst = 0, runCount = 0;
+                    size_t runFirst = 0, runCount = 0, gapCount = 0;
                     for (const ShadowCasterChunk& ch : mShadowWorldChunks) {
                         if (boxVisible(ch.min, ch.max, m)) {
                             if (runCount == 0) {
                                 runFirst = ch.firstVertex;
+                                gapCount = 0; // nothing to bridge back to
                             }
-                            runCount += ch.vertexCount;
+                            runCount += gapCount + ch.vertexCount;
+                            gapCount = 0;
                         } else if (runCount != 0) {
-                            mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN,
-                                                        runFirst, runCount);
-                            runCount = 0;
+                            gapCount += ch.vertexCount;
+                            if (gapCount > kShadowChunkBridgeTriangles * 3) {
+                                mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN,
+                                                            runFirst, runCount);
+                                runCount = 0;
+                                gapCount = 0;
+                            }
                         }
                     }
                     if (runCount != 0) {
                         mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst,
                                                     runCount);
                     }
-                } else {
+                } else if (l == SHADOW_MAP_LAYER_WORLD || boxVisible(actorMin, actorMax, &matrices[c * 16])) {
+                    // The actor list gets one box for the whole layer rather than spans: it holds the
+                    // characters, which stand together, so cutting it up would only add tests. A cascade the
+                    // characters are nowhere near now issues no draw at all instead of re-transforming every
+                    // one of them to have the viewport throw them away.
                     mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN);
                 }
             }
-            if (sceneryHere && mShadowSceneryReady.size() >= 9) {
+            // Scenery actors are per-frame and uncached, and were going into all four cascades untested. Same
+            // one-box treatment as the characters above.
+            if (sceneryHere && mShadowSceneryReady.size() >= 9 &&
+                boxVisible(sceneryMin, sceneryMax, &matrices[c * 16])) {
                 mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,
                                             SHADOW_MAP_CASTER_SLOT_SCENERY);
             }
