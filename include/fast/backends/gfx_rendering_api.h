@@ -140,6 +140,14 @@ class GfxRenderingAPI {
     virtual void PrewarmShaderVariants(uint32_t extraOptionBits) {
     }
 
+    // Whether a PrewarmShaderVariants call is still working. The application uses it to hold the option OFF
+    // until its shaders exist, so that turning one on costs a moment of the feature arriving late instead of
+    // a frozen frame per material. Always false where prewarming is synchronous or absent, which keeps the
+    // old behaviour exactly.
+    virtual bool ShaderPrewarmInProgress() {
+        return false;
+    }
+
     // Whether this backend can render the depth pass. Checked once per frame by the application.
     virtual bool SupportsShadowMap() {
         return false;

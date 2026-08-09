@@ -465,10 +465,16 @@ class Interpreter {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
-        if (enabled && !mShadowMapEnabled && mRapi != nullptr) {
+        if (enabled && !mShadowMapRequested && mRapi != nullptr) {
             mRapi->PrewarmShaderVariants((uint32_t)SHADER_OPT(SHADOW_MAP));
         }
-        mShadowMapEnabled = enabled;
+        mShadowMapRequested = enabled;
+        // Held off until the variants it needs exist. Without this the prewarm would be racing the draws it
+        // is meant to get ahead of, and every material that arrived first would compile inside its frame
+        // anyway -- the freeze this exists to remove. What it costs instead is the shadows appearing a
+        // moment after the switch, which is a wait the player can watch rather than one that stops the
+        // picture. Nothing downstream needs to know: this is the same state as the mode being off.
+        mShadowMapEnabled = enabled && (mRapi == nullptr || !mRapi->ShaderPrewarmInProgress());
         mShadowMapCascadeCount = cascadeCount < 1                       ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                           : cascadeCount;
@@ -844,7 +850,8 @@ class Interpreter {
     // per frame would be worth avoiding.
     uint64_t mShadowWorldCacheGeneration = 0;
     bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
-    bool mShadowMapEnabled = false;            // app-pushed: shadow-map mode selected AND backend capable
+    bool mShadowMapEnabled = false;   // app-pushed AND its shaders are ready
+    bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,

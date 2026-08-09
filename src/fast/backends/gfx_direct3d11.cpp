@@ -53,6 +53,9 @@ using namespace Microsoft::WRL; // For ComPtr
 namespace Fast {
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    // Before anything else: the prewarm threads read a member of this object, so none may still be running.
+    JoinPrewarm();
+
 }
 
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
@@ -559,23 +562,30 @@ void GfxRenderingAPIDX11::PrewarmShaderVariants(uint32_t extraOptionBits) {
         return;
     }
 
-    std::atomic<size_t> next{ 0 };
-    std::atomic<uint32_t> compiled{ 0 };
-    auto work = [this, &sources, &next, &compiled]() {
+    // Held on the object rather than on the stack: the threads outlive this call now, and what they read
+    // has to outlive them. Any previous batch is finished first, so there is only ever one live set.
+    JoinPrewarm();
+    mPrewarmSources = std::move(sources);
+    mPrewarmNext.store(0);
+    mPrewarmRemaining.store((uint32_t)mPrewarmSources.size());
+
+    auto work = [this]() {
         for (;;) {
-            const size_t i = next.fetch_add(1);
-            if (i >= sources.size()) {
+            const size_t i = mPrewarmNext.fetch_add(1);
+            if (i >= mPrewarmSources.size()) {
                 return;
             }
-            const std::string& src = sources[i];
+            const std::string& src = mPrewarmSources[i];
             const uint64_t hashA = ShaderHash(src.data(), src.size(), 0xCBF29CE484222325ull ^ kShaderCompileFlags);
             const uint64_t hashB = ShaderHash(src.data(), src.size(), 0x9E3779B97F4A7C15ull ^ kShaderCompileFlags);
             const std::string path = ShaderCachePath(hashA, hashB);
             if (path.empty()) {
+                mPrewarmRemaining.fetch_sub(1);
                 continue;
             }
             std::vector<uint8_t> haveVs, havePs;
             if (ShaderCacheLoad(path, hashA, hashB, src.size(), haveVs, havePs)) {
+                mPrewarmRemaining.fetch_sub(1);
                 continue; // a previous run already paid for this one
             }
             ComPtr<ID3DBlob> vs, ps, err;
@@ -585,28 +595,51 @@ void GfxRenderingAPIDX11::PrewarmShaderVariants(uint32_t extraOptionBits) {
                                    kShaderCompileFlags, 0, ps.GetAddressOf(), err.GetAddressOf()))) {
                 // Left for the on-demand path, which reports it properly and takes the process down. Warming
                 // must not be where a broken shader is discovered, and must never be where it is hidden.
+                mPrewarmRemaining.fetch_sub(1);
                 continue;
             }
             ShaderCacheStore(path, hashA, hashB, src.size(), vs->GetBufferPointer(), vs->GetBufferSize(),
                              ps->GetBufferPointer(), ps->GetBufferSize());
-            compiled.fetch_add(1);
+            mPrewarmRemaining.fetch_sub(1);
         }
     };
 
     unsigned int threads = std::thread::hardware_concurrency();
     threads = threads == 0 ? 2u : (threads > 8u ? 8u : threads);
-    threads = (unsigned int)std::min<size_t>(threads, sources.size());
+    threads = (unsigned int)std::min<size_t>(threads, mPrewarmSources.size());
 
-    std::vector<std::thread> pool;
-    pool.reserve(threads - 1);
-    for (unsigned int t = 1; t < threads; t++) {
-        pool.emplace_back(work);
+    // Started and left running. The calling thread does NOT take a share any more -- it is the frame, and
+    // the whole point is to give it back. The application holds the option off until these finish, so what
+    // used to be a frozen frame per material is now the feature arriving a moment late.
+    mPrewarmThreads.reserve(threads);
+    for (unsigned int t = 0; t < threads; t++) {
+        mPrewarmThreads.emplace_back(work);
     }
-    work();
-    for (std::thread& t : pool) {
-        t.join();
+    SPDLOG_INFO("Shader prewarm: {} variants queued on {} threads", mPrewarmSources.size(), threads);
+}
+
+bool GfxRenderingAPIDX11::ShaderPrewarmInProgress() {
+    if (mPrewarmThreads.empty()) {
+        return false;
     }
-    SPDLOG_INFO("Shader prewarm: {} of {} variants compiled on {} threads", compiled.load(), sources.size(), threads);
+    if (mPrewarmRemaining.load() != 0) {
+        return true;
+    }
+    // The work is done; collect the threads so the next batch starts from a clean slate.
+    JoinPrewarm();
+    return false;
+}
+
+// Joining is the only thing that has to be right about these threads: they read mPrewarmSources, which
+// belongs to this object, so none of them may still be running when it goes away. Called before starting a
+// batch, when one finishes, and from the destructor.
+void GfxRenderingAPIDX11::JoinPrewarm() {
+    for (std::thread& t : mPrewarmThreads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    mPrewarmThreads.clear();
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint32_t shader_id1) {

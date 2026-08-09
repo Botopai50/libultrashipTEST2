@@ -9,6 +9,9 @@
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
+#include <thread>
+#include <atomic>
+#include <vector>
 
 namespace Fast {
 
@@ -151,6 +154,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // SOH [Enhancement] Cascaded shadow maps (see fast/shadow_map.h). This is the only backend that
     // implements the depth pass.
     void PrewarmShaderVariants(uint32_t extraOptionBits) override;
+    bool ShaderPrewarmInProgress() override;
     bool SupportsShadowMap() override;
     bool ShadowMapConfigure(int cascadeCount, int resolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
@@ -218,6 +222,15 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // cache is only ever swapped wholesale when it is genuinely rebuilt.
     const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    // SOH [Enhancement] Background shader prewarm. The threads compile into the on-disk cache and touch
+    // nothing else -- no device objects, no shader pool -- so the only thing that has to be got right is that
+    // they are finished before this object is. Joined in the destructor.
+    std::vector<std::thread> mPrewarmThreads;
+    std::vector<std::string> mPrewarmSources;
+    std::atomic<size_t> mPrewarmNext{ 0 };
+    std::atomic<uint32_t> mPrewarmRemaining{ 0 };
+    void JoinPrewarm();
+
     int mShadowCurrentLayer = 0; // layer named by the most recent ShadowMapBeginCascade
     int mShadowCurrentSlice = -1; // slice it opened, so a failed upload can drop that slice's record
     // What each slice was last filled with, so a slice whose casters and matrix are both unchanged is left
