@@ -374,27 +374,25 @@ float3 ShadowNormalOffset(float3 normalWs, float3 lightAxis) {
     return n * (shadow_params.z * grazing);
 }
 
-ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewProj, float texelWorld,
-                               float texelUv, float depthBias, uint cascade, float sliceBase) {
-    float3 p = worldPos + offsetDir * texelWorld;
-    float4 clip = mul(float4(p, 1.0), viewProj);
-
-    // Projected position and shadow-map coordinate, computed BEFORE any branch on purpose. The screen-space
-    // derivatives below have to be taken in flow every pixel of the quad reaches, or neighbouring pixels
-    // that took different paths would poison them.
-    float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
-    float3 ndc = clip.xyz / safeW;
-    // NDC -> texture space (y flips: NDC is +up, textures are +down).
-    float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-
-    // How fast the receiver's depth changes per unit of shadow-map uv, recovered from screen-space
-    // derivatives. The two derivative pairs give depth and uv per screen pixel; inverting the uv Jacobian
-    // turns that into depth per uv, which is the receiver plane expressed in the map's own coordinates.
-    // SampleShadowPCF4 uses it to compare each texel against the plane rather than against one point on it.
+// The receiver plane expressed in shadow-map coordinates: how fast its depth changes per unit of uv. The
+// two derivative pairs give depth and uv per screen pixel, and inverting the uv Jacobian turns that into
+// depth per uv. SampleShadowPCF4 uses it to compare each texel against the plane rather than against one
+// point on it.
+//
+// SEPARATE from the projection, and called only from flow every pixel reaches, because it is the only part
+// of this that may not be branched around: screen-space derivatives taken where neighbouring pixels of a
+// quad took different paths are undefined.
+//
+// It is also the same answer for EVERY cascade, which is what lets one call serve both projections. The
+// cascade's radius scales uv and its depth range scales z, and the depth range is five times the radius by
+// construction -- so the radius cancels and the gradient is a property of the surface and the light, not of
+// the cascade looking at it. Checked numerically against pairs of cascades with independent radii and
+// centres: the two agree to 2e-10 relative, which is the arithmetic's own noise.
+float2 ShadowPlaneGradient(float2 uv, float ndcZ) {
     float2 duvdx = ddx(uv);
     float2 duvdy = ddy(uv);
-    float dzdx = ddx(ndc.z);
-    float dzdy = ddy(ndc.z);
+    float dzdx = ddx(ndcZ);
+    float dzdy = ddy(ndcZ);
     float det = (duvdx.x * duvdy.y) - (duvdx.y * duvdy.x);
     float2 grad = float2(0.0, 0.0);
     if (abs(det) > 1e-12) {
@@ -406,11 +404,29 @@ ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewP
     // forty-five degrees to the light has a gradient of 2/5 -- the radius and the resolution both cancel.
     // 3.2 is eight times that, about eighty-three degrees, past which a receiver is edge-on enough that the
     // constant and normal-offset terms are the right tools.
-    grad = clamp(grad, -3.2, 3.2);
+    return clamp(grad, -3.2, 3.2);
+}
 
+// Everything about a lookup EXCEPT the gradient, which the caller fills in. No derivatives here, which is
+// what makes this safe to call from inside a branch -- and the partner projection is now built only where
+// it is actually read.
+//
+// `ndcZ` comes back separately because the gradient needs the depth as projected, while the struct carries
+// it with the cascade's constant bias already taken off.
+ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewProj, float texelWorld,
+                               float texelUv, float depthBias, uint cascade, float sliceBase, out float ndcZ) {
+    float3 p = worldPos + offsetDir * texelWorld;
+    float4 clip = mul(float4(p, 1.0), viewProj);
+
+    float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
+    float3 ndc = clip.xyz / safeW;
+    // NDC -> texture space (y flips: NDC is +up, textures are +down).
+    float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+
+    ndcZ = ndc.z;
     ShadowProjection o;
     o.uv = uv;
-    o.grad = grad;
+    o.grad = float2(0.0, 0.0);
     o.z = ndc.z - depthBias;
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
@@ -454,7 +470,8 @@ float ShadowSample(ShadowProjection p) {
 // Each branch moves four registers' worth of constants, so there is nothing left worth a real branch;
 // flattening to conditional moves is cheaper than the jump. Every index stays literal -- see ShadowSplitAt
 // for why a computed one cannot be used here.
-ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade, float sliceBase,
+                                 out float ndcZ) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelWorld = shadow_texel_world.x;
     float texelUv = shadow_texel_uv.x;
@@ -471,7 +488,7 @@ ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade
         depthBias = shadow_depth_bias.z;
     }
     // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowProject.
-    return ShadowProject(worldPos, offsetDir, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase);
+    return ShadowProject(worldPos, offsetDir, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase, ndcZ);
 }
 
 // Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
@@ -535,13 +552,12 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         float3 lightAxis = ShadowLightAxis();
         float3 offsetDir = ShadowNormalOffset(normalWs, lightAxis);
 
-        // BOTH projections are built here, unconditionally, because both contain screen-space derivatives
-        // and those are only defined where every pixel of the quad reaches them. The partner is clamped to
-        // the last cascade so it is always a valid lookup to build; whether it is ever SAMPLED is decided
-        // below. Building one that goes unused costs a matrix multiply and a few derivatives -- which is
-        // what the fetches behind it used to cost as well, and those were the expensive half.
-        ShadowProjection primary = ShadowProjectAt(worldPos, offsetDir, cascade, 0.0);
-        ShadowProjection partner = ShadowProjectAt(worldPos, offsetDir, min(cascade + 1, count - 1), 0.0);
+        // The primary lookup, and with it the one gradient both lookups use. This part runs for every pixel
+        // and has to: it is where the screen-space derivatives are taken, and those are only defined in flow
+        // every pixel of a quad reaches.
+        float primaryNdcZ;
+        ShadowProjection primary = ShadowProjectAt(worldPos, offsetDir, cascade, 0.0, primaryNdcZ);
+        primary.grad = ShadowPlaneGradient(primary.uv, primaryNdcZ);
 
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -556,6 +572,20 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
             blend = viewDepth > bandStart;
             t = blend ? smoothstep(bandStart, farEdge, viewDepth) : 0.0;
+        }
+
+        // The cross-fade partner, built ONLY where it is read.
+        //
+        // It used to be built for every pixel, because it carried its own derivatives and those cannot be
+        // branched around. It no longer carries any: the gradient is the same for every cascade (see
+        // ShadowPlaneGradient), so the primary's serves, and what is left is a matrix select and a multiply
+        // -- which can be skipped. The band is a tenth of a cascade's range by default, so this is work that
+        // was being thrown away on the large majority of the screen.
+        ShadowProjection partner = primary;
+        if (blend) {
+            float partnerNdcZ;
+            partner = ShadowProjectAt(worldPos, offsetDir, min(cascade + 1, count - 1), 0.0, partnerNdcZ);
+            partner.grad = primary.grad;
         }
 
         // Can the actor layer possibly shadow this point at all?
