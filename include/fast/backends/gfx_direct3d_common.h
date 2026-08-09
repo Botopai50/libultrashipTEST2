@@ -304,6 +304,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Slices cleared and redrawn since the last log line. The one number that says whether the cascades are
     // staying parked: eight means every slice is rebuilt every frame, which is what this all exists to stop.
     uint32_t mShadowSlicesDrawn = 0;
+    uint32_t mShadowSlicesFrames = 0; // timed frames those slices were spread over
     int mShadowTimerReported = 0; // frames since the last log line
     void ShadowTimerFrameBegin();
     bool ShadowTimerBegin();

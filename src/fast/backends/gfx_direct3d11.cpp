@@ -2179,7 +2179,12 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mShadowPassActive = true;
         ShadowTimerBegin();
     }
-    mShadowSlicesDrawn++; // this one is being cleared and redrawn; see the GPU report
+    if (mShadowTimerFrameOpen) {
+        // Counted only inside a timed frame, and against the frames actually counted. Incrementing it
+        // unconditionally made the first report after the timer was switched on dump however many slices had
+        // piled up while nothing was draining it -- a figure in the hundreds, "out of 8".
+        mShadowSlicesDrawn++;
+    }
     mShadowCurrentLayer = layer;
     mShadowCurrentSlice = slice;
     // Claimed before the draws, and dropped again by any of them that cannot complete (see
@@ -2551,6 +2556,7 @@ void GfxRenderingAPIDX11::ShadowTimerFrameEnd() {
     mContext->End(mShadowTimerDisjoint[i].Get());
     mShadowTimerPending[i] = true;
     mShadowTimerFrameOpen = false;
+    mShadowSlicesFrames++;
     mShadowTimerSlot = (i + 1) % kShadowTimerFrames;
     ShadowTimerCollect();
 }
@@ -2605,8 +2611,10 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
                         "{} of {} timed frames submitted a pass, {:.1f} of {} slices redrawn per frame "
                         "({} cascades x {} layers at {}px)",
                         frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerSamples,
-                        mShadowTimerFrameSamples, mShadowSlicesDrawn / 60.0f, mShadowCascadeCount * SHADOW_MAP_LAYERS,
-                        mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
+                        mShadowTimerFrameSamples,
+                        mShadowSlicesFrames > 0 ? (float)mShadowSlicesDrawn / (float)mShadowSlicesFrames : 0.0f,
+                        mShadowCascadeCount * SHADOW_MAP_LAYERS, mShadowCascadeCount, SHADOW_MAP_LAYERS,
+                        mShadowResolution);
         } else {
             SPDLOG_INFO("Shadow map GPU: no timing collected in the last 60 frames");
         }
@@ -2615,6 +2623,7 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
         mShadowTimerFrameSumMs = 0.0;
         mShadowTimerFrameSamples = 0;
         mShadowSlicesDrawn = 0;
+        mShadowSlicesFrames = 0;
     }
 }
 

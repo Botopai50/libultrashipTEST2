@@ -864,11 +864,16 @@ class Interpreter {
     static constexpr uint32_t kShadowAlphaChunkTriangles = 64;
     static constexpr uint32_t kShadowAlphaBridgeTriangles = 2 * kShadowAlphaChunkTriangles;
     std::vector<ShadowCasterChunk> mShadowWorldChunks;
+    // Same spans for the character layer, rebuilt every frame because that list is. Characters do not stand
+    // together, so one box for the whole layer reached across the map and intersected every cascade -- which
+    // is why every slice was being redrawn even where no character was anywhere near.
+    std::vector<ShadowCasterChunk> mShadowActorChunks;
     // Rebuilds since the last census line. Reported rather than inferred: whether the room mesh is being
     // re-captured every frame or once per room is invisible from the outside and is the difference between
     // the cache working and the cache being pure overhead.
     uint32_t mShadowWorldRebuilds = 0;
     void BuildShadowWorldChunks();
+    static void BuildShadowChunks(const std::vector<float>& verts, std::vector<ShadowCasterChunk>& out);
 
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)

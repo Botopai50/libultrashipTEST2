@@ -1497,14 +1497,20 @@ uint64_t Interpreter::ShadowHashBytes(uint64_t seed, const void* data, size_t by
 // once per frame -- so a single walk of the list here buys a cull test in every cascade of every frame until
 // the room changes.
 void Interpreter::BuildShadowWorldChunks() {
-    mShadowWorldChunks.clear();
-    const std::vector<float>& v = mShadowMapWorldCache;
+    BuildShadowChunks(mShadowMapWorldCache, mShadowWorldChunks);
+}
+
+// Cuts a caster list into fixed spans, each carrying the bounding box of the geometry inside it. Shared by
+// the cached room mesh and the per-frame character list: the two differ in how often they are rebuilt, not
+// in what a span is or what it is for.
+void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<ShadowCasterChunk>& out) {
+    out.clear();
     const size_t total = (v.size() / 9) * 9; // whole triangles only, same rule the draw path uses
     if (total == 0) {
         return;
     }
     const size_t chunkFloats = kShadowChunkTriangles * 9;
-    mShadowWorldChunks.reserve((total + chunkFloats - 1) / chunkFloats);
+    out.reserve((total + chunkFloats - 1) / chunkFloats);
     for (size_t base = 0; base < total; base += chunkFloats) {
         const size_t end = std::min(base + chunkFloats, total);
         ShadowCasterChunk chunk;
@@ -1521,7 +1527,7 @@ void Interpreter::BuildShadowWorldChunks() {
                 chunk.max[a] = std::max(chunk.max[a], p);
             }
         }
-        mShadowWorldChunks.push_back(chunk);
+        out.push_back(chunk);
     }
 }
 
@@ -3483,8 +3489,26 @@ void Interpreter::RenderShadowMap() {
                 }
             }
         };
-        growBox(mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS], 3, actorMin, actorMax);
         growBox(mShadowSceneryReady, 3, sceneryMin, sceneryMax);
+
+        // The character layer gets cut into spans in the same walk that measures it.
+        //
+        // One box for the whole layer was the wrong unit, and measurement said so: the characters in a scene
+        // do not stand together, so their union reached across the map and intersected every cascade -- which
+        // meant the "this slice will be empty" test never once fired and all eight slices were cleared and
+        // redrawn every frame. Per span, a cascade with no character anywhere near it can see that for
+        // itself.
+        //
+        // Rebuilt every frame rather than cached, because unlike the room mesh this list changes every frame
+        // by definition. It is small -- a few thousand triangles against the room's tens of thousands -- and
+        // the walk was already happening to find the box.
+        BuildShadowChunks(mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS], mShadowActorChunks);
+        for (const ShadowCasterChunk& ch : mShadowActorChunks) {
+            for (int a = 0; a < 3; a++) {
+                actorMin[a] = std::min(actorMin[a], ch.min[a]);
+                actorMax[a] = std::max(actorMax[a], ch.max[a]);
+            }
+        }
 
         // The box the SHADER is given also has to cover the layer's cutout casters, which the per-cascade
         // draw cull does not: the cutout ranges carry their own boxes and are tested one by one already. So
@@ -3846,6 +3870,41 @@ void Interpreter::RenderShadowMap() {
         return true;
     };
 
+    // Draws a chunked caster list into the cascade `m`, merging surviving spans into as few calls as
+    // possible. Both the cached room mesh and the per-frame character list go through this.
+    //
+    // Adjacent survivors become one draw, so a cascade that keeps everything still issues exactly one call:
+    // the cull can cost draw calls only where it is also saving whole spans of geometry. And short rejected
+    // runs are BRIDGED rather than split around, which is what makes a fine span size safe -- splitting on
+    // every rejection would tie the draw-call count to how finely the spans interleave, trading a
+    // rasterisation saving for a more expensive CPU one. A draw call costs far more than pushing a couple of
+    // hundred extra triangles through a pass with no pixel shader. Bridging is always correct: the spans are
+    // contiguous in the buffer, and a rejected span was only ever rejected as an optimisation.
+    auto drawChunkedCasters = [this, &boxVisible](const float* verts, size_t vertexCount,
+                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m) {
+        size_t runFirst = 0, runCount = 0, gapCount = 0;
+        for (const ShadowCasterChunk& ch : chunks) {
+            if (boxVisible(ch.min, ch.max, m)) {
+                if (runCount == 0) {
+                    runFirst = ch.firstVertex;
+                    gapCount = 0; // nothing to bridge back to
+                }
+                runCount += gapCount + ch.vertexCount;
+                gapCount = 0;
+            } else if (runCount != 0) {
+                gapCount += ch.vertexCount;
+                if (gapCount > kShadowChunkBridgeTriangles * 3) {
+                    mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+                    runCount = 0;
+                    gapCount = 0;
+                }
+            }
+        }
+        if (runCount != 0) {
+            mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+        }
+    };
+
     // Draws one cutout set into the cascade `m`, merging what survives back into as few calls as possible.
     //
     // Spans are contiguous in the buffer and consecutive ones usually share a texture, so a run of survivors
@@ -3915,7 +3974,10 @@ void Interpreter::RenderShadowMap() {
             // are nowhere near stops paying a full-resolution clear and a pipeline setup every frame.
             uint64_t contentKey = layerContentKeys[l];
             if (l == SHADOW_MAP_LAYER_ACTORS) {
-                bool anything = casters.size() >= 9 && boxVisible(actorMin, actorMax, &matrices[c * 16]);
+                bool anything = false;
+                for (size_t k = 0; !anything && k < mShadowActorChunks.size(); k++) {
+                    anything = boxVisible(mShadowActorChunks[k].min, mShadowActorChunks[k].max, &matrices[c * 16]);
+                }
                 for (size_t r = 0; !anything && r < alpha.ranges.size(); r++) {
                     const ShadowAlphaRange& range = alpha.ranges[r];
                     anything = range.textureId != UINT32_MAX && range.vertexCount >= 3 &&
@@ -3933,48 +3995,12 @@ void Interpreter::RenderShadowMap() {
             }
             if (casters.size() >= 9) {
                 const size_t casterVerts = casters.size() / 3;
-                if (l == SHADOW_MAP_LAYER_WORLD && !mShadowWorldChunks.empty()) {
-                    // Adjacent surviving spans are merged into one draw, so a cascade that keeps everything
-                    // still issues exactly one call -- the cull can cost draw calls only where it is also
-                    // saving whole spans of geometry.
-                    //
-                    // Short rejected runs are BRIDGED rather than split around, which is what makes a fine
-                    // span size safe. Splitting on every rejection ties the draw-call count to how finely the
-                    // spans interleave, and a mesh whose submission order alternates across the cascade edge
-                    // would pay one call per span -- trading a rasterisation saving for a more expensive CPU
-                    // one. A draw call costs far more than pushing a couple of hundred extra triangles
-                    // through a pass with no pixel shader, so a gap smaller than that is simply drawn.
-                    // Drawing it is always correct: the spans are contiguous in the buffer, and a rejected
-                    // span was only ever rejected as an optimisation.
-                    const float* m = &matrices[c * 16];
-                    size_t runFirst = 0, runCount = 0, gapCount = 0;
-                    for (const ShadowCasterChunk& ch : mShadowWorldChunks) {
-                        if (boxVisible(ch.min, ch.max, m)) {
-                            if (runCount == 0) {
-                                runFirst = ch.firstVertex;
-                                gapCount = 0; // nothing to bridge back to
-                            }
-                            runCount += gapCount + ch.vertexCount;
-                            gapCount = 0;
-                        } else if (runCount != 0) {
-                            gapCount += ch.vertexCount;
-                            if (gapCount > kShadowChunkBridgeTriangles * 3) {
-                                mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN,
-                                                            runFirst, runCount);
-                                runCount = 0;
-                                gapCount = 0;
-                            }
-                        }
-                    }
-                    if (runCount != 0) {
-                        mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst,
-                                                    runCount);
-                    }
-                } else if (l == SHADOW_MAP_LAYER_WORLD || boxVisible(actorMin, actorMax, &matrices[c * 16])) {
-                    // The actor list gets one box for the whole layer rather than spans: it holds the
-                    // characters, which stand together, so cutting it up would only add tests. A cascade the
-                    // characters are nowhere near now issues no draw at all instead of re-transforming every
-                    // one of them to have the viewport throw them away.
+                const std::vector<ShadowCasterChunk>& chunks =
+                    (l == SHADOW_MAP_LAYER_WORLD) ? mShadowWorldChunks : mShadowActorChunks;
+                if (!chunks.empty()) {
+                    drawChunkedCasters(casters.data(), casterVerts, chunks, &matrices[c * 16]);
+                } else {
+                    // No spans built for this list, so it goes in whole.
                     mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN);
                 }
             }
