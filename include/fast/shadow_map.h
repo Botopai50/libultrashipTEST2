@@ -18,10 +18,18 @@
 // the application may configure fewer at runtime, never more.
 #define SHADOW_MAP_MAX_CASCADES 4
 
-// How many are actually built unless the application says otherwise. All of them: the split ladder below is
-// absolute distances and the count selects how much of it is used, so lowering the count is not a quality
-// knob -- it shortens the shadowed range and the caster capture reach with it.
-#define SHADOW_MAP_DEFAULT_CASCADES SHADOW_MAP_MAX_CASCADES
+// How many are actually built unless the application says otherwise.
+//
+// Three, not four, and the ladder below is drawn to match so the RANGE is unchanged by that -- the count
+// selects how much of an absolute ladder is used, so shortening it without redrawing the ladder would simply
+// end shadows sooner. Redrawn, it is a straight trade of resolution in the middle distance for two fewer
+// slices, and slices are what the depth pass costs: measured at roughly 0.42 ms each at 4096, against a pass
+// that was 2.3 ms in a field.
+//
+// What it costs is the band from 1500 to 6000 units, which now falls in one cascade instead of two and comes
+// out about twice as coarse. What it does not cost is anything close to the camera: the first two bands are
+// untouched, and they are where a shadow's edge is actually read.
+#define SHADOW_MAP_DEFAULT_CASCADES 3
 
 // Casters are split into two layers, because the four interaction rules cannot be satisfied by one map:
 // scenery must be shadowed by characters, while characters must NOT be shadowed by characters. The same
@@ -101,9 +109,18 @@
 // Note that the last ACTIVE split -- split[cascadeCount - 1], not split 3 -- is also the distance out to
 // which the application captures casters at all. These values are the range; the cascade count selects how
 // much of it is used, so lowering the count shortens the shadowed range with it.
+//
+// Drawn for THREE cascades (see SHADOW_MAP_DEFAULT_CASCADES), so split 2 is the end of the range and split 3
+// goes unused. The middle band is stretched to 1500 to absorb what the retired cascade used to cover: a
+// cascade's radius is dominated by the frustum's lateral spread at its far edge, so the last band is coarse
+// whatever it starts at, and the way to keep the middle distance sharp is to hand more of it to the band
+// before. At 4096 that band's texel is 0.74 world units, against 3.6 in the last one.
+//
+// Raising the count back to four needs split 3 raised past split 2 with it, or the fourth band is handed a
+// range of nothing and costs two slices to draw it.
 #define SHADOW_MAP_DEFAULT_SPLIT_0 150.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_1 500.0f
-#define SHADOW_MAP_DEFAULT_SPLIT_2 2500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_1 1500.0f
+#define SHADOW_MAP_DEFAULT_SPLIT_2 6000.0f
 #define SHADOW_MAP_DEFAULT_SPLIT_3 6000.0f
 
 // Fraction of a cascade's range over which it cross-fades into the next one. The shader samples both
