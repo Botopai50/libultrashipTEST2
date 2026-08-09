@@ -82,24 +82,45 @@
 // SOH [Enhancement] How much larger than the sphere it was fitted to each cascade is built, as a fraction
 // of its radius. This is what lets a cascade stay PARKED across frames.
 //
-// A slice is redrawn only when its matrix changes, and the matrix changes when the cascade moves. Holding
-// it still is exact -- a cascade that still contains the fitted sphere shows every caster and every receiver
+// A slice is redrawn only when its matrix changes, and the matrix changes when the cascade moves. Holding it
+// still is exact -- a cascade that still contains the fitted sphere shows every caster and every receiver
 // the fitted one would -- but it can only be held while there is room to hold it, and the room is exactly
 // this margin. Without it the only slack was whatever the radius quantisation happened to leave, which
 // measured out at 0 to 28 world units against a camera that moves ten per frame: the cascades re-parked
 // every frame and nothing was ever reused.
 //
-// The cost is that the radius sets the texel size, so this widens the penumbra by the same fraction. That
-// is a real change and it is bounded rather than assumed: the kernel is four texels, a texel is 2R/
-// resolution, so the penumbra grows by 4 * 2R * margin / resolution world units -- while a screen pixel at
-// the nearest distance the cascade covers grows in the same proportion, because both scale with distance.
-// At 6%, 1080p and a 60 degree field of view that comes out at 0.55, 0.55 and 0.26 of a SCREEN PIXEL for
-// cascades 1, 2 and 3. Sub-pixel by construction, not by luck.
+// The margin is spent against ROTATION more than against walking, which is what sets these numbers. A
+// cascade is centred at the middle of its band, AHEAD of the camera, so turning swings it: the far band's
+// centre sits 3600 units out, and one degree of turn moves it 63. At six percent that band tolerated seven
+// degrees before re-parking -- less than a flick of the stick -- which is why the pass was still redrawing
+// four of five slices while the camera moved. Measured, not guessed: 3.9 of 5 against a floor of 3.
 //
-// Cascade 0 is deliberately excluded and keeps its exact fit. It covers the ground under the player, where
-// a shadow's contact point is read most closely -- and it is also where the margin buys least, since its
-// radius is small enough that six percent of it is one frame of walking.
+// The cost is that the radius sets the texel size, so this widens the penumbra by the same fraction. Stated
+// as a fraction on purpose, because the absolute number is not the meaningful one: at 4096 over the default
+// three-band ladder, the penumbra is already 18 screen pixels wide at the near edge of the middle band and
+// 11 at the near edge of the far one, so six percent of it is about a pixel and fifteen percent is under
+// three. A soft edge getting six or fifteen percent softer is not a thing an eye picks out; the same
+// fraction quoted in pixels sounds much worse than it looks.
+//
+// (An earlier revision of this comment quoted those as "0.55, 0.55 and 0.26 of a screen pixel, sub-pixel by
+// construction". That arithmetic was done on the FOUR-cascade ladder and was carried over unchecked when the
+// ladder dropped to three. Retiring a cascade makes every remaining band's radius much larger relative to
+// where it starts, and the true figures are the ones above -- roughly four times larger.)
+//
+// The last cascade gets more of it than the others. It is the one rotation hurts most in absolute terms, its
+// texel is already the coarsest by an order of magnitude, and it is the furthest away -- so it has both the
+// most to gain and the least to lose. Cascade 0 gets none at all and keeps its exact fit: it covers the
+// ground under the player, where a shadow's contact point is read most closely, and six percent of its
+// radius is one frame of walking anyway.
 #define SHADOW_MAP_CASCADE_PARK_MARGIN 0.06f
+#define SHADOW_MAP_CASCADE_PARK_MARGIN_FAR 0.15f
+
+// Which margin a given cascade of an active ladder gets. First one exact, last one generous, rest in
+// between. A one-cascade ladder is all "first", so it stays exact.
+#define SHADOW_MAP_PARK_MARGIN_FOR(cascade, count) \
+    ((cascade) == 0                                \
+         ? 0.0f                                    \
+         : ((cascade) + 1 >= (count) ? SHADOW_MAP_CASCADE_PARK_MARGIN_FAR : SHADOW_MAP_CASCADE_PARK_MARGIN))
 
 // How many independent caster lists a single layer may draw. Two, and only the world layer uses the second.
 //

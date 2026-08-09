@@ -3702,8 +3702,9 @@ void Interpreter::RenderShadowMap() {
             // quantisation then rounds that up again; the two stack, and only the margin is guaranteed.
             //
             // Cascade 0 asks for no margin and so is fitted exactly as before -- byte for byte the same
-            // matrices it produced before any of this existed.
-            const float margin = (c > 0) ? SHADOW_MAP_CASCADE_PARK_MARGIN : 0.0f;
+            // matrices it produced before any of this existed. The last one asks for the most, because it is
+            // the one a turn of the camera throws furthest and the one whose texel is already coarsest.
+            const float margin = SHADOW_MAP_PARK_MARGIN_FOR(c, mShadowMapCascadeCount);
             const float target = radius * (1.0f + margin);
             const float step = std::exp2(std::floor(std::log2(target)) - 3.0f);
             const float quantized = std::ceil(target / step) * step;
