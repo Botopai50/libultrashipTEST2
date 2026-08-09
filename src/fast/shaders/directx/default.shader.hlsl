@@ -474,41 +474,61 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, cascade, 0.0);
         ShadowProjection partner = ShadowProjectAt(worldPos, normalWs, min(cascade + 1, count - 1), 0.0);
 
-        lit.x = ShadowSample(primary);
-        // The same projection, read one layer further along the array. Adding the stride to the finished
-        // slice is the same number the second lookup used to build from scratch -- the slice is
-        // sliceBase + cascade either way, and both terms are small exact integers.
-        [branch]
-        if (wantActors) {
-            ShadowProjection actors = primary;
-            actors.slice += layerStride;
-            lit.y = ShadowSample(actors);
-        }
-
         // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
         // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
         // line that sweeps across the ground as the camera moves.
+        bool blend = false;
+        float t = 0.0;
         if (cascade + 1 < count) {
             // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name
             // at runtime where a stray definition would be baffling to debug.
             float farEdge = ShadowSplitAt(cascade);
             float nearEdge = (cascade == 0) ? 0.0 : ShadowSplitAt(cascade - 1);
             float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
-            // [branch] and it now means something: with the derivatives hoisted out, what is left inside is
-            // sixteen fetches and nothing that reads across the quad, so the pixels outside the band -- the
-            // large majority of the screen -- genuinely skip them instead of computing a kernel and then
-            // multiplying it by a weight of zero. The result is unchanged either way: lerp(lit, x, 0) is
-            // exactly lit.
-            [branch]
-            if (viewDepth > bandStart) {
-                float t = smoothstep(bandStart, farEdge, viewDepth);
-                lit.x = lerp(lit.x, ShadowSample(partner), t);
-                [branch]
-                if (wantActors) {
-                    ShadowProjection actorPartner = partner;
-                    actorPartner.slice += layerStride;
-                    lit.y = lerp(lit.y, ShadowSample(actorPartner), t);
-                }
+            blend = viewDepth > bandStart;
+            t = blend ? smoothstep(bandStart, farEdge, viewDepth) : 0.0;
+        }
+
+        // Four lookups at most -- {this cascade, its cross-fade partner} x {world layer, actor layer} --
+        // and they differ in exactly two things: which projection they read and which slice of the array.
+        // So they are one loop rather than four pasted copies of a sixteen-tap kernel.
+        //
+        // [loop] and not [unroll], deliberately, which is the whole point of the shape. Unrolled, the
+        // kernel appears four times in the compiled shader; looped, once. This file is compiled by FXC
+        // INSIDE a frame, the first time each material is drawn, so its size is not an abstraction -- it is
+        // the hitch felt on enabling shadows and on turning the camera into geometry that has not been
+        // drawn yet. The same reasoning already cut the four-arm cascade dispatch down to one selection.
+        //
+        // Nothing here reads across the pixel quad, which is what allows a loop at all: the derivatives are
+        // in ShadowProject, above and outside. And the skips mean a pixel executes exactly the lookups it
+        // executed before -- a character still does not touch the actor layer, and a pixel outside the band
+        // still does not touch the partner.
+        [loop]
+        for (uint i = 0; i < 4; i++) {
+            bool isActor = (i & 1) != 0;
+            bool isPartner = i >= 2;
+            if (isActor && !wantActors) {
+                continue; // a character is never shadowed by the actor layer, itself included
+            }
+            if (isPartner && !blend) {
+                continue; // outside the band the partner is multiplied by zero, so it is not read
+            }
+            // Assigned rather than selected with ?:, which HLSL does not offer over a user-defined struct.
+            ShadowProjection p = primary;
+            if (isPartner) {
+                p = partner;
+            }
+            // One layer further along the array. Adding the stride to the finished slice is the same number
+            // a separate lookup would have built from scratch -- the slice is sliceBase + cascade either
+            // way, and both terms are small exact integers.
+            if (isActor) {
+                p.slice += layerStride;
+            }
+            float s = ShadowSample(p);
+            if (isActor) {
+                lit.y = isPartner ? lerp(lit.y, s, t) : s;
+            } else {
+                lit.x = isPartner ? lerp(lit.x, s, t) : s;
             }
         }
     }
