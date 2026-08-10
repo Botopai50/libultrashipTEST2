@@ -1660,9 +1660,15 @@ bool GfxRenderingAPIDX11::ApplyFxaa(int fb_dst_id, int fb_src_id) {
         return false;
     }
 
-    // The source is about to be read, so it must not still be bound as a target.
-    ID3D11RenderTargetView* null_rtv = nullptr;
-    mContext->OMSetRenderTargets(1, &null_rtv, nullptr);
+    // Whatever is bound now has to come back. The caller binds the screen and clears it BEFORE asking for
+    // this pass -- the filtered texture is then handed to the interface layer, which draws it into that
+    // binding -- so a pass that leaves the target unbound costs the entire frame, not just the filtering.
+    ComPtr<ID3D11RenderTargetView> prev_rtv;
+    ComPtr<ID3D11DepthStencilView> prev_dsv;
+    mContext->OMGetRenderTargets(1, prev_rtv.GetAddressOf(), prev_dsv.GetAddressOf());
+    D3D11_VIEWPORT prev_vp;
+    UINT prev_vp_count = 1;
+    mContext->RSGetViewports(&prev_vp_count, &prev_vp);
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
@@ -1703,7 +1709,11 @@ bool GfxRenderingAPIDX11::ApplyFxaa(int fb_dst_id, int fb_src_id) {
     // runtime drops the binding with a warning.
     ID3D11ShaderResourceView* null_srv = nullptr;
     mContext->PSSetShaderResources(0, 1, &null_srv);
-    mContext->OMSetRenderTargets(1, &null_rtv, nullptr);
+    // Put the caller's target and viewport back, exactly as they were.
+    mContext->OMSetRenderTargets(1, prev_rtv.GetAddressOf(), prev_dsv.Get());
+    if (prev_vp_count > 0) {
+        mContext->RSSetViewports(1, &prev_vp);
+    }
 
     // Everything this touched is set again from scratch by whatever draws next: StartDrawToFramebuffer
     // re-binds the target unconditionally, LoadShader re-binds the shaders and the input layout, and the
