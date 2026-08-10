@@ -76,6 +76,10 @@ struct TextureData {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resource_view;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
+    // The same sampler clamped to the top mip level, for screen-space draws (see SetTextureLodClamp). Built
+    // alongside the other one and only when this texture has a chain, so a draw switching between world and
+    // interface is a bind rather than a state rebuild.
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state_lod0;
     uint32_t width;
     uint32_t height;
     bool linear_filtering;
@@ -127,6 +131,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
+    // Picks between a texture's full and top-level-only samplers for the current draw.
+    const Microsoft::WRL::ComPtr<ID3D11SamplerState>& SamplerFor(uint32_t textureId);
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetZmodeDecal(bool decal) override;
     void SetViewport(int x, int y, int width, int height) override;

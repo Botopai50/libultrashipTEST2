@@ -1016,6 +1016,14 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
                                                     texture_data->resource_view.ReleaseAndGetAddressOf()));
 }
 
+// Which of a texture's two samplers this draw wants: the clamped one for screen-space geometry, the full
+// one otherwise. Falls back to the full sampler whenever the clamped one was not built, which is every
+// texture without a chain -- so nothing that had one sampler before now depends on having two.
+const Microsoft::WRL::ComPtr<ID3D11SamplerState>& GfxRenderingAPIDX11::SamplerFor(uint32_t textureId) {
+    TextureData& t = mTextures[textureId];
+    return (mTextureLodClamped && t.sampler_state_lod0 != nullptr) ? t.sampler_state_lod0 : t.sampler_state;
+}
+
 void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
     D3D11_SAMPLER_DESC sampler_desc;
     ZeroMemory(&sampler_desc, sizeof(D3D11_SAMPLER_DESC));
@@ -1051,8 +1059,18 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     // Maybe that could be skipped? Anyway, make sure to release the first default sampler
     // state before setting the actual one.
     texture_data->sampler_state.Reset();
+    texture_data->sampler_state_lod0.Reset();
 
     ThrowIfFailed(mDevice->CreateSamplerState(&sampler_desc, texture_data->sampler_state.GetAddressOf()));
+
+    // The interface's variant, built only where there is a chain for it to differ from. Same filter and same
+    // addressing -- only the level is pinned to the top and the bias dropped, so a HUD element drawn from a
+    // large texture reads exactly the pixels it read before mipmapping existed.
+    if (mips) {
+        sampler_desc.MaxLOD = 0.0f;
+        sampler_desc.MipLODBias = 0.0f;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sampler_desc, texture_data->sampler_state_lod0.GetAddressOf()));
+    }
 }
 
 void GfxRenderingAPIDX11::SetDepthTestAndMask(bool depth_test, bool depth_mask) {
@@ -1218,12 +1236,12 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                     textures_changed = true;
                 }
 
-                if (mLastSamplerStates[i].Get() != mTextures[mCurrentTextureIds[i]].sampler_state.Get()) {
-                    mLastSamplerStates[i] = mTextures[mCurrentTextureIds[i]].sampler_state.Get();
+                if (mLastSamplerStates[i].Get() != SamplerFor(mCurrentTextureIds[i]).Get()) {
+                    mLastSamplerStates[i] = SamplerFor(mCurrentTextureIds[i]).Get();
                 }
             }
         }
-        mContext->PSSetSamplers(i, 1, mTextures[mCurrentTextureIds[i]].sampler_state.GetAddressOf());
+        mContext->PSSetSamplers(i, 1, SamplerFor(mCurrentTextureIds[i]).GetAddressOf());
     }
 
     // Set per-draw constant buffer

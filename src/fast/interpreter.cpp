@@ -2100,6 +2100,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // instead of naming them one at a time, and it cannot mistake a scene draw for one: a projection with no
     // perspective term has no perspective to lose.
     const bool screenSpaceProjection = std::fabs(mRsp->P_matrix[2][3]) < 1e-6f;
+    // SOH [Enhancement] The interface reads its textures at full size (see SetTextureLodClamp). The same
+    // projection test the shadow receiver uses, and for the same reason: it catches every screen-space draw
+    // at once rather than naming them, and a texrect is only some of them.
+    const int8_t lodClamped = (screenSpaceProjection || is_rect) ? 1 : 0;
+    if (lodClamped != mRenderingState.texture_lod_clamped) {
+        Flush();
+        mRapi->SetTextureLodClamp(lodClamped != 0);
+        mRenderingState.texture_lod_clamped = lodClamped;
+    }
     // Translucent surfaces do not take the shadow either.
     //
     // They are the wrong place to spend it. A see-through surface reads mostly as what is behind it, so

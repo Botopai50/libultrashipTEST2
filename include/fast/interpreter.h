@@ -411,6 +411,11 @@ struct ColorCombiner {
 struct RenderingState {
     uint8_t depth_test_and_mask; // 1: depth test, 2: depth mask
     bool decal_mode;
+    // SOH [Enhancement] Whether the draw is screen-space, in which case its textures are read at full size
+    // however small they are on screen (see SetTextureLodClamp). Zero-initialised with the rest of this
+    // struct, which is the same value the backend's own flag starts at, so the two agree before the first
+    // draw and stay in step from there -- neither is reset per frame.
+    int8_t texture_lod_clamped;
     bool alpha_blend;
     struct XYWidthHeight viewport, scissor;
     struct ShaderProgram* mShaderProgram;

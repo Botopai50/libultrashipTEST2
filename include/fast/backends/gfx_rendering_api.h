@@ -114,6 +114,19 @@ class GfxRenderingAPI {
         return mMipmapEnabled;
     }
 
+    // SOH [Enhancement] Read this draw's textures at full size, ignoring the mip chain.
+    //
+    // For the interface. A HUD element is drawn at a fixed size on screen, and if its texture is larger than
+    // that -- which with a replacement pack it always is -- the GPU sees minification and picks a smaller
+    // level, so the interface would soften as a side effect of a setting meant for the world. The LOD bias
+    // makes that worse on purpose: turned up for frames it would blur every button and heart on screen.
+    //
+    // Clamping to the top level is what the interface had before mipmapping existed, so this is not a
+    // correction applied to the interface -- it is the interface being left alone.
+    virtual void SetTextureLodClamp(bool clamped) {
+        mTextureLodClamped = clamped;
+    }
+
     virtual void SetTextureFilter(FilteringMode mode) = 0;
     virtual FilteringMode GetTextureFilter() = 0;
     virtual void SetSrgbMode() = 0;
@@ -319,6 +332,7 @@ class GfxRenderingAPI {
     // SOH [Enhancement] Mipmapping (see GFX_MIPMAP_MIN_TEXTURE_SIZE). Off until the application asks, so a
     // host that never pushes these keeps exactly the single-level uploads it had before.
     bool mMipmapEnabled = false;
+    bool mTextureLodClamped = false;
     float mMipmapLodBias = 0.0f;
     int mMipmapAnisotropy = 1;
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
