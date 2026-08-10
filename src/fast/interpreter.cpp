@@ -3856,75 +3856,6 @@ void Interpreter::RenderShadowMap() {
         nearDist = farDist;
     }
 
-    // The secondary light's slice. Same orthographic construction as a cascade -- deliberately, since that
-    // is the whole reason this is one slice and not a cube (see SHADOW_MAP_POINT_SLICES) -- but fitted to
-    // the light's own reach instead of a slice of the view, and around its own axes instead of the sun's.
-    //
-    // Nothing here is parked across frames. A cascade holds still because it is fitted to the camera and the
-    // camera mostly turns in place; this is fitted to a lamp that is moving on purpose, and holding it still
-    // would just mean it stopped containing the thing it exists to contain.
-    mShadowPointActive = false;
-    if (mRapi->ShadowMapPointCastsShadow()) {
-        const float* pd = mRapi->ShadowMapPointDir();
-        const float* pc = mRapi->ShadowMapPointCentre();
-        float pz[3] = { pd[0], pd[1], pd[2] };
-        const float pzLen = std::sqrt((pz[0] * pz[0]) + (pz[1] * pz[1]) + (pz[2] * pz[2]));
-        if (pzLen > 1e-6f) {
-            for (int i = 0; i < 3; i++) {
-                pz[i] /= pzLen;
-            }
-            // Any axis not parallel to the light will do for the basis; pick the one it leans on least so the
-            // cross product never collapses.
-            const float up[3] = { std::fabs(pz[1]) > 0.99f ? 1.0f : 0.0f, std::fabs(pz[1]) > 0.99f ? 0.0f : 1.0f,
-                                  0.0f };
-            float px[3] = { up[1] * pz[2] - up[2] * pz[1], up[2] * pz[0] - up[0] * pz[2],
-                            up[0] * pz[1] - up[1] * pz[0] };
-            const float pxLen = std::sqrt((px[0] * px[0]) + (px[1] * px[1]) + (px[2] * px[2]));
-            if (pxLen > 1e-6f) {
-                for (int i = 0; i < 3; i++) {
-                    px[i] /= pxLen;
-                }
-                const float py[3] = { pz[1] * px[2] - pz[2] * px[1], pz[2] * px[0] - pz[0] * px[2],
-                                      pz[0] * px[1] - pz[1] * px[0] };
-                // Fitted past the light's reach, because the slice has to contain the SHADOW and not the
-                // light: a caster just inside the radius throws its shadow well outside it.
-                const float radius = mRapi->ShadowMapPointRadius() * (1.0f + SHADOW_MAP_POINT_SLICE_MARGIN);
-                float center[3] = { pc[0], pc[1], pc[2] };
-                // Snap to whole texels along the light's axes, exactly as the cascades do. The light moves
-                // every frame, so this does not stop the image changing -- but it does stop the depth values
-                // sliding by a fraction of a texel underneath a comparison that is sitting right on the bias.
-                const float texelWorldSize = (2.0f * radius) / (float)mShadowMapResolution;
-                if (texelWorldSize > 0.0f) {
-                    float cx = center[0] * px[0] + center[1] * px[1] + center[2] * px[2];
-                    float cy = center[0] * py[0] + center[1] * py[1] + center[2] * py[2];
-                    float cz = center[0] * pz[0] + center[1] * pz[1] + center[2] * pz[2];
-                    cx = std::floor(cx / texelWorldSize) * texelWorldSize;
-                    cy = std::floor(cy / texelWorldSize) * texelWorldSize;
-                    cz = std::floor(cz / texelWorldSize) * texelWorldSize;
-                    for (int i = 0; i < 3; i++) {
-                        center[i] = px[i] * cx + py[i] * cy + pz[i] * cz;
-                    }
-                }
-                const float back = radius * 3.0f;
-                const float eye[3] = { center[0] - pz[0] * back, center[1] - pz[1] * back,
-                                       center[2] - pz[2] * back };
-                const float zFar = back + radius * 2.0f;
-                float* m = mShadowPointMatrix;
-                const float sx = 1.0f / radius;
-                const float sz = 1.0f / zFar;
-                m[0] = px[0] * sx, m[1] = py[0] * sx, m[2] = pz[0] * sz, m[3] = 0.0f;
-                m[4] = px[1] * sx, m[5] = py[1] * sx, m[6] = pz[1] * sz, m[7] = 0.0f;
-                m[8] = px[2] * sx, m[9] = py[2] * sx, m[10] = pz[2] * sz, m[11] = 0.0f;
-                m[12] = -(eye[0] * px[0] + eye[1] * px[1] + eye[2] * px[2]) * sx;
-                m[13] = -(eye[0] * py[0] + eye[1] * py[1] + eye[2] * py[2]) * sx;
-                m[14] = -(eye[0] * pz[0] + eye[1] * pz[1] + eye[2] * pz[2]) * sz;
-                m[15] = 1.0f;
-                mShadowPointActive = true;
-            }
-        }
-    }
-    mRapi->SetShadowMapPointMatrix(mShadowPointActive ? mShadowPointMatrix : nullptr);
-
     // Render layer by layer, cascades within. Every cascade of a layer draws the same caster list, and the
     // backend skips re-uploading a list it already holds -- but only for consecutive calls. Walking
     // cascade-first alternated between the two layers on every call, so the check never matched and the
@@ -4000,8 +3931,7 @@ void Interpreter::RenderShadowMap() {
     // hundred extra triangles through a pass with no pixel shader. Bridging is always correct: the spans are
     // contiguous in the buffer, and a rejected span was only ever rejected as an optimisation.
     auto drawChunkedCasters = [this, &boxVisible](const float* verts, size_t vertexCount,
-                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m,
-                                                  int slot = SHADOW_MAP_CASTER_SLOT_MAIN) {
+                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m) {
         size_t runFirst = 0, runCount = 0, gapCount = 0;
         for (const ShadowCasterChunk& ch : chunks) {
             if (boxVisible(ch.min, ch.max, m)) {
@@ -4014,14 +3944,14 @@ void Interpreter::RenderShadowMap() {
             } else if (runCount != 0) {
                 gapCount += ch.vertexCount;
                 if (gapCount > kShadowChunkBridgeTriangles * 3) {
-                    mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
+                    mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
                     runCount = 0;
                     gapCount = 0;
                 }
             }
         }
         if (runCount != 0) {
-            mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
+            mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
         }
     };
 
@@ -4145,77 +4075,6 @@ void Interpreter::RenderShadowMap() {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
                                                   mShadowAlphaSceneryReady.VertexCount());
                 drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16]);
-            }
-        }
-    }
-
-    // The secondary light's slice, drawn last. It takes BOTH caster lists rather than one, because it is a
-    // second light rather than a second layer: everything that blocks it blocks it, and the layer split
-    // upstream exists to answer "may a character shadow a character", which is settled here by who SAMPLES
-    // this slice (scenery does, characters do not) and not by what goes into it.
-    if (mShadowPointActive) {
-        // The light reaches a couple of hundred units and the player is usually the only thing inside it, so
-        // the common case by far is a slice with nothing in it at all -- every frame spent outdoors, and every
-        // interior where the player has walked away from the lamp. Declaring that lets the backend keep the
-        // empty map it already holds even though the matrix moved, which is what stops a light that follows
-        // the player from costing a full-resolution clear every frame for nothing.
-        bool anything = false;
-        for (size_t k = 0; !anything && k < mShadowWorldChunks.size(); k++) {
-            anything = boxVisible(mShadowWorldChunks[k].min, mShadowWorldChunks[k].max, mShadowPointMatrix);
-        }
-        for (size_t k = 0; !anything && k < mShadowActorChunks.size(); k++) {
-            anything = boxVisible(mShadowActorChunks[k].min, mShadowActorChunks[k].max, mShadowPointMatrix);
-        }
-        if (!anything && mShadowSceneryReady.size() >= 9) {
-            anything = boxVisible(sceneryMin, sceneryMax, mShadowPointMatrix);
-        }
-        // Both layers' keys fold into one: this slice's image depends on both lists, so it may only be reused
-        // when neither has changed. Mixed rather than added so two lists swapping contents cannot cancel out,
-        // and steered off the reserved empty key, which means something else entirely.
-        uint64_t contentKey = SHADOW_MAP_EMPTY_CONTENT_KEY;
-        if (anything) {
-            contentKey = (layerContentKeys[SHADOW_MAP_LAYER_WORLD] * 0x9E3779B97F4A7C15ull) ^
-                         (layerContentKeys[SHADOW_MAP_LAYER_ACTORS] + 0x165667B19E3779F9ull);
-            if (contentKey == SHADOW_MAP_EMPTY_CONTENT_KEY) {
-                contentKey = 1ull;
-            }
-        }
-        if (mRapi->ShadowMapBeginCascade(SHADOW_MAP_LAYER_POINT, 0, mShadowPointMatrix, contentKey)) {
-            if (mShadowMapWorldCache.size() >= 9) {
-                if (!mShadowWorldChunks.empty()) {
-                    drawChunkedCasters(mShadowMapWorldCache.data(), mShadowMapWorldCache.size() / 3,
-                                       mShadowWorldChunks, mShadowPointMatrix);
-                } else {
-                    mRapi->ShadowMapDrawCasters(mShadowMapWorldCache.data(), mShadowMapWorldCache.size() / 3,
-                                                SHADOW_MAP_CASTER_SLOT_MAIN);
-                }
-            }
-            // Into the ACTORS slot, not MAIN: this slice draws the room mesh as well, and two lists
-            // alternating through one buffer would re-upload both on every frame (see
-            // SHADOW_MAP_CASTER_SLOT_ACTORS).
-            const std::vector<float>& actors = mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS];
-            if (actors.size() >= 9 && !mShadowActorChunks.empty()) {
-                drawChunkedCasters(actors.data(), actors.size() / 3, mShadowActorChunks, mShadowPointMatrix,
-                                   SHADOW_MAP_CASTER_SLOT_ACTORS);
-            }
-            if (mShadowSceneryReady.size() >= 9 && boxVisible(sceneryMin, sceneryMax, mShadowPointMatrix)) {
-                mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,
-                                            SHADOW_MAP_CASTER_SLOT_SCENERY);
-            }
-            if (mShadowAlphaWorldCache.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaWorldCache.verts.data(),
-                                                   mShadowAlphaWorldCache.VertexCount());
-                drawAlphaRanges(mShadowAlphaWorldCache, mShadowPointMatrix);
-            }
-            const ShadowAlphaCasters& actorAlpha = mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS];
-            if (actorAlpha.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(actorAlpha.verts.data(), actorAlpha.VertexCount());
-                drawAlphaRanges(actorAlpha, mShadowPointMatrix);
-            }
-            if (mShadowAlphaSceneryReady.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
-                                                   mShadowAlphaSceneryReady.VertexCount());
-                drawAlphaRanges(mShadowAlphaSceneryReady, mShadowPointMatrix);
             }
         }
     }

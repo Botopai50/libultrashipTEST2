@@ -230,11 +230,6 @@ class GfxRenderingAPI {
         mShadowCascadesActive = cascadeCount < 0 ? 0
                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                          : cascadeCount;
-        // The frame's reset point for the secondary light's slice. It is raised again only if the interpreter
-        // actually fits one this frame (SetShadowMapPointMatrix), so any path that skips the depth pass --
-        // an early exit, a frame with no casters, the shadow map being switched off -- leaves it down and the
-        // receiver stops sampling a slice that is no longer being maintained.
-        mShadowPointActive = false;
         if (viewProj != nullptr) {
             for (int i = 0; i < mShadowCascadesActive * 16; i++) {
                 mShadowViewProj[i] = viewProj[i];
@@ -293,55 +288,6 @@ class GfxRenderingAPI {
         mShadowSlopeBias = slopeBias;
     }
 
-    // SOH [Enhancement] The frame's SECONDARY light -- a point light near the player that is not the light
-    // the cascades were built from (see SHADOW_MAP_POINT_SLICES). Pushed once a frame; radius <= 0 or both
-    // strengths at zero means "there isn't one", which is the state most frames outdoors are in.
-    //
-    // centre is where the light is, in world space, and radius is how far it reaches; together they are the
-    // falloff the shader applies. dir is the direction its light TRAVELS -- taken from the light toward
-    // whatever it is lighting, and with the same elevation floor the main key gets, so a light at floor level
-    // does not throw a shadow to the horizon. The application decides all of that, because which light this
-    // is and how it should be aimed is game policy; this only draws it.
-    virtual void SetShadowMapPointLight(const float centre[3], const float dir[3], float radius, float brighten,
-                                        float shadowStrength) {
-        for (int i = 0; i < 3; i++) {
-            mShadowPointCentre[i] = centre[i];
-            mShadowPointDir[i] = dir[i];
-        }
-        mShadowPointRadius = radius;
-        mShadowPointBrighten = brighten;
-        mShadowPointShadow = shadowStrength;
-    }
-
-    // Is the extra slice worth building this frame? Both the interpreter (which decides whether to fit and
-    // draw it) and the backend (which decides whether to upload its matrix) ask, so the rule lives once.
-    // Brightening alone does not need it -- that half is pure arithmetic on the receiver.
-    bool ShadowMapPointCastsShadow() const {
-        return mShadowPointRadius > 0.0f && mShadowPointShadow > 0.0f;
-    }
-    const float* ShadowMapPointCentre() const {
-        return mShadowPointCentre;
-    }
-    const float* ShadowMapPointDir() const {
-        return mShadowPointDir;
-    }
-    float ShadowMapPointRadius() const {
-        return mShadowPointRadius;
-    }
-
-    // The interpreter hands back the transform it fitted for that light, or null when it did not fit one --
-    // which is the same thing the shader needs to hear, since a receiver must not project into a slice that
-    // was never drawn. Kept separate from SetShadowMapPointLight because the two are pushed from opposite
-    // sides: the application supplies the light, the interpreter supplies the projection built from it.
-    virtual void SetShadowMapPointMatrix(const float lightViewProj[16]) {
-        mShadowPointActive = lightViewProj != nullptr;
-        if (mShadowPointActive) {
-            for (int i = 0; i < 16; i++) {
-                mShadowPointViewProj[i] = lightViewProj[i];
-            }
-        }
-    }
-
   protected:
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
@@ -375,15 +321,6 @@ class GfxRenderingAPI {
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
-    // The secondary point light. Radius zero until a frame says otherwise, which reads as "there is no second
-    // light" everywhere it is tested and costs nothing.
-    float mShadowPointCentre[3] = {};
-    float mShadowPointDir[3] = { 0.0f, -1.0f, 0.0f };
-    float mShadowPointRadius = 0.0f;
-    float mShadowPointBrighten = 0.0f;
-    float mShadowPointShadow = 0.0f;
-    float mShadowPointViewProj[16] = {};
-    bool mShadowPointActive = false;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
