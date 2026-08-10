@@ -131,6 +131,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
+    bool ApplyFxaa(int fbIdDst, int fbIdSrc) override;
+    // Builds the FXAA pipeline on first use and answers whether it is usable. Compiled here rather than with
+    // the combiner shaders because it shares nothing with them: no prism options, one variant forever.
+    bool EnsureFxaaPipeline();
     // Picks between a texture's full and top-level-only samplers for the current draw.
     const Microsoft::WRL::ComPtr<ID3D11SamplerState>& SamplerFor(uint32_t textureId);
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
@@ -181,6 +185,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float normalOffset, float strength, float filterWidth, float debugMode,
                             float edgeHardness, float edgeHardnessFar) override;
+
+    // SOH [Enhancement] FXAA post-process pass. Null until first used; mFxaaFailed latches a compile or
+    // creation failure so a broken pipeline is attempted once and not once per frame.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mFxaaVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mFxaaPs;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mFxaaSampler;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mFxaaCb;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mFxaaDepthStencilState;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mFxaaBlendState;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mFxaaRasterizerState;
+    bool mFxaaFailed = false;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;

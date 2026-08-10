@@ -133,6 +133,86 @@ bool sShadowGather = false;
 // Both halves are asked. The compiler settles whether the intrinsic exists at this profile;
 // CreatePixelShader settles whether the driver accepts the bytecode it produced. Either one saying no drops
 // the session to the 4.0 kernel, which draws exactly the same picture out of four times the fetches.
+// SOH [Enhancement] FXAA -- an alternative to MSAA that works on the finished image instead of on geometry.
+//
+// The two are not variations of one setting; they attack different things and cost differently. MSAA takes
+// several depth/coverage samples per pixel along POLYGON EDGES, so it costs in proportion to the geometry
+// and to the render target's size -- at 4x it is four times the depth work and four times the colour
+// bandwidth -- and it does nothing at all for an edge that is inside a texture rather than between two
+// triangles. FXAA is one full-screen pass over the finished frame that finds high-contrast edges and blurs
+// ALONG them, so it costs a fixed few milliseconds regardless of scene complexity, catches texture and alpha
+// edges MSAA cannot see, and softens the image slightly because it cannot tell a real edge from a drawn one.
+//
+// Kept as a source string here rather than in the shader template because it shares nothing with it: no
+// combiner, no prism options, one variant forever.
+static const char kFxaaShader[] = R"HLSL(
+Texture2D t_src : register(t0);
+SamplerState s_src : register(s0);
+
+cbuffer FxaaCB : register(b0) {
+    float2 rcp_frame; // 1 / render target size, in pixels
+    float2 fxaa_pad;
+};
+
+struct VOut {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+// One oversized triangle covering the screen, built from the vertex id, so the pass needs no vertex buffer
+// and no input layout at all.
+VOut VSMain(uint id : SV_VertexID) {
+    VOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4((uv * float2(2.0, -2.0)) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+float FxaaLuma(float3 c) {
+    return dot(c, float3(0.299, 0.587, 0.114));
+}
+
+float4 PSMain(VOut i) : SV_TARGET {
+    float3 rgbM = t_src.Sample(s_src, i.uv).rgb;
+    float lumaM = FxaaLuma(rgbM);
+    float lumaNW = FxaaLuma(t_src.Sample(s_src, i.uv + (float2(-1.0, -1.0) * rcp_frame)).rgb);
+    float lumaNE = FxaaLuma(t_src.Sample(s_src, i.uv + (float2( 1.0, -1.0) * rcp_frame)).rgb);
+    float lumaSW = FxaaLuma(t_src.Sample(s_src, i.uv + (float2(-1.0,  1.0) * rcp_frame)).rgb);
+    float lumaSE = FxaaLuma(t_src.Sample(s_src, i.uv + (float2( 1.0,  1.0) * rcp_frame)).rgb);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    float range = lumaMax - lumaMin;
+
+    // Flat neighbourhood: leave it exactly as it was. This early-out is most of why the pass is cheap, and
+    // it is also what keeps large areas of flat colour from being touched at all.
+    if (range < max(1.0 / 16.0, lumaMax * (1.0 / 8.0))) {
+        return float4(rgbM, 1.0);
+    }
+
+    // The edge's direction, as the gradient of luma across the four corners, turned ninety degrees.
+    float2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    // Damp the direction where the whole neighbourhood is dark: luma differences there are small in absolute
+    // terms but large in ratio, and without this they steer the blur wildly.
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * (1.0 / 8.0), 1.0 / 128.0);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, -8.0, 8.0) * rcp_frame;
+
+    // Two taps inside the edge, then two further out. If the wider pair strays outside the luma range the
+    // neighbourhood had, it has wandered onto something that is not this edge, so the narrow pair is used.
+    float3 rgbA = 0.5 * (t_src.Sample(s_src, i.uv + (dir * ((1.0 / 3.0) - 0.5))).rgb +
+                         t_src.Sample(s_src, i.uv + (dir * ((2.0 / 3.0) - 0.5))).rgb);
+    float3 rgbB = (rgbA * 0.5) + (0.25 * (t_src.Sample(s_src, i.uv + (dir * -0.5)).rgb +
+                                          t_src.Sample(s_src, i.uv + (dir *  0.5)).rgb));
+    float lumaB = FxaaLuma(rgbB);
+    return float4(((lumaB < lumaMin) || (lumaB > lumaMax)) ? rgbA : rgbB, 1.0);
+}
+)HLSL";
+
 bool ShadowGatherProbe(pD3DCompile compileFn, ID3D11Device* device) {
     if (compileFn == nullptr || device == nullptr) {
         return false;
@@ -1475,6 +1555,164 @@ void GfxRenderingAPIDX11::ClearFramebuffer(bool color, bool depth) {
         mContext->ClearDepthStencilView(fb.depth_stencil_view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                         1.0f, 0);
     }
+}
+
+bool GfxRenderingAPIDX11::EnsureFxaaPipeline() {
+    if (mFxaaPs != nullptr) {
+        return true;
+    }
+    if (mFxaaFailed || mD3dCompile == nullptr || mDevice == nullptr) {
+        return false;
+    }
+    // Latched up front: every path out of here that is not success leaves it set, so a driver that cannot
+    // build this is asked once rather than once a frame forever.
+    mFxaaFailed = true;
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob, err;
+    UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    if (FAILED(mD3dCompile(kFxaaShader, sizeof(kFxaaShader) - 1, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", flags,
+                           0, vs_blob.GetAddressOf(), err.GetAddressOf()))) {
+        SPDLOG_ERROR("FXAA: vertex shader failed to compile: {}",
+                     err != nullptr ? (const char*)err->GetBufferPointer() : "no message");
+        return false;
+    }
+    err.Reset();
+    if (FAILED(mD3dCompile(kFxaaShader, sizeof(kFxaaShader) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", flags,
+                           0, ps_blob.GetAddressOf(), err.GetAddressOf()))) {
+        SPDLOG_ERROR("FXAA: pixel shader failed to compile: {}",
+                     err != nullptr ? (const char*)err->GetBufferPointer() : "no message");
+        return false;
+    }
+    if (FAILED(mDevice->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr,
+                                           mFxaaVs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr,
+                                          mFxaaPs.GetAddressOf()))) {
+        SPDLOG_ERROR("FXAA: could not create the shaders.");
+        return false;
+    }
+
+    // Bilinear and clamped. The blur reads at fractional offsets, so the filtering is doing real work here
+    // rather than being a formality, and clamping keeps the taps at the screen edge from wrapping around.
+    D3D11_SAMPLER_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(mDevice->CreateSamplerState(&sd, mFxaaSampler.GetAddressOf()))) {
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd;
+    ZeroMemory(&cbd, sizeof(cbd));
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 16; // float2 + padding, and constant buffers come in multiples of 16
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(mDevice->CreateBuffer(&cbd, nullptr, mFxaaCb.GetAddressOf()))) {
+        return false;
+    }
+
+    // No depth, no blend, no culling: the pass covers the target exactly once and replaces it.
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    ZeroMemory(&dsd, sizeof(dsd));
+    dsd.DepthEnable = false;
+    dsd.StencilEnable = false;
+    if (FAILED(mDevice->CreateDepthStencilState(&dsd, mFxaaDepthStencilState.GetAddressOf()))) {
+        return false;
+    }
+    D3D11_BLEND_DESC bd;
+    ZeroMemory(&bd, sizeof(bd));
+    bd.RenderTarget[0].BlendEnable = false;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(mDevice->CreateBlendState(&bd, mFxaaBlendState.GetAddressOf()))) {
+        return false;
+    }
+    D3D11_RASTERIZER_DESC rd;
+    ZeroMemory(&rd, sizeof(rd));
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = false;
+    if (FAILED(mDevice->CreateRasterizerState(&rd, mFxaaRasterizerState.GetAddressOf()))) {
+        return false;
+    }
+
+    mFxaaFailed = false;
+    SPDLOG_INFO("FXAA: post-process pass ready.");
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ApplyFxaa(int fb_dst_id, int fb_src_id) {
+    if (fb_src_id < 0 || fb_dst_id < 0 || fb_src_id >= (int)mFrameBuffers.size() ||
+        fb_dst_id >= (int)mFrameBuffers.size() || fb_src_id == fb_dst_id) {
+        return false;
+    }
+    if (!EnsureFxaaPipeline()) {
+        return false;
+    }
+
+    FramebufferDX11& fb_dst = mFrameBuffers[fb_dst_id];
+    FramebufferDX11& fb_src = mFrameBuffers[fb_src_id];
+    TextureData& td_src = mTextures[fb_src.texture_id];
+    TextureData& td_dst = mTextures[fb_dst.texture_id];
+    // A multisampled source cannot be read as an ordinary texture; it has to be resolved first, and the
+    // caller is expected to have done that. Refusing is better than binding a view that does not exist.
+    if (fb_src.msaa_level > 1 || td_src.resource_view == nullptr || fb_dst.render_target_view == nullptr) {
+        return false;
+    }
+
+    // The source is about to be read, so it must not still be bound as a target.
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    mContext->OMSetRenderTargets(1, &null_rtv, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    ZeroMemory(&ms, sizeof(ms));
+    if (FAILED(mContext->Map(mFxaaCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return false;
+    }
+    // One over the SOURCE's size: the offsets the shader steps by are texels of what it is reading.
+    float rcp[4] = { td_src.width > 0 ? 1.0f / (float)td_src.width : 0.0f,
+                     td_src.height > 0 ? 1.0f / (float)td_src.height : 0.0f, 0.0f, 0.0f };
+    memcpy(ms.pData, rcp, sizeof(rcp));
+    mContext->Unmap(mFxaaCb.Get(), 0);
+
+    D3D11_VIEWPORT vp;
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)td_dst.width;
+    vp.Height = (float)td_dst.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+
+    mContext->OMSetRenderTargets(1, fb_dst.render_target_view.GetAddressOf(), nullptr);
+    mContext->OMSetDepthStencilState(mFxaaDepthStencilState.Get(), 0);
+    mContext->OMSetBlendState(mFxaaBlendState.Get(), nullptr, 0xFFFFFFFF);
+    mContext->RSSetState(mFxaaRasterizerState.Get());
+    mContext->RSSetViewports(1, &vp);
+    // Vertex-id geometry: one triangle larger than the screen, so there is no vertex buffer and no input
+    // layout to bind or to put back afterwards.
+    mContext->IASetInputLayout(nullptr);
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->VSSetShader(mFxaaVs.Get(), nullptr, 0);
+    mContext->PSSetShader(mFxaaPs.Get(), nullptr, 0);
+    mContext->PSSetConstantBuffers(0, 1, mFxaaCb.GetAddressOf());
+    mContext->PSSetShaderResources(0, 1, td_src.resource_view.GetAddressOf());
+    mContext->PSSetSamplers(0, 1, mFxaaSampler.GetAddressOf());
+    mContext->Draw(3, 0);
+
+    // Unbind the source, or the next pass that wants to draw INTO it finds it still bound as input and the
+    // runtime drops the binding with a warning.
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    mContext->PSSetShaderResources(0, 1, &null_srv);
+    mContext->OMSetRenderTargets(1, &null_rtv, nullptr);
+
+    // Everything this touched is set again from scratch by whatever draws next: StartDrawToFramebuffer
+    // re-binds the target unconditionally, LoadShader re-binds the shaders and the input layout, and the
+    // per-draw setup re-binds the states and the viewport. The one exception is the cached record of which
+    // sampler each texture slot holds, which would otherwise skip a rebind it now needs.
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        mLastSamplerStates[i] = nullptr;
+    }
+    return true;
 }
 
 void GfxRenderingAPIDX11::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {

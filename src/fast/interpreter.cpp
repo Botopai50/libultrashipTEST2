@@ -409,6 +409,15 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
     return &mPrevCombiner->second;
 }
 
+uintptr_t Interpreter::PresentedFramebufferTexture(int srcFb) {
+    // ApplyFxaa answers false on a backend that has no such pass and on a pipeline that would not build, and
+    // in both cases the untouched source is exactly the right thing to show.
+    if (mFxaaEnabled && mRapi->ApplyFxaa(mGameFbFxaa, srcFb)) {
+        return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
+    }
+    return (uintptr_t)mRapi->GetFramebufferTextureId(srcFb);
+}
+
 void Interpreter::TextureCacheClear() {
     for (const auto& entry : mTextureCache.map) {
         mTextureCache.free_texture_ids.push_back(entry.second.texture_id);
@@ -6518,12 +6527,14 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
     mCurDimensions.internal_mul =
         Ship::Context::GetInstance()->GetConsoleVariables()->GetFloat(CVAR_INTERNAL_RESOLUTION, 1);
     mMsaaLevel = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_MSAA_VALUE, 1);
+    mFxaaEnabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_FXAA, 0) != 0;
 
     mCurDimensions.width = width;
     mCurDimensions.height = height;
 
     mGameFb = mRapi->CreateFramebuffer();
     mGameFbMsaaResolved = mRapi->CreateFramebuffer();
+    mGameFbFxaa = mRapi->CreateFramebuffer();
 
     mNativeDimensions.width = SCREEN_WIDTH;
     mNativeDimensions.height = SCREEN_HEIGHT;
@@ -6607,7 +6618,9 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    // FXAA joins the reasons to render into a framebuffer rather than straight at the screen: the pass
+    // reads the finished frame as a texture, and drawing to the window directly leaves it nothing to read.
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || mFxaaEnabled) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
@@ -6621,6 +6634,11 @@ void Interpreter::StartFrame() {
         if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
+        }
+        if (mFxaaEnabled) {
+            // Matches whatever it will be filtering, which is the game framebuffer at internal resolution.
+            mRapi->UpdateFramebufferParameters(mGameFbFxaa, mCurDimensions.width, mCurDimensions.height, 1, false,
+                                               true, false, false);
         }
     } else {
         mRendersToFb = false;
@@ -6655,12 +6673,12 @@ void Interpreter::RunGuiOnly() {
         if (mMsaaLevel > 1) {
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                mGfxFrameBuffer = PresentedFramebufferTexture(mGameFbMsaaResolved);
             } else {
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            mGfxFrameBuffer = PresentedFramebufferTexture(mGameFb);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
@@ -6720,12 +6738,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         if (mMsaaLevel > 1) {
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                mGfxFrameBuffer = PresentedFramebufferTexture(mGameFbMsaaResolved);
             } else {
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            mGfxFrameBuffer = PresentedFramebufferTexture(mGameFb);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
@@ -6917,6 +6935,10 @@ void Interpreter::SetResolutionMultiplier(float multiplier) {
 
 void Interpreter::SetMsaaLevel(uint32_t level) {
     mMsaaLevel = level;
+}
+
+void Interpreter::SetFxaaEnabled(bool enabled) {
+    mFxaaEnabled = enabled;
 }
 
 void Interpreter::GetCurDimensions(uint32_t* width, uint32_t* height) {

@@ -333,6 +333,10 @@ void Fast3dWindow::SetResolutionMultiplier(float multiplier) {
     mInterpreter->SetResolutionMultiplier(multiplier);
 }
 
+void Fast3dWindow::SetFxaaEnabled(bool enabled) {
+    mInterpreter->SetFxaaEnabled(enabled);
+}
+
 void Fast3dWindow::SetMsaaLevel(uint32_t value) {
     mInterpreter->SetMsaaLevel(value);
 }

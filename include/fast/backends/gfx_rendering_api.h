@@ -97,6 +97,12 @@ class GfxRenderingAPI {
     virtual void ClearFramebuffer(bool color, bool depth) = 0;
     virtual void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) = 0;
     virtual void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) = 0;
+    // SOH [Enhancement] Run FXAA over fbIdSrc into fbIdDst. Answers false when the backend has no such pass
+    // (every backend but D3D11) or when its pipeline could not be built, and the caller then presents the
+    // source unchanged -- so a failure here costs the anti-aliasing and never the frame.
+    virtual bool ApplyFxaa(int fbIdDst, int fbIdSrc) {
+        return false;
+    }
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
     virtual void* GetFramebufferTextureId(int fbId) = 0;

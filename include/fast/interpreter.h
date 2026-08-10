@@ -564,6 +564,9 @@ class Interpreter {
     void SetNativeDimensions(float width, float height);
     void SetResolutionMultiplier(float multiplier);
     void SetMsaaLevel(uint32_t level);
+    // SOH [Enhancement] Turning this on also decides whether the frame is rendered into a texture at all,
+    // so it takes effect on the next frame that reconsiders the framebuffer setup rather than instantly.
+    void SetFxaaEnabled(bool enabled);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
 
     // private: TODO make these private
@@ -571,6 +574,9 @@ class Interpreter {
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void TextureCacheClear();
+    // Which texture the finished frame should be presented from: the FXAA output when that pass ran, and the
+    // source itself when it did not -- a backend without the pass, or a pipeline that failed to build.
+    uintptr_t PresentedFramebufferTexture(int srcFb);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void ImportTextureRgba16(int tile, bool importReplacement);
@@ -934,6 +940,10 @@ class Interpreter {
 
     int mGameFb{};             // game_framebuffer;
     int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
+    // SOH [Enhancement] Destination of the FXAA pass. A post-process cannot read and write one image, so the
+    // finished frame is filtered into this and it is this that gets presented.
+    int mGameFbFxaa{};
+    bool mFxaaEnabled = false;
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
