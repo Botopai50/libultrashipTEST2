@@ -105,6 +105,7 @@ void Fast3dWindow::Init() {
 
     SetTextureFilter((FilteringMode)Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
         CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
+    ApplyMipmapSettings();
 }
 
 int32_t Fast3dWindow::GetTargetFps() {
@@ -157,6 +158,26 @@ void Fast3dWindow::InitWindowManager() {
 
 void Fast3dWindow::SetTextureFilter(FilteringMode filteringMode) {
     mInterpreter->GetCurrentRenderingAPI()->SetTextureFilter(filteringMode);
+}
+
+void Fast3dWindow::ApplyMipmapSettings() {
+    auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
+    const bool enabled = cvars->GetInteger(CVAR_MIPMAPS, 0) != 0;
+    const float bias = cvars->GetFloat(CVAR_MIPMAP_LOD_BIAS, 0.0f);
+    const int aniso = cvars->GetInteger(CVAR_MIPMAP_ANISOTROPY, 1);
+
+    GfxRenderingAPI* rapi = mInterpreter->GetCurrentRenderingAPI();
+    if (rapi == nullptr) {
+        return;
+    }
+    const bool wasEnabled = rapi->MipmapEnabled();
+    rapi->SetMipmapParams(enabled, bias, aniso);
+    // Only the toggle needs the cache dropped -- the bias and the anisotropy are read when a sampler is
+    // built, which happens per draw, so those are live already and re-uploading every texture for them would
+    // be a stutter for nothing.
+    if (enabled != wasEnabled) {
+        mInterpreter->TextureCacheClear();
+    }
 }
 
 void Fast3dWindow::EnableSRGBMode() {

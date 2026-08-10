@@ -18,6 +18,21 @@ struct GfxClipParameters {
 
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
 
+// SOH [Enhancement] Smallest texture, per side, that is given a mip chain.
+//
+// The threshold is the whole reason this is close to free on stock assets. A mip chain costs memory, a
+// generation pass on every upload, and a second bilinear fetch per sample -- and it repays that only where
+// a texture is MINIFIED enough that neighbouring pixels land in far-apart texels and every fetch misses the
+// cache. Stock N64 textures cannot get there: TMEM is 4 KB, so nothing native exceeds roughly 64 by 64, and
+// a texture that small sits entirely in the GPU's texture cache however it is sampled -- there are no misses
+// left to remove. At any modern internal resolution those textures are being magnified anyway, and
+// magnification always reads level 0, so the chain would never even be consulted.
+//
+// What DOES get there is a replacement texture pack, where a 1024-square image stands in for a 32-square
+// one. Minified onto a distant wall that is megabytes of traffic per frame, and a mip chain removes nearly
+// all of it. 128 sits above everything the stock game can produce and below anything a pack ships.
+#define GFX_MIPMAP_MIN_TEXTURE_SIZE 128
+
 // SOH [Enhancement] World light casting / actor shadows: per-draw stencil mode for the Wind Waker-style
 // stencil-volume techniques. The interpreter pushes this via SetStencilMode (from a gSPStencil command,
 // or directly from RenderShadowVolumes); backends apply the matching stencil state in their per-draw
@@ -87,6 +102,18 @@ class GfxRenderingAPI {
     virtual void* GetFramebufferTextureId(int fbId) = 0;
     virtual void SelectTextureFb(int fbId) = 0;
     virtual void DeleteTexture(uint32_t texId) = 0;
+    // SOH [Enhancement] Mip chains for large (replacement-pack) textures. `enabled` only decides whether
+    // NEW uploads are given a chain, so a change needs the texture cache cleared to take effect everywhere;
+    // the bias and the anisotropy are read when the sampler is built and so apply immediately.
+    virtual void SetMipmapParams(bool enabled, float lodBias, int maxAnisotropy) {
+        mMipmapEnabled = enabled;
+        mMipmapLodBias = lodBias;
+        mMipmapAnisotropy = maxAnisotropy < 1 ? 1 : (maxAnisotropy > 16 ? 16 : maxAnisotropy);
+    }
+    bool MipmapEnabled() const {
+        return mMipmapEnabled;
+    }
+
     virtual void SetTextureFilter(FilteringMode mode) = 0;
     virtual FilteringMode GetTextureFilter() = 0;
     virtual void SetSrgbMode() = 0;
@@ -289,6 +316,11 @@ class GfxRenderingAPI {
     }
 
   protected:
+    // SOH [Enhancement] Mipmapping (see GFX_MIPMAP_MIN_TEXTURE_SIZE). Off until the application asks, so a
+    // host that never pushes these keeps exactly the single-level uploads it had before.
+    bool mMipmapEnabled = false;
+    float mMipmapLodBias = 0.0f;
+    int mMipmapAnisotropy = 1;
     float mToonLightDir[3] = { 0.0f, 0.0f, 1.0f };
     float mToonLightColor[3] = { 1.0f, 1.0f, 1.0f };
     float mToonAmbient[3] = { 0.0f, 0.0f, 0.0f };

@@ -79,6 +79,9 @@ struct TextureData {
     uint32_t width;
     uint32_t height;
     bool linear_filtering;
+    // Whether this texture was given a mip chain on upload. Read when its sampler is built: a chain that is
+    // not there must not be selected for, and one that is there wants a different filter and the LOD bias.
+    bool has_mips = false;
 };
 
 struct FramebufferDX11 {

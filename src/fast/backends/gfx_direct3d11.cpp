@@ -963,17 +963,44 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     D3D11_TEXTURE2D_DESC texture_desc;
     ZeroMemory(&texture_desc, sizeof(D3D11_TEXTURE2D_DESC));
 
+    // SOH [Enhancement] Only textures big enough for minification to actually cost something get a chain,
+    // which is what keeps this off the thousands of tiny stock textures that would pay for it and gain
+    // nothing (see GFX_MIPMAP_MIN_TEXTURE_SIZE). Sub-1 dimensions are excluded because GenerateMips has
+    // nothing to halve.
+    const bool want_mips = mMipmapEnabled && width >= GFX_MIPMAP_MIN_TEXTURE_SIZE &&
+                           height >= GFX_MIPMAP_MIN_TEXTURE_SIZE;
+    texture_data->has_mips = want_mips;
+
     texture_desc.Width = width;
     texture_desc.Height = height;
-    texture_desc.Usage = D3D11_USAGE_IMMUTABLE;
-    texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture_desc.CPUAccessFlags = 0;
-    texture_desc.MiscFlags = 0; // D3D11_RESOURCE_MISC_GENERATE_MIPS ?
     texture_desc.ArraySize = 1;
-    texture_desc.MipLevels = 1;
     texture_desc.SampleDesc.Count = 1;
     texture_desc.SampleDesc.Quality = 0;
+
+    if (want_mips) {
+        // A chain generated on the GPU, which needs the texture to be writable and bindable as a render
+        // target -- so it cannot be IMMUTABLE with initial data the way the single-level path is. The levels
+        // are filled by UpdateSubresource + GenerateMips below instead.
+        texture_desc.Usage = D3D11_USAGE_DEFAULT;
+        texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        texture_desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        texture_desc.MipLevels = 0; // 0 asks for the full chain down to 1x1
+
+        ThrowIfFailed(
+            mDevice->CreateTexture2D(&texture_desc, nullptr, texture_data->texture.ReleaseAndGetAddressOf()));
+        ThrowIfFailed(mDevice->CreateShaderResourceView(texture_data->texture.Get(), nullptr,
+                                                        texture_data->resource_view.ReleaseAndGetAddressOf()));
+        mContext->UpdateSubresource(texture_data->texture.Get(), 0, nullptr, rgba32_buf, width * 4, 0);
+        mContext->GenerateMips(texture_data->resource_view.Get());
+        return;
+    }
+
+    texture_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texture_desc.MiscFlags = 0;
+    texture_desc.MipLevels = 1;
 
     D3D11_SUBRESOURCE_DATA resource_data;
     resource_data.pSysMem = rgba32_buf;
@@ -993,8 +1020,24 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     D3D11_SAMPLER_DESC sampler_desc;
     ZeroMemory(&sampler_desc, sizeof(D3D11_SAMPLER_DESC));
 
-    sampler_desc.Filter = linear_filter && mCurrentFilterMode == FILTER_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                                                                               : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    TextureData* texture_data = &mTextures[mCurrentTextureIds[tile]];
+    const bool linear = linear_filter && mCurrentFilterMode == FILTER_LINEAR;
+    // SOH [Enhancement] Only a texture that actually HAS a chain may ask for mip filtering, and only then is
+    // the bias meaningful. Everything without one keeps exactly the filter it had before.
+    const bool mips = texture_data->has_mips;
+
+    if (linear) {
+        // Anisotropic only where there is a chain to walk: it is a minification filter, and on a
+        // single-level texture it costs extra taps to reach the same texel.
+        sampler_desc.Filter =
+            (mips && mMipmapAnisotropy > 1) ? D3D11_FILTER_ANISOTROPIC : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    } else {
+        // Point magnification is the look the game is drawn for, so it survives the chain: only the choice
+        // BETWEEN levels goes linear, which is what stops a visible seam where one level takes over.
+        sampler_desc.Filter = mips ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    }
+    sampler_desc.MaxAnisotropy = (mips && linear) ? (UINT)mMipmapAnisotropy : 1;
+    sampler_desc.MipLODBias = mips ? mMipmapLodBias : 0.0f;
 
     sampler_desc.AddressU = gfx_cm_to_d3d11(cms);
     sampler_desc.AddressV = gfx_cm_to_d3d11(cmt);
@@ -1002,7 +1045,6 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     sampler_desc.MinLOD = 0;
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
-    TextureData* texture_data = &mTextures[mCurrentTextureIds[tile]];
     texture_data->linear_filtering = linear_filter;
 
     // This function is called twice per texture, the first one only to set default values.

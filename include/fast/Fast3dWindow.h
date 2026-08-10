@@ -54,6 +54,10 @@ class Fast3dWindow : public Ship::Window {
     void GetPixelDepthPrepare(float x, float y);
     uint16_t GetPixelDepth(float x, float y);
     void SetTextureFilter(FilteringMode filteringMode);
+    // SOH [Enhancement] Re-reads the mipmap settings and applies them. Clearing the texture cache is part of
+    // it: whether a texture has a chain is decided when it is uploaded, so without that the toggle would
+    // only reach textures the game happened to evict and re-load afterwards.
+    void ApplyMipmapSettings();
     void SetRendererUCode(UcodeHandlers ucode);
     void EnableSRGBMode();
     bool DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
