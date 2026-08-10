@@ -161,9 +161,23 @@
 // buffers rather than separate calls into one, because the "already holds this list" check is what the
 // caching is made of -- alternating two lists through a single buffer would defeat it on every cascade and
 // hand back exactly the cost the cache exists to avoid.
-#define SHADOW_MAP_CASTER_SLOTS 2
+// The secondary light's slice needs a third, for the same reason the world layer needed a second: it draws
+// BOTH layers' lists into one slice, so the room mesh and the characters would otherwise alternate through
+// one buffer and defeat the check on every frame.
+#define SHADOW_MAP_CASTER_SLOTS 3
 #define SHADOW_MAP_CASTER_SLOT_MAIN 0    // the room mesh in the world layer; characters in the actor layer
 #define SHADOW_MAP_CASTER_SLOT_SCENERY 1 // scenery actors, world layer only, rebuilt every frame
+#define SHADOW_MAP_CASTER_SLOT_ACTORS 2  // characters, in the secondary light's slice only
+
+// How many independent banks of those slots the backend keeps: one per caster layer, plus one for the
+// secondary light's slice.
+//
+// The extra bank is not a nicety. Without it that slice's layer index falls outside the layer range and
+// clamps to the world layer's bank, so drawing the characters into it overwrites the buffer holding the
+// CACHED ROOM MESH and, worse, the record of what that buffer holds -- which silently costs a full
+// re-upload of the room mesh in every world cascade on every following frame. That is precisely the cost
+// the slot mechanism exists to avoid, so the slice that needs both lists needs its own bank.
+#define SHADOW_MAP_CASTER_BANKS (SHADOW_MAP_LAYERS + SHADOW_MAP_POINT_SLICES)
 
 // Per-cascade square resolution bounds. 4096 is the largest the near cascade is ever asked for, and
 // anything under 256 produces texels so large that the bias needed to hide the acne swallows the

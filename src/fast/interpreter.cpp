@@ -4000,7 +4000,8 @@ void Interpreter::RenderShadowMap() {
     // hundred extra triangles through a pass with no pixel shader. Bridging is always correct: the spans are
     // contiguous in the buffer, and a rejected span was only ever rejected as an optimisation.
     auto drawChunkedCasters = [this, &boxVisible](const float* verts, size_t vertexCount,
-                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m) {
+                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m,
+                                                  int slot = SHADOW_MAP_CASTER_SLOT_MAIN) {
         size_t runFirst = 0, runCount = 0, gapCount = 0;
         for (const ShadowCasterChunk& ch : chunks) {
             if (boxVisible(ch.min, ch.max, m)) {
@@ -4013,14 +4014,14 @@ void Interpreter::RenderShadowMap() {
             } else if (runCount != 0) {
                 gapCount += ch.vertexCount;
                 if (gapCount > kShadowChunkBridgeTriangles * 3) {
-                    mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+                    mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
                     runCount = 0;
                     gapCount = 0;
                 }
             }
         }
         if (runCount != 0) {
-            mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+            mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
         }
     };
 
@@ -4189,9 +4190,13 @@ void Interpreter::RenderShadowMap() {
                                                 SHADOW_MAP_CASTER_SLOT_MAIN);
                 }
             }
+            // Into the ACTORS slot, not MAIN: this slice draws the room mesh as well, and two lists
+            // alternating through one buffer would re-upload both on every frame (see
+            // SHADOW_MAP_CASTER_SLOT_ACTORS).
             const std::vector<float>& actors = mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS];
             if (actors.size() >= 9 && !mShadowActorChunks.empty()) {
-                drawChunkedCasters(actors.data(), actors.size() / 3, mShadowActorChunks, mShadowPointMatrix);
+                drawChunkedCasters(actors.data(), actors.size() / 3, mShadowActorChunks, mShadowPointMatrix,
+                                   SHADOW_MAP_CASTER_SLOT_ACTORS);
             }
             if (mShadowSceneryReady.size() >= 9 && boxVisible(sceneryMin, sceneryMax, mShadowPointMatrix)) {
                 mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,

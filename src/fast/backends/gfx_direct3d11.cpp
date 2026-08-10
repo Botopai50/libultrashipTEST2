@@ -2273,7 +2273,10 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
         return;
     }
 
-    const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    // Banks, not layers: the secondary light's slice is numbered past both layers and has a bank of its
+    // own, because it draws both layers' lists (see SHADOW_MAP_CASTER_BANKS).
+    const int layerIndex =
+        (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_CASTER_BANKS) ? mShadowCurrentLayer : 0;
     const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
     // One buffer per (layer, slot). The slot is what lets the world layer draw its cached room mesh and a
     // per-frame scenery list in the same cascade without either one evicting the other's upload.
@@ -2458,6 +2461,11 @@ void GfxRenderingAPIDX11::SetShadowMapPointMatrix(const float lightViewProj[16])
         memset(mPerShadowCbData.shadow_point_view_proj, 0, sizeof(mPerShadowCbData.shadow_point_view_proj));
     }
     WriteShadowPointLight();
+    // This runs AFTER SetShadowMapParams, which is where the buffer is normally marked for re-upload. Without
+    // marking it again here, the transform and the may-be-sampled flag written above never reach the GPU: the
+    // shader keeps reading the zeroed matrix and a clear flag, so the second light brightens (those fields
+    // were written earlier, and uploaded) but never casts. Which is exactly how the bug presented.
+    mShadowCbDirty = true;
 }
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
