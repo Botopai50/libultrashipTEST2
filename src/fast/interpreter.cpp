@@ -3685,6 +3685,7 @@ void Interpreter::RenderShadowMap() {
     float matrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
     float splits[SHADOW_MAP_MAX_CASCADES] = {};
     float nearDist = 0.0f;
+    float shadowReach = 0.0f; // furthest view depth any cascade's footprint reaches; grown per cascade below
 
     for (int c = 0; c < mShadowMapCascadeCount; c++) {
         const float farDist = mShadowMapSplits[c] > nearDist ? mShadowMapSplits[c] : nearDist + 1.0f;
@@ -3805,6 +3806,30 @@ void Interpreter::RenderShadowMap() {
         const float eye[3] = { center[0] - lz[0] * back, center[1] - lz[1] * back, center[2] - lz[2] * back };
         const float zNear = 0.0f;
         const float zFar = back + radius * 2.0f;
+
+        // How far down the view axis this cascade's footprint can still reach. The receiver shader answers
+        // "lit" without projecting at all past the furthest of these -- see SetShadowMapReach.
+        //
+        // Measured from the BOX, not from the split, and the difference is not small: the box is 2R by 2R by
+        // the depth range, and the depth range is five radii, so it overshoots its own band by thousands of
+        // units. Cutting at the split would delete real shadows -- a low sun throws them well past the band
+        // that cast them, which is exactly the geometry this range exists to catch.
+        //
+        // Standard box-onto-an-axis bound: the centre projects to a point and the half-extents project to a
+        // radius. The box is centred half a radius behind the cascade centre along the light (the eye sits
+        // 3R back and the range runs 5R, so the middle is at 2.5R from the eye), with half-extents R, R and
+        // 2.5R along the three light axes.
+        {
+            const float boxCentre[3] = { center[0] - lz[0] * radius * 0.5f, center[1] - lz[1] * radius * 0.5f,
+                                         center[2] - lz[2] * radius * 0.5f };
+            const float along = ((boxCentre[0] - nearC[0]) * viewDir[0]) + ((boxCentre[1] - nearC[1]) * viewDir[1]) +
+                                ((boxCentre[2] - nearC[2]) * viewDir[2]);
+            const float spread =
+                radius * std::fabs((lx[0] * viewDir[0]) + (lx[1] * viewDir[1]) + (lx[2] * viewDir[2])) +
+                radius * std::fabs((ly[0] * viewDir[0]) + (ly[1] * viewDir[1]) + (ly[2] * viewDir[2])) +
+                radius * 2.5f * std::fabs((lz[0] * viewDir[0]) + (lz[1] * viewDir[1]) + (lz[2] * viewDir[2]));
+            shadowReach = std::max(shadowReach, along + spread);
+        }
 
         // view * ortho, folded into one row-vector matrix (world position * M -> clip).
         float* m = &matrices[c * 16];
@@ -4082,6 +4107,10 @@ void Interpreter::RenderShadowMap() {
                         mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].ranges.size());
         }
     }
+    // Nudged out by a thousandth. The bound above is TIGHT -- one corner of the box sits exactly on it --
+    // and a comparison made in single precision against a number that large can round the wrong way. A
+    // thousandth of the reach is far below anything a shadow occupies and removes the question.
+    mRapi->SetShadowMapReach(shadowReach * 1.001f);
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
                               mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth,
                               mShadowMapDebug, mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);

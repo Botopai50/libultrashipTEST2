@@ -263,6 +263,14 @@ class GfxRenderingAPI {
     // can shadow with lies inside this box, and a receiver with none of it behind them along the light
     // cannot be shadowed by it -- which is most of a map, most of the time, since the box holds a handful of
     // characters. The shader uses it to skip that layer's whole kernel.
+    // SOH [Enhancement] The furthest view depth any cascade's footprint can reach. Past it no cascade covers
+    // anything, so the receiver shader can answer "lit" without projecting at all -- which is otherwise
+    // impossible to know cheaply, since a cascade's box overshoots its own band by a long way and cutting at
+    // the split would take real shadows with it.
+    virtual void SetShadowMapReach(float maxViewDepth) {
+        mShadowMaxViewDepth = maxViewDepth;
+    }
+
     virtual void SetShadowMapActorBounds(const float boundsMin[3], const float boundsMax[3]) {
         for (int i = 0; i < 3; i++) {
             mShadowActorBoundsMin[i] = boundsMin[i];
@@ -304,6 +312,8 @@ class GfxRenderingAPI {
     float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
     // Inverted until a frame says otherwise, so every test against it fails and the actor layer is skipped.
+    // Zero until a frame says otherwise, which reads as "no cascade reaches anywhere" and costs nothing.
+    float mShadowMaxViewDepth = 0.0f;
     float mShadowActorBoundsMin[3] = { 1e30f, 1e30f, 1e30f };
     float mShadowActorBoundsMax[3] = { -1e30f, -1e30f, -1e30f };
     float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;

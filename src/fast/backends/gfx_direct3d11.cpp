@@ -2447,7 +2447,10 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_incidence[0] = minInc;
         mPerShadowCbData.shadow_incidence[1] = fullInc;
         mPerShadowCbData.shadow_incidence[2] = floorScale;
-        mPerShadowCbData.shadow_incidence[3] = 0.0f;
+        // The reach bound rides in the incidence block's spare slot rather than growing the buffer for one
+        // float. It is not an incidence value and has nothing to do with the three beside it; see
+        // SetShadowMapReach.
+        mPerShadowCbData.shadow_incidence[3] = mShadowMaxViewDepth;
     }
     for (int i = 0; i < 3; i++) {
         mPerShadowCbData.shadow_actor_min[i] = mShadowActorBoundsMin[i];

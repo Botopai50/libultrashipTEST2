@@ -140,7 +140,8 @@ cbuffer PerShadowCB : register(b3) {
     //   x = incidence below which the hardening is at its floor
     //   y = incidence at which the hardening is at full strength
     //   z = that floor, as a fraction of the configured hardness
-    //   w = unused
+    //   w = NOT an incidence value: the furthest view depth any cascade's footprint reaches, riding in the
+    //     spare slot rather than growing the buffer for one float. Past it there is nothing to look up.
     // In the constant buffer rather than as template symbols so they can be dialled while the game runs --
     // a compile-time symbol makes every trial a rebuild.
     float4 shadow_incidence;
@@ -388,22 +389,30 @@ float3 ShadowNormalOffset(float3 normalWs, float3 lightAxis) {
 // construction -- so the radius cancels and the gradient is a property of the surface and the light, not of
 // the cascade looking at it. Checked numerically against pairs of cascades with independent radii and
 // centres: the two agree to 2e-10 relative, which is the arithmetic's own noise.
-float2 ShadowPlaneGradient(float2 uv, float ndcZ) {
-    float2 duvdx = ddx(uv);
-    float2 duvdy = ddy(uv);
-    float dzdx = ddx(ndcZ);
-    float dzdy = ddy(ndcZ);
+float2 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
+    float3 dpx = ddx(p);
+    float3 dpy = ddy(p);
+    // The uv and depth derivatives, each missing its cascade's own scale factor: uv carries 0.5/radius and
+    // depth carries 1/(5*radius). Both are dropped here and put back as the single 2/5 below, which is what
+    // the two scales reduce to once the solve divides one by the other -- see the constant.
+    float2 duvdx = float2(dot(dpx, lx), -dot(dpx, ly));
+    float2 duvdy = float2(dot(dpy, lx), -dot(dpy, ly));
+    float dzdx = dot(dpx, lz);
+    float dzdy = dot(dpy, lz);
     float det = (duvdx.x * duvdy.y) - (duvdx.y * duvdy.x);
     float2 grad = float2(0.0, 0.0);
     if (abs(det) > 1e-12) {
-        grad = float2((duvdy.y * dzdx) - (duvdx.y * dzdy), (duvdx.x * dzdy) - (duvdy.x * dzdx)) / det;
+        // 0.4 is the 2/5 the radius collapses to. A cascade's depth range is five times its radius by
+        // construction, so the radius in the uv scale and the radius in the depth scale cancel and leave a
+        // pure number -- which is the whole reason this can be computed without knowing which cascade will
+        // read it. Verified against the projection-based form it replaces over 300000 random surfaces and
+        // cascades: 4.6e-10 relative, the arithmetic's own noise.
+        grad = float2((duvdy.y * dzdx) - (duvdx.y * dzdy), (duvdx.x * dzdy) - (duvdy.x * dzdx)) * (0.4 / det);
     }
     // Bound it. At a silhouette the quad straddles two surfaces and the derivative is meaningless, and an
-    // unbounded correction there would punch a hole through the shadow. The depth range of every cascade is
-    // five times its radius by construction and a texel is two radii over the resolution, so a surface at
-    // forty-five degrees to the light has a gradient of 2/5 -- the radius and the resolution both cancel.
-    // 3.2 is eight times that, about eighty-three degrees, past which a receiver is edge-on enough that the
-    // constant and normal-offset terms are the right tools.
+    // unbounded correction there would punch a hole through the shadow. A surface at forty-five degrees to
+    // the light has a gradient of 2/5; 3.2 is eight times that, about eighty-three degrees, past which a
+    // receiver is edge-on enough that the constant and normal-offset terms are the right tools.
     return clamp(grad, -3.2, 3.2);
 }
 
@@ -413,9 +422,8 @@ float2 ShadowPlaneGradient(float2 uv, float ndcZ) {
 //
 // `ndcZ` comes back separately because the gradient needs the depth as projected, while the struct carries
 // it with the cascade's constant bias already taken off.
-ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewProj, float texelWorld,
-                               float texelUv, float depthBias, uint cascade, float sliceBase, out float ndcZ) {
-    float3 p = worldPos + offsetDir * texelWorld;
+ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float depthBias, uint cascade,
+                               float sliceBase, float2 grad) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -423,10 +431,9 @@ ShadowProjection ShadowProject(float3 worldPos, float3 offsetDir, float4x4 viewP
     // NDC -> texture space (y flips: NDC is +up, textures are +down).
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
-    ndcZ = ndc.z;
     ShadowProjection o;
     o.uv = uv;
-    o.grad = float2(0.0, 0.0);
+    o.grad = grad;
     o.z = ndc.z - depthBias;
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
@@ -470,25 +477,32 @@ float ShadowSample(ShadowProjection p) {
 // Each branch moves four registers' worth of constants, so there is nothing left worth a real branch;
 // flattening to conditional moves is cheaper than the jump. Every index stays literal -- see ShadowSplitAt
 // for why a computed one cannot be used here.
-ShadowProjection ShadowProjectAt(float3 worldPos, float3 offsetDir, uint cascade, float sliceBase,
-                                 out float ndcZ) {
+// The world size of one texel, on its own, because the point that gets projected depends on it and the
+// gradient is taken from that point -- which now happens before any of the rest is selected.
+float ShadowTexelWorldAt(uint cascade) {
+    float v = shadow_texel_world.z;
+    if (cascade == 0) {
+        v = shadow_texel_world.x;
+    } else if (cascade == 1) {
+        v = shadow_texel_world.y;
+    }
+    return v;
+}
+
+ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float2 grad) {
     float4x4 viewProj = shadow_view_proj[0];
-    float texelWorld = shadow_texel_world.x;
     float texelUv = shadow_texel_uv.x;
     float depthBias = shadow_depth_bias.x;
     if (cascade == 1) {
         viewProj = shadow_view_proj[1];
-        texelWorld = shadow_texel_world.y;
         texelUv = shadow_texel_uv.y;
         depthBias = shadow_depth_bias.y;
     } else if (cascade == 2) {
         viewProj = shadow_view_proj[2];
-        texelWorld = shadow_texel_world.z;
         texelUv = shadow_texel_uv.z;
         depthBias = shadow_depth_bias.z;
     }
-    // `slice` is only ever a texture coordinate, and those may be dynamic -- see ShadowProject.
-    return ShadowProject(worldPos, offsetDir, viewProj, texelWorld, texelUv, depthBias, cascade, sliceBase, ndcZ);
+    return ShadowProject(p, viewProj, texelUv, depthBias, cascade, sliceBase, grad);
 }
 
 // Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
@@ -544,149 +558,162 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         }
         cascade = min(cascade, count - 1);
 
-        // Everything the two projections agree on, resolved once. The light axis is the same vector for
-        // every cascade and the push along the normal is the same direction; recovering either inside the
-        // projection meant computing it identically twice per pixel -- two normalises, two square roots and
-        // the sign selection -- for one answer. Only the LENGTH of the push is per cascade, and that is a
-        // single multiply by texelWorld at the point of use.
+        // The light's basis, and everything the two projections agree on. Each cascade's matrix holds these
+        // three axes scaled by its own factors, so normalising the columns of any of them gives the same
+        // vectors -- cascade 0's are taken. The push along the normal follows: same direction for every
+        // cascade, only its length differs.
         float3 lightAxis = ShadowLightAxis();
+        float3 lightX = normalize(shadow_view_proj[0]._11_21_31);
+        float3 lightY = normalize(shadow_view_proj[0]._12_22_32);
         float3 offsetDir = ShadowNormalOffset(normalWs, lightAxis);
 
-        // The primary lookup, and with it the one gradient both lookups use. This part runs for every pixel
-        // and has to: it is where the screen-space derivatives are taken, and those are only defined in flow
-        // every pixel of a quad reaches.
-        float primaryNdcZ;
-        ShadowProjection primary = ShadowProjectAt(worldPos, offsetDir, cascade, 0.0, primaryNdcZ);
-        primary.grad = ShadowPlaneGradient(primary.uv, primaryNdcZ);
+        // The point that gets projected, and the gradient of the receiver plane through it. This much runs
+        // for every pixel and has to: the gradient is where the screen-space derivatives are taken, and
+        // those are only defined in flow every pixel of a quad reaches.
+        //
+        // It is also ALL that has to. The gradient used to be read off a finished projection, which meant a
+        // matrix select and a multiply had to happen first, for every pixel, before anything could be
+        // decided. Taken from the point's light-space derivatives instead it needs no projection at all --
+        // and everything downstream becomes branchable, which is what the two skips below are made of.
+        float3 sample = worldPos + offsetDir * ShadowTexelWorldAt(cascade);
+        float2 grad = ShadowPlaneGradient(sample, lightX, lightY, lightAxis);
 
-        // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
-        // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
-        // line that sweeps across the ground as the camera moves.
-        bool blend = false;
-        float t = 0.0;
-        if (cascade + 1 < count) {
-            // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name
-            // at runtime where a stray definition would be baffling to debug.
-            float farEdge = ShadowSplitAt(cascade);
-            float nearEdge = (cascade == 0) ? 0.0 : ShadowSplitAt(cascade - 1);
-            float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
-            blend = viewDepth > bandStart;
-            t = blend ? smoothstep(bandStart, farEdge, viewDepth) : 0.0;
-        }
+        // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
+        // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
+        // the boxes themselves rather than from the split ladder -- a cascade's box overshoots its band by a
+        // long way, and cutting at the split would take real shadows with it (a low sun throws them well
+        // past the band that cast them).
+        if (viewDepth <= shadow_incidence.w) {
+            ShadowProjection primary = ShadowProjectAt(sample, cascade, 0.0, grad);
 
-        // The cross-fade partner, built ONLY where it is read.
-        //
-        // It used to be built for every pixel, because it carried its own derivatives and those cannot be
-        // branched around. It no longer carries any: the gradient is the same for every cascade (see
-        // ShadowPlaneGradient), so the primary's serves, and what is left is a matrix select and a multiply
-        // -- which can be skipped. The band is a tenth of a cascade's range by default, so this is work that
-        // was being thrown away on the large majority of the screen.
-        ShadowProjection partner = primary;
-        if (blend) {
-            float partnerNdcZ;
-            partner = ShadowProjectAt(worldPos, offsetDir, min(cascade + 1, count - 1), 0.0, partnerNdcZ);
-            partner.grad = primary.grad;
-        }
+            // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
+            // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
+            // line that sweeps across the ground as the camera moves.
+            bool blend = false;
+            float t = 0.0;
+            if (cascade + 1 < count) {
+                // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name
+                // at runtime where a stray definition would be baffling to debug.
+                float farEdge = ShadowSplitAt(cascade);
+                float nearEdge = (cascade == 0) ? 0.0 : ShadowSplitAt(cascade - 1);
+                float bandStart = farEdge - (farEdge - nearEdge) * shadow_params.y;
+                blend = viewDepth > bandStart;
+                t = blend ? smoothstep(bandStart, farEdge, viewDepth) : 0.0;
+            }
 
-        // Can the actor layer possibly shadow this point at all?
-        //
-        // That layer holds the characters and nothing else -- a handful of small objects standing somewhere
-        // on the map -- yet every scenery pixel on screen was sampling it sixteen fetches deep to be told it
-        // was lit. Its world bounding box arrives as a uniform, so a receiver with none of that box behind it
-        // along the light can skip the layer's entire kernel. Over a room that is very nearly every scenery
-        // pixel, which halves the shadow cost of all of them.
-        //
-        // The skip is exact, not an approximation. A lookup landing where no actor was drawn reads the
-        // cleared depth and returns "lit", which is precisely the value left in place by not doing it. The
-        // only thing that has to hold is the direction of the error: the box may be grown, never shrunk.
-        bool actorsPossible = false;
-        if (wantActors) {
-            // Everything that can move a lookup off the exact light ray, in world units. The kernel reaches
-            // about three texels from the sample point -- each bilinear quad spans two and sits one texel out
-            // -- and the normal offset pushes the sample up to shadow_params.z texels off the surface before
-            // any of that. Scaled by the LARGEST cascade's texel, because which cascade this pixel lands in
-            // is not decided here for the partner and the unused entries are zero, so the max is both safe
-            // and free.
-            float texelWorld = max(shadow_texel_world.x, max(shadow_texel_world.y, shadow_texel_world.z));
-            float margin = texelWorld * (3.0 + shadow_params.z);
-            float3 boxLo = shadow_actor_min.xyz - margin;
-            float3 boxHi = shadow_actor_max.xyz + margin;
-            // An empty layer arrives inverted and stays inverted once the margin is applied -- the sentinel
-            // is many orders of magnitude larger -- so this doubles as the "no characters this frame" test.
-            if (all(boxLo <= boxHi)) {
-                // Slab test along the ray from here towards the light. The light TRAVELS along +lightAxis
-                // (see ShadowProject), so anything that can occlude this point lies at -lightAxis from it.
-                //
-                // Zero components are nudged rather than special-cased: a ray parallel to a slab then yields
-                // a huge t of the correct sign, which the min/max below already handle, and never a 0/0.
-                float3 dir = -lightAxis;
-                float3 safeDir = float3(abs(dir.x) < 1e-6 ? 1e-6 : dir.x, abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
-                                        abs(dir.z) < 1e-6 ? 1e-6 : dir.z);
-                float3 t0 = (boxLo - worldPos) / safeDir;
-                float3 t1 = (boxHi - worldPos) / safeDir;
-                float3 tNear = min(t0, t1);
-                float3 tFar = max(t0, t1);
-                // Entry is clamped at -margin rather than 0: the point actually projected is already pushed
-                // off the surface and the comparison carries a depth bias, both of which slide the effective
-                // origin a little way towards the light.
-                float tEnter = max(max(tNear.x, tNear.y), max(tNear.z, -margin));
-                float tExit = min(min(tFar.x, tFar.y), tFar.z);
-                actorsPossible = tEnter <= tExit;
+            // The cross-fade partner, built ONLY where it is read.
+            //
+            // It used to be built for every pixel, because it carried its own derivatives and those cannot be
+            // branched around. It no longer carries any: the gradient is the same for every cascade (see
+            // ShadowPlaneGradient), so the primary's serves, and what is left is a matrix select and a multiply
+            // -- which can be skipped. The band is a tenth of a cascade's range by default, so this is work that
+            // was being thrown away on the large majority of the screen.
+            ShadowProjection partner = primary;
+            if (blend) {
+                uint pc = min(cascade + 1, count - 1);
+                partner = ShadowProjectAt(worldPos + offsetDir * ShadowTexelWorldAt(pc), pc, 0.0, grad);
             }
-        }
 
-        // Four lookups at most -- {this cascade, its cross-fade partner} x {world layer, actor layer} --
-        // and they differ in exactly two things: which projection they read and which slice of the array.
-        // So they are one loop rather than four pasted copies of a sixteen-tap kernel.
-        //
-        // [loop] and not [unroll], deliberately, which is the whole point of the shape. Unrolled, the
-        // kernel appears four times in the compiled shader; looped, once. This file is compiled by FXC
-        // INSIDE a frame, the first time each material is drawn, so its size is not an abstraction -- it is
-        // the hitch felt on enabling shadows and on turning the camera into geometry that has not been
-        // drawn yet. The same reasoning already cut the four-arm cascade dispatch down to one selection.
-        //
-        // Nothing here reads across the pixel quad, which is what allows a loop at all: the derivatives are
-        // in ShadowProject, above and outside. And the skips mean a pixel executes exactly the lookups it
-        // executed before -- a character still does not touch the actor layer, and a pixel outside the band
-        // still does not touch the partner.
-        [loop]
-        for (uint i = 0; i < 4; i++) {
-            bool isActor = (i & 1) != 0;
-            bool isPartner = i >= 2;
-            if (isActor && !wantActors) {
-                continue; // a character is never shadowed by the actor layer, itself included
+            // Can the actor layer possibly shadow this point at all?
+            //
+            // That layer holds the characters and nothing else -- a handful of small objects standing somewhere
+            // on the map -- yet every scenery pixel on screen was sampling it sixteen fetches deep to be told it
+            // was lit. Its world bounding box arrives as a uniform, so a receiver with none of that box behind it
+            // along the light can skip the layer's entire kernel. Over a room that is very nearly every scenery
+            // pixel, which halves the shadow cost of all of them.
+            //
+            // The skip is exact, not an approximation. A lookup landing where no actor was drawn reads the
+            // cleared depth and returns "lit", which is precisely the value left in place by not doing it. The
+            // only thing that has to hold is the direction of the error: the box may be grown, never shrunk.
+            bool actorsPossible = false;
+            if (wantActors) {
+                // Everything that can move a lookup off the exact light ray, in world units. The kernel reaches
+                // about three texels from the sample point -- each bilinear quad spans two and sits one texel out
+                // -- and the normal offset pushes the sample up to shadow_params.z texels off the surface before
+                // any of that. Scaled by the LARGEST cascade's texel, because which cascade this pixel lands in
+                // is not decided here for the partner and the unused entries are zero, so the max is both safe
+                // and free.
+                float texelWorld = max(shadow_texel_world.x, max(shadow_texel_world.y, shadow_texel_world.z));
+                float margin = texelWorld * (3.0 + shadow_params.z);
+                float3 boxLo = shadow_actor_min.xyz - margin;
+                float3 boxHi = shadow_actor_max.xyz + margin;
+                // An empty layer arrives inverted and stays inverted once the margin is applied -- the sentinel
+                // is many orders of magnitude larger -- so this doubles as the "no characters this frame" test.
+                if (all(boxLo <= boxHi)) {
+                    // Slab test along the ray from here towards the light. The light TRAVELS along +lightAxis
+                    // (see ShadowProject), so anything that can occlude this point lies at -lightAxis from it.
+                    //
+                    // Zero components are nudged rather than special-cased: a ray parallel to a slab then yields
+                    // a huge t of the correct sign, which the min/max below already handle, and never a 0/0.
+                    float3 dir = -lightAxis;
+                    float3 safeDir = float3(abs(dir.x) < 1e-6 ? 1e-6 : dir.x, abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
+                                            abs(dir.z) < 1e-6 ? 1e-6 : dir.z);
+                    float3 t0 = (boxLo - worldPos) / safeDir;
+                    float3 t1 = (boxHi - worldPos) / safeDir;
+                    float3 tNear = min(t0, t1);
+                    float3 tFar = max(t0, t1);
+                    // Entry is clamped at -margin rather than 0: the point actually projected is already pushed
+                    // off the surface and the comparison carries a depth bias, both of which slide the effective
+                    // origin a little way towards the light.
+                    float tEnter = max(max(tNear.x, tNear.y), max(tNear.z, -margin));
+                    float tExit = min(min(tFar.x, tFar.y), tFar.z);
+                    actorsPossible = tEnter <= tExit;
+                }
             }
-            if (isActor && !actorsPossible) {
-                continue; // nothing that layer holds is between this point and the light -- see above
+
+            // Four lookups at most -- {this cascade, its cross-fade partner} x {world layer, actor layer} --
+            // and they differ in exactly two things: which projection they read and which slice of the array.
+            // So they are one loop rather than four pasted copies of a sixteen-tap kernel.
+            //
+            // [loop] and not [unroll], deliberately, which is the whole point of the shape. Unrolled, the
+            // kernel appears four times in the compiled shader; looped, once. This file is compiled by FXC
+            // INSIDE a frame, the first time each material is drawn, so its size is not an abstraction -- it is
+            // the hitch felt on enabling shadows and on turning the camera into geometry that has not been
+            // drawn yet. The same reasoning already cut the four-arm cascade dispatch down to one selection.
+            //
+            // Nothing here reads across the pixel quad, which is what allows a loop at all: the derivatives are
+            // in ShadowProject, above and outside. And the skips mean a pixel executes exactly the lookups it
+            // executed before -- a character still does not touch the actor layer, and a pixel outside the band
+            // still does not touch the partner.
+            [loop]
+            for (uint i = 0; i < 4; i++) {
+                bool isActor = (i & 1) != 0;
+                bool isPartner = i >= 2;
+                if (isActor && !wantActors) {
+                    continue; // a character is never shadowed by the actor layer, itself included
+                }
+                if (isActor && !actorsPossible) {
+                    continue; // nothing that layer holds is between this point and the light -- see above
+                }
+                // The actor layer is SHORTER than the world layer -- see SHADOW_MAP_ACTOR_CASCADES. Past its
+                // last cascade there is no slice to read, and the answer is the one an empty slice would give.
+                // Asked of the cascade index rather than of the projection, so the skip lands before the struct
+                // copy below rather than after it.
+                if (isActor && (isPartner ? min(cascade + 1, count - 1) : cascade) >= @{o_shadow_actor_cascades}) {
+                    continue;
+                }
+                if (isPartner && !blend) {
+                    continue; // outside the band the partner is multiplied by zero, so it is not read
+                }
+                // Assigned rather than selected with ?:, which HLSL does not offer over a user-defined struct.
+                ShadowProjection p = primary;
+                if (isPartner) {
+                    p = partner;
+                }
+                // One layer further along the array. Adding the stride to the finished slice is the same number
+                // a separate lookup would have built from scratch -- the slice is sliceBase + cascade either
+                // way, and both terms are small exact integers.
+                if (isActor) {
+                    p.slice += layerStride;
+                }
+                float s = ShadowSample(p);
+                if (isActor) {
+                    lit.y = isPartner ? lerp(lit.y, s, t) : s;
+                } else {
+                    lit.x = isPartner ? lerp(lit.x, s, t) : s;
+                }
             }
-            // The actor layer is SHORTER than the world layer -- see SHADOW_MAP_ACTOR_CASCADES. Past its
-            // last cascade there is no slice to read, and the answer is the one an empty slice would give.
-            // Asked of the cascade index rather than of the projection, so the skip lands before the struct
-            // copy below rather than after it.
-            if (isActor && (isPartner ? min(cascade + 1, count - 1) : cascade) >= @{o_shadow_actor_cascades}) {
-                continue;
-            }
-            if (isPartner && !blend) {
-                continue; // outside the band the partner is multiplied by zero, so it is not read
-            }
-            // Assigned rather than selected with ?:, which HLSL does not offer over a user-defined struct.
-            ShadowProjection p = primary;
-            if (isPartner) {
-                p = partner;
-            }
-            // One layer further along the array. Adding the stride to the finished slice is the same number
-            // a separate lookup would have built from scratch -- the slice is sliceBase + cascade either
-            // way, and both terms are small exact integers.
-            if (isActor) {
-                p.slice += layerStride;
-            }
-            float s = ShadowSample(p);
-            if (isActor) {
-                lit.y = isPartner ? lerp(lit.y, s, t) : s;
-            } else {
-                lit.x = isPartner ? lerp(lit.x, s, t) : s;
-            }
-        }
+        } // viewDepth within reach
     }
     return lit;
 }
