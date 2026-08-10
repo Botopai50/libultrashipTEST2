@@ -151,6 +151,18 @@ cbuffer PerShadowCB : register(b3) {
     // should do.
     float4 shadow_actor_min;
     float4 shadow_actor_max;
+    // SOH [Enhancement] The SECOND light: a lamp near the player -- a torch, or the fairy in an unlit room --
+    // that is not the light the cascades were built from. It gets one orthographic slice of its own, past
+    // both caster layers, and it is what puts a shadow inside another shadow. Which is not a trick: two
+    // lights make two shadows, and the only reason one light was ever enough here is that the cascades have
+    // exactly one direction to give away.
+    row_major float4x4 shadow_point_view_proj;
+    float4 shadow_point_pos;    // xyz = where it is, w = how far it reaches
+    // x = brighten, y = shadow strength, z = 1 when its slice was drawn this frame and may be sampled,
+    // w = which slice that is.
+    float4 shadow_point_params;
+    // x = world size of one of its texels, y = one texel in UV, z = its constant bias in NDC depth.
+    float4 shadow_point_texel;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -717,6 +729,55 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
     }
     return lit;
 }
+
+// The second light's contribution, as the amount it ADDS to whatever the cascades decided. Zero everywhere
+// it does not reach, which is most of the screen most of the time, and the caller branches on that.
+//
+// Two halves, and only the second one costs anything. The falloff is arithmetic: a distance, a squared
+// ramp. The occlusion is a projection into this light's own slice and a kernel, and it is skipped whenever
+// the light is only brightening (shadow strength 0, no slice built) or the receiver is a character -- the
+// same rule the actor layer follows, and for the same reason. This slice holds the characters, so letting
+// one sample it would be letting it shadow itself from a lamp a few tens of units away, which is all
+// self-intersection and no shadow.
+//
+// No receiver-plane gradient here, unlike the cascades. That term corrects for depth running away across a
+// texel, and it earns its keep where texels are large -- this light's whole slice spans a couple of hundred
+// units, so its texel is on the order of the NEAREST cascade's and far finer than the rest. Skipping it also
+// keeps the screen-space derivatives it needs out of the frame entirely: they may only be taken in flow
+// every pixel reaches, so computing one here would cost every pixel in the frame, including the majority
+// with no second light anywhere near them.
+float ShadowPointLight(float3 worldPos, float3 normalWs, bool wantActors) {
+    float reach = shadow_point_pos.w;
+    float3 toLight = shadow_point_pos.xyz - worldPos;
+    float distSq = dot(toLight, toLight);
+    float contribution = 0.0;
+    if (reach > 0.0 && distSq < reach * reach) {
+        // Same squared ramp the game's own key selector scores this light with, so what the hierarchy
+        // measured as "how much this light matters here" and what actually gets added agree.
+        float falloff = 1.0 - (sqrt(distSq) / reach);
+        falloff *= falloff;
+        float lit = 1.0;
+        [branch]
+        if (shadow_point_params.z > 0.5 && wantActors) {
+            float3 axis = normalize(shadow_point_view_proj._13_23_33);
+            float3 offsetDir = ShadowNormalOffset(normalWs, axis);
+            float3 sample = worldPos + offsetDir * shadow_point_texel.x;
+            ShadowProjection p = ShadowProject(sample, shadow_point_view_proj, shadow_point_texel.y,
+                                               shadow_point_texel.z, 0, shadow_point_params.w,
+                                               float2(0.0, 0.0));
+            // Outside its footprint means "this light is not blocked here", never "fully occluded" -- the
+            // debug inversion in ShadowSample is about finding a cascade's edge and would read as a black
+            // disc around the lamp. So the lookup is done directly.
+            if (p.inside > 0.5) {
+                lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv);
+            }
+        }
+        // Strength 0 leaves the light unblocked, which is the brighten-only case, and it is the same
+        // arithmetic rather than a second path through the shader.
+        contribution = shadow_point_params.x * falloff * lerp(1.0, lit, shadow_point_params.y);
+    }
+    return contribution;
+}
 @end
 
 float random(in float3 value) {
@@ -1087,7 +1148,18 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         if (shadow_filter.y > 1.5) {
             texel.rgb = float3(1.0 - shadowLayers.y, 1.0 - shadowLayers.x, 0.0);
         } else {
-            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            // The cascades' answer, and then the second light ADDED to it rather than blended with it --
+            // which is the shape two lights actually have, and it is what makes the whole thing behave.
+            // Adding means the second light can only ever lift the first one's shadow and never deepen it,
+            // so a point that both lights fail to reach is exactly as dark as the cascades alone made it. A
+            // shadow inside a shadow is not doubly dark; it is the lifted patch failing to be lifted.
+            float shadowTerm = lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            [branch]
+            if (shadow_point_params.x > 0.0) {
+                shadowTerm = saturate(shadowTerm + ShadowPointLight(input.worldPos.xyz, shadowN,
+                                                                    input.worldPos.w > 0.5));
+            }
+            texel.rgb *= shadowTerm;
         }
     @end
 

@@ -49,6 +49,11 @@
 #define SHADOW_MAP_LAYERS 2
 #define SHADOW_MAP_LAYER_WORLD 0
 #define SHADOW_MAP_LAYER_ACTORS 1
+// SOH [Enhancement] Not a third caster layer -- a selector for the secondary light's single slice, which
+// holds BOTH layers' casters (see SHADOW_MAP_POINT_SLICES). It rides the same ShadowMapBeginCascade call so
+// the reuse, clear and pipeline machinery is shared rather than duplicated; it is numbered past the real
+// layers precisely so no loop over SHADOW_MAP_LAYERS ever reaches it by accident.
+#define SHADOW_MAP_LAYER_POINT 2
 // How many cascades the ACTOR layer gets, which is fewer than the world layer's.
 //
 // That layer costs a full slice per cascade and is redrawn every frame no matter what: its contents are
@@ -63,7 +68,28 @@
 // Slices are laid out world-layer-first: world cascade C is slice C, actor cascade C is slice
 // cascadeCount + C. The actor half is the shorter one, so the total is not a simple product.
 #define SHADOW_MAP_ACTOR_CASCADES_FOR(count) ((count) < SHADOW_MAP_ACTOR_CASCADES ? (count) : SHADOW_MAP_ACTOR_CASCADES)
-#define SHADOW_MAP_SLICES_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count))
+// SOH [Enhancement] One more slice past the two layers, for a SECOND light: the point light that is lighting
+// the player when the frame's key light is something else (a torch, or Navi in an unlit room -- see the
+// hierarchy in the game's key selector). It is what makes a shadow appear INSIDE another shadow, which is
+// not a trick but simply what two lights do.
+//
+// It is a plain orthographic slice like any cascade, not a perspective or cube projection, and that is worth
+// stating because a point light "should" need one of those. It does not here, for a reason particular to
+// what this light is used for: the shadow's LENGTH is the caster's height over the tangent of the light's
+// elevation, which is the same formula for a point light and a directional one, so a caster standing on the
+// ground it is being cast onto comes out the same size either way. What a real point projection would add is
+// divergence BETWEEN objects at different distances from the light -- and this light's whole reach is a
+// couple of hundred units, inside which there is rarely more than the player and the floor. So the cheap
+// projection buys nearly all of the look, keeps w == 1 through the entire existing sampling path, and costs
+// one slice instead of six.
+//
+// It holds BOTH caster layers, unlike the cascades, and is sampled only by receivers that are not characters
+// -- the same rule the actor layer follows. That is what puts the player's own silhouette on the floor
+// beside him without also letting his chest shadow his own arm from a light a few tens of units away.
+#define SHADOW_MAP_POINT_SLICES 1
+#define SHADOW_MAP_SLICES_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count) + SHADOW_MAP_POINT_SLICES)
+// The point slice is always the LAST one, so adding it never renumbers a cascade.
+#define SHADOW_MAP_POINT_SLICE_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count))
 #define SHADOW_MAP_MAX_SLICES SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)
 
 // SOH [Enhancement] Content key meaning "nothing will be drawn into this slice at all".
@@ -468,5 +494,28 @@
 
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
+
+// SOH [Enhancement] The secondary point light (see SHADOW_MAP_POINT_SLICES), as two separate strengths.
+//
+// They are separate because they are two different effects and only one of them costs anything. BRIGHTEN is
+// how much light the second source adds where it reaches, and it is pure shader arithmetic -- a distance,
+// a falloff, an add. SHADOW is how strongly that added light is blocked by geometry, and it is what pays
+// for the extra slice and the extra kernel.
+//
+// So brighten alone is the cheap half of the effect: standing near a torch inside a building's shadow, the
+// shadow lifts around you. Turning shadow up is what makes the player's own silhouette appear inside that
+// lifted patch. At zero the slice is not built at all and the receiver never projects into it, which is why
+// this is a strength rather than a boolean -- the "off" case falls out of the same code path.
+//
+// The light is ADDED rather than blended: final = saturate(sunTerm + brighten * falloff * pointLit). That is
+// the shape two lights actually have, and it is why the second shadow can only ever darken back down to the
+// first light's answer and never below it. A shadow inside a shadow is not doubly dark.
+#define SHADOW_MAP_DEFAULT_POINT_BRIGHTEN 0.35f
+#define SHADOW_MAP_DEFAULT_POINT_SHADOW 1.0f
+
+// How far past the light's own radius its slice is fitted, as a fraction. The light falls to nothing at its
+// radius, so a caster beyond that casts nothing -- but one just inside it casts a shadow that lands well
+// outside, and the slice has to contain the shadow, not the light.
+#define SHADOW_MAP_POINT_SLICE_MARGIN 0.6f
 
 #endif // FAST_SHADOW_MAP_H

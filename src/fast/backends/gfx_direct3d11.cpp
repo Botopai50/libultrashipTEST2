@@ -2119,11 +2119,20 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     if (layer == SHADOW_MAP_LAYER_ACTORS && cascadeIndex >= SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowCascadeCount)) {
         return false;
     }
-    if (layer < 0 || layer >= SHADOW_MAP_LAYERS) {
+    if (layer < 0 || (layer >= SHADOW_MAP_LAYERS && layer != SHADOW_MAP_LAYER_POINT)) {
         return false;
     }
-    // Layer L, cascade C lives in slice L*cascadeCount + C (see fast/shadow_map.h).
-    const int slice = layer * mShadowCascadeCount + cascadeIndex;
+    // Layer L, cascade C lives in slice L*cascadeCount + C (see fast/shadow_map.h). The secondary light is
+    // not a layer and has exactly one slice, parked past both of them.
+    int slice;
+    if (layer == SHADOW_MAP_LAYER_POINT) {
+        if (cascadeIndex != 0) {
+            return false;
+        }
+        slice = SHADOW_MAP_POINT_SLICE_FOR(mShadowCascadeCount);
+    } else {
+        slice = layer * mShadowCascadeCount + cascadeIndex;
+    }
 
     // Resolved before the reuse test rather than after: the slope bias this cascade rasterises with is
     // part of what its depth map contains, and it follows a user setting. Building it here is free -- the
@@ -2415,6 +2424,42 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
     mContext->Draw((UINT)vertexCount, (UINT)firstVertex);
 }
 
+void GfxRenderingAPIDX11::WriteShadowPointLight() {
+    for (int i = 0; i < 3; i++) {
+        mPerShadowCbData.shadow_point_pos[i] = mShadowPointCentre[i];
+    }
+    mPerShadowCbData.shadow_point_pos[3] = mShadowPointRadius;
+    mPerShadowCbData.shadow_point_params[0] = mShadowPointBrighten;
+    mPerShadowCbData.shadow_point_params[1] = mShadowPointShadow;
+    // Sampling is allowed only once a slice has actually been fitted AND drawn this frame.
+    mPerShadowCbData.shadow_point_params[2] = mShadowPointActive ? 1.0f : 0.0f;
+    mPerShadowCbData.shadow_point_params[3] = (float)SHADOW_MAP_POINT_SLICE_FOR(mShadowCascadeCount);
+
+    // Texel size and depth bias, read off the fitted transform by the same trick the cascades use: the
+    // projection scales the light's unit axes by 1/radius and 1/(zFar - zNear), so the lengths of those
+    // columns ARE the conversion factors. Doing it this way rather than recomputing the radius here means
+    // the two can never drift apart if the fit changes.
+    const float* m = mShadowPointViewProj;
+    const float sx = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+    const float sz = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
+    mPerShadowCbData.shadow_point_texel[0] = (sx > 1e-9f && mShadowResolution > 0)
+                                                 ? 2.0f / (sx * (float)mShadowResolution)
+                                                 : 0.0f;
+    mPerShadowCbData.shadow_point_texel[1] = mShadowResolution > 0 ? 1.0f / (float)mShadowResolution : 0.0f;
+    mPerShadowCbData.shadow_point_texel[2] = mShadowDepthBiasWorld * sz;
+    mPerShadowCbData.shadow_point_texel[3] = 0.0f;
+}
+
+void GfxRenderingAPIDX11::SetShadowMapPointMatrix(const float lightViewProj[16]) {
+    GfxRenderingAPI::SetShadowMapPointMatrix(lightViewProj);
+    if (mShadowPointActive) {
+        memcpy(mPerShadowCbData.shadow_point_view_proj, mShadowPointViewProj, sizeof(mShadowPointViewProj));
+    } else {
+        memset(mPerShadowCbData.shadow_point_view_proj, 0, sizeof(mPerShadowCbData.shadow_point_view_proj));
+    }
+    WriteShadowPointLight();
+}
+
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
                                              float blendFraction, float normalOffset, float strength,
                                              float filterWidth, float debugMode, float edgeHardness,
@@ -2458,6 +2503,12 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     }
     mPerShadowCbData.shadow_actor_min[3] = 0.0f;
     mPerShadowCbData.shadow_actor_max[3] = 0.0f;
+
+    // The secondary light. The ZeroMemory above has just cleared its transform and its "may be sampled"
+    // flag, and both are re-supplied by SetShadowMapPointMatrix during the depth pass. A frame in which the
+    // interpreter never fits a slice therefore leaves the flag clear -- which is exactly right, because a
+    // receiver must not project into a slice still holding some earlier frame's image.
+    WriteShadowPointLight();
 
     for (int c = 0; c < count; c++) {
         const float* m = &mShadowViewProj[c * 16];

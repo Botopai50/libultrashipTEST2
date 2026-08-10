@@ -917,6 +917,12 @@ class Interpreter {
     // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
     // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.
     float mShadowMapLightDirHeld[3] = {};
+    // The secondary point light's slice (see SHADOW_MAP_POINT_SLICES). Its matrix is rebuilt from scratch
+    // every frame rather than parked like a cascade: the light is a lamp near the player and the whole point
+    // of it is that it moves, so there is no still frame to hold. It is fitted small enough -- a couple of
+    // hundred units against a cascade's thousands -- that redrawing it is cheap.
+    float mShadowPointMatrix[16] = {};
+    bool mShadowPointActive = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

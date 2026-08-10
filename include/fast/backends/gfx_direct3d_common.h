@@ -57,6 +57,17 @@ struct PerShadowCB {
     // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
     float shadow_actor_min[4];
     float shadow_actor_max[4];
+    // SOH [Enhancement] The secondary point light (see SHADOW_MAP_POINT_SLICES). Its own transform, then
+    // xyz = where it is in world space and w = how far it reaches, then the two strengths.
+    float shadow_point_view_proj[16];
+    float shadow_point_pos[4];
+    // x = brighten (how much light it adds), y = shadow strength, z = 1 when its slice was drawn this frame
+    // and may be sampled, 0 when it was not, w = which slice that is. z is separate from the strengths
+    // because the light can be brightening with no slice behind it at all -- that is the cheap half.
+    float shadow_point_params[4];
+    // x = world size of one of its texels, y = one texel in UV, z = its constant bias in NDC depth, w unused.
+    // Derived from the transform the interpreter fitted, exactly as the cascades' are.
+    float shadow_point_texel[4];
 };
 
 struct PerDrawCB {
@@ -172,6 +183,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float normalOffset, float strength, float filterWidth, float debugMode,
                             float edgeHardness, float edgeHardnessFar) override;
+    void SetShadowMapPointMatrix(const float lightViewProj[16]) override;
+    // Copies the secondary light's position, reach and strengths into the constant buffer. Called from both
+    // of the above rather than from one, so the two can arrive in either order: the application pushes the
+    // light, the interpreter pushes the transform fitted to it, and neither knows about the other.
+    void WriteShadowPointLight();
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
