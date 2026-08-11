@@ -14,11 +14,17 @@
 #include <simd/simd.h>
 
 static constexpr size_t kMaxVertexBufferPoolSize = 3;
-// SOH [Enhancement] Initial per-frame vertex buffer size (bytes). Matches the CPU mBufVbo stride
-// (256 tris * VBO_MAX_FLOATS_PER_VERTEX floats/vertex * 3 verts) with room for ~50 flushes/frame.
-// Large scenes (e.g. Hyrule Field) can need more, so the buffer grows on demand in StartFrame (see
-// mVertexBufferTargetLength) and can never overflow/crash.
-static constexpr size_t kInitialVertexBufferLength = 256 * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float) * 50;
+// SOH [Enhancement] Initial per-frame vertex buffer size (bytes), expressed as a triangle budget for a
+// whole frame (the 12800 below is the 256-triangle batch * ~50 flushes/frame this was originally tuned
+// against). It is deliberately NOT derived from MAX_TRI_BUFFER: a bigger batch makes flushes fewer and
+// larger without changing how much vertex data a frame produces, so scaling this with the batch size
+// would over-allocate by exactly that factor. Large scenes (e.g. Hyrule Field) can need more, so the
+// buffer grows on demand in StartFrame (see mVertexBufferTargetLength) and can never overflow/crash.
+static constexpr size_t kVertexBufferFrameTriBudget = 12800;
+static constexpr size_t kInitialVertexBufferLength =
+    kVertexBufferFrameTriBudget * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float);
+static_assert(kInitialVertexBufferLength >= MAX_TRI_BUFFER * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float),
+              "Initial vertex buffer must hold at least one full batch.");
 static constexpr size_t METAL_MAX_MULTISAMPLE_SAMPLE_COUNT = 8;
 static constexpr size_t MAX_PIXEL_DEPTH_COORDS = 1024;
 

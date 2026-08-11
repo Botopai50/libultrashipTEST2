@@ -35,6 +35,13 @@
 // overruns the buffer.
 #define VBO_MAX_FLOATS_PER_VERTEX 44
 
+// Maximum triangles batched before the interpreter flushes. Every flush is one draw call, so dense
+// geometry -- custom high-poly models above all -- was being split on batch exhaustion alone, with no
+// state change to justify the break: at 256 a 20k-triangle mesh cost at least 79 draw calls before
+// anything else was considered. Lives here rather than in interpreter.cpp because the D3D11 and Metal
+// vertex buffers are sized from it and must not drift out of sync with the CPU-side mBufVbo.
+#define MAX_TRI_BUFFER 2048
+
 #include <stdint.h>
 #include <stdbool.h>
 
