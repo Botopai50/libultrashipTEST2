@@ -6,24 +6,32 @@ std::shared_ptr<Ship::CVar> CVarGet(const char* name) {
 }
 
 extern "C" {
+// The read side goes through GetConsoleVariablesRaw rather than GetInstance()->GetConsoleVariables().
+// These are called well over a thousand times a frame from game code -- z_parameter.c alone has 481 call
+// sites, all of them running every frame for the HUD -- and the owning form costs four atomic
+// read-modify-writes per call (a weak_ptr::lock compare-exchange loop, then a shared_ptr copy) to reach
+// a pointer that is fixed for the lifetime of the game.
+//
+// The writes are left as they were: they happen when a setting changes, not per frame, so there is
+// nothing to win and the owning form is the safer default.
 int32_t CVarGetInteger(const char* name, int32_t defaultValue) {
-    return Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(name, defaultValue);
+    return Ship::Context::GetConsoleVariablesRaw()->GetInteger(name, defaultValue);
 }
 
 float CVarGetFloat(const char* name, float defaultValue) {
-    return Ship::Context::GetInstance()->GetConsoleVariables()->GetFloat(name, defaultValue);
+    return Ship::Context::GetConsoleVariablesRaw()->GetFloat(name, defaultValue);
 }
 
 const char* CVarGetString(const char* name, const char* defaultValue) {
-    return Ship::Context::GetInstance()->GetConsoleVariables()->GetString(name, defaultValue);
+    return Ship::Context::GetConsoleVariablesRaw()->GetString(name, defaultValue);
 }
 
 Color_RGBA8 CVarGetColor(const char* name, Color_RGBA8 defaultValue) {
-    return Ship::Context::GetInstance()->GetConsoleVariables()->GetColor(name, defaultValue);
+    return Ship::Context::GetConsoleVariablesRaw()->GetColor(name, defaultValue);
 }
 
 Color_RGB8 CVarGetColor24(const char* name, Color_RGB8 defaultValue) {
-    return Ship::Context::GetInstance()->GetConsoleVariables()->GetColor24(name, defaultValue);
+    return Ship::Context::GetConsoleVariablesRaw()->GetColor24(name, defaultValue);
 }
 
 void CVarSetInteger(const char* name, int32_t value) {

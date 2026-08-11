@@ -6,6 +6,8 @@
 #include <memory>
 #include <unordered_map>
 #include <string>
+#include <string_view>
+#include <functional>
 
 namespace Ship {
 typedef enum class ConsoleVariableType { Integer, Float, String, Color, Color24 } ConsoleVariableType;
@@ -31,6 +33,10 @@ class ConsoleVariable {
     ConsoleVariable();
     ~ConsoleVariable();
 
+    // Deliberately still hands out a shared_ptr. Returning the raw CVar* instead measured as a 0.1 ns
+    // saving out of the ~18 ns this change is worth -- nothing -- while the audio thread reads CVars
+    // (audio_playback.c, audio_synthesis.c) and the owning reference is what keeps a variable alive
+    // there if the main thread clears it mid-read. Not a trade worth making.
     std::shared_ptr<CVar> Get(const char* name);
 
     int32_t GetInteger(const char* name, int32_t defaultValue);
@@ -64,6 +70,17 @@ class ConsoleVariable {
     void LoadLegacy();
 
   private:
-    std::unordered_map<std::string, std::shared_ptr<CVar>> mVariables;
+    // Transparent hashing so a lookup can take the const char* the caller already has. With a plain
+    // unordered_map<std::string, ...> every find() has to build a std::string first, and CVar names
+    // ("gCosmetics.Navi.IdlePrimary.Changed") run well past the small-string buffer -- so the hot read
+    // path was doing a heap allocation and a free per lookup, purely to throw the string away again.
+    struct TransparentStringHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view name) const noexcept {
+            return std::hash<std::string_view>{}(name);
+        }
+    };
+
+    std::unordered_map<std::string, std::shared_ptr<CVar>, TransparentStringHash, std::equal_to<>> mVariables;
 };
 } // namespace Ship

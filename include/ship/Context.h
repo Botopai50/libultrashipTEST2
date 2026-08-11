@@ -55,6 +55,17 @@ class Context {
     std::shared_ptr<spdlog::logger> GetLogger();
     std::shared_ptr<Config> GetConfig();
     std::shared_ptr<ConsoleVariable> GetConsoleVariables();
+
+    // Non-owning access to the same object, for callers hot enough that the ownership costs more than
+    // the work. GetInstance() is a weak_ptr::lock -- an atomic compare-exchange loop -- and
+    // GetConsoleVariables() then copies a shared_ptr on top of it, so the usual
+    // Context::GetInstance()->GetConsoleVariables() pair costs four atomic read-modify-writes before any
+    // variable is even looked at. The C CVar bridge pays that over a thousand times a frame for a
+    // pointer that does not change while the game runs.
+    //
+    // Null before the context is initialized and again once it is torn down, which is the same window in
+    // which GetInstance() returns an empty shared_ptr -- so callers are no worse off than they were.
+    static ConsoleVariable* GetConsoleVariablesRaw();
     std::shared_ptr<ResourceManager> GetResourceManager();
     std::shared_ptr<ControlDeck> GetControlDeck();
     std::shared_ptr<CrashHandler> GetCrashHandler();
@@ -87,6 +98,9 @@ class Context {
 
   private:
     static std::weak_ptr<Context> mContext;
+    // Backs GetConsoleVariablesRaw. Set when the variables are created, cleared before they are
+    // destroyed, so it never outlives what it points at.
+    static ConsoleVariable* mConsoleVariablesRaw;
 
     std::shared_ptr<spdlog::logger> mLogger;
     std::shared_ptr<Config> mConfig;

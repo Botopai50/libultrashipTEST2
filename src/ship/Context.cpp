@@ -25,6 +25,7 @@
 
 namespace Ship {
 std::weak_ptr<Context> Context::mContext;
+ConsoleVariable* Context::mConsoleVariablesRaw = nullptr;
 
 std::shared_ptr<Context> Context::GetInstance() {
     return mContext.lock();
@@ -41,6 +42,8 @@ Context::~Context() {
     mCrashHandler = nullptr;
     mControlDeck = nullptr;
     mResourceManager = nullptr;
+    // Drop the non-owning pointer before the object it refers to goes away.
+    mConsoleVariablesRaw = nullptr;
     mConsoleVariables = nullptr;
     GetConfig()->Save();
     mConfig = nullptr;
@@ -187,6 +190,7 @@ bool Context::InitConsoleVariables() {
     }
 
     mConsoleVariables = std::make_shared<ConsoleVariable>();
+    mConsoleVariablesRaw = mConsoleVariables.get();
 
     if (GetConsoleVariables() == nullptr) {
         SPDLOG_ERROR("Failed to initialize console variables");
@@ -341,6 +345,10 @@ bool Context::InitFileDropMgr() {
 
 std::shared_ptr<ConsoleVariable> Context::GetConsoleVariables() {
     return mConsoleVariables;
+}
+
+ConsoleVariable* Context::GetConsoleVariablesRaw() {
+    return mConsoleVariablesRaw;
 }
 
 std::shared_ptr<spdlog::logger> Context::GetLogger() {
