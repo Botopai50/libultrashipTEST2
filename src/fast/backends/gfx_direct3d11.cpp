@@ -416,15 +416,21 @@ void GfxRenderingAPIDX11::Init() {
     ZeroMemory(&vertex_buffer_desc, sizeof(D3D11_BUFFER_DESC));
 
     vertex_buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-    // Matches the CPU mBufVbo allocation in interpreter.cpp (VBO_MAX_FLOATS_PER_VERTEX floats/vertex).
-    vertex_buffer_desc.ByteWidth =
-        MAX_TRI_BUFFER * VBO_MAX_FLOATS_PER_VERTEX * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+    // A ring of batches rather than one. DrawTriangles appends into this instead of renaming it per draw, so
+    // it no longer has to match the CPU mBufVbo allocation -- it only has to be able to take the largest
+    // single flush, which kVertexRingBytes derives from the same two constants mBufVbo does.
+    vertex_buffer_desc.ByteWidth = kVertexRingBytes;
     vertex_buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vertex_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     vertex_buffer_desc.MiscFlags = 0;
 
     ThrowIfFailed(mDevice->CreateBuffer(&vertex_buffer_desc, nullptr, mVertexBuffer.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create vertex buffer.");
+    // A fresh buffer holds nothing, so the ring starts at the beginning and the binding record must not
+    // claim an offset is still bound from the buffer this one replaces.
+    mVertexRingOffset = 0;
+    mLastVertexBufferOffset = UINT32_MAX;
+    mLastVertexBufferStride = 0;
 
     // Create per-frame constant buffer
 
@@ -1370,17 +1376,40 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
 
     // Set vertex buffer data
 
+    // Appended into the ring, not written over the front of the buffer.
+    //
+    // MAP_WRITE_DISCARD renames the buffer: the driver hands back a fresh block of the FULL ByteWidth out of
+    // a pool it then has to recycle against the GPU's progress. Doing that per draw made the price of a draw
+    // call a function of how big the buffer is rather than of how much it writes -- which is why raising
+    // MAX_TRI_BUFFER cost more than it saved the last time it was tried.
+    //
+    // MAP_WRITE_NO_OVERWRITE promises the opposite: that nothing already submitted is being touched. That
+    // holds here by construction, because the offset only moves forwards over ground no draw has been
+    // pointed at since the last rename. Running out is exactly when the promise would stop being true, and
+    // that is where DISCARD comes back -- the rename leaves the draws already in flight reading the old
+    // block, so wrapping cannot disturb them.
+    const uint32_t size = (uint32_t)(buf_vbo_len * sizeof(float));
+    D3D11_MAP mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (mVertexRingOffset + size > kVertexRingBytes) {
+        mVertexRingOffset = 0;
+        mapType = D3D11_MAP_WRITE_DISCARD;
+    }
+
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-    mContext->Map(mVertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, buf_vbo, buf_vbo_len * sizeof(float));
+    mContext->Map(mVertexBuffer.Get(), 0, mapType, 0, &ms);
+    memcpy((char*)ms.pData + mVertexRingOffset, buf_vbo, size);
     mContext->Unmap(mVertexBuffer.Get(), 0);
 
-    uint32_t stride = mShaderProgram->numFloats * sizeof(float);
-    uint32_t offset = 0;
+    const uint32_t stride = mShaderProgram->numFloats * sizeof(float);
+    const uint32_t offset = mVertexRingOffset;
+    mVertexRingOffset += size;
 
-    if (mLastVertexBufferStride != stride) {
+    // The offset moves every draw now, so this can no longer be skipped on the stride alone. What replaces
+    // the rename is a binding, which is the whole of the trade being made here.
+    if (mLastVertexBufferStride != stride || mLastVertexBufferOffset != offset) {
         mLastVertexBufferStride = stride;
+        mLastVertexBufferOffset = offset;
         mContext->IASetVertexBuffers(0, 1, mVertexBuffer.GetAddressOf(), &stride, &offset);
     }
 

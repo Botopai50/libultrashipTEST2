@@ -15,6 +15,17 @@
 
 namespace Fast {
 
+// SOH [Enhancement] Size of the dynamic vertex ring DrawTriangles appends into, in bytes.
+//
+// Eight worst-case batches. The ring is written forwards and only renamed (MAP_WRITE_DISCARD) when the next
+// flush will not fit, so this size decides how OFTEN that rename happens -- and the rename is the expensive
+// part, since it costs a fresh block of the whole buffer out of the driver's pool. Eight puts it at a
+// handful of times a frame rather than once per draw, which is what it used to be.
+//
+// Worst case rather than typical: most draws use about a third of the vertex layout, but the ring must be
+// able to take the largest single flush whole.
+constexpr uint32_t kVertexRingBytes = 8u * MAX_TRI_BUFFER * VBO_MAX_FLOATS_PER_VERTEX * 3u * sizeof(float);
+
 struct PerFrameCB {
     uint32_t noise_frame;
     float noise_scale;
@@ -408,6 +419,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     struct ShaderProgramD3D11* mLastShaderProgram = nullptr;
     uint32_t mLastVertexBufferStride = 0;
+    uint32_t mLastVertexBufferOffset = UINT32_MAX; // no offset bound yet
+    // Where the next flush is written in the vertex ring, in bytes. See DrawTriangles: the buffer is filled
+    // forwards with MAP_WRITE_NO_OVERWRITE and only renamed with MAP_WRITE_DISCARD when it runs out.
+    uint32_t mVertexRingOffset = 0;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mLastBlendState = nullptr;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mLastResourceViews[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };

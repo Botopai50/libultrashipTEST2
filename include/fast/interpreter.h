@@ -35,23 +35,27 @@
 // overruns the buffer.
 #define VBO_MAX_FLOATS_PER_VERTEX 44
 
-// Maximum triangles batched before the interpreter flushes. Every flush is one draw call, so raising
-// this looks like it should cut draw calls on dense geometry. It does not pay off as things stand, and
-// 2048 was measurably WORSE -- keep it at 256 until the D3D11 upload path below is changed.
+// Maximum triangles batched before the interpreter flushes. Every flush is one draw call, so dense
+// geometry -- custom high-poly models above all -- was being split on batch exhaustion alone, with no
+// state change to justify the break: at 256 a 20k-triangle mesh cost at least 79 draw calls before
+// anything else was considered.
 //
-// Two reasons. Flushes here are overwhelmingly driven by state changes (shader, texture, blend, depth,
-// viewport), not by the batch filling up, so a bigger batch rarely gets used. And D3D11 maps its whole
-// vertex buffer with MAP_WRITE_DISCARD on EVERY draw, which makes the driver hand back a fresh block of
-// the buffer's full ByteWidth from its rename pool. Enlarging the batch therefore enlarges what every
-// draw call costs -- including the small, state-change-driven flushes that dominate -- and the pool
-// drains faster and stalls on the GPU.
+// This was raised once before and had to be put back, because the cost it added was larger than the cost
+// it removed. D3D11 used to map its WHOLE vertex buffer with MAP_WRITE_DISCARD on every draw, so the
+// driver handed back a fresh block of the buffer's full ByteWidth each time -- which made the price of
+// every draw call scale with the batch size, including the small, state-change-driven flushes that are
+// the large majority. Flushes here are overwhelmingly caused by state changes (shader, texture, blend,
+// depth, viewport) rather than by the batch filling up, so that was paying more on nearly every draw to
+// save on the few that filled it.
 //
-// Making a larger batch worthwhile means first turning that path into an append ring: MAP_WRITE_NO_OVERWRITE
-// at a running offset, MAP_WRITE_DISCARD only on wrap, the way the Metal backend already works.
+// What makes it worth having now is that GfxRenderingAPIDX11::DrawTriangles no longer works that way: it
+// appends into a ring with MAP_WRITE_NO_OVERWRITE and only renames the buffer on wrap, so the cost of a
+// draw call follows how much it actually writes rather than how large the buffer is. Raising this without
+// that change in place would reintroduce the regression exactly as before.
 //
 // Lives here rather than in interpreter.cpp because the D3D11 and Metal vertex buffers are sized from it
 // and must not drift out of sync with the CPU-side mBufVbo.
-#define MAX_TRI_BUFFER 256
+#define MAX_TRI_BUFFER 4096
 
 #include <stdint.h>
 #include <stdbool.h>
