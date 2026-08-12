@@ -926,6 +926,30 @@ class Interpreter {
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
+
+    // Everything GfxSpTri1 needs to decide which colour combiner a triangle draws with. Consecutive
+    // triangles of a mesh almost always agree on all of it, and resolving it costs some thirty branches, a
+    // key to build and a hash lookup -- per triangle, for an answer that changed once at the top of the
+    // draw call.
+    //
+    // Compared rather than dirty-flagged, deliberately. A flag has to be set by every write to every field
+    // below, spread over the whole command set, and the failure mode of missing one is a triangle drawn
+    // with the previous one's combiner -- wrong colour, wrong blending, and no way to tell from a log.
+    // Comparing the inputs themselves cannot miss a writer, because it reads what the writers wrote.
+    struct TriCombinerInputs {
+        uint64_t other_mode_l;
+        uint64_t other_mode_h;
+        uint64_t combine_mode;
+        uint32_t shader_id;
+        uint32_t flags; // the assorted bools, packed
+        bool operator==(const TriCombinerInputs&) const = default;
+    };
+    TriCombinerInputs mTriCombinerInputs = {};
+    ColorCombiner* mTriCombiner = nullptr;
+    // Resolved alongside the combiner and read after it: which caster layers this draw samples. Cached for
+    // the same reason and off the same inputs -- both are decided by fields in the key above.
+    bool mTriUseShadowMap = false;
+    bool mTriUseShadowMapActors = false;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
                                                         SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels
