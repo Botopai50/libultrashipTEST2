@@ -3575,7 +3575,7 @@ void Interpreter::RenderShadowMap() {
     // ShadowMapConfigure below, so the answer only becomes true after the first successful configure, and
     // the captures it governs all happen after this point in the frame.
     mShadowAlphaSupported = mRapi->SupportsShadowMapAlphaCasters();
-    if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution)) {
+    if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution, mShadowMapActorResolution)) {
         // Backend could not give us the maps; report no cascades so the main pass does not sample a
         // texture that was never filled.
         mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,

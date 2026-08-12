@@ -2256,8 +2256,9 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     return true;
 }
 
-bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolution) {
-    if (mShadowMapTexture != nullptr && cascadeCount == mShadowCascadeCount && resolution == mShadowResolution) {
+bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolution, int actorResolution) {
+    if (mShadowMapTexture != nullptr && cascadeCount == mShadowCascadeCount && resolution == mShadowResolution &&
+        actorResolution == mShadowActorResolution) {
         return true; // already the right shape
     }
 
@@ -2271,8 +2272,12 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     }
     mShadowMapSrv.Reset();
     mShadowMapTexture.Reset();
+    mShadowActorSrv.Reset();
+    mShadowActorTexture.Reset();
+    mShadowActorSplit = false;
     mShadowCascadeCount = 0;
     mShadowResolution = 0;
+    mShadowActorResolution = 0;
 
     // TYPELESS so the same slices can be a depth target (D16_UNORM) while writing and a texture
     // (R16_UNORM) while sampling.
@@ -2293,7 +2298,34 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     }
 
     const int sliceCount = SHADOW_MAP_SLICES_FOR(cascadeCount);
+
+    // The actor layer's own array, when it was asked to be a different size. Deliberately the SAME ArraySize
+    // as the world one, even though only its upper half is ever drawn into: the slice number is then the same
+    // arithmetic in both arrays, so every index downstream -- the DSV table, mShadowSliceValid/Key/Matrix, and
+    // the shader's sliceBase + cascade + layerStride -- keeps working untouched, and the split is purely a
+    // question of WHICH texture a slice lives in. The unused half costs a few MB at the small resolutions this
+    // exists for, which is a good trade for not having two different slice numberings to keep in step.
+    //
+    // Failure is not fatal. Falling back to the shared array gives the arrangement that existed before the
+    // layers could be sized apart, which is worse than asked for but is not "no shadows".
+    if (actorResolution != resolution) {
+        D3D11_TEXTURE2D_DESC actor_desc = tex_desc;
+        actor_desc.Width = (UINT)actorResolution;
+        actor_desc.Height = (UINT)actorResolution;
+        if (FAILED(mDevice->CreateTexture2D(&actor_desc, nullptr, mShadowActorTexture.GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not create the {}x{} actor-layer depth array; "
+                         "falling back to the world layer's array.",
+                         actorResolution, actorResolution);
+            mShadowActorTexture.Reset();
+        } else {
+            mShadowActorSplit = true;
+        }
+    }
     for (int i = 0; i < sliceCount; i++) {
+        // Slices at or past cascadeCount are the actor layer (see shadow_map.h), so they come out of the actor
+        // array when there is one.
+        ID3D11Texture2D* sliceTexture =
+            (mShadowActorSplit && i >= cascadeCount) ? mShadowActorTexture.Get() : mShadowMapTexture.Get();
         D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
         ZeroMemory(&dsv_desc, sizeof(dsv_desc));
         dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
@@ -2301,7 +2333,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
         dsv_desc.Texture2DArray.MipSlice = 0;
         dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
         dsv_desc.Texture2DArray.ArraySize = 1;
-        if (FAILED(mDevice->CreateDepthStencilView(mShadowMapTexture.Get(), &dsv_desc, mShadowMapDsv[i].GetAddressOf()))) {
+        if (FAILED(mDevice->CreateDepthStencilView(sliceTexture, &dsv_desc, mShadowMapDsv[i].GetAddressOf()))) {
             SPDLOG_ERROR("Shadow map: could not create the depth view for slice {}.", i);
             for (int j = 0; j < i; j++) {
                 mShadowMapDsv[j].Reset(); // do not leave views pointing at a texture we are dropping
@@ -2325,15 +2357,56 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
             mShadowMapDsv[i].Reset();
         }
         mShadowMapTexture.Reset();
+        mShadowActorTexture.Reset();
+        mShadowActorSplit = false;
         return false;
+    }
+
+    // The actor slot. When the layers share one array this is the very same view, so the shader reads the
+    // same texels through both slots and the split costs nothing but a second binding.
+    if (mShadowActorSplit) {
+        if (FAILED(mDevice->CreateShaderResourceView(mShadowActorTexture.Get(), &srv_desc,
+                                                     mShadowActorSrv.GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not create the actor-layer resource view; "
+                         "falling back to the world layer's array.");
+            mShadowActorSrv.Reset();
+            mShadowActorTexture.Reset();
+            mShadowActorSplit = false;
+            // The actor slices' depth views point into a texture we just dropped, so they have to be rebuilt
+            // against the shared array before anything renders through them.
+            for (int i = cascadeCount; i < sliceCount; i++) {
+                D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+                ZeroMemory(&dsv_desc, sizeof(dsv_desc));
+                dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
+                dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+                dsv_desc.Texture2DArray.MipSlice = 0;
+                dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
+                dsv_desc.Texture2DArray.ArraySize = 1;
+                mShadowMapDsv[i].Reset();
+                if (FAILED(mDevice->CreateDepthStencilView(mShadowMapTexture.Get(), &dsv_desc,
+                                                           mShadowMapDsv[i].GetAddressOf()))) {
+                    SPDLOG_ERROR("Shadow map: could not rebuild the depth view for slice {}.", i);
+                    for (int j = 0; j < sliceCount; j++) {
+                        mShadowMapDsv[j].Reset();
+                    }
+                    mShadowMapSrv.Reset();
+                    mShadowMapTexture.Reset();
+                    return false;
+                }
+            }
+        }
+    }
+    if (!mShadowActorSplit) {
+        mShadowActorSrv = mShadowMapSrv;
     }
 
     mShadowCascadeCount = cascadeCount;
     mShadowResolution = resolution;
+    mShadowActorResolution = mShadowActorSplit ? actorResolution : resolution;
     return true;
 }
 
-bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
+bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {
     if (cascadeCount < 1) {
         cascadeCount = 1;
     } else if (cascadeCount > SHADOW_MAP_MAX_CASCADES) {
@@ -2344,10 +2417,18 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
     } else if (resolution > SHADOW_MAP_MAX_RESOLUTION) {
         resolution = SHADOW_MAP_MAX_RESOLUTION;
     }
+    // Clamped against the same bounds, and never above the world layer's: a character map finer than the
+    // scenery it is cast onto buys nothing, and allowing it would only spend the fill this split exists to
+    // save.
+    if (actorResolution < SHADOW_MAP_MIN_RESOLUTION) {
+        actorResolution = SHADOW_MAP_MIN_RESOLUTION;
+    } else if (actorResolution > resolution) {
+        actorResolution = resolution;
+    }
     if (!CreateShadowMapPipeline()) {
         return false;
     }
-    return CreateShadowMapTargets(cascadeCount, resolution);
+    return CreateShadowMapTargets(cascadeCount, resolution, actorResolution);
 }
 
 // SOH [Enhancement] Cascaded shadow maps: this cascade's rasterizer state, differing from the shared one
@@ -2364,9 +2445,9 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution) {
 // unit x axis by 1/radius, so that column's length IS 1/radius, and one texel spans 2*radius/resolution.
 // The result is quantised before it is compared, so a value drifting by a hair does not rebuild the state;
 // combined with the radius hysteresis, rebuilds happen once in a great while rather than per frame.
-ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int cascadeIndex,
+ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice, int resolution,
                                                                        const float lightViewProj[16]) {
-    if (cascadeIndex < 0 || cascadeIndex >= SHADOW_MAP_MAX_CASCADES || mShadowResolution <= 0) {
+    if (slice < 0 || slice >= SHADOW_MAP_MAX_SLICES || resolution <= 0) {
         return mShadowRasterizerState.Get();
     }
 
@@ -2376,7 +2457,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
     const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
                                (lightViewProj[8] * lightViewProj[8]));
     if (sx > 1e-9f) {
-        const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
+        const float texelWorld = 2.0f / (sx * (float)resolution);
         if (texelWorld > 1e-6f) {
             const float cap = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD / texelWorld;
             if (cap < slope) {
@@ -2394,7 +2475,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
     // be compared against itself -- but it needs the caster to HAVE a far side, and this game's scenery is
     // largely modelled from one side only. Those surfaces have nothing left once their front is culled and
     // stop casting entirely.
-    if (mShadowRasterizerCascade[cascadeIndex] == nullptr || mShadowRasterizerCascadeSlope[cascadeIndex] != slope) {
+    if (mShadowRasterizerCascade[slice] == nullptr || mShadowRasterizerCascadeSlope[slice] != slope) {
         D3D11_RASTERIZER_DESC rast_desc;
         ZeroMemory(&rast_desc, sizeof(rast_desc));
         rast_desc.FillMode = D3D11_FILL_SOLID;
@@ -2406,13 +2487,13 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int casca
         if (FAILED(mDevice->CreateRasterizerState(&rast_desc, built.GetAddressOf()))) {
             // Not fatal: the shared state is the same thing with the base slope, so the cascade keeps the
             // bias it had before this refinement existed.
-            SPDLOG_ERROR("Shadow map: could not build the rasterizer state for cascade {}.", cascadeIndex);
+            SPDLOG_ERROR("Shadow map: could not build the rasterizer state for slice {}.", slice);
             return mShadowRasterizerState.Get();
         }
-        mShadowRasterizerCascade[cascadeIndex] = built;
-        mShadowRasterizerCascadeSlope[cascadeIndex] = slope;
+        mShadowRasterizerCascade[slice] = built;
+        mShadowRasterizerCascadeSlope[slice] = slope;
     }
-    return mShadowRasterizerCascade[cascadeIndex].Get();
+    return mShadowRasterizerCascade[slice].Get();
 }
 
 bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
@@ -2437,7 +2518,11 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     // Resolved before the reuse test rather than after: the slope bias this cascade rasterises with is
     // part of what its depth map contains, and it follows a user setting. Building it here is free -- the
     // state objects are cached and this is the same call the draw path was going to make anyway.
-    ID3D11RasterizerState* rasterState = ShadowRasterizerForCascade(cascadeIndex, lightViewProj);
+    // Keyed and sized by the slice, because the actor layer may be a different resolution and the cap this
+    // applies is a texel-size question -- the same cascade index has a different texel in each layer.
+    const int sliceResolutionForBias =
+        (layer == SHADOW_MAP_LAYER_ACTORS && mShadowActorSplit) ? mShadowActorResolution : mShadowResolution;
+    ID3D11RasterizerState* rasterState = ShadowRasterizerForCascade(slice, sliceResolutionForBias, lightViewProj);
 
     // Nothing is going to be drawn here and nothing was last time either, so the slice is already the map of
     // nothing this call would produce. That reads identically however it is projected -- every receiver
@@ -2466,8 +2551,8 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mContext->RSGetViewports(&mShadowSavedViewportCount, &mShadowSavedViewport);
         // The cascade array is about to become a depth target, so it must not still be bound for
         // reading from the previous frame's main pass.
-        ID3D11ShaderResourceView* null_srv[1] = { nullptr };
-        mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, null_srv);
+        ID3D11ShaderResourceView* null_srv[2] = { nullptr, nullptr };
+        mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 2, null_srv);
         // Forget the previous pass's ACTOR upload. That vector is double-buffered by the interpreter, so it
         // keeps the same two allocations frame to frame while its contents change completely -- a pointer
         // match across passes would wrongly skip the upload and render last frame's characters forever.
@@ -2517,8 +2602,11 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     D3D11_VIEWPORT viewport;
     viewport.TopLeftX = 0.0f;
     viewport.TopLeftY = 0.0f;
-    viewport.Width = (float)mShadowResolution;
-    viewport.Height = (float)mShadowResolution;
+    // Sized for the array this slice actually lives in, not for the world layer.
+    const float sliceResolution =
+        (float)((layer == SHADOW_MAP_LAYER_ACTORS && mShadowActorSplit) ? mShadowActorResolution : mShadowResolution);
+    viewport.Width = sliceResolution;
+    viewport.Height = sliceResolution;
     viewport.MinDepth = 0.0f;
     viewport.MaxDepth = 1.0f;
     mContext->RSSetViewports(1, &viewport);
@@ -2793,6 +2881,8 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
                                         : texelWorld;
             mPerShadowCbData.shadow_texel_world[c] = texelWorld < offsetCap ? texelWorld : offsetCap;
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
+            mPerShadowCbData.shadow_actor_texel_uv[c] =
+                1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
 
         // Depth bias, in world units, converted into this cascade's NDC depth. The projection scales the
@@ -2989,6 +3079,12 @@ void GfxRenderingAPIDX11::ShadowMapBindForReading() {
     if (mShadowMapSrv != nullptr) {
         mContext->PSSetShaderResources(SHADER_MAX_TEXTURES, 1, mShadowMapSrv.GetAddressOf());
         mContext->PSSetSamplers(SHADER_MAX_TEXTURES, 1, mShadowMapSampler.GetAddressOf());
+        // The actor layer's slot. Holds the same view as above while the layers share an array, so this is
+        // the unsplit arrangement reaching the shader through two names rather than one.
+        if (mShadowActorSrv != nullptr) {
+            mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 1, 1, mShadowActorSrv.GetAddressOf());
+            mContext->PSSetSamplers(SHADER_MAX_TEXTURES + 1, 1, mShadowMapSampler.GetAddressOf());
+        }
     }
 }
 

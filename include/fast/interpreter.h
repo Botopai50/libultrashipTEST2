@@ -480,7 +480,8 @@ class Interpreter {
     // already account for the backend's capability -- the interpreter does not second-guess it, it just
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
     // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
-    void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, const float splits[4],
+    void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, int actorResolution,
+                            const float splits[4],
                             const float lightDir[3], float blendFraction, float normalOffset, float strength,
                             float filterWidth, float minCasterSize, float debugMode,
                             float edgeHardness, float edgeHardnessFar, float minIncidence, float fullIncidence,
@@ -502,6 +503,9 @@ class Interpreter {
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                           : cascadeCount;
         mShadowMapResolution = resolution;
+        // Never finer than the world layer (see shadow_map.h); the backend clamps it again, but keeping the
+        // two in order here means the value the interpreter reasons with is the one that will be used.
+        mShadowMapActorResolution = actorResolution > resolution ? resolution : actorResolution;
         if (splits != nullptr) {
             for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
                 mShadowMapSplits[i] = splits[i];
@@ -917,6 +921,7 @@ class Interpreter {
     bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
+    int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
                                                         SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels

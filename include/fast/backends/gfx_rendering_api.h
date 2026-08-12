@@ -202,9 +202,13 @@ class GfxRenderingAPI {
     // Allocate (or resize) the cascade depth array. Safe to call every frame: implementations
     // reallocate only when the count or resolution actually changes. Returns false if the resources
     // could not be created, in which case the caller must treat shadow maps as unavailable this frame.
-    // cascadeCount is clamped to [1, SHADOW_MAP_MAX_CASCADES], resolution to the SHADOW_MAP_*_RESOLUTION
-    // bounds.
-    virtual bool ShadowMapConfigure(int cascadeCount, int resolution) {
+    // cascadeCount is clamped to [1, SHADOW_MAP_MAX_CASCADES], both resolutions to the
+    // SHADOW_MAP_*_RESOLUTION bounds.
+    //
+    // actorResolution sizes the actor layer independently of the world layer (see shadow_map.h). Passing the
+    // same value for both is the unsplit arrangement and must behave exactly as it did before the parameter
+    // existed; an implementation that does not support the split is free to ignore it entirely.
+    virtual bool ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {
         return false;
     }
 

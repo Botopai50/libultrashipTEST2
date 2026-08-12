@@ -57,6 +57,9 @@ struct PerShadowCB {
     // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
     float shadow_actor_min[4];
     float shadow_actor_max[4];
+    // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
+    // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
+    float shadow_actor_texel_uv[4];
 };
 
 struct PerDrawCB {
@@ -173,7 +176,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void PrewarmShaderVariants(uint32_t extraOptionBits) override;
     bool ShaderPrewarmInProgress() override;
     bool SupportsShadowMap() override;
-    bool ShadowMapConfigure(int cascadeCount, int resolution) override;
+    bool ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
                                uint64_t contentKey) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
@@ -212,8 +215,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Both report failure instead of throwing -- a device that cannot make a shadow map must degrade to
     // "no shadow map" rather than take the whole renderer down.
     bool CreateShadowMapPipeline();
-    bool CreateShadowMapTargets(int cascadeCount, int resolution);
-    ID3D11RasterizerState* ShadowRasterizerForCascade(int cascadeIndex, const float lightViewProj[16]);
+    bool CreateShadowMapTargets(int cascadeCount, int resolution, int actorResolution);
+    ID3D11RasterizerState* ShadowRasterizerForCascade(int slice, int resolution, const float lightViewProj[16]);
     void ShadowMapInvalidateOpenSlice();
     void ShadowMapBindForReading();
 
@@ -223,6 +226,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMapTexture;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMapDsv[SHADOW_MAP_MAX_SLICES];
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMapSrv;
+    // The actor layer's own array, built only when its resolution differs from the world layer's. While the
+    // two match these stay null and both shader slots are fed from mShadowMapTexture, which is bit for bit
+    // the arrangement that existed before the layers could be sized apart.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowActorTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowActorSrv;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowMapSampler;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowDepthVs;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowDepthLayout;
@@ -240,8 +248,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // far cascades, whose texels are several world units, need a smaller multiplier to stay under the same
     // world-space ceiling. Rebuilt only when a cascade's required value actually changes, which the radius
     // hysteresis makes rare; null means "use the shared state above".
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_CASCADES];
-    float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_CASCADES] = {};
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_SLICES];
+    float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_SLICES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
     // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
@@ -288,6 +296,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool mShadowAlphaBound = false;         // the alpha pipeline is the one currently set on the context
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists
     int mShadowResolution = 0;
+    // Resolution of the actor layer, and whether it ended up in an array of its own. Split is false whenever
+    // the resolutions match AND whenever building the second array failed, so the fallback is the shared
+    // array rather than no shadows.
+    int mShadowActorResolution = 0;
+    bool mShadowActorSplit = false;
     bool mShadowPipelineReady = false;
     bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
     bool mShadowPassActive = false;     // between BeginCascade and EndPass

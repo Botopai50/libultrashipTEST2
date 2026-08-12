@@ -146,6 +146,23 @@
 #define SHADOW_MAP_MAX_RESOLUTION 4096
 #define SHADOW_MAP_DEFAULT_RESOLUTION 4096
 
+// The actor layer's own resolution, chosen separately from the world layer's.
+//
+// The two layers are not the same shape of problem. The world layer covers whatever the cascade covers and
+// is reused across frames when the camera holds still; the actor layer holds a few thousand triangles of
+// animating characters standing in one small part of that area, and its content key changes every frame, so
+// it is cleared and redrawn every frame no matter what. Measured in a modded save it was 2 of the 4.6 slices
+// redrawn per frame -- and a slice is a fixed cost in fill, whatever is drawn into it, because the clear
+// alone writes the whole surface (33.6 MB at 4096, D16).
+//
+// Spending the world layer's resolution on that is the waste this separates out: characters are small, near,
+// and shadowed onto ground the player is standing on, so their map is oversampled at 4096 by a wide margin.
+//
+// Defaults to matching the world layer, so the split changes nothing until it is asked for. When the two are
+// equal the backend binds ONE array to both slots and the result is identical to having no split at all --
+// the second array only exists once the resolutions differ.
+#define SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION SHADOW_MAP_DEFAULT_RESOLUTION
+
 // Default split distances (world units from the camera) for the four cascades. These bound the far
 // plane of each cascade's ortho projection; the near plane of cascade N is the far plane of N-1.
 //

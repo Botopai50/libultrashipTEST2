@@ -108,6 +108,17 @@ cbuffer PerToonCB : register(b2) {
 Texture2DArray<float> g_shadowMap : register(t6);
 SamplerState g_shadowSampler : register(s6);
 
+// SOH [Enhancement] The ACTOR caster layer, which may live in an array of its own at its own resolution
+// (see fast/shadow_map.h). While the two layers are the same size the backend binds the SAME view here, so
+// every fetch below reads exactly the texels it read before the layers could be sized apart.
+//
+// Selected with a branch rather than by duplicating the kernel: `isActor` is uniform for the whole of a
+// lookup, both textures are referenced statically, and no index is dynamic -- so this stays inside what
+// ps_4_0 will map, which duplicating eighty lines of tuned filtering by hand would have risked getting
+// subtly wrong instead.
+Texture2DArray<float> g_shadowMapActors : register(t7);
+SamplerState g_shadowActorSampler : register(s7);
+
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
 // subtly wrong. Layout matches the PerShadowCB C++ struct exactly.
@@ -151,6 +162,9 @@ cbuffer PerShadowCB : register(b3) {
     // should do.
     float4 shadow_actor_min;
     float4 shadow_actor_max;
+    // One texel of the ACTOR layer in UV terms, per cascade. Equal to shadow_texel_uv while the two layers
+    // share a resolution; separate once that layer is sized on its own (see fast/shadow_map.h).
+    float4 shadow_actor_texel_uv;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -183,7 +197,7 @@ cbuffer PerShadowCB : register(b3) {
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
 float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel, float z, float slice,
-                       float texelUv) {
+                       float texelUv, bool isActor) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
@@ -210,13 +224,22 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel
     // picks is decided in fixed point, and asking at a texel centre puts that decision half a texel from a
     // boundary in each direction -- orders of magnitude more margin than the hardware's sub-texel precision
     // -- so the four texels are the computed ones and not their neighbours.
-    float4 stored = g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
+    float4 stored = isActor ? g_shadowMapActors.Gather(g_shadowActorSampler, float3(uv00 + texelUv * 0.5, slice))
+                            : g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
 @else
     float4 stored;
-    stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, slice), 0);
-    stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
-    stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
-    stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
+    if (isActor) {
+        stored.w = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00, slice), 0);
+        stored.z = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+        stored.x = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+        stored.y =
+            g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
+    } else {
+        stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, slice), 0);
+        stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+        stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+        stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
+    }
 @end
 
     // The four depths the receiver's own plane has at those texels.
@@ -264,7 +287,7 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel
 // Redistributing the cascade splits was checked first and does not help: the far cascade's radius comes
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
-float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texelUv) {
+float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texelUv, bool isActor) {
     // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
     // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
     // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
@@ -276,10 +299,10 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // they share a cascade, so they share its texel -- so it is formed once here rather than four times
     // inside them.
     float2 gradTexel = grad * texelUv;
-    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv);
-    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, gradTexel, z, slice, texelUv);
+    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
     return sum * 0.25;
 }
 
@@ -450,10 +473,10 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
 // footprint looks identical to one that nothing occludes, so a shadow that stops at the cascade edge reads
 // as a shadow that was never cast. The debug flag inverts the rejected case to "fully occluded", which draws
 // the footprint boundary on screen.
-float ShadowSample(ShadowProjection p) {
+float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = shadow_filter.y > 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv);
+        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor);
     }
     return lit;
 }
@@ -485,6 +508,16 @@ float ShadowTexelWorldAt(uint cascade) {
         v = shadow_texel_world.x;
     } else if (cascade == 1) {
         v = shadow_texel_world.y;
+    }
+    return v;
+}
+
+float ShadowActorTexelUvAt(uint cascade) {
+    float v = shadow_actor_texel_uv.z;
+    if (cascade == 0) {
+        v = shadow_actor_texel_uv.x;
+    } else if (cascade == 1) {
+        v = shadow_actor_texel_uv.y;
     }
     return v;
 }
@@ -705,8 +738,12 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
                 // way, and both terms are small exact integers.
                 if (isActor) {
                     p.slice += layerStride;
+                    // The projection is shared with the world layer -- uv and depth are normalised, so they
+                    // do not care how big the map is -- but the filter kernel walks in TEXELS, and that layer
+                    // may have its own. Equal to the world layer's whenever the two are the same size.
+                    p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
-                float s = ShadowSample(p);
+                float s = ShadowSample(p, isActor);
                 if (isActor) {
                     lit.y = isPartner ? lerp(lit.y, s, t) : s;
                 } else {
