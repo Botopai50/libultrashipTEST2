@@ -2132,120 +2132,88 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     //
     // Alpha-tested cutouts are NOT caught by this and must not be: grass and canopies are opaque where they
     // are opaque, they draw in ZMODE_OPA, and they go on receiving exactly as before.
-    // Consecutive triangles of a mesh agree on all of this, and resolving it is some thirty branches, a
-    // key to build and a hash lookup. Done once per run of triangles that share it rather than once each.
-    //
-    // The comparison is against the INPUTS, not a dirty flag: a flag would have to be set by every writer
-    // of every field named here, scattered across the command set, and missing one draws a triangle with
-    // the previous one's combiner -- wrong colours with nothing in a log to say so. Reading the inputs
-    // cannot miss a writer.
-    //
-    // is_rect and the projection test belong in the key as much as the RDP registers do: both feed
-    // use_shadow_map below, so a screen-space quad following world geometry has to re-resolve even though
-    // no register moved.
-    const TriCombinerInputs triInputs = {
-        mRdp->other_mode_l,
-        mRdp->other_mode_h,
-        mRdp->combine_mode,
-        (uint32_t)(mRdp->current_shader.enabled ? mRdp->current_shader.id : 0u),
-        (uint32_t)((mRdp->grayscale ? 1u : 0u) | (mRdp->toon ? 2u : 0u) | (mRdp->toon_shadow ? 4u : 0u) |
-                   (mRdp->shadow_no_receive ? 8u : 0u) |
-                   ((mRsp->geometry_mode & G_LIGHTING) ? 16u : 0u) |
-                   (mRdp->loaded_texture[0].masked ? 32u : 0u) | (mRdp->loaded_texture[1].masked ? 64u : 0u) |
-                   (mRdp->loaded_texture[0].blended ? 128u : 0u) | (mRdp->loaded_texture[1].blended ? 256u : 0u) |
-                   (mRdp->current_shader.enabled ? 512u : 0u) | (is_rect ? 1024u : 0u) |
-                   (screenSpaceProjection ? 2048u : 0u) | (mShadowMapEnabled ? 4096u : 0u)),
-    };
-    if (mTriCombiner == nullptr || !(triInputs == mTriCombinerInputs)) {
-        mTriCombinerInputs = triInputs;
-        const bool translucentSurface = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
-        // And neither does a draw whose colour the blender throws away. `invisible` means the blend is
-        // memory-only -- the source term is multiplied by zero -- so the pixel shader's rgb never reaches the
-        // framebuffer, and shading it is work with no possible output. Dropping the option rather than
-        // discarding in the shader is deliberate: a discard would also suppress the DEPTH write, which these
-        // draws still perform and which something downstream may be relying on. This changes what is computed,
-        // not what is written.
-        bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !translucentSurface &&
-                              !invisible && !mRdp->shadow_no_receive;
-        // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
-        // characters from shadowing each other (or themselves) while still being shadowed by the world.
-        bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
-        auto shader = mRdp->current_shader;
+    const bool translucentSurface = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
+    // And neither does a draw whose colour the blender throws away. `invisible` means the blend is
+    // memory-only -- the source term is multiplied by zero -- so the pixel shader's rgb never reaches the
+    // framebuffer, and shading it is work with no possible output. Dropping the option rather than
+    // discarding in the shader is deliberate: a discard would also suppress the DEPTH write, which these
+    // draws still perform and which something downstream may be relying on. This changes what is computed,
+    // not what is written.
+    bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !translucentSurface &&
+                          !invisible && !mRdp->shadow_no_receive;
+    // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
+    // characters from shadowing each other (or themselves) while still being shadowed by the world.
+    bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
+    auto shader = mRdp->current_shader;
 
-        if (texture_edge) {
-            if (use_alpha) {
-                alpha_threshold = true;
-                texture_edge = false;
-            }
-            use_alpha = true;
-        }
-
+    if (texture_edge) {
         if (use_alpha) {
-            cc_options |= SHADER_OPT(ALPHA);
+            alpha_threshold = true;
+            texture_edge = false;
         }
-        if (use_fog) {
-            cc_options |= SHADER_OPT(FOG);
-        }
-        if (texture_edge) {
-            cc_options |= SHADER_OPT(TEXTURE_EDGE);
-        }
-        if (use_noise) {
-            cc_options |= SHADER_OPT(NOISE);
-        }
-        if (use_2cyc) {
-            cc_options |= SHADER_OPT(_2CYC);
-        }
-        if (alpha_threshold) {
-            cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
-        }
-        if (invisible) {
-            cc_options |= SHADER_OPT(INVISIBLE);
-        }
-        if (use_grayscale) {
-            cc_options |= SHADER_OPT(GRAYSCALE);
-        }
-        if (use_toon) {
-            cc_options |= SHADER_OPT(TOON);
-        }
-        if (use_shadow_map) {
-            cc_options |= SHADER_OPT(SHADOW_MAP);
-        }
-        if (mRdp->loaded_texture[0].masked) {
-            cc_options |= SHADER_OPT(TEXEL0_MASK);
-        }
-        if (mRdp->loaded_texture[1].masked) {
-            cc_options |= SHADER_OPT(TEXEL1_MASK);
-        }
-        if (mRdp->loaded_texture[0].blended) {
-            cc_options |= SHADER_OPT(TEXEL0_BLEND);
-        }
-        if (mRdp->loaded_texture[1].blended) {
-            cc_options |= SHADER_OPT(TEXEL1_BLEND);
-        }
-        if (shader.enabled) {
-            cc_options |= SHADER_OPT(USE_SHADER);
-            // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
-            // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
-            // wrong shader for every draw in the game.
-            cc_options |= (shader.id << 19);
-        }
-
-        ColorCombinerKey key;
-        key.combine_mode = mRdp->combine_mode;
-        key.options = cc_options;
-
-        // If we are not using alpha, clear the alpha components of the combiner as they have no effect
-        if (!use_alpha && !shader.enabled) {
-            key.combine_mode &= ~((0xfff << 16) | ((uint64_t)0xfff << 44));
-        }
-
-        mTriCombiner = LookupOrCreateColorCombiner(key);
-        mTriUseShadowMap = use_shadow_map;
-        mTriUseShadowMapActors = use_shadow_map_actors;
+        use_alpha = true;
     }
-    ColorCombiner* comb = mTriCombiner;
-    const bool use_shadow_map = mTriUseShadowMap;
-    const bool use_shadow_map_actors = mTriUseShadowMapActors;
+
+    if (use_alpha) {
+        cc_options |= SHADER_OPT(ALPHA);
+    }
+    if (use_fog) {
+        cc_options |= SHADER_OPT(FOG);
+    }
+    if (texture_edge) {
+        cc_options |= SHADER_OPT(TEXTURE_EDGE);
+    }
+    if (use_noise) {
+        cc_options |= SHADER_OPT(NOISE);
+    }
+    if (use_2cyc) {
+        cc_options |= SHADER_OPT(_2CYC);
+    }
+    if (alpha_threshold) {
+        cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
+    }
+    if (invisible) {
+        cc_options |= SHADER_OPT(INVISIBLE);
+    }
+    if (use_grayscale) {
+        cc_options |= SHADER_OPT(GRAYSCALE);
+    }
+    if (use_toon) {
+        cc_options |= SHADER_OPT(TOON);
+    }
+    if (use_shadow_map) {
+        cc_options |= SHADER_OPT(SHADOW_MAP);
+    }
+    if (mRdp->loaded_texture[0].masked) {
+        cc_options |= SHADER_OPT(TEXEL0_MASK);
+    }
+    if (mRdp->loaded_texture[1].masked) {
+        cc_options |= SHADER_OPT(TEXEL1_MASK);
+    }
+    if (mRdp->loaded_texture[0].blended) {
+        cc_options |= SHADER_OPT(TEXEL0_BLEND);
+    }
+    if (mRdp->loaded_texture[1].blended) {
+        cc_options |= SHADER_OPT(TEXEL1_BLEND);
+    }
+    if (shader.enabled) {
+        cc_options |= SHADER_OPT(USE_SHADER);
+        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
+        // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
+        // wrong shader for every draw in the game.
+        cc_options |= (shader.id << 19);
+    }
+
+    ColorCombinerKey key;
+    key.combine_mode = mRdp->combine_mode;
+    key.options = cc_options;
+
+    // If we are not using alpha, clear the alpha components of the combiner as they have no effect
+    if (!use_alpha && !shader.enabled) {
+        key.combine_mode &= ~((0xfff << 16) | ((uint64_t)0xfff << 44));
+    }
+
+    ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
