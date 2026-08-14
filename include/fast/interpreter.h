@@ -703,6 +703,45 @@ class Interpreter {
     GfxTextureCache mTextureCache{};
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
+
+    // SOH [Enhancement] GfxSpTri1 resolves which colour combiner a triangle draws with -- some thirty
+    // branches folding blend, alpha-compare, cycle type, grayscale, toon and shadow-receiver state into an
+    // option word, a key built from it and a lookup on that key. It runs once per TRIANGLE for an answer
+    // that changes once at the top of a draw call and then holds for the whole mesh. This caches it.
+    //
+    // Invalidated by a dirty flag rather than by comparing the inputs, and that is the substance of the
+    // design. Comparing inputs means writing down a list of every field the answer depends on, and a field
+    // nobody thought of is silently absent from that list; a flag is set by the WRITERS, so a field nobody
+    // thought of still gets invalidated as long as whoever writes it says so. The failure being guarded
+    // against is not a wrong colour: comb decides numInputs and usedTextures, which decide how many floats
+    // GfxSpTri1 writes per vertex, so a stale combiner produces a vertex buffer whose stride does not match
+    // what the shader reads -- geometry flying apart, with nothing in a log to say why.
+    //
+    // Set true by every writer of: mRdp->other_mode_l / other_mode_h / combine_mode / combine_mode via
+    // GfxDpSetCombineMode, grayscale, toon, toon_shadow, shadow_no_receive, current_shader,
+    // loaded_texture[].masked / .blended, and mRsp->geometry_mode (for its G_LIGHTING bit). Save/restore
+    // pairs around internal passes must mark BOTH ends -- restoring state behind a clean flag is the same
+    // corruption as changing it behind one.
+    //
+    // is_rect, the screen-space projection test and mShadowMapEnabled have no writer to mark (the first two
+    // are arguments/derived per triangle), so they are compared directly below instead.
+    bool mRdpCombinerDirty = true;
+    struct TriCombinerCache {
+        ColorCombiner* comb = nullptr;
+        // Resolved alongside the combiner and read further down GfxSpTri1, off the same inputs.
+        bool useShadowMap = false;
+        bool useShadowMapActors = false;
+        bool operator==(const TriCombinerCache&) const = default;
+    };
+    TriCombinerCache mTriCombiner{};
+    bool mTriIsRect = false;
+    bool mTriScreenSpaceProjection = false;
+    bool mTriShadowMapEnabled = false;
+    // Debug safety net (written and read only under !NDEBUG; kept unconditional so the layout of this class
+    // does not depend on NDEBUG). Names the field that moved when the assert in GfxSpTri1 fires.
+    static constexpr int kTriCombinerInputCount = 13;
+    uint64_t mTriCombinerInputsDebug[kTriCombinerInputCount] = {};
+
     uint8_t* mTexUploadBuffer = nullptr;
 
     GfxDimensions mGfxCurrentWindowDimensions{}; // gfx_current_window_dimensions;

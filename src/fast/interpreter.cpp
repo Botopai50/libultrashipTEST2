@@ -2065,7 +2065,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     }
 
     uint64_t cc_id = mRdp->combine_mode;
-    uint64_t cc_options = 0;
     bool use_alpha = ((mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
                       (mRdp->other_mode_l & (3 << 16)) == (G_BL_1MA << 16)) ||
                      ((mRdp->other_mode_l & (3 << 22)) == (G_BL_CLR_MEM << 22) &&
@@ -2133,19 +2132,14 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // Alpha-tested cutouts are NOT caught by this and must not be: grass and canopies are opaque where they
     // are opaque, they draw in ZMODE_OPA, and they go on receiving exactly as before.
     const bool translucentSurface = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_XLU;
-    // And neither does a draw whose colour the blender throws away. `invisible` means the blend is
-    // memory-only -- the source term is multiplied by zero -- so the pixel shader's rgb never reaches the
-    // framebuffer, and shading it is work with no possible output. Dropping the option rather than
-    // discarding in the shader is deliberate: a discard would also suppress the DEPTH write, which these
-    // draws still perform and which something downstream may be relying on. This changes what is computed,
-    // not what is written.
-    bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !translucentSurface &&
-                          !invisible && !mRdp->shadow_no_receive;
-    // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
-    // characters from shadowing each other (or themselves) while still being shadowed by the world.
-    bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
-    auto shader = mRdp->current_shader;
 
+    // Kept deliberately OUT of the cached region below, and it must stay out. It MUTATES use_alpha,
+    // texture_edge and alpha_threshold, and use_alpha is read further down this function -- once for
+    // SetUseAlpha, and once to decide how many shader inputs get packed per vertex. Run it inside the cached
+    // block and a cache hit skips the mutation, so the combiner says "alpha" while the packing loop says
+    // "no alpha": a vertex stride that does not match the one the shader reads, which is geometry flying
+    // apart. Its inputs are pure functions of other_mode_l and it is four branches, so there is nothing to
+    // gain by caching it anyway.
     if (texture_edge) {
         if (use_alpha) {
             alpha_threshold = true;
@@ -2154,66 +2148,166 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         use_alpha = true;
     }
 
-    if (use_alpha) {
-        cc_options |= SHADER_OPT(ALPHA);
-    }
-    if (use_fog) {
-        cc_options |= SHADER_OPT(FOG);
-    }
-    if (texture_edge) {
-        cc_options |= SHADER_OPT(TEXTURE_EDGE);
-    }
-    if (use_noise) {
-        cc_options |= SHADER_OPT(NOISE);
-    }
-    if (use_2cyc) {
-        cc_options |= SHADER_OPT(_2CYC);
-    }
-    if (alpha_threshold) {
-        cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
-    }
-    if (invisible) {
-        cc_options |= SHADER_OPT(INVISIBLE);
-    }
-    if (use_grayscale) {
-        cc_options |= SHADER_OPT(GRAYSCALE);
-    }
-    if (use_toon) {
-        cc_options |= SHADER_OPT(TOON);
-    }
-    if (use_shadow_map) {
-        cc_options |= SHADER_OPT(SHADOW_MAP);
-    }
-    if (mRdp->loaded_texture[0].masked) {
-        cc_options |= SHADER_OPT(TEXEL0_MASK);
-    }
-    if (mRdp->loaded_texture[1].masked) {
-        cc_options |= SHADER_OPT(TEXEL1_MASK);
-    }
-    if (mRdp->loaded_texture[0].blended) {
-        cc_options |= SHADER_OPT(TEXEL0_BLEND);
-    }
-    if (mRdp->loaded_texture[1].blended) {
-        cc_options |= SHADER_OPT(TEXEL1_BLEND);
-    }
-    if (shader.enabled) {
-        cc_options |= SHADER_OPT(USE_SHADER);
-        // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
-        // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
-        // wrong shader for every draw in the game.
-        cc_options |= (shader.id << 19);
-    }
+    // Everything from here to the lookup is the answer to "which colour combiner does this triangle draw
+    // with", and it is the same answer for every triangle of a mesh: it changes when the draw call sets up
+    // and then holds. Resolved once per change rather than once per triangle (see mRdpCombinerDirty).
+    //
+    // The lambda is the whole resolution, unchanged and with no side effects beyond the combiner pool. It
+    // exists so the debug net below can run exactly the same code the cache is standing in for, rather than
+    // a second copy of it that could drift.
+    auto resolveTriCombiner = [&]() -> TriCombinerCache {
+        // And a draw whose colour the blender throws away does not take the shadow either. `invisible` means
+        // the blend is memory-only -- the source term is multiplied by zero -- so the pixel shader's rgb
+        // never reaches the framebuffer, and shading it is work with no possible output. Dropping the option
+        // rather than discarding in the shader is deliberate: a discard would also suppress the DEPTH write,
+        // which these draws still perform and which something downstream may be relying on. This changes
+        // what is computed, not what is written.
+        bool use_shadow_map = mShadowMapEnabled && !is_rect && !screenSpaceProjection && !translucentSurface &&
+                              !invisible && !mRdp->shadow_no_receive;
+        // Scenery samples both caster layers; a character samples only the world layer, which is what keeps
+        // characters from shadowing each other (or themselves) while still being shadowed by the world.
+        bool use_shadow_map_actors = use_shadow_map && !mRdp->toon_shadow;
+        auto shader = mRdp->current_shader;
 
-    ColorCombinerKey key;
-    key.combine_mode = mRdp->combine_mode;
-    key.options = cc_options;
+        uint64_t cc_options = 0;
+        if (use_alpha) {
+            cc_options |= SHADER_OPT(ALPHA);
+        }
+        if (use_fog) {
+            cc_options |= SHADER_OPT(FOG);
+        }
+        if (texture_edge) {
+            cc_options |= SHADER_OPT(TEXTURE_EDGE);
+        }
+        if (use_noise) {
+            cc_options |= SHADER_OPT(NOISE);
+        }
+        if (use_2cyc) {
+            cc_options |= SHADER_OPT(_2CYC);
+        }
+        if (alpha_threshold) {
+            cc_options |= SHADER_OPT(ALPHA_THRESHOLD);
+        }
+        if (invisible) {
+            cc_options |= SHADER_OPT(INVISIBLE);
+        }
+        if (use_grayscale) {
+            cc_options |= SHADER_OPT(GRAYSCALE);
+        }
+        if (use_toon) {
+            cc_options |= SHADER_OPT(TOON);
+        }
+        if (use_shadow_map) {
+            cc_options |= SHADER_OPT(SHADOW_MAP);
+        }
+        if (mRdp->loaded_texture[0].masked) {
+            cc_options |= SHADER_OPT(TEXEL0_MASK);
+        }
+        if (mRdp->loaded_texture[1].masked) {
+            cc_options |= SHADER_OPT(TEXEL1_MASK);
+        }
+        if (mRdp->loaded_texture[0].blended) {
+            cc_options |= SHADER_OPT(TEXEL0_BLEND);
+        }
+        if (mRdp->loaded_texture[1].blended) {
+            cc_options |= SHADER_OPT(TEXEL1_BLEND);
+        }
+        if (shader.enabled) {
+            cc_options |= SHADER_OPT(USE_SHADER);
+            // SOH [Enhancement] shader.id packs above the option bits; shifted 17->18 for TOON, 18->19 for
+            // SHADOW_MAP. Keep in lockstep with the decode in gfx_cc_get_features -- a mismatch selects the
+            // wrong shader for every draw in the game.
+            cc_options |= (shader.id << 19);
+        }
 
-    // If we are not using alpha, clear the alpha components of the combiner as they have no effect
-    if (!use_alpha && !shader.enabled) {
-        key.combine_mode &= ~((0xfff << 16) | ((uint64_t)0xfff << 44));
+        ColorCombinerKey key;
+        key.combine_mode = mRdp->combine_mode;
+        key.options = cc_options;
+
+        // If we are not using alpha, clear the alpha components of the combiner as they have no effect
+        if (!use_alpha && !shader.enabled) {
+            key.combine_mode &= ~((0xfff << 16) | ((uint64_t)0xfff << 44));
+        }
+
+        return { LookupOrCreateColorCombiner(key), use_shadow_map, use_shadow_map_actors };
+    };
+
+    // The flag covers everything with a writer. These three do not have one: is_rect is an argument,
+    // screenSpaceProjection is read off the projection matrix per triangle, and mShadowMapEnabled is set
+    // from outside the command stream. All three feed use_shadow_map, so a screen-space quad following
+    // world geometry has to re-resolve even though no RDP register moved. Three bool compares.
+    const bool triCombinerStale = mTriCombiner.comb == nullptr || mRdpCombinerDirty || is_rect != mTriIsRect ||
+                                  screenSpaceProjection != mTriScreenSpaceProjection ||
+                                  mShadowMapEnabled != mTriShadowMapEnabled;
+
+#ifndef NDEBUG
+    // Debug safety net. Resolves unconditionally and checks that the flag agreed with reality: if the cached
+    // answer was reused while a fresh resolution gives something different, some writer of the combiner
+    // state forgot to set mRdpCombinerDirty. Without this a missed writer is silent -- it does not show up
+    // as a slightly wrong colour, it shows up as a vertex buffer whose stride no longer matches what the
+    // shader reads, which is geometry flying apart with nothing in a log to say why.
+    //
+    // The check is on the OUTPUT, not on a list of inputs, and that is the point: a list can omit a field
+    // nobody thought of, which is exactly how the earlier attempt at this failed. Comparing the resolved
+    // combiner cannot omit anything, because it is the thing being cached. The input snapshot underneath it
+    // is a diagnostic only -- it names the field that moved -- and is allowed to be incomplete.
+    {
+        static const char* const kInputNames[Interpreter::kTriCombinerInputCount] = {
+            "mRdp->other_mode_l",
+            "mRdp->other_mode_h",
+            "mRdp->combine_mode",
+            "mRdp->current_shader",
+            "mRdp->grayscale",
+            "mRdp->toon",
+            "mRdp->toon_shadow",
+            "mRdp->shadow_no_receive",
+            "mRsp->geometry_mode (G_LIGHTING)",
+            "mRdp->loaded_texture[0].masked",
+            "mRdp->loaded_texture[1].masked",
+            "mRdp->loaded_texture[0].blended",
+            "mRdp->loaded_texture[1].blended",
+        };
+        const uint64_t inputsNow[Interpreter::kTriCombinerInputCount] = {
+            mRdp->other_mode_l,
+            mRdp->other_mode_h,
+            mRdp->combine_mode,
+            mRdp->current_shader.enabled ? ((uint64_t)1 << 32) | (uint16_t)mRdp->current_shader.id : 0,
+            mRdp->grayscale ? 1u : 0u,
+            mRdp->toon ? 1u : 0u,
+            mRdp->toon_shadow ? 1u : 0u,
+            mRdp->shadow_no_receive ? 1u : 0u,
+            (mRsp->geometry_mode & G_LIGHTING) != 0 ? 1u : 0u,
+            mRdp->loaded_texture[0].masked ? 1u : 0u,
+            mRdp->loaded_texture[1].masked ? 1u : 0u,
+            mRdp->loaded_texture[0].blended ? 1u : 0u,
+            mRdp->loaded_texture[1].blended ? 1u : 0u,
+        };
+        if (!triCombinerStale) {
+            const TriCombinerCache fresh = resolveTriCombiner();
+            if (!(fresh == mTriCombiner)) {
+                for (int i = 0; i < Interpreter::kTriCombinerInputCount; i++) {
+                    if (inputsNow[i] != mTriCombinerInputsDebug[i]) {
+                        SPDLOG_ERROR("GfxSpTri1: {} changed without setting mRdpCombinerDirty", kInputNames[i]);
+                    }
+                }
+                assert(false && "GfxSpTri1: cached colour combiner is stale -- a writer of the combiner state "
+                                "did not set mRdpCombinerDirty (see the log for which field moved)");
+            }
+        }
+        memcpy(mTriCombinerInputsDebug, inputsNow, sizeof(inputsNow));
     }
+#endif
 
-    ColorCombiner* comb = LookupOrCreateColorCombiner(key);
+    if (triCombinerStale) {
+        mTriCombiner = resolveTriCombiner();
+        mRdpCombinerDirty = false;
+        mTriIsRect = is_rect;
+        mTriScreenSpaceProjection = screenSpaceProjection;
+        mTriShadowMapEnabled = mShadowMapEnabled;
+    }
+    ColorCombiner* comb = mTriCombiner.comb;
+    const bool use_shadow_map = mTriCombiner.useShadowMap;
+    const bool use_shadow_map_actors = mTriCombiner.useShadowMapActors;
 
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
@@ -2516,6 +2610,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 void Interpreter::GfxSpGeometryMode(uint32_t clear, uint32_t set) {
     mRsp->geometry_mode &= ~clear;
     mRsp->geometry_mode |= set;
+    // G_LIGHTING gates the toon combiner option (see use_toon in GfxSpTri1).
+    mRdpCombinerDirty = true;
 }
 
 void Interpreter::GfxSpExtraGeometryMode(uint32_t clear, uint32_t set) {
@@ -2808,6 +2904,8 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = false;
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
     }
+    // masked/blended each carry a combiner option (TEXEL0/1_MASK, TEXEL0/1_BLEND). One mark for the pair.
+    mRdpCombinerDirty = true;
 
     mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
 }
@@ -2878,6 +2976,8 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = false;
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
     }
+    // masked/blended each carry a combiner option (TEXEL0/1_MASK, TEXEL0/1_BLEND). One mark for the pair.
+    mRdpCombinerDirty = true;
 
     mRdp->texture_tile[tile].uls = uls;
     mRdp->texture_tile[tile].ult = ult;
@@ -2921,6 +3021,7 @@ static void GfxDpSetCombineMode(uint32_t rgb, uint32_t alpha) {
 
 void Interpreter::GfxDpSetCombineMode(uint32_t rgb, uint32_t alpha, uint32_t rgb_cyc2, uint32_t alpha_cyc2) {
     mRdp->combine_mode = rgb | (alpha << 16) | ((uint64_t)rgb_cyc2 << 28) | ((uint64_t)alpha_cyc2 << 44);
+    mRdpCombinerDirty = true;
 }
 
 static inline uint32_t color_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
@@ -4162,6 +4263,10 @@ void Interpreter::RenderShadowVolumes() {
     mRdp->toon_shadow = false; // the volume geometry must not be re-captured
     mRdp->grayscale = false;
     mRdp->other_mode_h = (savedOtherH & ~(3U << G_MDSFT_CYCLETYPE)) | G_CYC_1CYCLE;
+    // One mark for the four writes above: nothing reads the combiner between them. GfxDpSetCombineMode
+    // below marks it again for combine_mode. The RESTORE at the end of this function marks it too -- both
+    // ends of a save/restore pair have to, or the flag comes out clean over state that has moved back.
+    mRdpCombinerDirty = true;
     GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_PRIMITIVE), alpha_comb(0, 0, 0, G_ACMUX_PRIMITIVE), 0, 0);
 
     const uint32_t cullFront = get_attr(CULL_FRONT);
@@ -4295,14 +4400,19 @@ void Interpreter::RenderShadowVolumes() {
         // the pipeline with its own state.
         mRdp->prim_color = { 0, 0, 0, 0 };
         mRdp->other_mode_l = G_RM_AA_ZB_XLU_SURF | G_RM_AA_ZB_XLU_SURF2;
+        mRdpCombinerDirty = true;
         shadowStride = 0;
         {
             const uint32_t geoSaved = mRsp->geometry_mode;
             mRsp->geometry_mode = G_ZBUFFER; // no cull -> GfxSpTri1 runs its full setup for this triangle
+            // Both ends of this save/restore marked. The setup triangle below exists precisely to learn the
+            // VBO stride GfxSpTri1 produces, so it MUST re-resolve rather than reuse the previous answer.
+            mRdpCombinerDirty = true;
             Flush();
             loadTri(0);
             GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
             mRsp->geometry_mode = geoSaved;
+            mRdpCombinerDirty = true;
             const size_t stride = (mBufVboNumTris > 0) ? (mBufVboLen / 3) : 0;
             if (stride > 4 && stride <= VBO_MAX_FLOATS_PER_VERTEX) {
                 for (size_t f = 4; f < stride; f++) {
@@ -4319,6 +4429,7 @@ void Interpreter::RenderShadowVolumes() {
         // calls. Wrap ops + the composite's nonzero test make primitive order and facing polarity
         // irrelevant; only "opposite ops per facing" matters (see StencilMode::VolumeIncrDecr).
         mRsp->geometry_mode = G_ZBUFFER;
+        mRdpCombinerDirty = true;
         Flush();
         mRapi->SetStencilMode((int)StencilMode::VolumeIncrDecr);
         drawVolume();
@@ -4327,6 +4438,7 @@ void Interpreter::RenderShadowVolumes() {
         mRdp->prim_color = { 0, 0, 0, bandA };
         mRdp->other_mode_l = G_RM_AA_XLU_SURF | G_RM_AA_XLU_SURF2;
         mRsp->geometry_mode = 0;
+        mRdpCombinerDirty = true; // one mark for the pair above
         mRapi->SetStencilMode((int)StencilMode::Composite);
         {
             const float qx[4] = { -1.0f, 1.0f, 1.0f, -1.0f }, qy[4] = { -1.0f, -1.0f, 1.0f, 1.0f };
@@ -4347,6 +4459,7 @@ void Interpreter::RenderShadowVolumes() {
             mRapi->SetStencilMode((int)StencilMode::Off);
             mRsp->geometry_mode = cullBack;
             mRdp->other_mode_l = G_RM_AA_XLU_SURF | G_RM_AA_XLU_SURF2;
+            mRdpCombinerDirty = true; // one mark for the pair above
             const std::vector<uint8_t>& kinds = mShadowVolumeKind[band];
             for (int batch = 0; batch < 2; batch++) {
                 mRdp->prim_color = (batch == 0) ? RGBA{ 0, 0, 0, 128 } : RGBA{ 40, 90, 255, 128 };
@@ -4372,6 +4485,10 @@ void Interpreter::RenderShadowVolumes() {
     mRdp->toon = savedToon;
     mRdp->toon_shadow = savedToonShadow;
     mRdp->grayscale = savedGray;
+    // The restore end of the save/restore pair at the top of this function. Restoring state is a write like
+    // any other: leaving the flag clean here would hand the next draw the combiner this function resolved
+    // for its own volume geometry.
+    mRdpCombinerDirty = true;
 
     clearAccums();
 }
@@ -4427,6 +4544,7 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
     if (cycle_type == G_CYC_COPY) {
         mRdp->other_mode_h = (mRdp->other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | G_TF_POINT;
+        mRdpCombinerDirty = true; // restored at the bottom of this function, which marks it again
     }
 
     // U10.2 coordinates
@@ -4485,16 +4603,19 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
     mRsp->geometry_mode = 0;
+    mRdpCombinerDirty = true;
 
     GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, true);
     GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, true);
 
     mRsp->geometry_mode = geometry_mode_saved;
+    mRdpCombinerDirty = true; // the restore end of the pair above
     mRdp->viewport = viewport_saved;
     mRdp->viewport_or_scissor_changed = true;
 
     if (cycle_type == G_CYC_COPY) {
         mRdp->other_mode_h = saved_other_mode_h;
+        mRdpCombinerDirty = true; // the restore end of the pair at the top of this function
     }
 }
 
@@ -4562,6 +4683,9 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     }
     mRdp->first_tile_index = saved_tile;
     mRdp->combine_mode = saved_combine_mode;
+    // The restore end of the save at the top: the G_CYC_COPY branch there goes through GfxDpSetCombineMode,
+    // which marks the flag, so this end has to as well.
+    mRdpCombinerDirty = true;
 }
 
 void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_t ulx, int32_t uly, int16_t uls,
@@ -4646,6 +4770,8 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
 
     GfxDrawRectangle(ulx, uly, lrx, lry);
     mRdp->combine_mode = saved_combine_mode;
+    // The restore end of the G_CYC_FILL save above (that end marks the flag via GfxDpSetCombineMode).
+    mRdpCombinerDirty = true;
 }
 
 void Interpreter::GfxDpSetZImage(void* zBufAddr) {
@@ -4662,11 +4788,13 @@ void Interpreter::GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t 
     om = (om & ~mask) | mode;
     mRdp->other_mode_l = (uint32_t)om;
     mRdp->other_mode_h = (uint32_t)(om >> 32);
+    mRdpCombinerDirty = true;
 }
 
 void Interpreter::GfxDpSetOtherMode(uint32_t h, uint32_t l) {
     mRdp->other_mode_h = h;
     mRdp->other_mode_l = l;
+    mRdpCombinerDirty = true;
 }
 
 void Interpreter::Gfxs2dexBgCopy(F3DuObjBg* bg) {
@@ -5101,12 +5229,17 @@ bool gfx_set_shader_custom(F3DGfx** cmd0) {
 
     if (file == nullptr) {
         gfx->mRsp->current_shader = { 0, 0, false };
+        // Marked even though GfxSpTri1 reads mRdp->current_shader and this writes the RSP copy: the two are
+        // separate fields and this clear looks like it was meant for the RDP one. Marking is free; if that
+        // is ever corrected, the flag is already in the right place.
+        gfx->mRdpCombinerDirty = true;
         return false;
     }
 
     const auto path = std::string(file);
     const auto shaderId = gfx->CreateShader(path);
     gfx->mRdp->current_shader = { true, shaderId, (uint8_t)C0(16, 1) };
+    gfx->mRdpCombinerDirty = true;
     return false;
 }
 
@@ -5763,6 +5896,7 @@ bool gfx_set_grayscale_handler_custom(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
 
     gfx->mRdp->grayscale = cmd->words.w1;
+    gfx->mRdpCombinerDirty = true;
     return false;
 }
 
@@ -5778,6 +5912,7 @@ bool gfx_set_toon_handler_custom(F3DGfx** cmd0) {
     gfx->mRdp->toon_shadow = false;
 
     gfx->mRdp->toon = cmd->words.w1;
+    gfx->mRdpCombinerDirty = true; // one mark for toon and the toon_shadow clear above it
     // A fresh key must be supplied (per object) after each toon-on; clear any stale one.
     gfx->mRsp->toon_key_valid = false;
     return false;
@@ -5853,10 +5988,12 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         }
         if (sizeOrSentinel <= -4.5e30f) {
             gfx->mRdp->shadow_no_receive = false; // gSPShadowMapReceiveOn
+            gfx->mRdpCombinerDirty = true;
             return false;
         }
         if (sizeOrSentinel <= -3.5e30f) {
             gfx->mRdp->shadow_no_receive = true; // gSPShadowMapReceiveOff
+            gfx->mRdpCombinerDirty = true;
             return false;
         }
         if (sizeOrSentinel <= -2.5e30f) {
@@ -5891,6 +6028,7 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
 
     gfx->mRsp->toon_shadow_size = sizeOrSentinel;
     gfx->mRdp->toon_shadow = (nx | ny | nz) != 0;
+    gfx->mRdpCombinerDirty = true; // toon_shadow decides use_shadow_map_actors
     // Decode the s16 feet clamp packed in nx:ny (TOON_SHADOW_NO_CLAMP = leave the feet at the captured
     // geometry). Set alongside toon_shadow_size so the deferred FlushToonShadow reads this object's value.
     int16_t feetClamp = (int16_t)(((uint16_t)nx << 8) | (uint16_t)ny);
