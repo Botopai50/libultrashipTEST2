@@ -6758,7 +6758,24 @@ void Interpreter::StartFrame() {
     // reads the finished frame as a texture, and drawing to the window directly leaves it nothing to read.
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || mFxaaEnabled) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        // The window-sized game framebuffer belongs to MSAA and to nothing else: its resolve target has to
+        // match the window, because that path resolves STRAIGHT INTO the window rather than handing a
+        // texture on to be drawn. Everything else wants the game framebuffer at the render resolution.
+        //
+        // FXAA must not take it. It resolves nothing -- it filters into its own target, which the interface
+        // then draws into the game's viewport rect -- so it is the render-resolution case in every respect,
+        // exactly like a mismatched viewport. Reaching this branch cost it twice over: the frame was drawn
+        // into the wrong sub-rect of a window-sized target (AdjustVIewportOrScissor, GetPixelDepthPrepare
+        // and the framebuffer-copy rect all offset for `mMsaaLevel > 1 && viewport matches`, which is false
+        // here), and the filter then read a window-sized source into a viewport-sized destination. With the
+        // interface's menu bar shrinking the viewport, that put the picture off the presented region
+        // entirely -- a black screen that came back the moment the internal resolution stopped being 1x,
+        // because any other value takes the branch above and never gets here.
+        //
+        // Written as the same predicate those three call sites use, so "the game framebuffer is
+        // window-sized" has one meaning across all four.
+        const bool windowSizedForMsaaResolve = mMsaaLevel > 1 && ViewportMatchesRendererResolution();
+        if (!windowSizedForMsaaResolve) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {
@@ -6773,6 +6790,9 @@ void Interpreter::StartFrame() {
         }
         if (mFxaaEnabled) {
             // Matches whatever it will be filtering, which is the game framebuffer at internal resolution.
+            // True again now that FXAA no longer reaches the window-sized branch above: with MSAA off the
+            // source is mGameFb at these dimensions, and with MSAA on it is mGameFbMsaaResolved, which is
+            // sized from mCurDimensions too.
             mRapi->UpdateFramebufferParameters(mGameFbFxaa, mCurDimensions.width, mCurDimensions.height, 1, false,
                                                true, false, false);
         }
