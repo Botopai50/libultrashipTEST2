@@ -1022,6 +1022,10 @@ void GfxRenderingAPIDX11::ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numI
     usedTextures[1] = p->usedTextures[1];
 }
 
+size_t GfxRenderingAPIDX11::GetVertexStrideFloats(struct ShaderProgram* prg) {
+    return prg != nullptr ? ((struct ShaderProgramD3D11*)prg)->numFloats : 0;
+}
+
 uint32_t GfxRenderingAPIDX11::NewTexture() {
     mTextures.resize(mTextures.size() + 1);
     return (uint32_t)(mTextures.size() - 1);

@@ -634,6 +634,10 @@ void GfxRenderingAPIOGL::ShaderGetInfo(struct ShaderProgram* prg, uint8_t* numIn
     usedTextures[1] = prg->usedTextures[1];
 }
 
+size_t GfxRenderingAPIOGL::GetVertexStrideFloats(struct ShaderProgram* prg) {
+    return prg != nullptr ? prg->numFloats : 0;
+}
+
 GLuint GfxRenderingAPIOGL::NewTexture() {
     GLuint ret;
     glGenTextures(1, &ret);

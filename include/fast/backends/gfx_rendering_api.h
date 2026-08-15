@@ -72,6 +72,22 @@ class GfxRenderingAPI {
     virtual ShaderProgram* CreateAndLoadNewShader(uint64_t shaderId0, uint32_t shaderId1) = 0;
     virtual ShaderProgram* LookupShader(uint64_t shaderId0, uint32_t shaderId1) = 0;
     virtual void ShaderGetInfo(ShaderProgram* prg, uint8_t* numInputs, bool usedTextures[2]) = 0;
+    // SOH [Enhancement] How many floats per vertex this program's vertex layout expects.
+    //
+    // The interpreter packs a vertex attribute by attribute and the backend reads it back with a stride
+    // taken from the shader -- and the two agree only because they were written to agree. Nothing checks
+    // them, and the stride is not even a constant: it is accumulated at runtime by the template engine as
+    // it walks the shader source (see the update_floats calls in default.shader.*), so the number lives in
+    // an asset rather than in code. A mismatch produces a vertex buffer the shader reads at the wrong
+    // offsets, which is geometry flying apart, and it produces it silently.
+    //
+    // Answering this lets the interpreter check the agreement rather than assume it. Zero means "this
+    // backend cannot say", and the check is skipped -- the default, so a backend that has no answer needs
+    // no change.
+    virtual size_t GetVertexStrideFloats(ShaderProgram* prg) {
+        (void)prg;
+        return 0;
+    }
     virtual uint32_t NewTexture() = 0;
     virtual void SelectTexture(int tile, uint32_t textureId) = 0;
     virtual void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) = 0;

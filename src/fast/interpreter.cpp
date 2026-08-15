@@ -152,6 +152,25 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
+        // SOH [Enhancement] The vertex layout is an agreement between three places that have no way of
+        // checking each other: this function packs the attributes, the backend reads them back with a
+        // stride, and that stride is not a constant anywhere -- it is accumulated at run time by the
+        // template engine walking the shader source (the update_floats calls in default.shader.*). Break
+        // the agreement and every attribute after the break is read from the wrong offset, which is
+        // geometry flying apart, silently, with nothing in a log.
+        //
+        // Asserted here because this is the one place that knows both numbers: how many floats were
+        // actually written per vertex, and what the bound program expects. A backend that cannot answer
+        // returns zero and the check is skipped.
+        assert([&] {
+            const size_t expected = mRapi->GetVertexStrideFloats(mRenderingState.mShaderProgram);
+            if (expected == 0 || mBufVboNumTris == 0) {
+                return true;
+            }
+            return mBufVboLen == expected * 3 * mBufVboNumTris;
+        }() && "vertex stride disagrees with the bound shader's layout -- the packing in GfxSpTri1 and the "
+               "update_floats calls in the shader template have gone out of step");
+
         // SOH [Enhancement] Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
