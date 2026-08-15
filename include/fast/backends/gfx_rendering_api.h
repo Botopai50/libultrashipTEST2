@@ -325,6 +325,20 @@ class GfxRenderingAPI {
         mShadowMinHardnessScale = minHardnessScale;
     }
 
+    // SOH [Enhancement] Turns the shadow map's GPU timing on WITHOUT the cascade-bounds debug view.
+    //
+    // The two used to be the same switch, which made the pass impossible to measure honestly: the debug
+    // value the timer was gated on is the same value the receiver shader reads, and at anything above zero
+    // it paints every point outside a cascade's footprint as fully occluded. So the only way to learn what
+    // the depth pass costs was to blacken most of the screen -- which changes the very frame being timed,
+    // and tells you nothing about what the pass costs while playing normally.
+    //
+    // Separate flag, no shader involvement. The debug view still enables timing on its own, so nothing that
+    // worked before stops working; this only adds a way to get the numbers without the picture.
+    void SetShadowMapProfiling(bool enabled) {
+        mShadowProfile = enabled;
+    }
+
     // SOH [Enhancement] World bounds of the ACTOR caster layer, pushed once a frame. Everything that layer
     // can shadow with lies inside this box, and a receiver with none of it behind them along the light
     // cannot be shadowed by it -- which is most of a map, most of the time, since the box holds a handful of
@@ -381,6 +395,8 @@ class GfxRenderingAPI {
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;
     float mShadowFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
     float mShadowDebug = 0.0f;
+    // Timing only -- read by the backend's timer, never by a shader. See SetShadowMapProfiling.
+    bool mShadowProfile = false;
     float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
     // Inverted until a frame says otherwise, so every test against it fails and the actor layer is skipped.

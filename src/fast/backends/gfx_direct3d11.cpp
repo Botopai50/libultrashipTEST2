@@ -2996,7 +2996,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
 void GfxRenderingAPIDX11::ShadowTimerFrameBegin() {
     mShadowTimerOpen = false;
     mShadowTimerFrameOpen = false;
-    if (mShadowDebug < 0.5f || mShadowTimerFailed || mDevice == nullptr) {
+    // Either switch arms the timer: the debug view (which has always timed as a side effect) or the
+    // profiling flag, which times without touching what the shader draws. See SetShadowMapProfiling.
+    if ((!mShadowProfile && mShadowDebug < 0.5f) || mShadowTimerFailed || mDevice == nullptr) {
         return;
     }
     const int i = mShadowTimerSlot;
@@ -3062,7 +3064,7 @@ void GfxRenderingAPIDX11::ShadowTimerFrameEnd() {
 // Reads back whichever frame's queries are old enough to have finished, and reports the average once a
 // second. D3D11_ASYNC_GETDATA_DONOTFLUSH throughout: this must never push the GPU along to get an answer.
 void GfxRenderingAPIDX11::ShadowTimerCollect() {
-    if (mShadowDebug < 0.5f) {
+    if (!mShadowProfile && mShadowDebug < 0.5f) {
         return;
     }
     // The slot about to be reused is the oldest one outstanding, so that is the one to drain.
