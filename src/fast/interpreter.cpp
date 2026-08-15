@@ -1813,6 +1813,24 @@ void Interpreter::ShadeVertexBlock(const float* nx, const float* ny, const float
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    // SOH [Enhancement] Which vertex path this binary was built with. The four-wide transforms and shade
+    // below are selected at COMPILE time and both paths produce the same picture -- which is the point of
+    // them, and also why nothing you can see in the game tells you which one you have.
+    //
+    // Reported from the first batch rather than from Init, and that is not arbitrary: Init runs while the
+    // window is being created, some five hundred lines before the app opens its log file, so a line printed
+    // there goes nowhere. Reporting it here also says something stronger than "it was compiled in" -- it
+    // says the path actually ran.
+    static bool loggedVertexPath = false;
+    if (!loggedVertexPath) {
+        loggedVertexPath = true;
+#ifdef FAST3D_SSE2
+        SPDLOG_INFO("Fast3D vertex math: SSE2, four vertices per block");
+#else
+        SPDLOG_INFO("Fast3D vertex math: scalar (SSE2 not available for this target)");
+#endif
+    }
+
     // SOH [Enhancement] Cascaded shadow maps: signature of the world-caster geometry drawn this frame, used to
     // decide whether the cached caster list is still valid (see mShadowMapWorldCache). Every batch that runs
     // inside the bracket folds its source address and size in, order-sensitively, so a different room, a
@@ -6866,15 +6884,6 @@ void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX
 
 void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi, const char* game_name,
                        bool start_in_fullscreen, uint32_t width, uint32_t height, uint32_t posX, uint32_t posY) {
-    // SOH [Enhancement] Which vertex path this binary was built with. The four-wide transforms and shade in
-    // GfxSpVertex are selected at COMPILE time, so no amount of watching the game can tell you whether they
-    // are in the build in front of you -- both paths produce the same picture, which is the point of them.
-    // One line at startup makes the question answerable from a log.
-#ifdef FAST3D_SSE2
-    SPDLOG_INFO("Fast3D vertex math: SSE2, four vertices per block");
-#else
-    SPDLOG_INFO("Fast3D vertex math: scalar (SSE2 not available for this target)");
-#endif
     mWapi = wapi;
     mRapi = rapi;
     mWapi->Init(game_name, rapi->GetName(), start_in_fullscreen, width, height, posX, posY);
