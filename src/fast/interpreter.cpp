@@ -123,12 +123,22 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
 }
 
+// SOH [Diagnostic] TEMPORARY, part of the FXAA black-screen instrumentation. Counts what the frame actually
+// submitted, so a screen that comes out black can be told apart from a screen that was never drawn.
+static uint64_t gDiagTris = 0;
+static uint64_t gDiagDraws = 0;
+static uint64_t gDiagFxaaCalls = 0;
+static uint64_t gDiagFxaaOk = 0;
+static uint64_t gDiagFrames = 0;
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         // SOH [Enhancement] Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+        gDiagTris += mBufVboNumTris;
+        gDiagDraws++;
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -412,14 +422,12 @@ uintptr_t Interpreter::PresentedFramebufferTexture(int srcFb) {
     // in both cases the untouched source is exactly the right thing to show.
     if (mFxaaEnabled) {
         const bool filtered = mRapi->ApplyFxaa(mGameFbFxaa, srcFb);
-        // SOH [Diagnostic] TEMPORARY, remove with the rest of the FXAA diagnostic (see StartFrame). Says
-        // whether the pass actually ran and which framebuffer it read, on change only.
-        static int diagPrevFiltered = -1;
-        static int diagPrevSrc = -1;
-        if ((int)filtered != diagPrevFiltered || srcFb != diagPrevSrc) {
-            diagPrevFiltered = (int)filtered;
-            diagPrevSrc = srcFb;
-            SPDLOG_INFO("FXAA diag: ApplyFxaa(dst={}, src={}) -> {}", mGameFbFxaa, srcFb, filtered);
+        // SOH [Diagnostic] TEMPORARY, remove with the rest of the FXAA diagnostic (see StartFrame). Counted
+        // rather than only logged on change: "no new line" could not tell a value that stayed the same from
+        // a call that stopped happening, which is a distinction this bug turns on.
+        gDiagFxaaCalls++;
+        if (filtered) {
+            gDiagFxaaOk++;
         }
         if (filtered) {
             return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
@@ -6934,6 +6942,28 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         mRapi->StartDrawToFramebuffer(0, 1);
 
         assert(0 && "active framebuffer was never reset back to original");
+    }
+
+    // SOH [Diagnostic] TEMPORARY. The first instrument ruled out the framebuffer configuration: entering the
+    // debug map select changed none of it. So this measures the other half -- whether the frame is being
+    // DRAWN at all. Every 60 frames it reports the triangles and draw calls the frame submitted and how
+    // often the filter ran.
+    //
+    // The fork it settles: if the counts hold up on the black screen, the geometry is being submitted and
+    // the picture is lost somewhere between the game framebuffer and the window. If they collapse towards
+    // zero, nothing is being drawn and the fault is upstream of the renderer entirely, in what that screen
+    // produces once the game is rendering into a framebuffer instead of straight at the window.
+    //
+    // Counted rather than logged on change, deliberately: the previous instrument could not tell a value
+    // that stayed the same from a call that stopped happening, and this bug may well turn on exactly that.
+    gDiagFrames++;
+    if ((gDiagFrames % 60) == 0) {
+        SPDLOG_INFO("FXAA diag2: frames={} tris/frame={} draws/frame={} fxaaCalls={} fxaaOk={} fbActiveAtEnd={}",
+                    gDiagFrames, gDiagTris / 60, gDiagDraws / 60, gDiagFxaaCalls, gDiagFxaaOk, (int)mFbActive);
+        gDiagTris = 0;
+        gDiagDraws = 0;
+        gDiagFxaaCalls = 0;
+        gDiagFxaaOk = 0;
     }
 }
 
