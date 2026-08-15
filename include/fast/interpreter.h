@@ -240,6 +240,10 @@ struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
+    // SOH [Enhancement] What this entry costs in graphics memory: the RGBA32 the backend uploaded, which is
+    // width * height * 4 whatever the source format was. Zero until the upload reports it, so an entry that
+    // was reserved and then abandoned is free rather than a guess (see TextureCacheAccountUpload).
+    size_t bytes = 0;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
@@ -420,6 +424,8 @@ struct GfxTextureCache {
     TextureCacheMap map;
     std::list<TextureCacheMapIter> lru;
     std::vector<uint32_t> free_texture_ids;
+    // SOH [Enhancement] Sum of `bytes` over the live entries. What the eviction budget is measured against.
+    size_t bytes = 0;
 };
 
 struct ColorCombiner {
@@ -605,6 +611,13 @@ class Interpreter {
     uintptr_t PresentedFramebufferTexture(int srcFb);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    // SOH [Enhancement] Upload through the interpreter rather than straight to the backend, so the cache
+    // learns what the entry it just reserved actually costs. Every ImportTexture* path goes through here.
+    void UploadTextureAccounted(const uint8_t* rgba32Buf, uint32_t width, uint32_t height);
+    // Drop least-recently-used entries until the cache fits its memory budget. Entries bound to a texture
+    // unit right now are stepped over rather than dropped -- mRenderingState holds raw pointers into the
+    // map, and erasing one of those is a dangling read on the very next draw.
+    void TextureCacheEvictToBudget();
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -708,6 +721,12 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
+    // SOH [Enhancement] What the texture cache is allowed to hold, in bytes. Followed from a CVar in
+    // megabytes once a frame; see the note on the default in interpreter.cpp.
+    size_t mTextureCacheBudgetBytes = 0;
+    // The entry TextureCacheLookup reserved on its last miss, waiting for its upload to say how big it is.
+    // Cleared as soon as it is accounted, so an import that bails out before uploading leaves nothing stale.
+    TextureCacheNode* mTextureCachePending = nullptr;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
 

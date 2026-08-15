@@ -72,7 +72,24 @@ std::stack<std::string> currentDir;
 #define RATIO_Y(activeFb, dims) \
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
-#define TEXTURE_CACHE_MAX_SIZE 1024
+// SOH [Enhancement] The texture cache is bounded by how much graphics memory it holds, not by how many
+// images it holds.
+//
+// A count is the wrong unit the moment textures stop being the same size as each other. Stock textures run
+// to a few kilobytes, so a thousand of them is some tens of megabytes and the limit never binds; an HD pack
+// replaces those same thousand with images a hundred times larger, and the limit still says "a thousand" --
+// so it binds constantly, and in a room whose materials do not all fit it evicts one to admit the next,
+// then evicts that one to admit the first again, re-decoding and re-uploading megabytes every frame for
+// geometry that never changed. A byte budget says the thing that was actually meant: hold as much as fits.
+//
+// The default is deliberately far above what the old count amounted to. Vanilla assets total well under it,
+// so vanilla simply caches everything and never evicts at all; an HD pack gets a real working set instead of
+// a hundred-odd slots. It is a ceiling and not a reservation -- nothing is allocated until the game asks for
+// it -- and a card that cannot spare this much can be told a smaller number.
+#define TEXTURE_CACHE_DEFAULT_MB 512
+// Never evict below this many entries however small the budget is set. A pathologically low setting must
+// degrade into re-uploading, not into a cache that cannot hold the handful of textures one draw needs.
+#define TEXTURE_CACHE_MIN_ENTRIES 16
 
 namespace Fast {
 
@@ -432,6 +449,8 @@ void Interpreter::TextureCacheClear() {
     }
     mTextureCache.map.clear();
     mTextureCache.lru.clear();
+    mTextureCache.bytes = 0;
+    mTextureCachePending = nullptr;
 }
 
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
@@ -443,16 +462,14 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
         *n = &*it;
         mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
                                  it->second.lru_location); // move to back
+        // A hit uploads nothing, so nothing is owed. Cleared rather than left standing so that an import
+        // which reserved an entry and then bailed out before uploading cannot have the NEXT upload charged
+        // against it.
+        mTextureCachePending = nullptr;
         return true;
     }
 
-    if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
-        // Remove the texture that was least recently used
-        it = mTextureCache.lru.front().it;
-        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
-        mTextureCache.map.erase(it);
-        mTextureCache.lru.pop_front();
-    }
+    TextureCacheEvictToBudget();
 
     uint32_t texture_id;
     if (!mTextureCache.free_texture_ids.empty()) {
@@ -470,7 +487,74 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
     *n = node;
+    // The upload that follows this miss is what will say how large the entry is (see
+    // UploadTextureAccounted). Until it does, the entry counts as free -- which errs towards keeping the
+    // cache under budget rather than over it.
+    mTextureCachePending = node;
     return false;
+}
+
+// SOH [Enhancement] Charge the entry reserved by the last cache miss for what it uploaded.
+//
+// The size is taken from the RGBA32 the backend receives rather than from the source asset, because that is
+// what actually occupies graphics memory: a 4-bit CI texture and a 32-bit RGBA one of the same dimensions
+// cost the same once uploaded, and the budget is about memory, not about file size. Mip chains add a third
+// on top of this and are not counted; the figure is a floor, and a consistent one.
+void Interpreter::UploadTextureAccounted(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    mRapi->UploadTexture(rgba32_buf, width, height);
+
+    if (mTextureCachePending == nullptr) {
+        // A re-upload into an entry that already exists -- a replacement texture, or a path that uploads
+        // without having missed. Nothing reserved, nothing to charge.
+        return;
+    }
+    // Replaces rather than adds: a path that uploads twice into the same reserved entry (the masked and
+    // blended variants do) must not be counted twice.
+    mTextureCache.bytes -= mTextureCachePending->second.bytes;
+    mTextureCachePending->second.bytes = (size_t)width * (size_t)height * 4u;
+    mTextureCache.bytes += mTextureCachePending->second.bytes;
+    mTextureCachePending = nullptr;
+}
+
+void Interpreter::TextureCacheEvictToBudget() {
+    // Walked from the front, which is the least recently used end, and stepping over anything currently
+    // bound to a texture unit. mRenderingState.mTextures holds raw pointers into the map, so erasing an
+    // entry it points at leaves the next draw reading freed memory -- a hazard the old code never had to
+    // think about, because it evicted exactly one entry per miss and the odds of that one being live were
+    // negligible. A byte budget can evict a great many at once to admit a single large texture, and then
+    // the odds stop being negligible.
+    //
+    // The evicted texture id goes back on the free list exactly as before rather than being deleted. The
+    // backends do not have a working DeleteTexture to call -- Direct3D's is empty and OpenGL's destroys a
+    // name this cache is about to hand out again -- so recycling the id IS the release: the memory goes
+    // when the id is next reused and its contents overwritten. The consequence is that the resident figure
+    // lags the budget by roughly one eviction burst rather than tracking it exactly.
+    auto it = mTextureCache.lru.begin();
+    while (mTextureCache.bytes > mTextureCacheBudgetBytes && mTextureCache.map.size() > TEXTURE_CACHE_MIN_ENTRIES &&
+           it != mTextureCache.lru.end()) {
+        TextureCacheMap::iterator victim = it->it;
+        TextureCacheNode* node = &*victim;
+
+        bool bound = false;
+        for (int slot = 0; slot < SHADER_MAX_TEXTURES; slot++) {
+            if (mRenderingState.mTextures[slot] == node) {
+                bound = true;
+                break;
+            }
+        }
+        if (bound) {
+            ++it;
+            continue;
+        }
+
+        mTextureCache.bytes -= victim->second.bytes;
+        mTextureCache.free_texture_ids.push_back(victim->second.texture_id);
+        if (mTextureCachePending == node) {
+            mTextureCachePending = nullptr;
+        }
+        mTextureCache.map.erase(victim);
+        it = mTextureCache.lru.erase(it);
+    }
 }
 
 std::string Interpreter::GetBaseTexturePath(const std::string& path) {
@@ -490,6 +574,10 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
             if (it->first.texture_addr == origAddr) {
                 mTextureCache.lru.erase(it->second.lru_location);
                 mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+                mTextureCache.bytes -= it->second.bytes;
+                if (mTextureCachePending == &*it) {
+                    mTextureCachePending = nullptr;
+                }
                 mTextureCache.map.erase(it->first);
                 again = true;
                 break;
@@ -546,7 +634,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         }
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
@@ -569,7 +657,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
 
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes / 2;
     uint32_t height = (size_bytes / 2) / mRdp->texture_tile[tile].line_size_bytes;
-    mRapi->UploadTexture(addr, width, height);
+    UploadTextureAccounted(addr, width, height);
 }
 
 void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
@@ -607,7 +695,7 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes * 2;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
@@ -643,7 +731,7 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
@@ -691,7 +779,7 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
         }
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
@@ -741,7 +829,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         }
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
@@ -772,7 +860,7 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
     uint32_t width = mRdp->texture_tile[tile].line_size_bytes;
     uint32_t height = sizeBytes / mRdp->texture_tile[tile].line_size_bytes;
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
@@ -824,7 +912,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     uint32_t width = resultLineSizeBytes * 2;
     uint32_t height = sizeBytes / resultLineSizeBytes;
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
@@ -868,7 +956,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     uint32_t width = resultLineSizeBytes;
     uint32_t height = sizeBytes / resultLineSizeBytes;
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
@@ -885,7 +973,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
 
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
-    mRapi->UploadTexture(addr, width, height);
+    UploadTextureAccounted(addr, width, height);
 }
 
 void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
@@ -932,7 +1020,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
-        mRapi->UploadTexture(addr, width, height);
+        UploadTextureAccounted(addr, width, height);
         return;
     }
 
@@ -965,7 +1053,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
+    UploadTextureAccounted(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
@@ -1118,7 +1206,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         }
     }
 
-    mRapi->UploadTexture(mTexUploadBuffer, width, height);
+    UploadTextureAccounted(mTexUploadBuffer, width, height);
 }
 
 void Interpreter::NormalizeVector(float v[3]) {
@@ -6893,6 +6981,13 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
         Ship::Context::GetInstance()->GetConsoleVariables()->GetFloat(CVAR_INTERNAL_RESOLUTION, 1);
     mMsaaLevel = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_MSAA_VALUE, 1);
     mFxaaEnabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_FXAA, 0) != 0;
+    // Seeded here as well as followed per frame (see StartFrame), so the budget is never zero for a texture
+    // imported before the first frame begins.
+    {
+        const int32_t textureCacheMb = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
+            CVAR_TEXTURE_CACHE_MB, TEXTURE_CACHE_DEFAULT_MB);
+        mTextureCacheBudgetBytes = (size_t)(textureCacheMb > 1 ? textureCacheMb : 1) * 1024u * 1024u;
+    }
 
     mCurDimensions.width = width;
     mCurDimensions.height = height;
@@ -6955,6 +7050,16 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 }
 
 void Interpreter::StartFrame() {
+    // SOH [Enhancement] Followed once a frame rather than read per texture miss, and rather than sampled
+    // once at startup: a per-miss read would put a string lookup on the path this change exists to make
+    // cheaper, and a startup-only read would mean the setting did nothing until the game was restarted.
+    // Lowering it mid-session takes effect on the next miss, when the eviction loop next runs.
+    {
+        const int32_t megabytes = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
+            CVAR_TEXTURE_CACHE_MB, TEXTURE_CACHE_DEFAULT_MB);
+        mTextureCacheBudgetBytes = (size_t)(megabytes > 1 ? megabytes : 1) * 1024u * 1024u;
+    }
+
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
