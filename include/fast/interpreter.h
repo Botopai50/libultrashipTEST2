@@ -638,6 +638,13 @@ class Interpreter {
     void GfxSpMatrix(uint8_t params, const int32_t* addr);
     void GfxSpPopMatrix(uint32_t count);
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
+    // SOH [Enhancement] The vertex shade for one four-vertex block of GfxSpVertex, lifted out of the
+    // per-vertex body so the directional case -- which is every light in almost every scene -- can be
+    // summed four vertices at a time. Takes object-space normals and world positions a lane each, and
+    // writes the pre-clamp colour accumulators back the same way. Four lanes always: a short final block
+    // carries a repeat of its own first vertex, so shading the padding is harmless.
+    void ShadeVertexBlock(const float* nx, const float* ny, const float* nz, const float* wx, const float* wy,
+                          const float* wz, int32_t* outR, int32_t* outG, int32_t* outB);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);

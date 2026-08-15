@@ -1681,7 +1681,136 @@ inline void TransformNormals4(const float m[4][4], const float nx[kVtxBlock], co
 #endif
 }
 
+#ifdef FAST3D_SSE2
+// Round each lane toward zero and back, which is what `int r; r += <float>;` does to the running total at
+// every step. Summing in float and truncating once at the end is a DIFFERENT number, so the truncation has
+// to happen per light here too.
+inline __m128 TruncateTowardZero(__m128 v) {
+    return _mm_cvtepi32_ps(_mm_cvttps_epi32(v));
+}
+#endif
+
 } // namespace
+
+// SOH [Enhancement] Vertex shade, four vertices at a time.
+//
+// The directional case is three multiplies, two adds and a divide per light per vertex, then a compare and
+// three more multiply-adds -- the same operation on independent vertices, like the transforms above, and
+// vectorised the same way.
+//
+// The accumulation is the subtle part and the reason this is not simply four dot products. The original
+// sums into `int r` from a float expression, so every light truncates the running total toward zero before
+// the next one is added; summing four lights in float and rounding once at the end gives a different
+// colour. The vector path truncates per light for that reason, and it is why the operation used is
+// cvttps/cvtps rather than a plain add.
+//
+// Positional lights take the scalar path per lane, unchanged. That branch is per vertex by nature -- a
+// square root, a floor, a transposed matrix multiply and three clamps against a light POSITION -- and it
+// exists for a microcode this game barely uses, so vectorising it would be risk spent where there is no
+// time to save.
+void Interpreter::ShadeVertexBlock(const float* nx, const float* ny, const float* nz, const float* wx, const float* wy,
+                                   const float* wz, int32_t* outR, int32_t* outG, int32_t* outB) {
+    const F3DLight_t& ambient = mRsp->current_lights[mRsp->current_num_lights - 1].l;
+    const int numDirectional = (int)mRsp->current_num_lights - 1;
+    const bool positional = (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) != 0;
+
+#ifdef FAST3D_SSE2
+    if (!positional) {
+        const __m128 zero = _mm_setzero_ps();
+        const __m128 vnx = _mm_loadu_ps(nx);
+        const __m128 vny = _mm_loadu_ps(ny);
+        const __m128 vnz = _mm_loadu_ps(nz);
+        __m128 accR = _mm_set1_ps((float)ambient.col[0]);
+        __m128 accG = _mm_set1_ps((float)ambient.col[1]);
+        __m128 accB = _mm_set1_ps((float)ambient.col[2]);
+        for (int i = 0; i < numDirectional; i++) {
+            // Started from zero and added to, exactly as the scalar does: it matters for a normal whose
+            // first product is negative zero.
+            __m128 intensity = zero;
+            intensity = _mm_add_ps(intensity, _mm_mul_ps(vnx, _mm_set1_ps(mRsp->current_lights_coeffs[i][0])));
+            intensity = _mm_add_ps(intensity, _mm_mul_ps(vny, _mm_set1_ps(mRsp->current_lights_coeffs[i][1])));
+            intensity = _mm_add_ps(intensity, _mm_mul_ps(vnz, _mm_set1_ps(mRsp->current_lights_coeffs[i][2])));
+            // Divided, not multiplied by a reciprocal, because the scalar divides.
+            intensity = _mm_div_ps(intensity, _mm_set1_ps(127.0f));
+            // A lane at or below zero contributes nothing. NaN compares false here and takes the same
+            // branch it takes in the scalar.
+            const __m128 lit = _mm_cmpgt_ps(intensity, zero);
+            const F3DLight_t& l = mRsp->current_lights[i].l;
+            accR = TruncateTowardZero(
+                _mm_add_ps(accR, _mm_and_ps(lit, _mm_mul_ps(intensity, _mm_set1_ps((float)l.col[0])))));
+            accG = TruncateTowardZero(
+                _mm_add_ps(accG, _mm_and_ps(lit, _mm_mul_ps(intensity, _mm_set1_ps((float)l.col[1])))));
+            accB = TruncateTowardZero(
+                _mm_add_ps(accB, _mm_and_ps(lit, _mm_mul_ps(intensity, _mm_set1_ps((float)l.col[2])))));
+        }
+        _mm_storeu_si128((__m128i*)outR, _mm_cvttps_epi32(accR));
+        _mm_storeu_si128((__m128i*)outG, _mm_cvttps_epi32(accG));
+        _mm_storeu_si128((__m128i*)outB, _mm_cvttps_epi32(accB));
+        return;
+    }
+#endif
+
+    for (size_t k = 0; k < kVtxBlock; k++) {
+        int r = ambient.col[0];
+        int g = ambient.col[1];
+        int b = ambient.col[2];
+
+        for (int i = 0; i < numDirectional; i++) {
+            float intensity = 0;
+            if (positional && (mRsp->current_lights[i].p.unk3 != 0)) {
+                // Calculate distance from the light to the vertex
+                float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - wx[k],
+                                      mRsp->current_lights[i].p.pos[1] - wy[k],
+                                      mRsp->current_lights[i].p.pos[2] - wz[k] };
+                float dist_sq = dist_vec[0] * dist_vec[0] + dist_vec[1] * dist_vec[1] +
+                                dist_vec[2] * dist_vec[2] * 2; // The *2 comes from GLideN64, unsure of why it does it
+                float dist = sqrt(dist_sq);
+
+                // Transform distance vector (which acts as a direction light vector) into model's space
+                float light_model[3];
+                TransposedMatrixMul(light_model, dist_vec,
+                                    mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+
+                // Calculate intensity for each axis using standard formula for intensity
+                float light_intensity[3];
+                for (int light_i = 0; light_i < 3; light_i++) {
+                    light_intensity[light_i] = 4.0f * light_model[light_i] / dist_sq;
+                    light_intensity[light_i] = std::clamp(light_intensity[light_i], -1.0f, 1.0f);
+                }
+
+                // Adjust intensity based on surface normal and sum up total
+                float total_intensity =
+                    light_intensity[0] * nx[k] + light_intensity[1] * ny[k] + light_intensity[2] * nz[k];
+                total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
+
+                // Attenuate intensity based on attenuation values.
+                // Example formula found at https://ogldev.org/www/tutorial20/tutorial20.html
+                // Specific coefficients for MM's microcode sourced from GLideN64
+                // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
+                float distf = floorf(dist);
+                float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
+                                     distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
+                                        (float)0xFFFF +
+                                    1.0f;
+                intensity = total_intensity / attenuation;
+            } else {
+                intensity += nx[k] * mRsp->current_lights_coeffs[i][0];
+                intensity += ny[k] * mRsp->current_lights_coeffs[i][1];
+                intensity += nz[k] * mRsp->current_lights_coeffs[i][2];
+                intensity /= 127.0f;
+            }
+            if (intensity > 0.0f) {
+                r += intensity * mRsp->current_lights[i].l.col[0];
+                g += intensity * mRsp->current_lights[i].l.col[1];
+                b += intensity * mRsp->current_lights[i].l.col[2];
+            }
+        }
+
+        outR[k] = r;
+        outG[k] = g;
+        outB[k] = b;
+    }
+}
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
     // SOH [Enhancement] Cascaded shadow maps: signature of the world-caster geometry drawn this frame, used to
@@ -1718,6 +1847,21 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     const bool needModelview = needWorldPos || positional;
     float(*const mv)[4] = mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1];
 
+    // Hoisted out of the per-vertex body, where it sat behind a flag that the first vertex cleared and the
+    // other thirty-one then re-tested. Nothing in the loop loads a light, so once per batch is once per
+    // change. The `n_vertices > 0` keeps it firing on exactly the batches it fired on before.
+    if (lighting && n_vertices > 0 && mRsp->lights_changed) {
+        for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
+            CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
+        }
+        CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
+        CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+        if (mRdp->toon) { // SOH [Enhancement] toon lighting: cache the dominant light
+            SelectToonLight();
+        }
+        mRsp->lights_changed = false;
+    }
+
     // Block scratch, filled kVtxBlock vertices at a time and then read one lane per iteration. Kept out
     // here, and the loop left as one pass over vertices rather than a pass over blocks with a pass inside
     // it, so that everything below the transform keeps its shape: the vector work happens on the iterations
@@ -1727,6 +1871,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     alignas(16) float mx[kVtxBlock], my[kVtxBlock], mz[kVtxBlock], mw[kVtxBlock];
     alignas(16) float inx[kVtxBlock], iny[kVtxBlock], inz[kVtxBlock];
     alignas(16) float onx[kVtxBlock], ony[kVtxBlock], onz[kVtxBlock];
+    alignas(16) int32_t shadeR[kVtxBlock], shadeG[kVtxBlock], shadeB[kVtxBlock];
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const size_t k = i % kVtxBlock;
@@ -1745,14 +1890,19 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             if (needModelview) {
                 TransformPoints4(mv, ox, oy, oz, mx, my, mz, mw);
             }
-            if (needNormal) {
+            // The normals feed two things: the shade below, which wants them in object space, and the
+            // world-space normal the toon and shadow-map shaders read. Gathered once for both.
+            if (lighting) {
                 for (size_t j = 0; j < kVtxBlock; j++) {
                     const F3DVtx_tn* srcn = &vertices[i + (j < lanes ? j : 0)].n;
                     inx[j] = srcn->n[0];
                     iny[j] = srcn->n[1];
                     inz[j] = srcn->n[2];
                 }
-                TransformNormals4(mv, inx, iny, inz, onx, ony, onz);
+                ShadeVertexBlock(inx, iny, inz, mx, my, mz, shadeR, shadeG, shadeB);
+                if (needNormal) {
+                    TransformNormals4(mv, inx, iny, inz, onx, ony, onz);
+                }
             }
         }
 
@@ -1764,13 +1914,6 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         float y = cy[k];
         float z = cz[k];
         float w = cw[k];
-
-        float world_pos[3] = { 0.0 };
-        if (positional) {
-            world_pos[0] = mx[k];
-            world_pos[1] = my[k];
-            world_pos[2] = mz[k];
-        }
 
         x = AdjXForAspectRatio(x);
 
@@ -1794,76 +1937,11 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
 
-        if (mRsp->geometry_mode & G_LIGHTING) {
-            if (mRsp->lights_changed) {
-                for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-                    CalculateNormalDir(&mRsp->current_lights[i].l, mRsp->current_lights_coeffs[i]);
-                }
-                /*static const Light_t lookat_x = {{0, 0, 0}, 0, {0, 0, 0}, 0, {127, 0, 0}, 0};
-                static const Light_t lookat_y = {{0, 0, 0}, 0, {0, 0, 0}, 0, {0, 127, 0}, 0};*/
-                CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
-                CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
-                if (mRdp->toon) { // SOH [Enhancement] toon lighting: cache the dominant light
-                    SelectToonLight();
-                }
-                mRsp->lights_changed = false;
-            }
-
-            int r = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[0];
-            int g = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[1];
-            int b = mRsp->current_lights[mRsp->current_num_lights - 1].l.col[2];
-
-            for (int i = 0; i < mRsp->current_num_lights - 1; i++) {
-                float intensity = 0;
-                if ((mRsp->geometry_mode & G_LIGHTING_POSITIONAL) && (mRsp->current_lights[i].p.unk3 != 0)) {
-                    // Calculate distance from the light to the vertex
-                    float dist_vec[3] = { mRsp->current_lights[i].p.pos[0] - world_pos[0],
-                                          mRsp->current_lights[i].p.pos[1] - world_pos[1],
-                                          mRsp->current_lights[i].p.pos[2] - world_pos[2] };
-                    float dist_sq =
-                        dist_vec[0] * dist_vec[0] + dist_vec[1] * dist_vec[1] +
-                        dist_vec[2] * dist_vec[2] * 2; // The *2 comes from GLideN64, unsure of why it does it
-                    float dist = sqrt(dist_sq);
-
-                    // Transform distance vector (which acts as a direction light vector) into model's space
-                    float light_model[3];
-                    TransposedMatrixMul(light_model, dist_vec,
-                                        mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
-
-                    // Calculate intensity for each axis using standard formula for intensity
-                    float light_intensity[3];
-                    for (int light_i = 0; light_i < 3; light_i++) {
-                        light_intensity[light_i] = 4.0f * light_model[light_i] / dist_sq;
-                        light_intensity[light_i] = std::clamp(light_intensity[light_i], -1.0f, 1.0f);
-                    }
-
-                    // Adjust intensity based on surface normal and sum up total
-                    float total_intensity =
-                        light_intensity[0] * vn->n[0] + light_intensity[1] * vn->n[1] + light_intensity[2] * vn->n[2];
-                    total_intensity = std::clamp(total_intensity, -1.0f, 1.0f);
-
-                    // Attenuate intensity based on attenuation values.
-                    // Example formula found at https://ogldev.org/www/tutorial20/tutorial20.html
-                    // Specific coefficients for MM's microcode sourced from GLideN64
-                    // https://github.com/gonetz/GLideN64/blob/3b43a13a80dfc2eb6357673440b335e54eaa3896/src/gSP.cpp#L636
-                    float distf = floorf(dist);
-                    float attenuation = (distf * mRsp->current_lights[i].p.unk7 * 2.0f +
-                                         distf * distf * mRsp->current_lights[i].p.unkE / 8.0f) /
-                                            (float)0xFFFF +
-                                        1.0f;
-                    intensity = total_intensity / attenuation;
-                } else {
-                    intensity += vn->n[0] * mRsp->current_lights_coeffs[i][0];
-                    intensity += vn->n[1] * mRsp->current_lights_coeffs[i][1];
-                    intensity += vn->n[2] * mRsp->current_lights_coeffs[i][2];
-                    intensity /= 127.0f;
-                }
-                if (intensity > 0.0f) {
-                    r += intensity * mRsp->current_lights[i].l.col[0];
-                    g += intensity * mRsp->current_lights[i].l.col[1];
-                    b += intensity * mRsp->current_lights[i].l.col[2];
-                }
-            }
+        if (lighting) {
+            // Summed for the whole block at the top of it (see ShadeVertexBlock); this lane's share of it.
+            const int r = shadeR[k];
+            const int g = shadeG[k];
+            const int b = shadeB[k];
 
             d->color.r = r > 255 ? 255 : r;
             d->color.g = g > 255 ? 255 : g;
