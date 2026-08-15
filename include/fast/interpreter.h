@@ -27,12 +27,16 @@
 // The interpreter packs from this and every backend sizes its vertex buffers from it, so they stay in
 // lockstep — change it in one place only.
 //
-// Raised 40 -> 44 for the shadow-map world position (3 floats) plus the receiver kind packed beside it. The headroom is deliberate rather than
-// tight: summing every optional attribute at its maximum (4 position + 4 per texcoord with both clamps +
-// 4 fog + 4 grayscale + 3 normal + 3 world position + 4 per input up to seven inputs) already exceeds
-// this, so the ceiling is set by which combinations actually co-occur -- something not provable from the
-// combiner alone. Over-allocating a few floats per vertex costs a little memory; under-allocating
-// overruns the buffer.
+// Raised 40 -> 44 for the shadow-map world position (3 floats) plus the receiver kind packed beside it. The headroom is
+// deliberate rather than tight: summing every optional attribute at its maximum (4 position + 4 per texcoord with both
+// clamps + 4 fog + 4 grayscale + 3 normal + 4 world position + ONE per input up to seven inputs) already exceeds this,
+// so the ceiling is set by which combinations actually co-occur -- something not provable from the combiner alone.
+// Over-allocating a few floats per vertex costs a little memory; under-allocating overruns the buffer.
+//
+// The colour inputs count one apiece, not three or four: each is packed as four normalised bytes into a
+// single slot (see the packing in GfxSpTri1 and the update_packed_color calls in the shader templates).
+// This ceiling therefore has MORE headroom than it did, not less, and is left where it is because nothing
+// is gained by lowering it.
 #define VBO_MAX_FLOATS_PER_VERTEX 44
 
 // Maximum triangles batched before the interpreter flushes. Every flush is one draw call, so dense
@@ -490,12 +494,11 @@ class Interpreter {
     // already account for the backend's capability -- the interpreter does not second-guess it, it just
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
     // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
-    void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, int actorResolution,
-                            const float splits[4],
+    void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, int actorResolution, const float splits[4],
                             const float lightDir[3], float blendFraction, float normalOffset, float strength,
-                            float filterWidth, float minCasterSize, float debugMode,
-                            float edgeHardness, float edgeHardnessFar, float minIncidence, float fullIncidence,
-                            float minHardnessScale, float depthBiasWorld, float slopeBias) {
+                            float filterWidth, float minCasterSize, float debugMode, float edgeHardness,
+                            float edgeHardnessFar, float minIncidence, float fullIncidence, float minHardnessScale,
+                            float depthBiasWorld, float slopeBias) {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
@@ -509,7 +512,7 @@ class Interpreter {
         // moment after the switch, which is a wait the player can watch rather than one that stops the
         // picture. Nothing downstream needs to know: this is the same state as the mode being off.
         mShadowMapEnabled = enabled && (mRapi == nullptr || !mRapi->ShaderPrewarmInProgress());
-        mShadowMapCascadeCount = cascadeCount < 1                       ? 1
+        mShadowMapCascadeCount = cascadeCount < 1                         ? 1
                                  : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                           : cascadeCount;
         mShadowMapResolution = resolution;
@@ -803,10 +806,10 @@ class Interpreter {
     std::vector<LoadedVertex> mShadowXform;
     float mToonShadowAlpha = 0.5f;        // core blend strength (set per frame by SetToonShadowParams)
     float mToonShadowMinElevation = 0.6f; // min remapped key height above the floor (bounds shadow length)
-    float mShadowSlabDepth = 40.0f;    // stencil-volume: how far below the feet the slab reaches (ground band)
-    float mShadowSlabRise = 10.0f;     // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
-    int mShadowEdgeSoftness = 1;       // penumbra rings around the silhouette (0 = hard edge, max 2)
-    bool mShadowShowVolume = false;    // debug: draw the translucent shadow volume (black caps, blue walls)
+    float mShadowSlabDepth = 40.0f;       // stencil-volume: how far below the feet the slab reaches (ground band)
+    float mShadowSlabRise = 10.0f;        // stencil-volume: how far ABOVE the feet the slab top reaches (uphill)
+    int mShadowEdgeSoftness = 1;          // penumbra rings around the silhouette (0 = hard edge, max 2)
+    bool mShadowShowVolume = false;       // debug: draw the translucent shadow volume (black caps, blue walls)
 
     // SOH [Enhancement] Cascaded shadow maps. Casters are captured in world space exactly where the
     // stencil-volume system captures its silhouettes (same gSPToonShadow arming), but they are kept as
@@ -985,7 +988,7 @@ class Interpreter {
     // moved means contents that have not changed -- and that is the one list large enough that walking it
     // per frame would be worth avoiding.
     uint64_t mShadowWorldCacheGeneration = 0;
-    bool mShadowWorldCapture = true;         // capture the world layer this frame (rebuild pending)
+    bool mShadowWorldCapture = true;  // capture the world layer this frame (rebuild pending)
     bool mShadowMapEnabled = false;   // app-pushed AND its shaders are ready
     bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;

@@ -32,6 +32,10 @@ struct ShaderProgram {
     uint8_t numFloats;
     GLint attribLocations[16];
     uint8_t attribSizes[16];
+    // SOH [Enhancement] Whether attribute i is a packed colour: four normalised bytes in one float slot.
+    // No initialiser, for the reason spelled out on the uniform cache below -- this struct must stay an
+    // aggregate so the pool's value-initialisation keeps zeroing it.
+    bool attribPacked[16];
     uint8_t numAttribs;
     GLint frameCountLocation;
     GLint noiseScaleLocation;

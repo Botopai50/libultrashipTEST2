@@ -46,12 +46,11 @@
     @if(o_alpha)
         @{attr} vec4 aInput@{i + 1};
         @{out} vec4 vInput@{i + 1};
-        @{update_floats(4)}
     @else
         @{attr} vec3 aInput@{i + 1};
         @{out} vec3 vInput@{i + 1};
-        @{update_floats(3)}
     @end
+    @{update_packed_color()}
 @end
 
 void main() {

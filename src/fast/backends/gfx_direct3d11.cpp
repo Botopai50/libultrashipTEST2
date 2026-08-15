@@ -961,8 +961,15 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              0 };
     }
     for (unsigned int i = 0; i < cc_features.numInputs; i++) {
-        DXGI_FORMAT format = cc_features.opt_alpha ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32_FLOAT;
-        ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+        // SOH [Enhancement] Four normalised bytes rather than three or four floats -- a quarter of the room
+        // for exactly the precision the source has, since every one of these comes from an 8-bit RDP colour
+        // register or an 8-bit vertex colour and was being widened to float only to be narrowed again by the
+        // blender. The shader still declares float3 or float4 and still reads 0..1: the unpacking is the
+        // input assembler's, at no cost. A float3 declaration against a four-component slot simply ignores
+        // the fourth, which is what the no-alpha case wants.
+        ied[ied_index++] = {
+            "INPUT", i, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0
+        };
     }
 
     // vsData, not vs: on a cache hit the blob was never created and the bytecode lives in the vector.
@@ -3313,6 +3320,13 @@ prism::ContextTypes* update_raw_floats(prism::ContextTypes* _, prism::ContextTyp
     raw_numFloats += std::get<int>(*num);
     return nullptr;
 }
+
+// SOH [Enhancement] See the note beside the OpenGL one: a colour carried as four normalised bytes takes one
+// float's worth of the vertex, and the input layout describes that slot as R8G8B8A8_UNORM.
+prism::ContextTypes* update_packed_color(prism::ContextTypes* _) {
+    raw_numFloats += 1;
+    return nullptr;
+}
 // PRISM-HELPERS-END
 
 std::optional<std::string> dx_include_fs(const std::string& path) {
@@ -3385,6 +3399,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "srgb_mode", use_srgb },
         { "append_formula", (InvokeFunc)prism_append_formula },
         { "update_floats", (InvokeFunc)update_raw_floats },
+        { "update_packed_color", (InvokeFunc)update_packed_color },
     };
     processor.populate(mContext);
     auto init = std::make_shared<Ship::ResourceInitData>();

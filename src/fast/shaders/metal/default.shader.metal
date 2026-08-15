@@ -59,11 +59,10 @@ struct Vertex {
     @for(i in 0..o_inputs)
         @if(o_alpha)
             float4 input@{i + 1} [[attribute(@{get_vertex_index()})]];
-            @{update_floats(4)}
         @else
             float3 input@{i + 1} [[attribute(@{get_vertex_index()})]];
-            @{update_floats(3)}
         @end
+        @{update_packed_color()}
     @end
 };
 

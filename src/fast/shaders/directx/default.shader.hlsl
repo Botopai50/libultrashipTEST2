@@ -49,10 +49,10 @@ float4 worldPos : WORLDPOS;
 @for(i in 0..o_inputs)
     @if(o_alpha)
         float4 input@{i + 1} : INPUT@{i};
-        @{update_floats(4)}
+        @{update_packed_color()}
     @else
         float3 input@{i + 1} : INPUT@{i};
-        @{update_floats(3)}
+        @{update_packed_color()}
     @end
 @end
 };

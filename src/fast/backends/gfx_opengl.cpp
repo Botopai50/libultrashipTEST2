@@ -49,8 +49,16 @@ static void VertexArraySetAttribs(ShaderProgram* prg) {
     for (int i = 0; i < prg->numAttribs; i++) {
         if (prg->attribLocations[i] >= 0) {
             glEnableVertexAttribArray(prg->attribLocations[i]);
-            glVertexAttribPointer(prg->attribLocations[i], prg->attribSizes[i], GL_FLOAT, GL_FALSE,
-                                  numFloats * sizeof(float), (void*)(pos * sizeof(float)));
+            // A packed colour is always four components of GL_UNSIGNED_BYTE read as normalised, occupying
+            // the one float slot attribSizes reports. Everything else is float vectors as before, and the
+            // offset walk below is in float slots either way.
+            if (prg->attribPacked[i]) {
+                glVertexAttribPointer(prg->attribLocations[i], 4, GL_UNSIGNED_BYTE, GL_TRUE, numFloats * sizeof(float),
+                                      (void*)(pos * sizeof(float)));
+            } else {
+                glVertexAttribPointer(prg->attribLocations[i], prg->attribSizes[i], GL_FLOAT, GL_FALSE,
+                                      numFloats * sizeof(float), (void*)(pos * sizeof(float)));
+            }
         }
         pos += prg->attribSizes[i];
     }
@@ -412,6 +420,16 @@ static prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextT
     return nullptr;
 }
 
+// SOH [Enhancement] A colour attribute carried as four normalised bytes rather than as three or four
+// floats. It occupies one float's worth of the vertex, so the stride bookkeeping counts one -- what
+// differs between the backends is the FORMAT they then describe that slot with, which is why this is its
+// own verb in the template rather than update_floats(1): the template says what the attribute IS, and each
+// backend decides how to say it.
+static prism::ContextTypes* UpdatePackedColor(prism::ContextTypes* _) {
+    numFloats += 1;
+    return nullptr;
+}
+
 static std::string BuildVsShader(const CCFeatures& cc_features) {
     numFloats = 4;
     prism::Processor processor;
@@ -423,6 +441,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
+                                     { "update_packed_color", (InvokeFunc)UpdatePackedColor },
 #ifdef __APPLE__
                                      { "GLSL_VERSION", "#version 410 core" },
                                      { "attr", "in" },
@@ -555,7 +574,12 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
         char name[16];
         snprintf(name, sizeof(name), "aInput%d", i + 1);
         prg->attribLocations[cnt] = glGetAttribLocation(shader_program, name);
-        prg->attribSizes[cnt] = cc_features.opt_alpha ? 4 : 3;
+        // SOH [Enhancement] Four normalised bytes in one float's worth of the vertex (see the note on the
+        // Direct3D input layout). attribSizes counts the FLOAT SLOTS the attribute occupies, because that is
+        // what the offset walk in VertexArraySetAttribs advances by; attribPacked is what tells that walk to
+        // describe the slot as four bytes rather than as one float.
+        prg->attribSizes[cnt] = 1;
+        prg->attribPacked[cnt] = true;
         ++cnt;
     }
 

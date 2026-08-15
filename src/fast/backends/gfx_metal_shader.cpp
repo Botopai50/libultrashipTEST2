@@ -180,6 +180,16 @@ prism::ContextTypes* update_raw_floats(prism::ContextTypes* _, prism::ContextTyp
     return nullptr;
 }
 
+// SOH [Enhancement] See the note beside the OpenGL one. Metal names the slot's format outright, so this is
+// where a colour attribute becomes four normalised bytes instead of a float vector.
+prism::ContextTypes* update_packed_color(prism::ContextTypes* _) {
+    vertex_descriptor->attributes()->object(vertex_index)->setFormat(MTL::VertexFormatUChar4Normalized);
+    vertex_descriptor->attributes()->object(vertex_index)->setBufferIndex(0);
+    vertex_descriptor->attributes()->object(vertex_index++)->setOffset(raw_numFloats * sizeof(float));
+    raw_numFloats += 1;
+    return nullptr;
+}
+
 prism::ContextTypes* get_vertex_index() {
     return new prism::ContextTypes{ vertex_index };
 }
@@ -248,6 +258,7 @@ MTL::VertexDescriptor* gfx_metal_build_shader(std::string& result, size_t& numFl
         { "get_vertex_index", (InvokeFunc)get_vertex_index },
         { "append_formula", (InvokeFunc)p_append_formula },
         { "update_floats", (InvokeFunc)update_raw_floats },
+        { "update_packed_color", (InvokeFunc)update_packed_color },
     };
     processor.populate(context);
     auto init = std::make_shared<Ship::ResourceInitData>();

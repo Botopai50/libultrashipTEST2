@@ -2861,6 +2861,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         for (int j = 0; j < numInputs; j++) {
             RGBA* color;
             RGBA tmp;
+            // SOH [Enhancement] One shader input, four normalised bytes, one float slot -- a quarter of the
+            // room these used to take as three or four floats.
+            //
+            // Nothing is lost by it. Every value that lands here is already an 8-bit quantity: an RDP colour
+            // register, a vertex colour, an alpha, a LOD fraction. Widening each to a 32-bit float on the way
+            // to a GPU that normalises it straight back to 0..1 spends four times the vertex bandwidth to
+            // carry the same 256 levels.
+            //
+            // The alpha byte is written only when this variant HAS alpha; when it does not, the shader
+            // declares a three-component input and never reads the fourth, so it is left at the 255 below.
+            // The bytes go out in memory order r, g, b, a -- built as an array and copied, not shifted into
+            // an integer, so it reads the same on a big-endian target as on a little-endian one.
+            uint8_t packed[4] = { 0, 0, 0, 255 };
             for (int k = 0; k < 1 + (use_alpha ? 1 : 0); k++) {
                 switch (comb->shader_input_mapping[k][j]) {
                         // Note: CCMUX constants and ACMUX constants used here have same value, which is why this works
@@ -2916,18 +2929,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                         break;
                 }
                 if (k == 0) {
-                    mBufVbo[mBufVboLen++] = color->r / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->g / 255.0f;
-                    mBufVbo[mBufVboLen++] = color->b / 255.0f;
+                    packed[0] = color->r;
+                    packed[1] = color->g;
+                    packed[2] = color->b;
                 } else {
                     if (use_fog && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for fog
-                        mBufVbo[mBufVboLen++] = 1.0f;
+                        packed[3] = 255;
                     } else {
-                        mBufVbo[mBufVboLen++] = color->a / 255.0f;
+                        packed[3] = color->a;
                     }
                 }
             }
+            // The four bytes occupy one float's worth of the vertex. Copied rather than reinterpreted:
+            // writing bytes through a float lvalue would be an aliasing violation, and memcpy of four bytes
+            // compiles to the same single store.
+            memcpy(&mBufVbo[mBufVboLen++], packed, sizeof(packed));
         }
 
         // struct RGBA *color = &v_arr[i]->color;
