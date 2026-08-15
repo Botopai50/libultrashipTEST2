@@ -410,8 +410,20 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
 uintptr_t Interpreter::PresentedFramebufferTexture(int srcFb) {
     // ApplyFxaa answers false on a backend that has no such pass and on a pipeline that would not build, and
     // in both cases the untouched source is exactly the right thing to show.
-    if (mFxaaEnabled && mRapi->ApplyFxaa(mGameFbFxaa, srcFb)) {
-        return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
+    if (mFxaaEnabled) {
+        const bool filtered = mRapi->ApplyFxaa(mGameFbFxaa, srcFb);
+        // SOH [Diagnostic] TEMPORARY, remove with the rest of the FXAA diagnostic (see StartFrame). Says
+        // whether the pass actually ran and which framebuffer it read, on change only.
+        static int diagPrevFiltered = -1;
+        static int diagPrevSrc = -1;
+        if ((int)filtered != diagPrevFiltered || srcFb != diagPrevSrc) {
+            diagPrevFiltered = (int)filtered;
+            diagPrevSrc = srcFb;
+            SPDLOG_INFO("FXAA diag: ApplyFxaa(dst={}, src={}) -> {}", mGameFbFxaa, srcFb, filtered);
+        }
+        if (filtered) {
+            return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
+        }
     }
     return (uintptr_t)mRapi->GetFramebufferTextureId(srcFb);
 }
@@ -6778,6 +6790,41 @@ void Interpreter::StartFrame() {
         }
     } else {
         mRendersToFb = false;
+    }
+
+    // SOH [Diagnostic] TEMPORARY. Chasing a report of a black screen with FXAA on, seen only on the debug
+    // map select -- the one screen drawn entirely from 2D rectangles, with no 3D geometry over it to hide a
+    // misplaced draw. Three guesses at the cause have missed, so this prints the state they were guesses
+    // about instead: which branch above ran, the sizes it gave each framebuffer, and how the game's
+    // viewport sits inside the window. Printed only when one of them CHANGES, so an entire session is a
+    // handful of lines -- and if entering the map select prints nothing new, that is the answer too: the
+    // framebuffer configuration is not what differs, and the cause is elsewhere.
+    {
+        const uint32_t diagGameFbW =
+            ViewportMatchesRendererResolution() ? mGfxCurrentWindowDimensions.width : mCurDimensions.width;
+        const uint32_t diagGameFbH =
+            ViewportMatchesRendererResolution() ? mGfxCurrentWindowDimensions.height : mCurDimensions.height;
+        static uint64_t diagPrev = ~0ull;
+        const uint64_t diagNow =
+            ((uint64_t)mCurDimensions.width << 44) ^ ((uint64_t)mCurDimensions.height << 32) ^
+            ((uint64_t)mGfxCurrentWindowDimensions.width << 20) ^ ((uint64_t)mGfxCurrentWindowDimensions.height << 8) ^
+            ((uint64_t)(uint16_t)mGameWindowViewport.width << 52) ^
+            ((uint64_t)(uint16_t)mGameWindowViewport.height << 4) ^ ((uint64_t)(uint16_t)mGameWindowViewport.x << 16) ^
+            ((uint64_t)(uint16_t)mGameWindowViewport.y << 28) ^ ((uint64_t)mRendersToFb << 62) ^
+            ((uint64_t)(mFxaaEnabled ? 1 : 0) << 61) ^ ((uint64_t)mMsaaLevel << 56);
+        if (diagNow != diagPrev) {
+            diagPrev = diagNow;
+            SPDLOG_INFO("FXAA diag: fxaa={} msaa={} rendersToFb={} viewportMatchesRenderRes={} | render={}x{} "
+                        "window={}x{} gameViewport={}x{} at ({},{}) | gameFb={}x{} fxaaFb={}x{} | "
+                        "viewportOffsetApplied={}",
+                        mFxaaEnabled, mMsaaLevel, mRendersToFb, ViewportMatchesRendererResolution(),
+                        mCurDimensions.width, mCurDimensions.height, mGfxCurrentWindowDimensions.width,
+                        mGfxCurrentWindowDimensions.height, mGameWindowViewport.width, mGameWindowViewport.height,
+                        mGameWindowViewport.x, mGameWindowViewport.y, diagGameFbW, diagGameFbH, mCurDimensions.width,
+                        mCurDimensions.height,
+                        (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
+                                           mCurDimensions.height == mGameWindowViewport.height)));
+        }
     }
 
     mFbActive = false;
