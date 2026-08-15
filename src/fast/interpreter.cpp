@@ -123,22 +123,12 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
 }
 
-// SOH [Diagnostic] TEMPORARY, part of the FXAA black-screen instrumentation. Counts what the frame actually
-// submitted, so a screen that comes out black can be told apart from a screen that was never drawn.
-static uint64_t gDiagTris = 0;
-static uint64_t gDiagDraws = 0;
-static uint64_t gDiagFxaaCalls = 0;
-static uint64_t gDiagFxaaOk = 0;
-static uint64_t gDiagFrames = 0;
-
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         // SOH [Enhancement] Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
-        gDiagTris += mBufVboNumTris;
-        gDiagDraws++;
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -420,18 +410,8 @@ ColorCombiner* Interpreter::LookupOrCreateColorCombiner(const ColorCombinerKey& 
 uintptr_t Interpreter::PresentedFramebufferTexture(int srcFb) {
     // ApplyFxaa answers false on a backend that has no such pass and on a pipeline that would not build, and
     // in both cases the untouched source is exactly the right thing to show.
-    if (mFxaaEnabled) {
-        const bool filtered = mRapi->ApplyFxaa(mGameFbFxaa, srcFb);
-        // SOH [Diagnostic] TEMPORARY, remove with the rest of the FXAA diagnostic (see StartFrame). Counted
-        // rather than only logged on change: "no new line" could not tell a value that stayed the same from
-        // a call that stopped happening, which is a distinction this bug turns on.
-        gDiagFxaaCalls++;
-        if (filtered) {
-            gDiagFxaaOk++;
-        }
-        if (filtered) {
-            return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
-        }
+    if (mFxaaEnabled && mRapi->ApplyFxaa(mGameFbFxaa, srcFb)) {
+        return (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbFxaa);
     }
     return (uintptr_t)mRapi->GetFramebufferTextureId(srcFb);
 }
@@ -6800,41 +6780,6 @@ void Interpreter::StartFrame() {
         mRendersToFb = false;
     }
 
-    // SOH [Diagnostic] TEMPORARY. Chasing a report of a black screen with FXAA on, seen only on the debug
-    // map select -- the one screen drawn entirely from 2D rectangles, with no 3D geometry over it to hide a
-    // misplaced draw. Three guesses at the cause have missed, so this prints the state they were guesses
-    // about instead: which branch above ran, the sizes it gave each framebuffer, and how the game's
-    // viewport sits inside the window. Printed only when one of them CHANGES, so an entire session is a
-    // handful of lines -- and if entering the map select prints nothing new, that is the answer too: the
-    // framebuffer configuration is not what differs, and the cause is elsewhere.
-    {
-        const uint32_t diagGameFbW =
-            ViewportMatchesRendererResolution() ? mGfxCurrentWindowDimensions.width : mCurDimensions.width;
-        const uint32_t diagGameFbH =
-            ViewportMatchesRendererResolution() ? mGfxCurrentWindowDimensions.height : mCurDimensions.height;
-        static uint64_t diagPrev = ~0ull;
-        const uint64_t diagNow =
-            ((uint64_t)mCurDimensions.width << 44) ^ ((uint64_t)mCurDimensions.height << 32) ^
-            ((uint64_t)mGfxCurrentWindowDimensions.width << 20) ^ ((uint64_t)mGfxCurrentWindowDimensions.height << 8) ^
-            ((uint64_t)(uint16_t)mGameWindowViewport.width << 52) ^
-            ((uint64_t)(uint16_t)mGameWindowViewport.height << 4) ^ ((uint64_t)(uint16_t)mGameWindowViewport.x << 16) ^
-            ((uint64_t)(uint16_t)mGameWindowViewport.y << 28) ^ ((uint64_t)mRendersToFb << 62) ^
-            ((uint64_t)(mFxaaEnabled ? 1 : 0) << 61) ^ ((uint64_t)mMsaaLevel << 56);
-        if (diagNow != diagPrev) {
-            diagPrev = diagNow;
-            SPDLOG_INFO("FXAA diag: fxaa={} msaa={} rendersToFb={} viewportMatchesRenderRes={} | render={}x{} "
-                        "window={}x{} gameViewport={}x{} at ({},{}) | gameFb={}x{} fxaaFb={}x{} | "
-                        "viewportOffsetApplied={}",
-                        mFxaaEnabled, mMsaaLevel, mRendersToFb, ViewportMatchesRendererResolution(),
-                        mCurDimensions.width, mCurDimensions.height, mGfxCurrentWindowDimensions.width,
-                        mGfxCurrentWindowDimensions.height, mGameWindowViewport.width, mGameWindowViewport.height,
-                        mGameWindowViewport.x, mGameWindowViewport.y, diagGameFbW, diagGameFbH, mCurDimensions.width,
-                        mCurDimensions.height,
-                        (!mRendersToFb || (mMsaaLevel > 1 && mCurDimensions.width == mGameWindowViewport.width &&
-                                           mCurDimensions.height == mGameWindowViewport.height)));
-        }
-    }
-
     mFbActive = false;
 }
 
@@ -6942,28 +6887,6 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         mRapi->StartDrawToFramebuffer(0, 1);
 
         assert(0 && "active framebuffer was never reset back to original");
-    }
-
-    // SOH [Diagnostic] TEMPORARY. The first instrument ruled out the framebuffer configuration: entering the
-    // debug map select changed none of it. So this measures the other half -- whether the frame is being
-    // DRAWN at all. Every 60 frames it reports the triangles and draw calls the frame submitted and how
-    // often the filter ran.
-    //
-    // The fork it settles: if the counts hold up on the black screen, the geometry is being submitted and
-    // the picture is lost somewhere between the game framebuffer and the window. If they collapse towards
-    // zero, nothing is being drawn and the fault is upstream of the renderer entirely, in what that screen
-    // produces once the game is rendering into a framebuffer instead of straight at the window.
-    //
-    // Counted rather than logged on change, deliberately: the previous instrument could not tell a value
-    // that stayed the same from a call that stopped happening, and this bug may well turn on exactly that.
-    gDiagFrames++;
-    if ((gDiagFrames % 60) == 0) {
-        SPDLOG_INFO("FXAA diag2: frames={} tris/frame={} draws/frame={} fxaaCalls={} fxaaOk={} fbActiveAtEnd={}",
-                    gDiagFrames, gDiagTris / 60, gDiagDraws / 60, gDiagFxaaCalls, gDiagFxaaOk, (int)mFbActive);
-        gDiagTris = 0;
-        gDiagDraws = 0;
-        gDiagFxaaCalls = 0;
-        gDiagFxaaOk = 0;
     }
 }
 
