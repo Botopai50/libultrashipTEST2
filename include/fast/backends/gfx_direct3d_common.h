@@ -395,7 +395,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
-    PerToonCB mPerToonCbData;     // SOH [Enhancement] toon lighting
+    // SOH [Enhancement] toon lighting. What the buffer currently HOLDS, not a scratch area: the draw path
+    // compares against it to decide whether the upload is worth doing at all. Value-initialised, including
+    // the named padding, so that comparison never reads an indeterminate byte.
+    PerToonCB mPerToonCbData{};
+    bool mPerToonCbValid = false; // false until something has actually been uploaded to compare against
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
     bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
 

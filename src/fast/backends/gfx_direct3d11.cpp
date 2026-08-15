@@ -386,6 +386,10 @@ void GfxRenderingAPIDX11::Init() {
         mLastZmodeDecal = -1;
         mLastStencilMode = -1; // SOH [Enhancement] world light casting / actor shadows
         mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        // SOH [Enhancement] ClearState above unbinds the constant buffers too, so what the toon buffer was
+        // believed to hold is no longer a reason to skip re-uploading it.
+        mPerToonCbValid = false;
+        mShadowCbDirty = true;
     });
 
     // Create D3D Debug mDevice if in debug mode
@@ -1322,13 +1326,27 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
                     mPerDrawCbData.mTextures[i].linear_filtering = mTextures[mCurrentTextureIds[i]].linear_filtering;
                     textures_changed = true;
                 }
-
-                if (mLastSamplerStates[i].Get() != SamplerFor(mCurrentTextureIds[i]).Get()) {
-                    mLastSamplerStates[i] = SamplerFor(mCurrentTextureIds[i]).Get();
-                }
             }
         }
-        mContext->PSSetSamplers(i, 1, SamplerFor(mCurrentTextureIds[i]).GetAddressOf());
+        // SOH [Enhancement] Bound only when it is not already bound.
+        //
+        // This used to record what the sampler was and then set it anyway, every slot on every draw --
+        // six calls per draw call, almost all of them setting the state that was already there. The record
+        // was kept and never consulted, so it was half a cache with the half that saves the work missing.
+        //
+        // Comparing the state OBJECT rather than the texture id is what makes it correct: two different
+        // textures can share a sampler and want no rebind, and one texture's sampler changes under it when
+        // its filtering or wrap mode is set (see SetSamplerParameters) or when the LOD clamp flips, which
+        // the id alone would not notice.
+        //
+        // Every other pass that binds into these slots invalidates the record on its way out -- the FXAA
+        // pass clears all of them, the shadow map's cutout pass clears slot 0 -- or the first draw after
+        // one of those would skip a rebind it needs.
+        ID3D11SamplerState* const sampler = SamplerFor(mCurrentTextureIds[i]).Get();
+        if (mLastSamplerStates[i].Get() != sampler) {
+            mLastSamplerStates[i] = sampler;
+            mContext->PSSetSamplers(i, 1, &sampler);
+        }
     }
 
     // Set per-draw constant buffer
@@ -1344,22 +1362,37 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     // SOH [Enhancement] Toon lighting: per-object dominant light + ramp shape into the dedicated toon
     // CB (b2), re-uploaded per toon draw (WRITE_DISCARD makes this safe). Only the toon pixel shader
     // reads it, and PerFrameCB is left untouched so it stays frame-global.
+    // Uploaded only when the values differ from the ones already in the buffer. The key light is per
+    // OBJECT, not per draw -- the interpreter flushes at each object boundary so every toon object becomes
+    // its own batch -- so a single object that takes several draws was re-uploading the same sixteen floats
+    // for each of them, and a run of objects sharing a key light re-uploaded them across the whole run.
+    //
+    // Built into a local and compared whole rather than field by field: the struct is all floats with its
+    // padding named, and both sides are value-initialised, so the comparison sees no indeterminate bytes.
+    // mPerToonCbData is now what the buffer HOLDS rather than a scratch area, which is what makes it usable
+    // as the thing to compare against.
     if (mShaderProgram->opt_toon) {
+        PerToonCB toon{};
         for (int j = 0; j < 3; j++) {
-            mPerToonCbData.toon_light_dir[j] = mToonLightDir[j];
-            mPerToonCbData.toon_light_color[j] = mToonLightColor[j];
-            mPerToonCbData.toon_ambient[j] = mToonAmbient[j];
+            toon.toon_light_dir[j] = mToonLightDir[j];
+            toon.toon_light_color[j] = mToonLightColor[j];
+            toon.toon_ambient[j] = mToonAmbient[j];
         }
-        mPerToonCbData.toon_ramp_center = mToonRampCenter;
-        mPerToonCbData.toon_ramp_softness = mToonRampSoftness;
-        mPerToonCbData.toon_highlight_intensity = mToonHighlightIntensity;
-        mPerToonCbData.toon_shadow_intensity = mToonShadowIntensity;
-        mPerToonCbData.toon_debug = mToonDebug;
-        D3D11_MAPPED_SUBRESOURCE toon_ms;
-        ZeroMemory(&toon_ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-        mContext->Map(mPerToonCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &toon_ms);
-        memcpy(toon_ms.pData, &mPerToonCbData, sizeof(PerToonCB));
-        mContext->Unmap(mPerToonCb.Get(), 0);
+        toon.toon_ramp_center = mToonRampCenter;
+        toon.toon_ramp_softness = mToonRampSoftness;
+        toon.toon_highlight_intensity = mToonHighlightIntensity;
+        toon.toon_shadow_intensity = mToonShadowIntensity;
+        toon.toon_debug = mToonDebug;
+
+        if (!mPerToonCbValid || memcmp(&toon, &mPerToonCbData, sizeof(PerToonCB)) != 0) {
+            D3D11_MAPPED_SUBRESOURCE toon_ms;
+            ZeroMemory(&toon_ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
+            mContext->Map(mPerToonCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &toon_ms);
+            memcpy(toon_ms.pData, &toon, sizeof(PerToonCB));
+            mContext->Unmap(mPerToonCb.Get(), 0);
+            mPerToonCbData = toon;
+            mPerToonCbValid = true;
+        }
     }
 
     // SOH [Enhancement] Cascaded shadow maps: the cascade transforms are frame-global, so upload them once
@@ -2850,6 +2883,10 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
         // The main pass tracks which resource views it left bound; this pass binds its own, so that record
         // has to be invalidated or the next draw would skip a rebind it actually needs.
         mLastResourceViews[0] = nullptr;
+        // And the same for the sampler beside it, for exactly the same reason. This line was not needed
+        // while the main pass re-bound every sampler on every draw and so could not be misled by a stale
+        // record; it is needed now that the pass skips the ones it believes are already bound.
+        mLastSamplerStates[0] = nullptr;
     }
     mContext->PSSetShaderResources(0, 1, mTextures[textureId].resource_view.GetAddressOf());
     mContext->Draw((UINT)vertexCount, (UINT)firstVertex);

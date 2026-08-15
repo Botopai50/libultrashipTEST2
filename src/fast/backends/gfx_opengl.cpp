@@ -56,34 +56,103 @@ static void VertexArraySetAttribs(ShaderProgram* prg) {
     }
 }
 
+// SOH [Enhancement] Sent only when the value has moved. A uniform belongs to its program and keeps whatever
+// it was last given, so re-sending the same number is a driver call that changes nothing -- and the frame
+// count only moves once a frame while this runs on every change of shader.
 void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
-    glUniform1i(prg->frameCountLocation, mFrameCount);
-    glUniform1f(prg->noiseScaleLocation, mCurrentNoiseScale);
+    if (!prg->globalUniformsSent || mFrameCount != prg->lastFrameCount) {
+        glUniform1i(prg->frameCountLocation, mFrameCount);
+        prg->lastFrameCount = mFrameCount;
+    }
+    if (!prg->globalUniformsSent || mCurrentNoiseScale != prg->lastNoiseScale) {
+        glUniform1f(prg->noiseScaleLocation, mCurrentNoiseScale);
+        prg->lastNoiseScale = mCurrentNoiseScale;
+    }
+    prg->globalUniformsSent = true;
 }
 
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
-    if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
-        GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
-        glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
+    ShaderProgram* prg = mCurrentShaderProgram;
 
-        GLint width[2] = { textures[mCurrentTextureIds[0]].width, textures[mCurrentTextureIds[1]].width };
-        glUniform1iv(mCurrentShaderProgram->texture_width_location, 2, width);
+    // This one runs per DRAW CALL, which is where the redundancy was: a run of draws sharing a texture and a
+    // toon key was re-sending eleven uniforms apiece for no change at all. Each is now compared against what
+    // this program was last given. The `sent` flags are per block rather than one for the whole function,
+    // because the blocks are conditional -- a program that first draws untextured and later draws textured
+    // must not have the textured block believe its zeroed records are real.
+    if (prg->usedTextures[0] || prg->usedTextures[1]) {
+        const GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering,
+                                     textures[mCurrentTextureIds[1]].filtering };
+        const GLint width[2] = { textures[mCurrentTextureIds[0]].width, textures[mCurrentTextureIds[1]].width };
+        const GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
+        const bool first = !prg->texUniformsSent;
 
-        GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
-        glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+        if (first || filtering[0] != prg->lastTextureFiltering[0] || filtering[1] != prg->lastTextureFiltering[1]) {
+            glUniform1iv(prg->texture_filtering_location, 2, filtering);
+            prg->lastTextureFiltering[0] = filtering[0];
+            prg->lastTextureFiltering[1] = filtering[1];
+        }
+        if (first || width[0] != prg->lastTextureWidth[0] || width[1] != prg->lastTextureWidth[1]) {
+            glUniform1iv(prg->texture_width_location, 2, width);
+            prg->lastTextureWidth[0] = width[0];
+            prg->lastTextureWidth[1] = width[1];
+        }
+        if (first || height[0] != prg->lastTextureHeight[0] || height[1] != prg->lastTextureHeight[1]) {
+            glUniform1iv(prg->texture_height_location, 2, height);
+            prg->lastTextureHeight[0] = height[0];
+            prg->lastTextureHeight[1] = height[1];
+        }
+        prg->texUniformsSent = true;
     }
 
     // SOH [Enhancement] Toon lighting: per-object dominant light + frame-global ramp shape, both
     // pushed in by the application (SetToonLighting / SetToonRamp). No config reads in the framework.
-    if (mCurrentShaderProgram->opt_toon) {
-        glUniform3fv(mCurrentShaderProgram->toon_light_dir_location, 1, mToonLightDir);
-        glUniform3fv(mCurrentShaderProgram->toon_light_color_location, 1, mToonLightColor);
-        glUniform3fv(mCurrentShaderProgram->toon_ambient_location, 1, mToonAmbient);
-        glUniform1f(mCurrentShaderProgram->toon_ramp_center_location, mToonRampCenter);
-        glUniform1f(mCurrentShaderProgram->toon_ramp_softness_location, mToonRampSoftness);
-        glUniform1f(mCurrentShaderProgram->toon_highlight_intensity_location, mToonHighlightIntensity);
-        glUniform1f(mCurrentShaderProgram->toon_shadow_intensity_location, mToonShadowIntensity);
-        glUniform1f(mCurrentShaderProgram->toon_debug_location, mToonDebug);
+    // The key light changes at each object boundary, the ramp shape only when a setting is touched, so
+    // most toon draws move none of these.
+    if (prg->opt_toon) {
+        const bool first = !prg->toonUniformsSent;
+
+        if (first || mToonLightDir[0] != prg->lastToonLightDir[0] || mToonLightDir[1] != prg->lastToonLightDir[1] ||
+            mToonLightDir[2] != prg->lastToonLightDir[2]) {
+            glUniform3fv(prg->toon_light_dir_location, 1, mToonLightDir);
+            for (int c = 0; c < 3; c++) {
+                prg->lastToonLightDir[c] = mToonLightDir[c];
+            }
+        }
+        if (first || mToonLightColor[0] != prg->lastToonLightColor[0] ||
+            mToonLightColor[1] != prg->lastToonLightColor[1] || mToonLightColor[2] != prg->lastToonLightColor[2]) {
+            glUniform3fv(prg->toon_light_color_location, 1, mToonLightColor);
+            for (int c = 0; c < 3; c++) {
+                prg->lastToonLightColor[c] = mToonLightColor[c];
+            }
+        }
+        if (first || mToonAmbient[0] != prg->lastToonAmbient[0] || mToonAmbient[1] != prg->lastToonAmbient[1] ||
+            mToonAmbient[2] != prg->lastToonAmbient[2]) {
+            glUniform3fv(prg->toon_ambient_location, 1, mToonAmbient);
+            for (int c = 0; c < 3; c++) {
+                prg->lastToonAmbient[c] = mToonAmbient[c];
+            }
+        }
+        if (first || mToonRampCenter != prg->lastToonRampCenter) {
+            glUniform1f(prg->toon_ramp_center_location, mToonRampCenter);
+            prg->lastToonRampCenter = mToonRampCenter;
+        }
+        if (first || mToonRampSoftness != prg->lastToonRampSoftness) {
+            glUniform1f(prg->toon_ramp_softness_location, mToonRampSoftness);
+            prg->lastToonRampSoftness = mToonRampSoftness;
+        }
+        if (first || mToonHighlightIntensity != prg->lastToonHighlightIntensity) {
+            glUniform1f(prg->toon_highlight_intensity_location, mToonHighlightIntensity);
+            prg->lastToonHighlightIntensity = mToonHighlightIntensity;
+        }
+        if (first || mToonShadowIntensity != prg->lastToonShadowIntensity) {
+            glUniform1f(prg->toon_shadow_intensity_location, mToonShadowIntensity);
+            prg->lastToonShadowIntensity = mToonShadowIntensity;
+        }
+        if (first || mToonDebug != prg->lastToonDebug) {
+            glUniform1f(prg->toon_debug_location, mToonDebug);
+            prg->lastToonDebug = mToonDebug;
+        }
+        prg->toonUniformsSent = true;
     }
 }
 
@@ -491,6 +560,12 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     }
 
     prg->openglProgramId = shader_program;
+    // SOH [Enhancement] A fresh GL program starts with its uniforms at zero whatever this slot's records
+    // say, so anything remembered about a previous program compiled into it is worthless. Cleared here
+    // rather than trusted to the pool's value-initialisation, which only covers the first time.
+    prg->globalUniformsSent = false;
+    prg->texUniformsSent = false;
+    prg->toonUniformsSent = false;
     prg->numInputs = cc_features.numInputs;
     prg->usedTextures[0] = cc_features.usedTextures[0];
     prg->usedTextures[1] = cc_features.usedTextures[1];

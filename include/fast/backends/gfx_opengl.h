@@ -48,6 +48,33 @@ struct ShaderProgram {
     GLint toon_highlight_intensity_location;
     GLint toon_shadow_intensity_location;
     GLint toon_debug_location;
+
+    // SOH [Enhancement] What was last sent to THIS program's uniforms, so a value that has not moved is not
+    // sent again. Kept per program rather than globally because that is where GL keeps uniforms: switching
+    // away and back does not disturb them, so a per-program record stays true across the switch, where a
+    // single global one would have to be thrown away at every change of shader.
+    //
+    // Deliberately WITHOUT default member initialisers. The pool holds these by value in a std::map, and
+    // `pool[key]` value-initialises -- which zeroes every member only while this stays an aggregate. Giving
+    // any member an initialiser here would make the default constructor non-trivial and quietly leave the
+    // locations and flags above indeterminate instead. The `sent` flags being zero is exactly the false
+    // they need to start at.
+    bool globalUniformsSent;
+    bool texUniformsSent;
+    bool toonUniformsSent;
+    GLint lastFrameCount;
+    float lastNoiseScale;
+    GLint lastTextureFiltering[2];
+    GLint lastTextureWidth[2];
+    GLint lastTextureHeight[2];
+    float lastToonLightDir[3];
+    float lastToonLightColor[3];
+    float lastToonAmbient[3];
+    float lastToonRampCenter;
+    float lastToonRampSoftness;
+    float lastToonHighlightIntensity;
+    float lastToonShadowIntensity;
+    float lastToonDebug;
 };
 
 struct FramebufferOGL {
