@@ -1747,11 +1747,25 @@ bool GfxRenderingAPIDX11::ApplyFxaa(int fb_dst_id, int fb_src_id) {
 
     // Everything this touched is set again from scratch by whatever draws next: StartDrawToFramebuffer
     // re-binds the target unconditionally, LoadShader re-binds the shaders and the input layout, and the
-    // per-draw setup re-binds the states and the viewport. The one exception is the cached record of which
-    // sampler each texture slot holds, which would otherwise skip a rebind it now needs.
+    // per-draw setup re-binds the states and the viewport. The exceptions are the two cached records of
+    // what each texture slot holds, which would otherwise skip a rebind they now need.
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
         mLastSamplerStates[i] = nullptr;
     }
+    // Slot 0's resource view, for the same reason and with worse consequences. DrawTriangles only calls
+    // PSSetShaderResources when the view differs from this record, so leaving it saying "texture X is in
+    // slot 0" after this pass has just put NULL there means the next draw that uses texture X skips the
+    // rebind and samples nothing -- black, with no error anywhere, because a null view is a legal thing to
+    // sample in D3D11.
+    //
+    // Which is why it showed up on the debug map select and almost nowhere else. That screen draws every
+    // glyph from a single font texture, so once the record goes stale nothing ever forces a rebind and the
+    // whole screen stays blank behind the untextured clear; ordinary gameplay changes texture constantly,
+    // so the very next different texture repairs the binding before anyone sees it.
+    //
+    // The shadow map's alpha pass already does exactly this, for exactly this reason (see the note beside
+    // its own mLastResourceViews[0] reset). This pass was the one that did not.
+    mLastResourceViews[0] = nullptr;
     return true;
 }
 
