@@ -6866,6 +6866,15 @@ void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX
 
 void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi, const char* game_name,
                        bool start_in_fullscreen, uint32_t width, uint32_t height, uint32_t posX, uint32_t posY) {
+    // SOH [Enhancement] Which vertex path this binary was built with. The four-wide transforms and shade in
+    // GfxSpVertex are selected at COMPILE time, so no amount of watching the game can tell you whether they
+    // are in the build in front of you -- both paths produce the same picture, which is the point of them.
+    // One line at startup makes the question answerable from a log.
+#ifdef FAST3D_SSE2
+    SPDLOG_INFO("Fast3D vertex math: SSE2, four vertices per block");
+#else
+    SPDLOG_INFO("Fast3D vertex math: scalar (SSE2 not available for this target)");
+#endif
     mWapi = wapi;
     mRapi = rapi;
     mWapi->Init(game_name, rapi->GetName(), start_in_fullscreen, width, height, posX, posY);
