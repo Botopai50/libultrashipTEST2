@@ -1235,8 +1235,14 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // Receiver-plane gradient. GREEN ramps with its magnitude against the clamp; RED marks pixels
             // where the clamp actually bound and the plane correction stopped being exact. Black past
             // shadow_incidence.w, where no cascade reaches and nothing was projected.
+            // The two are exclusive on purpose. Ramping green with the magnitude AND flagging the clamp in
+            // red renders a clamped pixel yellow, because a clamped magnitude is by definition the top of
+            // the ramp -- so the flag was invisible as a colour of its own, which is the one thing this view
+            // exists to show. Green ramps only while the clamp is off; once it binds the pixel is pure red.
             float shadowGradMax = max(abs(shadowGrad.x), abs(shadowGrad.y));
-            texel.rgb = float3(shadowGradMax >= 3.2 - 1e-3 ? 1.0 : 0.0, saturate(shadowGradMax / 3.2), 0.0);
+            bool shadowGradClamped = shadowGradMax >= 3.2 - 1e-3;
+            texel.rgb = shadowGradClamped ? float3(1.0, 0.0, 0.0)
+                                          : float3(0.0, saturate(shadowGradMax / 3.2), 0.0);
         } else if (shadowDebugMode == 7) {
             // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands
             // read as the primary cascade's colour, since that is the one the picture is keyed to.
