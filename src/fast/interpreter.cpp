@@ -1721,30 +1721,45 @@ uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m) cons
     // allowed to survive a matrix change, which a slice with geometry in it must never do.
     bool any = false;
 
-    // Spans whose box reaches the cascade, folded in with their index so two different sets of spans cannot
-    // combine to the same value by containing the same hashes in a different order.
+    // Spans whose box reaches the cascade. Folded in one after another, and the fold is already
+    // order-sensitive, so a set is identified by which spans reach the cascade and in what order -- with
+    // the accepted COUNT mixed at the end so two sets cannot differ only by a span that hashes to the
+    // identity.
+    //
+    // Deliberately WITHOUT the array index, which is what this used to carry. An index is where a span sits
+    // in a list, not what is in it: the scenery list is rebuilt every frame, so a span that has not moved an
+    // inch changes index whenever anything before it appears, disappears or changes size -- and the key then
+    // said "different" about geometry that would rasterise bit for bit the same. That is a false
+    // invalidation, and it is invisible to any counter of what MOVED, which is why measurement kept coming
+    // back saying nothing moved while cascades kept being redrawn.
     auto mixChunks = [&](const std::vector<ShadowCasterChunk>& chunks) {
-        for (size_t i = 0; i < chunks.size(); i++) {
-            const ShadowCasterChunk& ch = chunks[i];
+        uint64_t accepted = 0;
+        for (const ShadowCasterChunk& ch : chunks) {
             if (!ShadowBoxVisible(ch.min, ch.max, m)) {
                 continue;
             }
             any = true;
-            const uint64_t entry[2] = { (uint64_t)i, ch.hash };
-            h = ShadowHashBytes(h, entry, sizeof(entry));
+            accepted++;
+            h = ShadowHashBytes(h, &ch.hash, sizeof(ch.hash));
         }
+        h = ShadowHashBytes(h, &accepted, sizeof(accepted));
     };
     // Cutout ranges carry their own boxes, so they are tested one by one exactly as the draw path tests
     // them. A range whose texture never resolved still counts: the draw path skips it, but it skipping it
     // is part of what the slice currently holds.
     auto mixAlphaRanges = [&](const ShadowAlphaCasters& a) {
-        for (size_t i = 0; i < a.ranges.size(); i++) {
-            const ShadowAlphaRange& r = a.ranges[i];
+        uint64_t accepted = 0;
+        for (const ShadowAlphaRange& r : a.ranges) {
             if (r.vertexCount < 3 || !ShadowBoxVisible(r.min, r.max, m)) {
                 continue;
             }
             any = true;
-            const uint32_t fields[4] = { (uint32_t)i, r.textureId, r.firstVertex, r.vertexCount };
+            accepted++;
+            // Texture and triangle count identify what is drawn. firstVertex does NOT -- it is the offset
+            // this range happens to occupy in a buffer that is rebuilt every frame, so including it made
+            // every range after any change in an earlier one look different while drawing the same thing.
+            // It is still used below to FIND the vertices; it just has no business being part of the answer.
+            const uint32_t fields[2] = { r.textureId, r.vertexCount };
             h = ShadowHashBytes(h, fields, sizeof(fields));
             // The cutout vertices themselves move under a range whose fields do not -- a swaying billboard
             // keeps its count and its texture. Only ranges that reach this cascade are walked.
@@ -1759,6 +1774,7 @@ uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m) cons
                 h = ShadowHashBytes(h, a.verts.data() + first, count * sizeof(float));
             }
         }
+        h = ShadowHashBytes(h, &accepted, sizeof(accepted));
     };
 
     if (layer == SHADOW_MAP_LAYER_WORLD) {
