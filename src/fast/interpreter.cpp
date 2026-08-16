@@ -1624,16 +1624,64 @@ void Interpreter::BuildShadowWorldChunks() {
     BuildShadowChunks(mShadowMapWorldCache, mShadowWorldChunks);
 }
 
+// SOH [Enhancement] Does this box reach into the cascade `m` covers? Hoisted out of RenderShadowMap, where
+// it was a lambda used only by the draw path, because the per-cascade reuse key has to ask exactly the same
+// question of exactly the same boxes -- if the key and the draws disagreed about what a cascade contains,
+// a slice could be declared unchanged while its contents changed. One definition removes the question.
+//
+// Conservative in the one direction that matters: a false positive costs a span drawn that need not have
+// been, a false negative drops a caster, so nothing here may be tightened into an exact test.
+//
+// The two lateral axes are tested on BOTH sides: the rasterizer discards anything outside the viewport
+// whatever its depth, so a span entirely off to one side contributes nothing and skipping it changes no
+// pixel.
+//
+// The depth axis is tested on ONE side only, and the asymmetry is not an oversight.
+//   NEAR side (in front of the cascade, towards the light): never tested. The depth pass runs with depth
+//     clipping disabled on purpose -- a caster above the cascade's slice still has to occlude, and clipping
+//     it away is exactly the shadow the slice exists to record.
+//   FAR side (past the cascade's far plane, away from the light): safe to reject, and free, since the
+//     projection of the box onto that axis is already being computed. The viewport clamps such a span to
+//     depth 1.0, the depth test is LESS, and the slice was cleared to 1.0 -- so it fails the test and writes
+//     nothing. The texel keeps the clear value either way, and every receiver the cascade covers has ndc
+//     z <= 1.0, which reads as lit against it. Drawing the span and skipping it therefore leave the map
+//     bit-identical.
+//
+// The matrix is row-vector (world * M), so the x column is m[0], m[4], m[8] and the translation m[12]. w is
+// exactly 1 -- the projection is orthographic by construction -- so clip xyz IS ndc xyz. Depth runs 0 to 1
+// (the matrix is built for that convention directly), the lateral axes -1 to 1.
+bool Interpreter::ShadowBoxVisible(const float* bmin, const float* bmax, const float* m) {
+    const float cx = (bmin[0] + bmax[0]) * 0.5f;
+    const float cy = (bmin[1] + bmax[1]) * 0.5f;
+    const float cz = (bmin[2] + bmax[2]) * 0.5f;
+    const float hx = (bmax[0] - bmin[0]) * 0.5f;
+    const float hy = (bmax[1] - bmin[1]) * 0.5f;
+    const float hz = (bmax[2] - bmin[2]) * 0.5f;
+    for (int axis = 0; axis < 3; axis++) {
+        const float a0 = m[0 + axis], a1 = m[4 + axis], a2 = m[8 + axis];
+        const float centre = (cx * a0) + (cy * a1) + (cz * a2) + m[12 + axis];
+        const float radius = (hx * std::fabs(a0)) + (hy * std::fabs(a1)) + (hz * std::fabs(a2));
+        if (centre - radius > 1.0f) {
+            return false;
+        }
+        if (axis < 2 && centre + radius < -1.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Cuts a caster list into fixed spans, each carrying the bounding box of the geometry inside it. Shared by
 // the cached room mesh and the per-frame character list: the two differ in how often they are rebuilt, not
 // in what a span is or what it is for.
-void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<ShadowCasterChunk>& out) {
+void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<ShadowCasterChunk>& out,
+                                    size_t trianglesPerChunk) {
     out.clear();
     const size_t total = (v.size() / 9) * 9; // whole triangles only, same rule the draw path uses
     if (total == 0) {
         return;
     }
-    const size_t chunkFloats = kShadowChunkTriangles * 9;
+    const size_t chunkFloats = (trianglesPerChunk > 0 ? trianglesPerChunk : kShadowChunkTriangles) * 9;
     out.reserve((total + chunkFloats - 1) / chunkFloats);
     for (size_t base = 0; base < total; base += chunkFloats) {
         const size_t end = std::min(base + chunkFloats, total);
@@ -1651,6 +1699,10 @@ void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<Sha
                 chunk.max[a] = std::max(chunk.max[a], p);
             }
         }
+        // The span's signature, taken here because this walk already has the data in cache. A cascade's
+        // reuse key is then a combine over the spans it touches, so the vertex data is hashed once per
+        // frame however many cascades read it.
+        chunk.hash = ShadowHashBytes(0xCBF29CE484222325ull, v.data() + base, (end - base) * sizeof(float));
         out.push_back(chunk);
     }
 }
@@ -1662,43 +1714,77 @@ void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<Sha
 // caster positions AND their uvs, and each cutout range's RESOLVED texture id -- the id is what the pass
 // binds, and a texture evicted and re-imported between frames changes the picture without moving a single
 // vertex. The matrix is compared separately by the backend, which is also what covers the camera moving.
-uint64_t Interpreter::ShadowMapLayerContentKey(int layer) const {
+uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m) const {
     uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t)layer;
+    // Whether anything at all reaches this cascade. Tracked separately from the hash because "no casters
+    // here" is not just another value: an empty slice reads identically however it is projected, so it is
+    // allowed to survive a matrix change, which a slice with geometry in it must never do.
+    bool any = false;
 
-    auto mixFloats = [&h](const std::vector<float>& v) {
-        const uint64_t n = (uint64_t)v.size();
-        h = ShadowHashBytes(h, &n, sizeof(n)); // length first: two lists cannot alias by being prefixes
-        if (!v.empty()) {
-            h = ShadowHashBytes(h, v.data(), v.size() * sizeof(float));
+    // Spans whose box reaches the cascade, folded in with their index so two different sets of spans cannot
+    // combine to the same value by containing the same hashes in a different order.
+    auto mixChunks = [&](const std::vector<ShadowCasterChunk>& chunks) {
+        for (size_t i = 0; i < chunks.size(); i++) {
+            const ShadowCasterChunk& ch = chunks[i];
+            if (!ShadowBoxVisible(ch.min, ch.max, m)) {
+                continue;
+            }
+            any = true;
+            const uint64_t entry[2] = { (uint64_t)i, ch.hash };
+            h = ShadowHashBytes(h, entry, sizeof(entry));
         }
     };
-    auto mixAlphaRanges = [&h](const ShadowAlphaCasters& a) {
-        const uint64_t n = (uint64_t)a.ranges.size();
-        h = ShadowHashBytes(h, &n, sizeof(n));
-        for (const ShadowAlphaRange& r : a.ranges) {
-            const uint32_t fields[3] = { r.textureId, r.firstVertex, r.vertexCount };
+    // Cutout ranges carry their own boxes, so they are tested one by one exactly as the draw path tests
+    // them. A range whose texture never resolved still counts: the draw path skips it, but it skipping it
+    // is part of what the slice currently holds.
+    auto mixAlphaRanges = [&](const ShadowAlphaCasters& a) {
+        for (size_t i = 0; i < a.ranges.size(); i++) {
+            const ShadowAlphaRange& r = a.ranges[i];
+            if (r.vertexCount < 3 || !ShadowBoxVisible(r.min, r.max, m)) {
+                continue;
+            }
+            any = true;
+            const uint32_t fields[4] = { (uint32_t)i, r.textureId, r.firstVertex, r.vertexCount };
             h = ShadowHashBytes(h, fields, sizeof(fields));
+            // The cutout vertices themselves move under a range whose fields do not -- a swaying billboard
+            // keeps its count and its texture. Only ranges that reach this cascade are walked.
+            //
+            // FIVE floats per vertex here, not three: this buffer carries world xyz AND uv (see
+            // ShadowAlphaCasters::verts). Indexing it by three would hash a sliding, wrong slice of the
+            // buffer, which fails in the dangerous direction -- two different frames hashing equal and a
+            // stale depth map left on screen.
+            const size_t first = (size_t)r.firstVertex * 5;
+            const size_t count = (size_t)r.vertexCount * 5;
+            if (first + count <= a.verts.size()) {
+                h = ShadowHashBytes(h, a.verts.data() + first, count * sizeof(float));
+            }
         }
     };
 
     if (layer == SHADOW_MAP_LAYER_WORLD) {
-        // The room mesh and its cutout half are the cache, and the cache is only ever replaced wholesale --
-        // so the generation counter identifies both without walking either. This is the point of the
-        // counter: these are by far the largest lists in the frame.
-        h = ShadowHashBytes(h, &mShadowWorldCacheGeneration, sizeof(mShadowWorldCacheGeneration));
-        mixAlphaRanges(mShadowAlphaWorldCache); // resolved ids still move under a stable cache
-        // Scenery actors are rebuilt every frame because they can move, so they are hashed for real.
-        mixFloats(mShadowSceneryReady);
-        mixFloats(mShadowAlphaSceneryReady.verts);
+        mixChunks(mShadowWorldChunks);
+        mixAlphaRanges(mShadowAlphaWorldCache);
+        // Scenery actors are rebuilt every frame because they can move, and they are the reason this key had
+        // to become per cascade at all: one of them swaying used to change the key for the whole layer.
+        mixChunks(mShadowSceneryChunks);
         mixAlphaRanges(mShadowAlphaSceneryReady);
+        // Only as a safety net, and only once something is known to be here. The world spans hash their own
+        // geometry, so a rebuilt cache is already visible in them; this covers a path that replaces the
+        // cache without rebuilding the spans, which would otherwise go unnoticed.
+        if (any) {
+            h = ShadowHashBytes(h, &mShadowWorldCacheGeneration, sizeof(mShadowWorldCacheGeneration));
+        }
     } else {
-        mixFloats(mShadowMapCastersReady[SHADOW_MAP_LAYER_ACTORS]);
-        mixFloats(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts);
+        mixChunks(mShadowActorChunks);
         mixAlphaRanges(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
     }
-    // Never hand back the reserved "this slice is empty" key, which carries a weaker reuse rule than a real
-    // one (see SHADOW_MAP_EMPTY_CONTENT_KEY). A hash landing on it would let a slice with casters in it
-    // survive a matrix change, which would freeze that cascade's shadows in place.
+
+    if (!any) {
+        return SHADOW_MAP_EMPTY_CONTENT_KEY;
+    }
+    // Never hand back the reserved "this slice is empty" key by accident, which carries the weaker reuse
+    // rule above. A hash landing on it would let a slice with casters in it survive a matrix change, which
+    // would freeze that cascade's shadows in place.
     return h == SHADOW_MAP_EMPTY_CONTENT_KEY ? 1ull : h;
 }
 
@@ -3906,7 +3992,7 @@ void Interpreter::RenderShadowMap() {
                 mShadowWorldKeyCached = mShadowWorldKeyAccum;
                 mShadowWorldCapture = false;
                 // The one place the cached lists change. Everything downstream reads the counter instead of
-                // the megabytes behind it (see ShadowMapLayerContentKey).
+                // the megabytes behind it (see ShadowMapCascadeContentKey).
                 mShadowWorldCacheGeneration++;
                 BuildShadowWorldChunks(); // the spans index into the list that was just swapped in
                 mShadowWorldRebuilds++;
@@ -3963,27 +4049,23 @@ void Interpreter::RenderShadowMap() {
     // Computed before the early exits below so that every SetShadowMapParams path -- including the ones that
     // report no cascades -- carries a box matching the frame it belongs to.
     //
-    // The same two boxes then cull those lists per cascade further down. Neither list is chunked the way the
-    // cached room mesh is -- both are small and rebuilt every frame, so one box each is the right granularity
-    // -- but until now neither was tested at all, and both were re-submitted into all four cascades.
+    // The actor box below is for the SHADER, which wants one box for the whole layer. Culling and the reuse
+    // key both work from spans instead: every caster list is chunked now -- the cached room mesh, the
+    // characters, and as of this change the scenery -- because a single box per list reached across the map
+    // and intersected every cascade, which is what kept every slice being redrawn.
     //
     // Sentinel is the one the backend starts from (see GfxRenderingAPI::mShadowActorBoundsMin): large enough
     // that no world coordinate reaches it, small enough that the shader's own margin cannot flip the
     // comparison or overflow the arithmetic it feeds. An empty list keeps it and fails every test.
     float actorMin[3] = { 1e30f, 1e30f, 1e30f };
     float actorMax[3] = { -1e30f, -1e30f, -1e30f };
-    float sceneryMin[3] = { 1e30f, 1e30f, 1e30f };
-    float sceneryMax[3] = { -1e30f, -1e30f, -1e30f };
     {
-        auto growBox = [](const std::vector<float>& verts, size_t stride, float* boxMin, float* boxMax) {
-            for (size_t i = 0; i + 2 < verts.size(); i += stride) {
-                for (int a = 0; a < 3; a++) {
-                    boxMin[a] = std::min(boxMin[a], verts[i + a]);
-                    boxMax[a] = std::max(boxMax[a], verts[i + a]);
-                }
-            }
-        };
-        growBox(mShadowSceneryReady, 3, sceneryMin, sceneryMax);
+        // SOH [Enhancement] Scenery is now cut into spans like the characters are, and for the same reason
+        // measurement gave for them: scattered across a field, one box for all of it covered the field and
+        // intersected every cascade. That single box was what let one swaying tree invalidate all three
+        // world cascades every frame. The union below is derived from the spans, so it stays exactly the
+        // box it was for the callers that still want the whole layer.
+        BuildShadowChunks(mShadowSceneryReady, mShadowSceneryChunks, kShadowSceneryChunkTriangles);
 
         // The character layer gets cut into spans in the same walk that measures it.
         //
@@ -4339,12 +4421,9 @@ void Interpreter::RenderShadowMap() {
     ResolveShadowAlphaTextures(mShadowAlphaSceneryReady);
     ResolveShadowAlphaTextures(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
 
-    // One summary of each layer's caster geometry, computed after the ids above are resolved because they
-    // are part of what gets drawn. Handed to the backend so a slice whose casters AND matrix are both
-    // unchanged is left holding the image it already has instead of being cleared and redrawn -- which for
-    // the world layer, in a room where only the camera moves, is every cascade every frame.
-    const uint64_t layerContentKeys[SHADOW_MAP_LAYERS] = { ShadowMapLayerContentKey(SHADOW_MAP_LAYER_WORLD),
-                                                           ShadowMapLayerContentKey(SHADOW_MAP_LAYER_ACTORS) };
+    // The summary of what each slice is about to hold is now asked per CASCADE, just below, rather than once
+    // per layer here. Handed to the backend so a slice whose casters AND matrix are both unchanged is left
+    // holding the image it already has instead of being cleared and redrawn.
 
     // Can any part of this span land inside the cascade's footprint? Standard conservative box-against-slab
     // test: the box's centre projects to a point and its half-extents project to a radius, so the span is
@@ -4370,24 +4449,7 @@ void Interpreter::RenderShadowMap() {
     // w is exactly 1 -- the projection is orthographic by construction -- so clip xyz IS ndc xyz. Depth runs
     // 0 to 1 (the matrix is built for that convention directly, above), the lateral axes -1 to 1.
     auto boxVisible = [](const float* bmin, const float* bmax, const float* m) {
-        const float cx = (bmin[0] + bmax[0]) * 0.5f;
-        const float cy = (bmin[1] + bmax[1]) * 0.5f;
-        const float cz = (bmin[2] + bmax[2]) * 0.5f;
-        const float hx = (bmax[0] - bmin[0]) * 0.5f;
-        const float hy = (bmax[1] - bmin[1]) * 0.5f;
-        const float hz = (bmax[2] - bmin[2]) * 0.5f;
-        for (int axis = 0; axis < 3; axis++) {
-            const float a0 = m[0 + axis], a1 = m[4 + axis], a2 = m[8 + axis];
-            const float centre = (cx * a0) + (cy * a1) + (cz * a2) + m[12 + axis];
-            const float radius = (hx * std::fabs(a0)) + (hy * std::fabs(a1)) + (hz * std::fabs(a2));
-            if (centre - radius > 1.0f) {
-                return false;
-            }
-            if (axis < 2 && centre + radius < -1.0f) {
-                return false;
-            }
-        }
-        return true;
+        return ShadowBoxVisible(bmin, bmax, m);
     };
 
     // Draws a chunked caster list into the cascade `m`, merging surviving spans into as few calls as
@@ -4401,7 +4463,8 @@ void Interpreter::RenderShadowMap() {
     // hundred extra triangles through a pass with no pixel shader. Bridging is always correct: the spans are
     // contiguous in the buffer, and a rejected span was only ever rejected as an optimisation.
     auto drawChunkedCasters = [this, &boxVisible](const float* verts, size_t vertexCount,
-                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m) {
+                                                  const std::vector<ShadowCasterChunk>& chunks, const float* m,
+                                                  int slot) {
         size_t runFirst = 0, runCount = 0, gapCount = 0;
         for (const ShadowCasterChunk& ch : chunks) {
             if (boxVisible(ch.min, ch.max, m)) {
@@ -4414,14 +4477,14 @@ void Interpreter::RenderShadowMap() {
             } else if (runCount != 0) {
                 gapCount += ch.vertexCount;
                 if (gapCount > kShadowChunkBridgeTriangles * 3) {
-                    mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+                    mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
                     runCount = 0;
                     gapCount = 0;
                 }
             }
         }
         if (runCount != 0) {
-            mRapi->ShadowMapDrawCasters(verts, vertexCount, SHADOW_MAP_CASTER_SLOT_MAIN, runFirst, runCount);
+            mRapi->ShadowMapDrawCasters(verts, vertexCount, slot, runFirst, runCount);
         }
     };
 
@@ -4487,30 +4550,14 @@ void Interpreter::RenderShadowMap() {
         const int cascadesHere = (l == SHADOW_MAP_LAYER_ACTORS) ? SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowMapCascadeCount)
                                                                 : mShadowMapCascadeCount;
         for (int c = 0; c < cascadesHere; c++) {
-            // Will anything at all reach this slice? Asked only for the ACTOR layer, which is the one that
-            // is routinely empty -- it holds the characters, standing in one cascade out of four, while the
-            // world layer has the room mesh in it and is empty essentially never. Answering it costs the
-            // same box tests the draws below are about to run; answering it for the world layer would mean
-            // walking every span twice.
-            //
-            // An empty slice is then declared as such, which lets the backend keep the one it already has
-            // even across a matrix change (see SHADOW_MAP_EMPTY_CONTENT_KEY) -- so a cascade the characters
-            // are nowhere near stops paying a full-resolution clear and a pipeline setup every frame.
-            uint64_t contentKey = layerContentKeys[l];
-            if (l == SHADOW_MAP_LAYER_ACTORS) {
-                bool anything = false;
-                for (size_t k = 0; !anything && k < mShadowActorChunks.size(); k++) {
-                    anything = boxVisible(mShadowActorChunks[k].min, mShadowActorChunks[k].max, &matrices[c * 16]);
-                }
-                for (size_t r = 0; !anything && r < alpha.ranges.size(); r++) {
-                    const ShadowAlphaRange& range = alpha.ranges[r];
-                    anything = range.textureId != UINT32_MAX && range.vertexCount >= 3 &&
-                               boxVisible(range.min, range.max, &matrices[c * 16]);
-                }
-                if (!anything) {
-                    contentKey = SHADOW_MAP_EMPTY_CONTENT_KEY;
-                }
-            }
+            // What THIS cascade is about to hold, built from only the spans and cutout ranges whose boxes
+            // reach into it. Two things fall out of that. A cascade nothing reaches reports itself empty and
+            // keeps the slice it has even across a matrix change (see SHADOW_MAP_EMPTY_CONTENT_KEY) -- which
+            // used to be asked of the actor layer alone and now covers both. And, the point of the exercise,
+            // geometry moving somewhere else in the map no longer changes this cascade's key: measurement
+            // put nearly every redrawn slice in the "contents changed while the cascade stood still" bucket,
+            // and a layer-wide key is what put them there.
+            const uint64_t contentKey = ShadowMapCascadeContentKey(l, &matrices[c * 16]);
             // False means this slice already holds exactly what the calls below would draw into it. Nothing
             // may be submitted then -- the backend has not cleared it, has not set the depth pipeline up,
             // and is not the render target.
@@ -4522,18 +4569,18 @@ void Interpreter::RenderShadowMap() {
                 const std::vector<ShadowCasterChunk>& chunks =
                     (l == SHADOW_MAP_LAYER_WORLD) ? mShadowWorldChunks : mShadowActorChunks;
                 if (!chunks.empty()) {
-                    drawChunkedCasters(casters.data(), casterVerts, chunks, &matrices[c * 16]);
+                    drawChunkedCasters(casters.data(), casterVerts, chunks, &matrices[c * 16],
+                                       SHADOW_MAP_CASTER_SLOT_MAIN);
                 } else {
                     // No spans built for this list, so it goes in whole.
                     mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN);
                 }
             }
-            // Scenery actors are per-frame and uncached, and were going into all four cascades untested. Same
-            // one-box treatment as the characters above.
-            if (sceneryHere && mShadowSceneryReady.size() >= 9 &&
-                boxVisible(sceneryMin, sceneryMax, &matrices[c * 16])) {
-                mRapi->ShadowMapDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,
-                                            SHADOW_MAP_CASTER_SLOT_SCENERY);
+            // Scenery actors are per-frame and uncached. Cut into spans now rather than tested as one box:
+            // scenery is scattered across a field, so its union covered the field and was never rejected.
+            if (sceneryHere && mShadowSceneryReady.size() >= 9 && !mShadowSceneryChunks.empty()) {
+                drawChunkedCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3, mShadowSceneryChunks,
+                                   &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_SCENERY);
             }
             // Alpha-cutout casters second, so the one big opaque batch keeps the fast path to itself and the
             // pipeline switch happens once per cascade rather than being interleaved.

@@ -899,7 +899,13 @@ class Interpreter {
     // cascades every frame otherwise. The big list, the cached room mesh, is not walked at all: it is only
     // ever replaced wholesale, so a counter bumped at each replacement identifies it exactly.
     static uint64_t ShadowHashBytes(uint64_t seed, const void* data, size_t bytes);
-    uint64_t ShadowMapLayerContentKey(int layer) const;
+    // SOH [Enhancement] Was per LAYER, and that was the whole problem: one key for all of a layer's cascades
+    // meant anything moving anywhere invalidated every one of them. Measurement put nearly every redrawn
+    // slice in the "contents changed while the cascade stood still" bucket, which is precisely what a
+    // narrower key answers. Now built from only the spans and cutout ranges whose boxes reach into THIS
+    // cascade, so a tree swaying next to the player stops rebuilding the two distant cascades it is nowhere
+    // near. Returns SHADOW_MAP_EMPTY_CONTENT_KEY when nothing reaches the cascade at all.
+    uint64_t ShadowMapCascadeContentKey(int layer, const float* lightViewProj) const;
     // Tile geometry and texture coordinates for the caster capture, which runs before the combiner setup
     // that normally derives them (see the definitions for why they are duplicated rather than shared).
     void ShadowCasterTexSize(int tile, float* outWidth, float* outHeight);
@@ -936,13 +942,20 @@ class Interpreter {
     // ranges into the one uploaded buffer, so skipping them costs no extra upload and no extra buffer: it is
     // the same draw call with a smaller range, or no draw call at all.
     //
-    // Only the world cache gets this. The scenery and character lists are small, and they are rebuilt every
-    // frame, so boxing them would cost more than it saved.
+    // Every caster list gets this now. It started as the world cache alone, on the argument that the
+    // scenery and character lists are small enough that one box each would do -- but small is not the
+    // question, scattered is: both lists spread across the map, so their single boxes intersected every
+    // cascade and neither the cull nor the reuse key could ever reject anything.
     struct ShadowCasterChunk {
         float min[3];
         float max[3];
         uint32_t firstVertex;
         uint32_t vertexCount;
+        // SOH [Enhancement] Signature of the geometry inside this span, taken in the same walk that measures
+        // the box. It exists so a cascade's reuse key can be built from the spans that cascade actually
+        // touches: hashing the vertex data once per frame here, then combining a handful of these per
+        // cascade, costs the same walk as hashing the list once and answers a much narrower question.
+        uint64_t hash;
     };
     // Triangles per span. The trade is granularity against per-cascade test count and draw-call count: too
     // large and every span straddles the cascade so nothing is culled, too small and the boxes stop being
@@ -966,6 +979,13 @@ class Interpreter {
     // across the near cascade is far more expensive per texel than a wall is. A material batch on its own
     // was much too coarse a unit -- one texture covers every blade of grass in a field, so its box covered
     // the field and nothing was ever rejected.
+    // SOH [Enhancement] Much finer for the SCENERY list, and the reason is size rather than cost. Scenery
+    // objects are tiny -- a bush, a rock, a signpost, a handful of triangles each -- and scattered across a
+    // field, so a 128-triangle span swallows twenty of them from opposite ends of the map and its box covers
+    // everything between. That box then intersects every cascade and rejects nothing, which is exactly the
+    // failure the single whole-list box had. The list is small and rebuilt every frame, so the extra spans
+    // cost a few dozen box tests and the runs are merged back before they are drawn.
+    static constexpr size_t kShadowSceneryChunkTriangles = 16;
     static constexpr uint32_t kShadowAlphaChunkTriangles = 64;
     static constexpr uint32_t kShadowAlphaBridgeTriangles = 2 * kShadowAlphaChunkTriangles;
     std::vector<ShadowCasterChunk> mShadowWorldChunks;
@@ -973,18 +993,27 @@ class Interpreter {
     // together, so one box for the whole layer reached across the map and intersected every cascade -- which
     // is why every slice was being redrawn even where no character was anywhere near.
     std::vector<ShadowCasterChunk> mShadowActorChunks;
+    // SOH [Enhancement] And for the scenery actors, which ride in the world layer but are rebuilt every
+    // frame. One box for all of them was the wrong unit for the same reason it was for the characters:
+    // scenery is scattered across a field, so its union covered the field and every cascade intersected it.
+    // That is what made a single swaying tree invalidate all three world cascades.
+    std::vector<ShadowCasterChunk> mShadowSceneryChunks;
     // Rebuilds since the last census line. Reported rather than inferred: whether the room mesh is being
     // re-captured every frame or once per room is invisible from the outside and is the difference between
     // the cache working and the cache being pure overhead.
     uint32_t mShadowWorldRebuilds = 0;
     void BuildShadowWorldChunks();
-    static void BuildShadowChunks(const std::vector<float>& verts, std::vector<ShadowCasterChunk>& out);
+    static void BuildShadowChunks(const std::vector<float>& verts, std::vector<ShadowCasterChunk>& out,
+                                  size_t trianglesPerChunk = kShadowChunkTriangles);
+    // Shared by the per-cascade reuse key and the per-cascade draw cull, which must agree about what a
+    // cascade contains or a slice could be called unchanged while its contents changed.
+    static bool ShadowBoxVisible(const float* bmin, const float* bmax, const float* m);
 
     std::vector<float> mShadowMapWorldCache; // world casters, rebuilt only when the signature changes
     uint64_t mShadowWorldKeyAccum = 0;       // signature accumulated this frame (0 = no world casters drawn)
     uint64_t mShadowWorldKeyCached = 0;      // signature the cache was built from
     // Bumped every time the cached world lists are replaced. It stands in for hashing the room mesh in
-    // ShadowMapLayerContentKey: the cache is only ever swapped wholesale, so a generation that has not
+    // ShadowMapCascadeContentKey: the cache is only ever swapped wholesale, so a generation that has not
     // moved means contents that have not changed -- and that is the one list large enough that walking it
     // per frame would be worth avoiding.
     uint64_t mShadowWorldCacheGeneration = 0;
