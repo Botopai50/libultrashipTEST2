@@ -354,6 +354,21 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // staying parked: eight means every slice is rebuilt every frame, which is what this all exists to stop.
     uint32_t mShadowSlicesDrawn = 0;
     uint32_t mShadowSlicesFrames = 0; // timed frames those slices were spread over
+    // SOH [Enhancement] WHY each of those slices had to be redrawn, which the count alone cannot say and
+    // which decides what is worth fixing. Two mutually exclusive causes, split on the question that
+    // actually separates the available remedies:
+    //
+    //   mShadowRedrawContent - the cascade had not moved at all; only what goes IN it changed. These are
+    //                          the redraws a narrower reuse key could avoid, since the key is currently
+    //                          computed per layer and mixes in per-frame scenery from anywhere in the map.
+    //   mShadowRedrawMatrix  - the cascade itself moved, because the camera walked out of it or the sun
+    //                          swung past the light-direction hysteresis. No reuse key can help these; the
+    //                          remedy would be parking margins.
+    //
+    // Plus the ones that were simply never filled. The three sum to mShadowSlicesDrawn.
+    uint32_t mShadowRedrawContent = 0;
+    uint32_t mShadowRedrawMatrix = 0;
+    uint32_t mShadowRedrawFirst = 0;
     int mShadowTimerReported = 0; // frames since the last log line
     void ShadowTimerFrameBegin();
     bool ShadowTimerBegin();

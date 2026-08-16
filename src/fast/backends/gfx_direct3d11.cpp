@@ -2670,6 +2670,18 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // unconditionally made the first report after the timer was switched on dump however many slices had
         // piled up while nothing was draining it -- a figure in the hundreds, "out of 8".
         mShadowSlicesDrawn++;
+        // Which of the two reuse conditions failed. Split here, where both comparisons have just been made,
+        // and split on the matrix rather than the key: a slice whose matrix is unchanged is one a narrower
+        // key could have saved, and a slice whose matrix moved is one no key can save. Everything else --
+        // the raster state, which follows a user setting and so changes almost never -- lands in the
+        // matrix-held bucket alongside the key, which is where a rounding error belongs.
+        if (!mShadowSliceValid[slice]) {
+            mShadowRedrawFirst++;
+        } else if (memcmp(mShadowSliceMatrix[slice], lightViewProj, 16 * sizeof(float)) != 0) {
+            mShadowRedrawMatrix++;
+        } else {
+            mShadowRedrawContent++;
+        }
     }
     mShadowCurrentLayer = layer;
     mShadowCurrentSlice = slice;
@@ -3107,14 +3119,16 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
             // The pass sample count is the interesting one now that cascades can be parked: it is how many
             // frames had to submit a depth pass at all, and the gap to the frame count is how many got away
             // with reusing every slice they needed.
+            const float perFrame = mShadowSlicesFrames > 0 ? 1.0f / (float)mShadowSlicesFrames : 0.0f;
             SPDLOG_INFO("Shadow map GPU: frame {:.2f} ms, of which the depth pass is {:.2f} ms ({:.0f}%); "
                         "{} of {} timed frames submitted a pass, {:.1f} of {} slices redrawn per frame "
+                        "({:.1f} content only, {:.1f} cascade moved, {:.1f} first fill) "
                         "({} cascades x {} layers at {}px)",
                         frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerSamples,
-                        mShadowTimerFrameSamples,
-                        mShadowSlicesFrames > 0 ? (float)mShadowSlicesDrawn / (float)mShadowSlicesFrames : 0.0f,
-                        SHADOW_MAP_SLICES_FOR(mShadowCascadeCount), mShadowCascadeCount, SHADOW_MAP_LAYERS,
-                        mShadowResolution);
+                        mShadowTimerFrameSamples, (float)mShadowSlicesDrawn * perFrame,
+                        SHADOW_MAP_SLICES_FOR(mShadowCascadeCount), (float)mShadowRedrawContent * perFrame,
+                        (float)mShadowRedrawMatrix * perFrame, (float)mShadowRedrawFirst * perFrame,
+                        mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
         } else {
             SPDLOG_INFO("Shadow map GPU: no timing collected in the last 60 frames");
         }
@@ -3124,6 +3138,9 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
         mShadowTimerFrameSamples = 0;
         mShadowSlicesDrawn = 0;
         mShadowSlicesFrames = 0;
+        mShadowRedrawContent = 0;
+        mShadowRedrawMatrix = 0;
+        mShadowRedrawFirst = 0;
     }
 }
 
