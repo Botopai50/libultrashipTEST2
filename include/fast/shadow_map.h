@@ -486,4 +486,28 @@
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
+// Highest debug view the receiver shader recognises. The application passes a view number through
+// GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
+//
+// Worth saying plainly, because it is the lesson every constant above was tuned without: NONE of them can
+// localise an artefact. They all act on the output of the depth comparison, and at that point a term that
+// is wrong is indistinguishable from a term that is right but badly scaled -- both are just a number that
+// came out too dark. So a shape-wrong artefact (faceted, triangular, stepped edges, as opposed to a shadow
+// in the wrong place) sends you tuning, and tuning can only trade it against a different artefact. The
+// history of this file is largely that loop.
+//
+// Views 3 and up exist to break it. They print the shader's INPUTS unshaded, so the question stops being
+// "does this setting help" and becomes "is this value the shape of the thing on screen":
+//   1  everything outside a cascade's footprint painted occluded    (output)
+//   2  the two caster layers separated by colour                    (output)
+//   3  the normal every bias is built on                            (input)
+//   4  where that normal came from, vertex or recovered face        (input)
+//   5  the filter's raw coverage, before the hardening remap        (input)
+//   6  the receiver-plane gradient, and where its clamp binds       (input)
+//   7  the cascade each pixel sampled                               (input)
+//   8  the edge hardness after the incidence taper                  (input)
+// The shader's PSMain carries the reading order -- which view to check first, and what each answer rules
+// out. Keep this bound in step with the arms implemented there.
+#define SHADOW_MAP_MAX_DEBUG_VIEW 8
+
 #endif // FAST_SHADOW_MAP_H

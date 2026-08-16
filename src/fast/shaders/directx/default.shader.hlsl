@@ -136,10 +136,20 @@ cbuffer PerShadowCB : register(b3) {
     // cascade, z = receiver push along the normal in texels, w = darkness where fully occluded.
     float4 shadow_params;
     // x = PCF kernel radius in texels (see SHADOW_MAP_DEFAULT_FILTER_WIDTH)
-    // y = debug. 1 paints everything OUTSIDE a cascade's footprint as fully occluded instead of silently
-    //     lit, which is the only way to see where a cascade actually ends. 2 replaces the shading with the
-    //     two caster layers separated by colour: green = occluded by the world layer, red = by the actor
-    //     layer.
+    // y = debug view selector. Modes 1 and 2 show what the system produced; 3 to 8 show what it was given,
+    //     which is what an artefact of unknown origin needs -- see the channel in PSMain for how to read
+    //     them against each other.
+    //     0 off
+    //     1 everything OUTSIDE a cascade's footprint painted fully occluded instead of silently lit, which
+    //       is the only way to see where a cascade actually ends
+    //     2 the two caster layers by colour: green = occluded by the world layer, red = by the actor layer
+    //     3 the normal the bias chain runs on, as a colour
+    //     4 where that normal came from: green = the draw's vertex normal (brightness = its interpolated
+    //       length), red = a face normal recovered from screen derivatives
+    //     5 the filter's raw coverage, before the hardening remap rewrites it
+    //     6 receiver-plane gradient magnitude, red where the clamp bound
+    //     7 cascade index, red/green/blue from nearest to furthest
+    //     8 edge hardness after the incidence taper, red = hard, green = soft
     // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
     //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
     float4 shadow_filter;
@@ -473,8 +483,13 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
 // footprint looks identical to one that nothing occludes, so a shadow that stops at the cascade edge reads
 // as a shadow that was never cast. The debug flag inverts the rejected case to "fully occluded", which draws
 // the footprint boundary on screen.
+//
+// Mode ONE, exactly -- not "any debug mode". This used to test `> 0.5`, which meant every mode from 1
+// upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
+// mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
+// line had already replaced. A diagnostic that alters what it measures is worse than none.
 float ShadowSample(ShadowProjection p, bool isActor) {
-    float lit = shadow_filter.y > 0.5 ? 0.0 : 1.0;
+    float lit = abs(shadow_filter.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
         lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor);
     }
@@ -560,6 +575,30 @@ float ShadowLadderFraction(float viewDepth) {
     return band;
 }
 
+// First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
+// no cascades were rendered this frame, which is the only case where the answer is not read.
+//
+// Lifted out of ShadowLitLayers so the diagnostic view can name the cascade a pixel landed in without
+// repeating the ladder -- a debug view that reimplements the thing it is inspecting can agree with the
+// picture and disagree with the code, which is the one failure mode an instrument may not have. Literal
+// indices only, same constraint as ShadowSplitAt.
+uint ShadowCascadeIndex(float viewDepth) {
+    uint count = (uint)shadow_params.x;
+    uint cascade = 0;
+    if (count > 0) {
+        cascade = count - 1;
+        if (viewDepth <= shadow_splits.x) {
+            cascade = 0;
+        } else if (count > 1 && viewDepth <= shadow_splits.y) {
+            cascade = 1;
+        } else if (count > 2 && viewDepth <= shadow_splits.z) {
+            cascade = 2;
+        }
+        cascade = min(cascade, count - 1);
+    }
+    return cascade;
+}
+
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
 // Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
 // moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
@@ -574,22 +613,23 @@ float ShadowLadderFraction(float viewDepth) {
 // `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
-float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride, bool wantActors) {
+//
+// `gradOut` hands the receiver-plane gradient back for the diagnostic views. It is not an extra
+// computation: the gradient is on the critical path of every comparison below whether anything reads it or
+// not, so this is a register move and nothing else. Debug mode 6 paints it, which is the only way to see
+// the clamp inside ShadowPlaneGradient binding -- and a clamp that binds on some triangles of a mesh and
+// not on others is one of the ways a triangular artefact gets drawn.
+float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride, bool wantActors,
+                       out float2 gradOut) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
+    // gradOut is pre-initialized for the same reason, and because an out parameter the compiler cannot
+    // prove is assigned on every path draws the "potentially uninitialized" warning ShadowSplitAt documents.
     float2 lit = float2(1.0, 1.0);
+    gradOut = float2(0.0, 0.0);
     uint count = (uint)shadow_params.x;
     if (count > 0) {
-        // First cascade whose far split still covers this depth; the last one catches everything beyond.
-        uint cascade = count - 1;
-        if (viewDepth <= shadow_splits.x) {
-            cascade = 0;
-        } else if (count > 1 && viewDepth <= shadow_splits.y) {
-            cascade = 1;
-        } else if (count > 2 && viewDepth <= shadow_splits.z) {
-            cascade = 2;
-        }
-        cascade = min(cascade, count - 1);
+        uint cascade = ShadowCascadeIndex(viewDepth);
 
         // The light's basis, and everything the two projections agree on. Each cascade's matrix holds these
         // three axes scaled by its own factors, so normalising the columns of any of them gives the same
@@ -610,6 +650,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // and everything downstream becomes branchable, which is what the two skips below are made of.
         float3 sample = worldPos + offsetDir * ShadowTexelWorldAt(cascade);
         float2 grad = ShadowPlaneGradient(sample, lightX, lightY, lightAxis);
+        gradOut = grad;
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -1060,9 +1101,18 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers =
-            ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
+        // shadowGrad is the receiver-plane gradient, kept for debug mode 6. It costs nothing to carry:
+        // ShadowLitLayers computes it on the way to every comparison regardless.
+        float2 shadowGrad;
+        float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x,
+                                              input.worldPos.w > 0.5, shadowGrad);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
+        // The filter's own output, before the hardening below rewrites it. Debug mode 5 paints this, and the
+        // pair (mode 5 against the shaded picture) is what separates the two halves of the pipeline: a
+        // boundary that is already faceted here was drawn by the comparison or by the map, and one that is
+        // smooth here and faceted on screen was drawn by the threshold. Those two have no cause in common,
+        // and every attempt at this artefact so far has had to guess which it was looking at.
+        float shadowCoverage = shadowLit;
         // Harden the edge. What the filter returns is COVERAGE -- how much of the kernel is occluded -- and
         // shading with it directly spreads that ramp across the whole kernel, which is the blur. Remapping
         // it through a narrow ramp centred on half coverage collapses the gradient into an edge instead.
@@ -1098,7 +1148,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
                                smoothstep(shadow_incidence.x, shadow_incidence.y, shadowIncidence));
         // Now remap. What the filter returned is coverage; a narrow ramp centred on half coverage collapses
         // that gradient into an edge. This must come after the taper -- it is the only reader of
-        // shadowHardness, so anything written to it below this point would be discarded by the compiler.
+        // shadowHardness on the shipping path, so anything written to it below this point would be
+        // discarded by the compiler. (Debug mode 8 reads it too, but only inside a branch on a uniform.)
         float shadowBand = lerp(0.5, 0.03, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
@@ -1120,9 +1171,82 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // boundary that is slightly rough.
         //
         // Its measurements survive in shadow_incidence, which now serves only the hardness taper above.
+        //
+        // DIAGNOSTIC CHANNEL. Modes 1 and 2 show what the shadow system PRODUCED; 3 to 8 show what it was
+        // GIVEN. That distinction is the whole reason the rest of this exists.
+        //
+        // Every knob in shadow_map.h -- the three biases, the incidence band, the hardness ramp, the filter
+        // width -- acts on the output of the comparison. Tuning them can make an artefact less visible and
+        // can never say where it came from, because a term that is wrong and a term that is right but badly
+        // scaled look identical once they have been multiplied into a colour. These views print the inputs
+        // instead, unshaded, so the question stops being "does this setting help" and becomes "is this value
+        // the shape of the thing on screen".
+        //
+        // Reading them for a faceted or triangular boundary, in the order that narrows fastest:
+        //   4 first. If it is red anywhere the artefact appears, the receiver has no vertex normal and every
+        //     downstream term is running off a face normal recovered from screen derivatives -- constant
+        //     across a whole triangle, so anything thresholding it prints that triangle's outline exactly.
+        //     Dark green is the subtler version: an interpolated normal sagging towards the 1e-4 test, which
+        //     flips the shading model INSIDE a triangle rather than between triangles.
+        //   3 next, to see it directly. Flat facets of colour on a surface that should be smooth confirm it.
+        //   5 against the shaded picture. Faceted here too -> the comparison or the map drew it, and 6 and 7
+        //     say which. Smooth here and faceted on screen -> the threshold drew it, and 8 says why.
+        //   8 for that: the hardness after the incidence taper. The taper is driven by the normal, so a
+        //     per-triangle normal makes a per-triangle hardness, and every triangle then renders the same
+        //     shadow boundary with a different edge.
+        //   6 for the receiver-plane gradient. Red is the +/-3.2 clamp in ShadowPlaneGradient binding; a
+        //     clamp that binds on some triangles of a mesh and not on others is another way to draw one.
+        //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
+        //     mesh artefact at all.
+        //
+        // None of these is a shipping path: each replaces the shaded colour outright. `[branch]` because the
+        // mode is a uniform, so a build with the channel off pays one jump and none of the arithmetic.
+        uint shadowDebugMode = (uint)(shadow_filter.y + 0.5);
+        @if(o_fog)
+            // Take the fog off the diagnostic. The block below writes a colour that MEANS something, and the
+            // fog blend further down would then wash it towards the fog colour in proportion to distance --
+            // which is exactly backwards, because distance is where the texels are coarse and the artefact
+            // is read. Mode 1's footprint boundary and mode 7's cascade bands sit at the far end by
+            // definition and were the worst served. `input` is a by-value copy, so this changes nothing for
+            // any other draw.
+            if (shadowDebugMode != 0) {
+                input.fog.a = 0.0;
+            }
+        @end
         [branch]
-        if (shadow_filter.y > 1.5) {
+        if (shadowDebugMode == 2) {
+            // Which caster layer occludes: GREEN where scenery does, RED where a character does.
             texel.rgb = float3(1.0 - shadowLayers.y, 1.0 - shadowLayers.x, 0.0);
+        } else if (shadowDebugMode == 3) {
+            // The normal the whole bias chain is built on, as a colour. A smooth surface should shade
+            // smoothly; flat patches of one colour are a mesh's triangles showing through.
+            texel.rgb = shadowN * 0.5 + 0.5;
+        } else if (shadowDebugMode == 4) {
+            // Where that normal came from. GREEN = the draw's own vertex normal, and its brightness is the
+            // interpolated length, so a triangle whose normal is collapsing towards the 1e-4 test darkens
+            // before it flips. RED = no usable normal, so a face normal recovered from ddx/ddy of the world
+            // position is being used instead -- constant per triangle by construction.
+            texel.rgb = (shadowNLen > 1e-4) ? float3(0.0, saturate(shadowNLen), 0.0) : float3(1.0, 0.0, 0.0);
+        } else if (shadowDebugMode == 5) {
+            // The filter's raw coverage, before the hardening remap. This is the fork: faceted here means
+            // the fault is upstream of the threshold, smooth here means the threshold made it.
+            texel.rgb = float3(shadowCoverage, shadowCoverage, shadowCoverage);
+        } else if (shadowDebugMode == 6) {
+            // Receiver-plane gradient. GREEN ramps with its magnitude against the clamp; RED marks pixels
+            // where the clamp actually bound and the plane correction stopped being exact. Black past
+            // shadow_incidence.w, where no cascade reaches and nothing was projected.
+            float shadowGradMax = max(abs(shadowGrad.x), abs(shadowGrad.y));
+            texel.rgb = float3(shadowGradMax >= 3.2 - 1e-3 ? 1.0 : 0.0, saturate(shadowGradMax / 3.2), 0.0);
+        } else if (shadowDebugMode == 7) {
+            // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands
+            // read as the primary cascade's colour, since that is the one the picture is keyed to.
+            uint shadowDebugCascade = ShadowCascadeIndex(input.position.w);
+            texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
+                               shadowDebugCascade == 2 ? 1.0 : 0.0);
+        } else if (shadowDebugMode == 8) {
+            // Edge hardness after the incidence taper: RED fully hard, GREEN fully soft. The taper reads the
+            // normal, so this is where a per-triangle normal turns into a per-triangle shadow edge.
+            texel.rgb = float3(shadowHardness, 1.0 - shadowHardness, 0.0);
         } else {
             texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }
