@@ -140,6 +140,12 @@ int main(int argc, char** argv) {
         { "srgb_mode", false },
         { "append_formula", (InvokeFunc)prism_append_formula },
         { "update_floats", (InvokeFunc)update_raw_floats },
+        // Every helper the renderer registers has to be registered here too. The DEFINITIONS come across in
+        // the sliced include and so cannot drift, but this list is a copy, and a copy did drift: the packed
+        // vertex-colour work added update_packed_color to the renderer and not to this, which left the tool
+        // aborting on prism::SyntaxError before it compiled a single variant. A validator that cannot run
+        // reports nothing and looks like a validator that passed.
+        { "update_packed_color", (InvokeFunc)update_packed_color },
     };
     processor.populate(ctx);
 
