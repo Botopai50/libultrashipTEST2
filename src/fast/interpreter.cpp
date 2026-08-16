@@ -4444,6 +4444,50 @@ void Interpreter::RenderShadowMap() {
     ResolveShadowAlphaTextures(mShadowAlphaSceneryReady);
     ResolveShadowAlphaTextures(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
 
+    // SOH [Enhancement] How much of the WORLD layer's cutout geometry moved since last frame. Measured here,
+    // after the texture ids are resolved, because a re-resolved id is itself part of what the reuse key sees
+    // and so part of what can invalidate a cascade.
+    //
+    // This is the half the first census missed. It counted the opaque scenery spans only, and the data came
+    // back saying world cascades were still being redrawn with those spans completely still and the room
+    // cache not rebuilding -- so the cause had to be in what was not being measured. Grass and foliage are
+    // cutout casters, and in an open field they are most of what moves.
+    {
+        size_t index = 0;
+        size_t changed = 0;
+        auto tally = [&](const ShadowAlphaCasters& set) {
+            for (const ShadowAlphaRange& r : set.ranges) {
+                // The same things the key mixes for this range, in one value: its identity fields and its
+                // vertices. Five floats per vertex here -- world xyz plus uv.
+                const uint32_t fields[3] = { r.textureId, r.firstVertex, r.vertexCount };
+                uint64_t h = ShadowHashBytes(0xCBF29CE484222325ull, fields, sizeof(fields));
+                const size_t first = (size_t)r.firstVertex * 5;
+                const size_t count = (size_t)r.vertexCount * 5;
+                if (first + count <= set.verts.size()) {
+                    h = ShadowHashBytes(h, set.verts.data() + first, count * sizeof(float));
+                }
+                if (index >= mShadowAlphaRangeHashPrev.size() || mShadowAlphaRangeHashPrev[index] != h) {
+                    changed++;
+                }
+                if (index < mShadowAlphaRangeHashPrev.size()) {
+                    mShadowAlphaRangeHashPrev[index] = h;
+                } else {
+                    mShadowAlphaRangeHashPrev.push_back(h);
+                }
+                index++;
+            }
+        };
+        tally(mShadowAlphaWorldCache);
+        tally(mShadowAlphaSceneryReady);
+        // Ranges that went away count as changes, and their slots go with them.
+        if (mShadowAlphaRangeHashPrev.size() > index) {
+            changed += mShadowAlphaRangeHashPrev.size() - index;
+            mShadowAlphaRangeHashPrev.resize(index);
+        }
+        mShadowAlphaRangesChanged += (uint32_t)changed;
+        mShadowAlphaRangesSeen += (uint32_t)index;
+    }
+
     // The summary of what each slice is about to hold is now asked per CASCADE, just below, rather than once
     // per layer here. Handed to the backend so a slice whose casters AND matrix are both unchanged is left
     // holding the image it already has instead of being cleared and redrawn.
@@ -4646,12 +4690,16 @@ void Interpreter::RenderShadowMap() {
             const uint32_t sceneryPerFrame = mShadowSceneryChunksSeen / 60;
             const uint32_t sceneryMovedPerFrame = mShadowSceneryChunksChanged / 60;
             SPDLOG_INFO("Shadow map world cache: {} rebuild(s) in the last 60 frames ({} tris cached, {} spans); "
-                        "scenery {} spans of which {} moved per frame",
+                        "scenery {} spans of which {} moved per frame; world cutout {} ranges of which {} "
+                        "moved per frame",
                         mShadowWorldRebuilds, mShadowMapWorldCache.size() / 9, mShadowWorldChunks.size(),
-                        sceneryPerFrame, sceneryMovedPerFrame);
+                        sceneryPerFrame, sceneryMovedPerFrame, mShadowAlphaRangesSeen / 60,
+                        mShadowAlphaRangesChanged / 60);
             mShadowWorldRebuilds = 0;
             mShadowSceneryChunksChanged = 0;
             mShadowSceneryChunksSeen = 0;
+            mShadowAlphaRangesChanged = 0;
+            mShadowAlphaRangesSeen = 0;
             SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), scenery {} tris (+{} "
                         "cutout in {} batches), actors {} tris (+{} cutout in {} batches)",
                         mShadowMapWorldCache.size() / 9, mShadowAlphaWorldCache.VertexCount() / 3,

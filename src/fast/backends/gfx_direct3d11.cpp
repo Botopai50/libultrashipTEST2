@@ -2681,6 +2681,11 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
             mShadowRedrawMatrix++;
         } else {
             mShadowRedrawContent++;
+            if (layer == SHADOW_MAP_LAYER_WORLD) {
+                mShadowRedrawContentWorld++;
+            } else {
+                mShadowRedrawContentActors++;
+            }
         }
     }
     mShadowCurrentLayer = layer;
@@ -3122,11 +3127,13 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
             const float perFrame = mShadowSlicesFrames > 0 ? 1.0f / (float)mShadowSlicesFrames : 0.0f;
             SPDLOG_INFO("Shadow map GPU: frame {:.2f} ms, of which the depth pass is {:.2f} ms ({:.0f}%); "
                         "{} of {} timed frames submitted a pass, {:.1f} of {} slices redrawn per frame "
-                        "({:.1f} content only, {:.1f} cascade moved, {:.1f} first fill) "
+                        "({:.1f} content only = {:.1f} world + {:.1f} actors, {:.1f} cascade moved, "
+                        "{:.1f} first fill) "
                         "({} cascades x {} layers at {}px)",
                         frameMs, passMs, frameMs > 0.0 ? (passMs / frameMs * 100.0) : 0.0, mShadowTimerSamples,
                         mShadowTimerFrameSamples, (float)mShadowSlicesDrawn * perFrame,
                         SHADOW_MAP_SLICES_FOR(mShadowCascadeCount), (float)mShadowRedrawContent * perFrame,
+                        (float)mShadowRedrawContentWorld * perFrame, (float)mShadowRedrawContentActors * perFrame,
                         (float)mShadowRedrawMatrix * perFrame, (float)mShadowRedrawFirst * perFrame,
                         mShadowCascadeCount, SHADOW_MAP_LAYERS, mShadowResolution);
         } else {
@@ -3139,6 +3146,8 @@ void GfxRenderingAPIDX11::ShadowTimerCollect() {
         mShadowSlicesDrawn = 0;
         mShadowSlicesFrames = 0;
         mShadowRedrawContent = 0;
+        mShadowRedrawContentWorld = 0;
+        mShadowRedrawContentActors = 0;
         mShadowRedrawMatrix = 0;
         mShadowRedrawFirst = 0;
     }

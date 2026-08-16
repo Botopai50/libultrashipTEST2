@@ -1009,6 +1009,14 @@ class Interpreter {
     std::vector<uint64_t> mShadowSceneryChunkHashPrev;
     uint32_t mShadowSceneryChunksChanged = 0;
     uint32_t mShadowSceneryChunksSeen = 0;
+    // SOH [Enhancement] The same for the CUTOUT casters of the world layer -- the world cache's own cutout
+    // half and the per-frame scenery cutouts together. Measuring only the opaque scenery left this entirely
+    // uncounted, and it is the half that grass and foliage live in, which in an open field is most of what
+    // moves. With scenery opaque spans still and the cache not rebuilding, world cascades were still being
+    // redrawn, so the cause has to be in what was not being measured.
+    std::vector<uint64_t> mShadowAlphaRangeHashPrev;
+    uint32_t mShadowAlphaRangesChanged = 0;
+    uint32_t mShadowAlphaRangesSeen = 0;
     void BuildShadowWorldChunks();
     static void BuildShadowChunks(const std::vector<float>& verts, std::vector<ShadowCasterChunk>& out,
                                   size_t trianglesPerChunk = kShadowChunkTriangles);

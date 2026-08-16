@@ -367,6 +367,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     //
     // Plus the ones that were simply never filled. The three sum to mShadowSlicesDrawn.
     uint32_t mShadowRedrawContent = 0;
+    // SOH [Enhancement] ...and split by layer, because the two have very different floors. The ACTOR layer
+    // holds animating characters, so its slices genuinely change every frame and nothing can reuse them --
+    // it is the irreducible part. Only the WORLD figure is the one with room left in it, and without the
+    // split the two are added together and the floor is invisible.
+    uint32_t mShadowRedrawContentWorld = 0;
+    uint32_t mShadowRedrawContentActors = 0;
     uint32_t mShadowRedrawMatrix = 0;
     uint32_t mShadowRedrawFirst = 0;
     int mShadowTimerReported = 0; // frames since the last log line
