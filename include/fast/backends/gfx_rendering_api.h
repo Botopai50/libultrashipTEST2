@@ -339,6 +339,13 @@ class GfxRenderingAPI {
         mShadowProfile = enabled;
     }
 
+    // Readable so the interpreter can put its own once-a-second shadow census behind the same switch. The
+    // backend times the pass; only the interpreter knows what went into it, and the two answer halves of the
+    // same question.
+    bool ShadowMapProfiling() const {
+        return mShadowProfile;
+    }
+
     // SOH [Enhancement] World bounds of the ACTOR caster layer, pushed once a frame. Everything that layer
     // can shadow with lies inside this box, and a receiver with none of it behind them along the light
     // cannot be shadowed by it -- which is most of a map, most of the time, since the box holds a handful of

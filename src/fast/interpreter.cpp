@@ -4067,6 +4067,29 @@ void Interpreter::RenderShadowMap() {
         // box it was for the callers that still want the whole layer.
         BuildShadowChunks(mShadowSceneryReady, mShadowSceneryChunks, kShadowSceneryChunkTriangles);
 
+        // SOH [Enhancement] How much of the scenery actually MOVED since last frame, which is the one thing
+        // the slice counters cannot see. Now that the reuse key is per cascade, a world cascade can only be
+        // redrawn because something inside it changed -- and the two candidates are scenery genuinely moving
+        // and the room-mesh cache being rebuilt. This counts the first directly, span by span, so the two
+        // stop being guesses. A span whose hash is unchanged did not move, however the list around it was
+        // rebuilt; spans appearing or disappearing count as changes, since they are.
+        {
+            const size_t n = mShadowSceneryChunks.size();
+            const size_t prev = mShadowSceneryChunkHashPrev.size();
+            size_t changed = n > prev ? n - prev : prev - n;
+            for (size_t i = 0; i < std::min(n, prev); i++) {
+                if (mShadowSceneryChunks[i].hash != mShadowSceneryChunkHashPrev[i]) {
+                    changed++;
+                }
+            }
+            mShadowSceneryChunksChanged += (uint32_t)changed;
+            mShadowSceneryChunksSeen += (uint32_t)n;
+            mShadowSceneryChunkHashPrev.resize(n);
+            for (size_t i = 0; i < n; i++) {
+                mShadowSceneryChunkHashPrev[i] = mShadowSceneryChunks[i].hash;
+            }
+        }
+
         // The character layer gets cut into spans in the same walk that measures it.
         //
         // One box for the whole layer was the wrong unit, and measurement said so: the characters in a scene
@@ -4602,7 +4625,10 @@ void Interpreter::RenderShadowMap() {
     // stopped being captured or a receiver that stopped sampling is invisible from the picture alone, and
     // these four numbers separate them: a shadow that disappears while its layer's count holds steady was
     // captured and not sampled, and one whose count drops was never submitted.
-    if (mShadowMapDebug > 0.5f) {
+    // Also on for plain GPU profiling, not just the debug view. The backend times the pass and counts the
+    // slices; only this side knows what went into them, and after the reuse key went per cascade those are
+    // the two halves of the same remaining question -- why a world cascade is still being redrawn at all.
+    if (mShadowMapDebug > 0.5f || (mRapi != nullptr && mRapi->ShadowMapProfiling())) {
         static int sCensusFrames = 0;
         if (++sCensusFrames >= 60) {
             sCensusFrames = 0;
@@ -4611,9 +4637,21 @@ void Interpreter::RenderShadowMap() {
             // and every rebuild is the whole mesh through the capture path again. A number that tracks the
             // frame count means the signature is not settling, which is a far larger cost than anything the
             // cascades do and would not otherwise be visible from a frame rate alone.
-            SPDLOG_INFO("Shadow map world cache: {} rebuild(s) in the last 60 frames ({} tris cached, {} spans)",
-                        mShadowWorldRebuilds, mShadowMapWorldCache.size() / 9, mShadowWorldChunks.size());
+            //
+            // Read together with the scenery figure beside it, these say which of the two remaining causes
+            // is keeping world cascades alive. A rebuild count above zero invalidates every cascade holding
+            // room geometry, which is all of them; scenery spans moving invalidate only the cascades those
+            // spans reach. If both are near zero and slices are still being redrawn, the cause is neither
+            // and I have the wrong model.
+            const uint32_t sceneryPerFrame = mShadowSceneryChunksSeen / 60;
+            const uint32_t sceneryMovedPerFrame = mShadowSceneryChunksChanged / 60;
+            SPDLOG_INFO("Shadow map world cache: {} rebuild(s) in the last 60 frames ({} tris cached, {} spans); "
+                        "scenery {} spans of which {} moved per frame",
+                        mShadowWorldRebuilds, mShadowMapWorldCache.size() / 9, mShadowWorldChunks.size(),
+                        sceneryPerFrame, sceneryMovedPerFrame);
             mShadowWorldRebuilds = 0;
+            mShadowSceneryChunksChanged = 0;
+            mShadowSceneryChunksSeen = 0;
             SPDLOG_INFO("Shadow map casters: world {} tris (+{} cutout in {} batches), scenery {} tris (+{} "
                         "cutout in {} batches), actors {} tris (+{} cutout in {} batches)",
                         mShadowMapWorldCache.size() / 9, mShadowAlphaWorldCache.VertexCount() / 3,
