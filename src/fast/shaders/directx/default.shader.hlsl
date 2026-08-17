@@ -315,7 +315,7 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
 float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texelUv, bool isActor,
-                        float kernelScale, float anisoTaps) {
+                        float kernelScale, float anisoStretch) {
     // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
     // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
     // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
@@ -332,7 +332,7 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // value that is uniform across a draw whenever the feature is off, so a build that does not use it pays
     // one jump and none of the rest.
     [branch]
-    if (anisoTaps <= 1.0) {
+    if (anisoStretch <= 0.0) {
         float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
         sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
         sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
@@ -357,7 +357,14 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     float2 axis = mag > 1e-6 ? (grad / mag) : float2(1.0, 0.0);
     float2 perp = float2(-axis.y, axis.x);
     float2 across = perp * d;
-    uint taps = (uint)anisoTaps;
+    // The count is UNIFORM -- read from the setting, not from this pixel's gradient. Deriving it per pixel
+    // is what put a per-triangle step into the filter; the stretch is carried by the spacing instead, which
+    // is a float and varies smoothly.
+    uint taps = (uint)max(shadow_plane.z, 1.0);
+    // Spaced so the row spans the stretch, never wider than the no-gap setting. Below that the row simply
+    // draws in: at a stretch of one it is about a texel across, which is the square kernel again, reached
+    // continuously rather than by switching.
+    float anisoSpacing = min(max(shadow_aniso.x, 0.05), anisoStretch / (float)taps);
     float sum = 0.0;
     [loop]
     for (uint i = 0; i < taps; i++) {
@@ -372,7 +379,7 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
         // What it costs is reach: the row is taps * spacing texels long either way, so halving the spacing
         // halves the span the same tap count covers. Density and reach trade against each other here, and
         // more of both is more taps.
-        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * max(shadow_aniso.x, 0.05);
+        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * anisoSpacing;
         float2 along = axis * offsetAlong;
         sum += SampleShadowPCF4(uv + along + across, uv, grad, gradTexel, z, slice, texelUv, isActor);
         sum += SampleShadowPCF4(uv + along - across, uv, grad, gradTexel, z, slice, texelUv, isActor);
@@ -429,7 +436,7 @@ struct ShadowProjection {
     float kernelScale;
     // How many bilinear quads the kernel lays along the receding direction. 1 is the square kernel, which is
     // what every pixel gets while the anisotropic path is off.
-    float anisoTaps;
+    float anisoStretch;
 };
 
 // The direction the light travels, which every cascade shares.
@@ -561,12 +568,25 @@ float4 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
     // quad spans two texels, so quads set two texels apart tile the run contiguously, and anything further
     // leaves texels between them sampled by nothing. That is a regular hole in the kernel, and it reads on
     // screen as a grid -- trading teeth for stripes. The count is what widens; the spacing never does.
-    float anisoTaps = 1.0;
+    // How far the sampling is stretched along the receding direction, as a continuous multiple.
+    //
+    // This used to round to a TAP COUNT here, and rounding was a mistake of exactly the kind this whole
+    // investigation was about. |grad| comes from screen derivatives of a planar function, so it is constant
+    // across a triangle; rounding it is a threshold on a per-triangle constant, and a threshold on a
+    // per-triangle constant prints that triangle's outline. Two neighbouring faces landed on four taps and
+    // five, got rows of different length, blurred by different amounts, and the seam between them was the
+    // edge they share. The artefact the kernel exists to remove, reintroduced by the kernel.
+    //
+    // Continuous now, and the tap COUNT is uniform -- see SampleShadowPCF16, which spaces a fixed number of
+    // quads to span this. A clamp still bounds it, but a clamp leaves the value continuous where a round
+    // does not: only the slope kinks, and a kink does not draw an outline.
+    //
+    // Zero means the anisotropic path is off, which is uniform across the draw.
+    float anisoStretch = 0.0;
     if (shadow_plane.z > 1.0) {
-        float magRaw = length(grad);
-        anisoTaps = clamp(round(magRaw / 0.4), 1.0, shadow_plane.z);
+        anisoStretch = clamp(length(grad) / 0.4, 1.0, shadow_plane.z);
     }
-    return float4(clamp(grad, -lim, lim), kernelScale, anisoTaps);
+    return float4(clamp(grad, -lim, lim), kernelScale, anisoStretch);
 }
 
 // Everything about a lookup EXCEPT the gradient, which the caller fills in. No derivatives here, which is
@@ -588,7 +608,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
     o.uv = uv;
     o.grad = gradScale.xy;
     o.kernelScale = gradScale.z;
-    o.anisoTaps = gradScale.w;
+    o.anisoStretch = gradScale.w;
     o.z = ndc.z - depthBias;
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
@@ -613,7 +633,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
 float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = abs(shadow_filter.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor, p.kernelScale, p.anisoTaps);
+        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor, p.kernelScale, p.anisoStretch);
     }
     return lit;
 }
@@ -1294,7 +1314,13 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // Computed unconditionally: fwidth is a gradient instruction and may not sit in varying control
         // flow, the same constraint the recovered normal above is written around.
         float shadowCoverageSlope = fwidth(shadowCoverage);
-        float shadowBandHard = shadow_plane.w > 0.5 ? max(shadowCoverageSlope * 0.75, 1e-5) : 0.03;
+        // Bounded, and the bounds are the point rather than paranoia. fwidth of a coverage field that is
+        // not perfectly smooth is itself noisy: where coverage happens to be locally flat it collapses to
+        // nothing and the remap becomes a bare step, which aliases and crawls; where coverage jumps it
+        // spikes and the same edge goes soft for a few pixels. Alternating between those two along one
+        // boundary is what reads as a scribbled edge rather than a drawn one. The floor keeps a pixel of
+        // antialiasing everywhere and the ceiling stops a spike smearing it.
+        float shadowBandHard = shadow_plane.w > 0.5 ? clamp(shadowCoverageSlope * 0.75, 0.015, 0.25) : 0.03;
         float shadowBand = lerp(0.5, shadowBandHard, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
