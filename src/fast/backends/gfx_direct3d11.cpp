@@ -1155,38 +1155,6 @@ void GfxRenderingAPIDX11::SetSamplerParameters(int tile, bool linear_filter, uin
     sampler_desc.MinLOD = 0;
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
 
-    // SOH [Enhancement] Stop the chain early on CLAMPED textures, because that is where mip levels produce
-    // seams.
-    //
-    // A clamped texture's edge is a real boundary: the game puts the next piece of the picture in a
-    // DIFFERENT texture and lays the two quads side by side. The skybox is the visible case -- looking up at
-    // the corner where three faces meet draws three thin lines along the joins the moment mipmapping is on.
-    //
-    // At level 0 the two sides disagree by less than a texel, which nothing can see. Level N averages 2^N
-    // texels together, and each side averages only its own, so the disagreement grows with the level until
-    // it is a band wide enough to read as a drawn line. Padding the textures would fix it and is not
-    // available here: the texels that are missing belong to the neighbouring texture, and nothing at upload
-    // time knows which texture that is.
-    //
-    // What IS available is the observation this file already makes about the threshold: at around 64 pixels
-    // a side a texture sits entirely in the GPU's texture cache, so there is no traffic left for a smaller
-    // copy to save. Every level past that costs seam and buys nothing. So the chain simply stops there --
-    // a 128 texture keeps one level, a 512 keeps three, and the deepest levels, which are the ones that
-    // draw the line, are never selected.
-    //
-    // WRAP and MIRROR are left alone: those tile by construction, their edges meet their own opposite edge
-    // at every level, and there is no seam to guard against.
-    if (mips && (((cms & G_TX_CLAMP) != 0) || ((cmt & G_TX_CLAMP) != 0))) {
-        const uint32_t shortSide = texture_data->width < texture_data->height ? texture_data->width
-                                                                             : texture_data->height;
-        // Guarded because this runs once per texture before the upload has filled the dimensions in, and
-        // log2 of nothing is not a level count. That call only sets defaults; the real one comes after.
-        if (shortSide >= GFX_MIPMAP_MIN_TEXTURE_SIZE) {
-            const float levels = std::floor(std::log2((float)shortSide / 64.0f));
-            sampler_desc.MaxLOD = levels > 0.0f ? levels : 0.0f;
-        }
-    }
-
     texture_data->linear_filtering = linear_filter;
 
     // This function is called twice per texture, the first one only to set default values.

@@ -2547,7 +2547,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // SOH [Enhancement] The interface reads its textures at full size (see SetTextureLodClamp). The same
     // projection test the shadow receiver uses, and for the same reason: it catches every screen-space draw
     // at once rather than naming them, and a texrect is only some of them.
-    const int8_t lodClamped = (screenSpaceProjection || is_rect) ? 1 : 0;
+    // ...and the sky says so outright, because no render state can express it (see
+    // texture_lod_clamp_forced).
+    const int8_t lodClamped = (screenSpaceProjection || is_rect || mRdp->texture_lod_clamp_forced) ? 1 : 0;
     if (lodClamped != mRenderingState.texture_lod_clamped) {
         Flush();
         mRapi->SetTextureLodClamp(lodClamped != 0);
@@ -6476,6 +6478,16 @@ bool gfx_set_toon_shadow_handler_custom(F3DGfx** cmd0) {
         // otherwise swallow both of these.
         // Tested before everything else: it is a veto, and the values sit past the rest of the range so the
         // chain below never has to make room for them.
+        // Furthest down the range, for the same reason the veto is: these have nothing to do with shadows
+        // and sit past the rest so the chain below never has to make room for them.
+        if (sizeOrSentinel <= -9.5e30f) {
+            gfx->mRdp->texture_lod_clamp_forced = false; // gSPTextureLodClampOff
+            return false;
+        }
+        if (sizeOrSentinel <= -8.5e30f) {
+            gfx->mRdp->texture_lod_clamp_forced = true; // gSPTextureLodClampOn
+            return false;
+        }
         if (sizeOrSentinel <= -7.5e30f) {
             gfx->mRdp->shadow_no_cast = true; // gSPShadowMapCasterOff
             return false;

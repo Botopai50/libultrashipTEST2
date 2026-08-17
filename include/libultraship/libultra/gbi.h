@@ -2897,6 +2897,21 @@ typedef union Gfx {
 // automatic for anything with a world position, which is right for the room and for actors but wrong for
 // the sky: a skybox is real 3D geometry, so it was being projected into the cascades and coming back with
 // dark streaks smeared across it, and the sun and moon the same.
+// SOH [Enhancement] Mipmapping: bracket draws that must read their textures at full size, ignoring the mip
+// chain. The renderer does this automatically for the interface, which it recognises by its projection
+// having no perspective term -- a test that cannot reach the sky, because the sky IS drawn in perspective.
+//
+// The sky needs it because its faces are separate textures laid edge to edge. At level 0 the two sides of a
+// join disagree by less than a texel and nothing sees it; level N averages 2^N texels and each side averages
+// only its own, so the disagreement widens with the level until it reads as a drawn line along every join.
+// Padding each texture with its neighbour's edge would be the general cure and is not reachable: those
+// texels live in another texture and nothing at upload time knows which. Nothing in the render state says
+// "this quad continues into the next texture" either. The game knows, so the game says so.
+//
+// Same opcode and sentinel range as the shadow markers, past the end of them.
+#define gSPTextureLodClampOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -9.0e30f)
+#define gSPTextureLodClampOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -10.0e30f)
+
 #define gSPShadowMapReceiveOff(pkt) gSPToonShadow(pkt, 0, 0, 0, -4.0e30f)
 #define gSPShadowMapReceiveOn(pkt) gSPToonShadow(pkt, 0, 0, 0, -5.0e30f)
 

@@ -400,6 +400,19 @@ struct RDP {
     // them, for geometry whose exclusion is not a render-state question -- effects, which are light drawn as
     // polygons and declare whatever mode suited the artist.
     bool shadow_no_cast;
+    // SOH [Enhancement] Mipmapping: the current draws read their textures at full size, whatever the mip
+    // chain says.
+    //
+    // The automatic rule is a projection test -- a draw with no perspective term is the interface, and the
+    // interface must read exactly the pixels it read before mipmapping existed. That rule catches the HUD
+    // and cannot catch the sky, which is real 3D geometry drawn in perspective.
+    //
+    // The sky needs it for a different reason. Its faces are separate textures laid edge to edge, and at
+    // level 0 the two sides of a join disagree by less than a texel. Level N averages 2^N texels and each
+    // side averages only its own, so the disagreement grows until it is a band wide enough to read as a
+    // drawn line -- three of them meeting overhead, along the joins. Nothing in the render state says "this
+    // quad continues into the next texture"; only the game knows, and it says so with the bracket.
+    bool texture_lod_clamp_forced;
     ShaderMod current_shader;
 
     uint8_t prim_lod_fraction;
