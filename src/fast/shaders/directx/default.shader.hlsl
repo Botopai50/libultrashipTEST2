@@ -150,6 +150,7 @@ cbuffer PerShadowCB : register(b3) {
     //     6 receiver-plane gradient magnitude, red where the clamp bound
     //     7 cascade index, red/green/blue from nearest to furthest
     //     8 edge hardness after the incidence taper, red = hard, green = soft
+    //     9 the PCF kernel's effective reach in texels, red = zero (the filter is doing nothing)
     // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
     //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
     float4 shadow_filter;
@@ -651,13 +652,15 @@ uint ShadowCascadeIndex(float viewDepth) {
 // the clamp inside ShadowPlaneGradient binding -- and a clamp that binds on some triangles of a mesh and
 // not on others is one of the ways a triangular artefact gets drawn.
 float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride, bool wantActors,
-                       out float2 gradOut) {
+                       out float3 gradOut) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     // gradOut is pre-initialized for the same reason, and because an out parameter the compiler cannot
     // prove is assigned on every path draws the "potentially uninitialized" warning ShadowSplitAt documents.
     float2 lit = float2(1.0, 1.0);
-    gradOut = float2(0.0, 0.0);
+    // z is the kernel scale, which is 1 wherever nothing has narrowed the filter -- the same value a pixel
+    // that never reaches a cascade would have used.
+    gradOut = float3(0.0, 0.0, 1.0);
     uint count = (uint)shadow_params.x;
     if (count > 0) {
         uint cascade = ShadowCascadeIndex(viewDepth);
@@ -683,7 +686,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // xy is the bounded gradient, z the kernel scale its bound left behind (1 unless the soft falloff
         // is on and the gradient overshot). Both travel together into every projection this pixel makes.
         float3 grad = ShadowPlaneGradient(sample, lightX, lightY, lightAxis);
-        gradOut = grad.xy;
+        gradOut = grad;
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -1136,7 +1139,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // them -- while the projection the two layers share is built once either way.
         // shadowGrad is the receiver-plane gradient, kept for debug mode 6. It costs nothing to carry:
         // ShadowLitLayers computes it on the way to every comparison regardless.
-        float2 shadowGrad;
+        float3 shadowGrad;
         float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x,
                                               input.worldPos.w > 0.5, shadowGrad);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
@@ -1231,6 +1234,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //     clamp that binds on some triangles of a mesh and not on others is another way to draw one.
         //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
         //     mesh artefact at all.
+        //   9 when a knob that should have mattered did not. Red means the kernel has no reach, which makes
+        //     the whole plane-bias path inert AND exposes the map's texel staircase directly -- one cause
+        //     for both halves of that puzzle.
         //
         // None of these is a shipping path: each replaces the shaded colour outright. `[branch]` because the
         // mode is a uniform, so a build with the channel off pays one jump and none of the arithmetic.
@@ -1272,16 +1278,37 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // red renders a clamped pixel yellow, because a clamped magnitude is by definition the top of
             // the ramp -- so the flag was invisible as a colour of its own, which is the one thing this view
             // exists to show. Green ramps only while the clamp is off; once it binds the pixel is pure red.
+            // Measured against the LIVE bound, not against the 3.2 it used to be a literal. Reading the
+            // constant here would have made this view lie the moment the bound was swept -- it would still
+            // have drawn the old threshold, and the sweep is the whole reason the bound became settable.
+            float shadowGradLimit = max(shadow_plane.x, 1e-4);
             float shadowGradMax = max(abs(shadowGrad.x), abs(shadowGrad.y));
-            bool shadowGradClamped = shadowGradMax >= 3.2 - 1e-3;
+            bool shadowGradClamped = shadowGradMax >= shadowGradLimit - (shadowGradLimit * 1e-3);
             texel.rgb = shadowGradClamped ? float3(1.0, 0.0, 0.0)
-                                          : float3(0.0, saturate(shadowGradMax / 3.2), 0.0);
+                                          : float3(0.0, saturate(shadowGradMax / shadowGradLimit), 0.0);
         } else if (shadowDebugMode == 7) {
             // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands
             // read as the primary cascade's colour, since that is the one the picture is keyed to.
             uint shadowDebugCascade = ShadowCascadeIndex(input.position.w);
             texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
                                shadowDebugCascade == 2 ? 1.0 : 0.0);
+        } else if (shadowDebugMode == 9) {
+            // How far the PCF kernel actually reaches, in texels: the configured filter width, times
+            // whatever the plane bound's taper left of it. GREEN ramps with it; RED means ZERO.
+            //
+            // This view exists because a null result needed explaining. Sweeping the plane-gradient bound
+            // changed nothing, and one thing makes every knob on that path inert at once: a kernel with no
+            // reach. At zero the sixteen taps collapse onto one bilinear tap, which softens WITHIN a texel
+            // and does nothing about the staircase BETWEEN texels -- so the map's texel grid is drawn
+            // straight to the screen, and a staircase crossed at an angle is a row of teeth.
+            //
+            // It also makes the receiver-plane correction meaningless: that term exists to reconcile taps
+            // that sit apart, and taps that sit together have nothing to reconcile. Which is exactly why
+            // moving its bound did nothing, and why narrowing an already-collapsed kernel did nothing.
+            //
+            // Red here and the answer is the filter width, not any bias in this file.
+            float shadowReach = min(shadow_filter.x, 1.0) * shadowGrad.z;
+            texel.rgb = shadowReach <= 1e-4 ? float3(1.0, 0.0, 0.0) : float3(0.0, saturate(shadowReach), 0.0);
         } else if (shadowDebugMode == 8) {
             // Edge hardness after the incidence taper: RED fully hard, GREEN fully soft. The taper reads the
             // normal, so this is where a per-triangle normal turns into a per-triangle shadow edge.

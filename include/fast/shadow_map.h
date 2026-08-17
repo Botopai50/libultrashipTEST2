@@ -543,8 +543,9 @@
 //   6  the receiver-plane gradient, and where its clamp binds       (input)
 //   7  the cascade each pixel sampled                               (input)
 //   8  the edge hardness after the incidence taper                  (input)
+//   9  the PCF kernel's effective reach, red where it is zero       (input)
 // The shader's PSMain carries the reading order -- which view to check first, and what each answer rules
 // out. Keep this bound in step with the arms implemented there.
-#define SHADOW_MAP_MAX_DEBUG_VIEW 8
+#define SHADOW_MAP_MAX_DEBUG_VIEW 9
 
 #endif // FAST_SHADOW_MAP_H
