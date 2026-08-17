@@ -71,6 +71,9 @@ struct PerShadowCB {
     // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
     // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
     float shadow_actor_texel_uv[4];
+    // x = the receiver-plane gradient's bound, y = 1 to narrow the kernel by the overshoot instead of only
+    // truncating the gradient, z and w unused. See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT.
+    float shadow_plane[4];
 };
 
 struct PerDrawCB {

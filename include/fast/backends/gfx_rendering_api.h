@@ -325,6 +325,21 @@ class GfxRenderingAPI {
         mShadowMinHardnessScale = minHardnessScale;
     }
 
+    // The receiver-plane gradient's bound, and whether overshooting it narrows the filter kernel as well as
+    // truncating the gradient. Its own entry point for the same reason the incidence band has one: nothing
+    // in the cascade fit reads either, they only ever reach the receiver's shader.
+    //
+    // See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT for what the bound is and why it is settable at all --
+    // short version, it is the last suspect standing for the faceted banding and a suspect that needs a
+    // rebuild per trial never gets tested.
+    virtual void SetShadowMapPlaneBias(float gradientLimit, bool softFalloff) {
+        // A bound at or below zero would kill the plane correction outright and, with the falloff on, divide
+        // the kernel away with it. Held off zero rather than rejected: sweeping it down to nothing is a
+        // legitimate half of the experiment, and the floor only stops it reaching the degenerate case.
+        mShadowPlaneGradientLimit = gradientLimit < 0.01f ? 0.01f : gradientLimit;
+        mShadowPlaneSoftFalloff = softFalloff;
+    }
+
     // SOH [Enhancement] Turns the shadow map's GPU timing on WITHOUT the cascade-bounds debug view.
     //
     // The two used to be the same switch, which made the pass impossible to measure honestly: the debug
@@ -414,6 +429,8 @@ class GfxRenderingAPI {
     float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
+    float mShadowPlaneGradientLimit = SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT;
+    bool mShadowPlaneSoftFalloff = SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF != 0;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
     int8_t mCurrentDepthTest = 0;

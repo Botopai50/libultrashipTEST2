@@ -486,6 +486,43 @@
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
 
+// Bound on the receiver-plane gradient, in the cascade's own normalised units.
+//
+// The gradient is how fast the receiver's depth moves per unit of shadow-map uv, and the PCF kernel uses it
+// to compare each tap against the receiver's own plane AT that tap rather than at the kernel's centre. It
+// has to be bounded: at a silhouette the pixel quad straddles two surfaces, the derivative it is recovered
+// from means nothing, and an unbounded correction there punches a hole straight through the shadow.
+//
+// 3.2 is where that bound has always sat. A surface at forty-five degrees to the light has a gradient of
+// 2/5 by construction -- the cascade's radius cancels between the uv scale and the depth scale -- so 3.2 is
+// eight times that, about eighty-three degrees, past which a receiver is edge-on enough that the constant
+// and normal-offset terms are the right tools.
+//
+// Settable because it is a SUSPECT, not because it wants tuning. The diagnostic views put the shape-wrong
+// artefact upstream of the threshold (the hardening is off) and upstream of the normal (every receiver has
+// a vertex normal), and the gradient view then showed this bound binding on exactly the faces that carry
+// the banding. That is correlation; sweeping the bound live is what turns it into cause or clears it.
+#define SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT 3.2f
+
+// Whether exceeding that bound also narrows the filter kernel. 0 keeps the old behaviour exactly.
+//
+// Truncating the gradient does not make the correction safe, it makes it WRONG in a specific way: the taps
+// then compare against a plane flatter than the surface they sit on, and the error grows with how far out
+// the tap is. So the kernel's outer taps disagree with its centre and the disagreement reads as banded
+// self-shadowing -- which is acne manufactured by the very term that exists to prevent it.
+//
+// The error is the product of two things, the kernel's reach and how far the gradient overshoots. The
+// correction cannot fix the second, so this shrinks the first by exactly the overshoot: the kernel is
+// scaled by limit/gradient once past the limit, which holds that product at the value it had AT the limit.
+// Bounded error instead of a truncated plane, and continuous in the gradient rather than switching
+// behaviour at a threshold -- which matters because a threshold on a per-face quantity is what draws a
+// mesh's own faces onto the screen.
+//
+// What it costs is filter width on steeply inclined surfaces: as the gradient runs away the kernel collapses
+// towards a single bilinear tap, so those surfaces get a harder shadow edge. They also receive almost no
+// light, which is the same reason the incidence band gave for easing off there.
+#define SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF 0
+
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //
