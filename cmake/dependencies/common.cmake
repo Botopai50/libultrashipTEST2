@@ -52,7 +52,37 @@ endif()
 
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
-file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+# Checked, because an unchecked download here fails in a way that costs an hour to read back to.
+#
+# file(DOWNLOAD) without STATUS reports nothing: a refused, rate-limited or redirected request leaves a
+# short file where the header should be, configuration continues, and every #include <stb_image.h> still
+# resolves. The build then dies minutes later on "'stbi_image_free' was not declared in this scope" -- in a
+# file that has included the header all along, which sends you looking anywhere but here.
+#
+# It also hides behind ccache. A translation unit that hits the cache never opens the header, so a bad
+# download surfaces only in whichever files happen to miss, and the same tree builds or does not depending
+# on what the cache holds. That is how this arrived: one file missed and the rest did not.
+#
+# The size test is the part that matters. An HTTP error page arrives with status 0 and is perfectly
+# downloaded -- status alone would pass it. stb_image.h is around 280 KB, so anything under 100 KB is not
+# the header whatever the transfer said.
+file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h"
+     "${STB_DIR}/stb_image.h" STATUS STB_DOWNLOAD_STATUS TLS_VERIFY ON)
+list(GET STB_DOWNLOAD_STATUS 0 STB_DOWNLOAD_CODE)
+list(GET STB_DOWNLOAD_STATUS 1 STB_DOWNLOAD_MESSAGE)
+if(NOT STB_DOWNLOAD_CODE EQUAL 0)
+    # Removed on the way out for the same reason as below: a failed transfer still leaves a file, and a
+    # leftover empty one would satisfy every #include on the next configure.
+    file(REMOVE "${STB_DIR}/stb_image.h")
+    message(FATAL_ERROR "Could not download stb_image.h: ${STB_DOWNLOAD_MESSAGE}")
+endif()
+file(SIZE "${STB_DIR}/stb_image.h" STB_HEADER_SIZE)
+if(STB_HEADER_SIZE LESS 100000)
+    file(REMOVE "${STB_DIR}/stb_image.h")
+    message(FATAL_ERROR
+        "stb_image.h downloaded but is only ${STB_HEADER_SIZE} bytes -- the request returned something "
+        "other than the header (an error or redirect page). Removed it so the next configure retries.")
+endif()
 file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
 
 add_library(stb STATIC)
