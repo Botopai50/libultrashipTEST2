@@ -156,6 +156,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Builds the FXAA pipeline on first use and answers whether it is usable. Compiled here rather than with
     // the combiner shaders because it shares nothing with them: no prism options, one variant forever.
     bool EnsureFxaaPipeline();
+    // SOH [Enhancement] The shadow-map viewer's pipeline and its draw. Both answer false / do nothing when
+    // there is no shadow map yet or the pipeline could not be built, so a failure here costs the overlay
+    // and never the frame.
+    bool EnsureShadowMapViewPipeline();
+    void DrawShadowMapView();
     // Picks between a texture's full and top-level-only samplers for the current draw.
     const Microsoft::WRL::ComPtr<ID3D11SamplerState>& SamplerFor(uint32_t textureId);
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
@@ -249,6 +254,21 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // the arrangement that existed before the layers could be sized apart.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowActorTexture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowActorSrv;
+    // SOH [Enhancement] The shadow-map viewer: a corner overlay that draws one slice of the depth array to
+    // the screen. Its own tiny pipeline, compiled once on first use and never through prism, exactly like
+    // the FXAA pass -- it shares nothing with the combiner shaders and has one variant forever.
+    //
+    // It exists because every other diagnostic in this renderer looks at the RECEIVER. Nine debug views ask
+    // what the shading pixel was given; none of them shows what the depth pass actually stored, and a
+    // shadow artefact can live in either half. This is the other half.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowViewVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowViewPs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowViewCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowViewSampler;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowViewDepthStencilState;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mShadowViewBlendState;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowViewRasterizerState;
+    bool mShadowViewFailed = false;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowMapSampler;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowDepthVs;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowDepthLayout;

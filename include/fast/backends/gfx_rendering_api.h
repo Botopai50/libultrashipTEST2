@@ -361,6 +361,18 @@ class GfxRenderingAPI {
         mShadowProfile = enabled;
     }
 
+    // SOH [Enhancement] Which slice of the cascade array to draw as a corner overlay; 0 is off.
+    //
+    // Separate from the receiver's debug views, and not because it is tidier: those nine ask what the
+    // SHADING pixel was given, and this one shows what the depth pass STORED. An artefact can live in
+    // either half, and until this existed only one half could be looked at.
+    //
+    // 1..N are the world layer's cascades in order and the rest are the actor layer's; the backend knows
+    // the split, since the actor layer can be shorter. Backends without a depth pass ignore it.
+    void SetShadowMapViewSlice(int slice) {
+        mShadowViewSlice = slice < 0 ? 0 : slice;
+    }
+
     // Readable so the interpreter can put its own once-a-second shadow census behind the same switch. The
     // backend times the pass; only the interpreter knows what went into it, and the two answer halves of the
     // same question.
@@ -440,6 +452,7 @@ class GfxRenderingAPI {
     int mShadowMaxAnisoTaps = SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS;
     bool mShadowEdgeScreenWidth = SHADOW_MAP_DEFAULT_EDGE_SCREEN_WIDTH != 0;
     float mShadowAnisoSpacing = SHADOW_MAP_DEFAULT_ANISO_SPACING;
+    int mShadowViewSlice = 0;
     bool mShadowPlaneSoftFalloff = SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF != 0;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;

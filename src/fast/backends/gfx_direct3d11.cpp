@@ -145,6 +145,54 @@ bool sShadowGather = false;
 //
 // Kept as a source string here rather than in the shader template because it shares nothing with it: no
 // combiner, no prism options, one variant forever.
+// SOH [Enhancement] The shadow-map viewer. Draws one slice of the cascade array into a corner of the screen.
+//
+// Every other diagnostic this renderer has looks at the RECEIVER -- what the shading pixel was handed. None
+// of them shows what the depth pass STORED, and a shadow artefact can live in either half. When receiver-side
+// reasoning stops making progress, this is the half left to look at.
+//
+// Depth is remapped rather than shown raw. A cascade's stored values crowd into a narrow band near the near
+// plane, so drawn directly the whole slice is one flat shade and reveals nothing; the range is stretched
+// around whatever this slice actually contains. Cleared texels (nothing was drawn there) come out BLUE so an
+// empty slice cannot be mistaken for a dark one, which is exactly the confusion that makes a missing caster
+// look like a present one.
+static const char kShadowMapViewShader[] = R"HLSL(
+Texture2DArray<float> t_shadow : register(t0);
+SamplerState s_shadow : register(s0);
+
+cbuffer ShadowViewCB : register(b0) {
+    float slice;      // which slice of the array to draw
+    float depth_lo;   // stretch the visible range: everything at or below this is black
+    float depth_hi;   // ...and at or above this is white
+    float view_pad;
+};
+
+struct VOut {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+// The same vertex-id triangle the FXAA pass uses; the viewport is what confines it to a corner.
+VOut VSMain(uint id : SV_VertexID) {
+    VOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4((uv * float2(2.0, -2.0)) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+float4 PSMain(VOut i) : SV_TARGET {
+    float d = t_shadow.SampleLevel(s_shadow, float3(i.uv, slice), 0);
+    // A texel at the far plane was never written by any caster. Blue, so "nothing here" reads differently
+    // from "something far away" -- the two are the same number and mean opposite things.
+    if (d >= 0.99999) {
+        return float4(0.05, 0.10, 0.45, 1.0);
+    }
+    float t = saturate((d - depth_lo) / max(depth_hi - depth_lo, 1e-6));
+    return float4(t, t, t, 1.0);
+}
+)HLSL";
+
 static const char kFxaaShader[] = R"HLSL(
 Texture2D t_src : register(t0);
 SamplerState s_src : register(s0);
@@ -1497,6 +1545,10 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    // Drawn here because here is where the scene is finished and its target is still bound. Anywhere inside
+    // the frame would be drawing into a picture that later passes overwrite, and anywhere later would mean
+    // this pass having to know which framebuffer is the final one -- which it has no business knowing.
+    DrawShadowMapView();
     ShadowTimerFrameEnd();
     mContext->Flush();
 }
@@ -1713,6 +1765,187 @@ bool GfxRenderingAPIDX11::EnsureFxaaPipeline() {
     mFxaaFailed = false;
     SPDLOG_INFO("FXAA: post-process pass ready.");
     return true;
+}
+
+bool GfxRenderingAPIDX11::EnsureShadowMapViewPipeline() {
+    if (mShadowViewPs != nullptr) {
+        return true;
+    }
+    if (mShadowViewFailed || mD3dCompile == nullptr || mDevice == nullptr) {
+        return false;
+    }
+    // Latched up front, like the FXAA pass: a driver that cannot build this is asked once, not once a frame.
+    mShadowViewFailed = true;
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob, err;
+    UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    if (FAILED(mD3dCompile(kShadowMapViewShader, sizeof(kShadowMapViewShader) - 1, nullptr, nullptr, nullptr, "VSMain",
+                           "vs_4_0", flags, 0, vs_blob.GetAddressOf(), err.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map view: vertex shader failed to compile: {}",
+                     err != nullptr ? (const char*)err->GetBufferPointer() : "no message");
+        return false;
+    }
+    err.Reset();
+    if (FAILED(mD3dCompile(kShadowMapViewShader, sizeof(kShadowMapViewShader) - 1, nullptr, nullptr, nullptr, "PSMain",
+                           "ps_4_0", flags, 0, ps_blob.GetAddressOf(), err.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map view: pixel shader failed to compile: {}",
+                     err != nullptr ? (const char*)err->GetBufferPointer() : "no message");
+        return false;
+    }
+    if (FAILED(mDevice->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr,
+                                           mShadowViewVs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr,
+                                          mShadowViewPs.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map view: could not create the shaders.");
+        return false;
+    }
+
+    // Point sampling, deliberately. The whole purpose is to see what is IN the map, and a bilinear filter
+    // would blend neighbouring texels into a picture the depth comparison never sees.
+    D3D11_SAMPLER_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(mDevice->CreateSamplerState(&sd, mShadowViewSampler.GetAddressOf()))) {
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd;
+    ZeroMemory(&cbd, sizeof(cbd));
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.ByteWidth = 16;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(mDevice->CreateBuffer(&cbd, nullptr, mShadowViewCb.GetAddressOf()))) {
+        return false;
+    }
+
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    ZeroMemory(&dsd, sizeof(dsd));
+    dsd.DepthEnable = false;
+    dsd.StencilEnable = false;
+    if (FAILED(mDevice->CreateDepthStencilState(&dsd, mShadowViewDepthStencilState.GetAddressOf()))) {
+        return false;
+    }
+    D3D11_BLEND_DESC bd;
+    ZeroMemory(&bd, sizeof(bd));
+    bd.RenderTarget[0].BlendEnable = false;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(mDevice->CreateBlendState(&bd, mShadowViewBlendState.GetAddressOf()))) {
+        return false;
+    }
+    D3D11_RASTERIZER_DESC rd;
+    ZeroMemory(&rd, sizeof(rd));
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = false;
+    if (FAILED(mDevice->CreateRasterizerState(&rd, mShadowViewRasterizerState.GetAddressOf()))) {
+        return false;
+    }
+
+    mShadowViewFailed = false;
+    SPDLOG_INFO("Shadow map view: overlay ready.");
+    return true;
+}
+
+void GfxRenderingAPIDX11::DrawShadowMapView() {
+    const int slice = mShadowViewSlice;
+    if (slice <= 0 || mShadowMapSrv == nullptr || mContext == nullptr) {
+        return;
+    }
+    // The array holds the world layer's cascades first and then the actor layer's, and the actor layer is
+    // the shorter one -- so the count is not a product. Asking for a slice past the end would sample
+    // whatever the clamp lands on and show a picture that is not there.
+    const int worldSlices = mShadowCascadesActive;
+    const int actorSlices = SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowCascadesActive);
+    const int totalSlices = worldSlices + actorSlices;
+    const int index = slice - 1; // the setting is 1-based so that 0 can mean off
+    if (index >= totalSlices) {
+        return;
+    }
+    if (!EnsureShadowMapViewPipeline()) {
+        return;
+    }
+
+    // Whatever is bound right now, which at this point in the frame is the scene's target. Taken from the
+    // context rather than from a framebuffer id because this pass has no business knowing which id that is,
+    // and it is put back before returning.
+    ComPtr<ID3D11RenderTargetView> prev_rtv;
+    ComPtr<ID3D11DepthStencilView> prev_dsv;
+    mContext->OMGetRenderTargets(1, prev_rtv.GetAddressOf(), prev_dsv.GetAddressOf());
+    if (prev_rtv == nullptr) {
+        return;
+    }
+    UINT prev_vp_count = 1;
+    D3D11_VIEWPORT prev_vp;
+    mContext->RSGetViewports(&prev_vp_count, &prev_vp);
+    if (prev_vp_count == 0) {
+        return;
+    }
+
+    // The actor layer may live in its own texture when the two resolutions differ; when they match it is
+    // null and both halves are slices of the one array.
+    const bool isActorHalf = index >= worldSlices;
+    ID3D11ShaderResourceView* srv = mShadowMapSrv.Get();
+    float sliceIndex = (float)index;
+    if (isActorHalf && mShadowActorSrv != nullptr) {
+        srv = mShadowActorSrv.Get();
+        sliceIndex = (float)(index - worldSlices);
+    }
+
+    // The stretch. A cascade's depths crowd near its near plane, so the raw range is nearly flat on screen
+    // and shows nothing; this opens it up around where the values actually sit. Fixed rather than measured
+    // because measuring would need a readback, and a readback here would stall the frame being looked at.
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(mContext->Map(mShadowViewCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return;
+    }
+    float* cb = (float*)ms.pData;
+    cb[0] = sliceIndex;
+    cb[1] = 0.0f;
+    cb[2] = 0.25f;
+    cb[3] = 0.0f;
+    mContext->Unmap(mShadowViewCb.Get(), 0);
+
+    // A quarter of the shorter screen edge, in the bottom-left corner, kept square so the map's own aspect
+    // is not distorted -- a stretched depth map hides exactly the kind of directional structure this is for.
+    const float side = (prev_vp.Width < prev_vp.Height ? prev_vp.Width : prev_vp.Height) * 0.25f;
+    D3D11_VIEWPORT vp;
+    vp.TopLeftX = prev_vp.TopLeftX + 8.0f;
+    vp.TopLeftY = prev_vp.TopLeftY + prev_vp.Height - side - 8.0f;
+    vp.Width = side;
+    vp.Height = side;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+
+    mContext->OMSetRenderTargets(1, prev_rtv.GetAddressOf(), nullptr);
+    mContext->OMSetDepthStencilState(mShadowViewDepthStencilState.Get(), 0);
+    mContext->OMSetBlendState(mShadowViewBlendState.Get(), nullptr, 0xFFFFFFFF);
+    mContext->RSSetState(mShadowViewRasterizerState.Get());
+    mContext->RSSetViewports(1, &vp);
+    mContext->IASetInputLayout(nullptr);
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->VSSetShader(mShadowViewVs.Get(), nullptr, 0);
+    mContext->PSSetShader(mShadowViewPs.Get(), nullptr, 0);
+    mContext->PSSetConstantBuffers(0, 1, mShadowViewCb.GetAddressOf());
+    mContext->PSSetShaderResources(0, 1, &srv);
+    mContext->PSSetSamplers(0, 1, mShadowViewSampler.GetAddressOf());
+    mContext->Draw(3, 0);
+
+    // Unbind, or the next pass that wants to WRITE this array finds it still bound as input and the runtime
+    // drops the binding with a warning.
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    mContext->PSSetShaderResources(0, 1, &null_srv);
+    mContext->OMSetRenderTargets(1, prev_rtv.GetAddressOf(), prev_dsv.Get());
+    mContext->RSSetViewports(1, &prev_vp);
+
+    // Same caches the FXAA pass invalidates, for the same reason: the per-draw path skips a rebind when it
+    // believes a slot already holds what it wants, and this pass has just made that belief wrong.
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        mLastSamplerStates[i] = nullptr;
+    }
+    mLastResourceViews[0] = nullptr;
 }
 
 bool GfxRenderingAPIDX11::ApplyFxaa(int fb_dst_id, int fb_src_id) {
