@@ -2960,7 +2960,7 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mPerShadowCbData.shadow_plane[0] = mShadowPlaneGradientLimit;
     mPerShadowCbData.shadow_plane[1] = mShadowPlaneSoftFalloff ? 1.0f : 0.0f;
     mPerShadowCbData.shadow_plane[2] = (float)mShadowMaxAnisoTaps;
-    mPerShadowCbData.shadow_plane[3] = 0.0f;
+    mPerShadowCbData.shadow_plane[3] = mShadowEdgeScreenWidth ? 1.0f : 0.0f;
     for (int i = 0; i < 3; i++) {
         mPerShadowCbData.shadow_actor_min[i] = mShadowActorBoundsMin[i];
         mPerShadowCbData.shadow_actor_max[i] = mShadowActorBoundsMax[i];

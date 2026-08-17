@@ -181,7 +181,7 @@ cbuffer PerShadowCB : register(b3) {
     //   y = 1 to also narrow the kernel by the overshoot, 0 to truncate the gradient and nothing else
     //   z = most bilinear quads the kernel may lay along the receding direction; 1 disables the anisotropic
     //       path entirely and every pixel takes the square kernel it always took
-    //   w = unused
+    //   w = 1 to measure the hard edge's ramp in screen pixels rather than in coverage
     // In the constant buffer rather than as literals so the bound can be swept while the game runs: it is
     // the last suspect standing for the faceted banding, and a suspect that needs a rebuild per trial is a
     // suspect that never gets tested.
@@ -1261,7 +1261,26 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // that gradient into an edge. This must come after the taper -- it is the only reader of
         // shadowHardness on the shipping path, so anything written to it below this point would be
         // discarded by the compiler. (Debug mode 8 reads it too, but only inside a branch on a uniform.)
-        float shadowBand = lerp(0.5, 0.03, shadowHardness);
+        // Width of the ramp the coverage is remapped through -- and the units it is measured in are the
+        // whole question for a cel edge.
+        //
+        // 0.03 is in COVERAGE, which is not what an eye reads. How many screen pixels that ramp spans
+        // depends on how fast coverage happens to change across the surface, and that varies enormously: on
+        // a floor square to the light it can be a fraction of a pixel, which aliases into a jagged line,
+        // while on a wall raking away from the light the same 0.03 is spread over many pixels and reads as
+        // a soft smudge on what was asked to be a hard edge. One number cannot be right for both, because
+        // it is not measuring the thing that matters.
+        //
+        // fwidth(coverage) is how much coverage moves per screen pixel, so dividing into it puts the band in
+        // SCREEN units instead: about three quarters of a pixel of ramp everywhere, whatever the surface is
+        // doing. That is a hard edge carrying exactly enough antialiasing to not crawl, and it is the same
+        // width on the floor and on the wall.
+        //
+        // Computed unconditionally: fwidth is a gradient instruction and may not sit in varying control
+        // flow, the same constraint the recovered normal above is written around.
+        float shadowCoverageSlope = fwidth(shadowCoverage);
+        float shadowBandHard = shadow_plane.w > 0.5 ? max(shadowCoverageSlope * 0.75, 1e-5) : 0.03;
+        float shadowBand = lerp(0.5, shadowBandHard, shadowHardness);
         float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
         shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world

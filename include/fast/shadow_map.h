@@ -551,6 +551,22 @@
 // resolution sweep, which is what would prove it.
 #define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 1
 
+// Whether the hard edge's ramp is measured in screen pixels instead of in coverage. 0 keeps the old
+// behaviour exactly.
+//
+// The hardening remaps coverage through a narrow ramp centred on half, and that ramp has always been 0.03
+// wide in COVERAGE. Coverage is not what an eye reads, though, and how many screen pixels 0.03 spans
+// depends entirely on how fast coverage moves across the surface. On a floor square to the light that can
+// be a fraction of a pixel, which aliases into a crawling jagged line; on a wall raking away from it the
+// same number spreads over many pixels and reads as a smudge on an edge that was asked to be hard. One
+// constant cannot serve both, because it is not measuring the quantity that decides the look.
+//
+// fwidth(coverage) is coverage per screen pixel, so the ramp becomes about three quarters of a pixel
+// everywhere: a hard edge carrying just enough antialiasing not to crawl, identical on the floor and on the
+// wall. For a cel-shaded look this is the difference between an edge that is CRISP and one that is merely
+// narrow.
+#define SHADOW_MAP_DEFAULT_EDGE_SCREEN_WIDTH 0
+
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //
