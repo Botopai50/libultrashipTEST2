@@ -499,7 +499,8 @@ class Interpreter {
                             float filterWidth, float minCasterSize, float debugMode, float edgeHardness,
                             float edgeHardnessFar, float minIncidence, float fullIncidence, float minHardnessScale,
                             float depthBiasWorld, float slopeBias, float planeGradientLimit, bool planeSoftFalloff,
-                            int maxAnisoTaps, bool edgeScreenWidth) {
+                            int maxAnisoTaps, bool edgeScreenWidth,
+                            float anisoSpacing) {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
@@ -544,7 +545,8 @@ class Interpreter {
         if (mRapi != nullptr) {
             mRapi->SetShadowMapIncidence(minIncidence, fullIncidence, minHardnessScale);
             mRapi->SetShadowMapBias(depthBiasWorld, slopeBias);
-            mRapi->SetShadowMapPlaneBias(planeGradientLimit, planeSoftFalloff, maxAnisoTaps, edgeScreenWidth);
+            mRapi->SetShadowMapPlaneBias(planeGradientLimit, planeSoftFalloff, maxAnisoTaps, edgeScreenWidth,
+                                         anisoSpacing);
         }
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would

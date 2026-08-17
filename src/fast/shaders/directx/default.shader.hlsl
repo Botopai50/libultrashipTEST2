@@ -186,6 +186,12 @@ cbuffer PerShadowCB : register(b3) {
     // the last suspect standing for the faceted banding, and a suspect that needs a rebuild per trial is a
     // suspect that never gets tested.
     float4 shadow_plane;
+    // x = spacing between the anisotropic kernel's quads, in texels. y, z, w reserved.
+    //
+    // Its own register rather than riding in a spare component of something else: it is not a plane-bias
+    // value and has nothing to do with the four beside it, and a number parked where it does not belong is
+    // how a constant buffer becomes unreadable.
+    float4 shadow_aniso;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -357,7 +363,16 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     for (uint i = 0; i < taps; i++) {
         // Centred on the sample point, so the kernel stays symmetric about the pixel it is shading rather
         // than reaching only one way along the light.
-        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * 2.0;
+        // Two texels puts the quads edge to edge, since each bilinear tap spans a 2x2 footprint -- the
+        // widest spacing that leaves no texel unsampled. It is not the SMOOTHEST, though, and that is the
+        // difference this value exists for: a bilinear tap weights its footprint as a tent, so tents that
+        // merely touch still dip between their centres, and the row reads as a line of separate samples
+        // rather than as one smear. Closing them to a texel overlaps the tents by half and the dip goes.
+        //
+        // What it costs is reach: the row is taps * spacing texels long either way, so halving the spacing
+        // halves the span the same tap count covers. Density and reach trade against each other here, and
+        // more of both is more taps.
+        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * max(shadow_aniso.x, 0.05);
         float2 along = axis * offsetAlong;
         sum += SampleShadowPCF4(uv + along + across, uv, grad, gradTexel, z, slice, texelUv, isActor);
         sum += SampleShadowPCF4(uv + along - across, uv, grad, gradTexel, z, slice, texelUv, isActor);

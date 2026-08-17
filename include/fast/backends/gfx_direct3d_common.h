@@ -75,6 +75,8 @@ struct PerShadowCB {
     // truncating the gradient, z = most quads the kernel may lay along the receding direction (1 = off),
     // w unused. See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT and SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS.
     float shadow_plane[4];
+    // x = spacing between the anisotropic kernel's quads, in texels; y, z, w reserved.
+    float shadow_aniso[4];
 };
 
 struct PerDrawCB {
