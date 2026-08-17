@@ -179,7 +179,9 @@ cbuffer PerShadowCB : register(b3) {
     // The receiver-plane gradient's bound and what happens at it.
     //   x = the bound itself, in the cascade's normalised units (see SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT)
     //   y = 1 to also narrow the kernel by the overshoot, 0 to truncate the gradient and nothing else
-    //   z, w = unused
+    //   z = most bilinear quads the kernel may lay along the receding direction; 1 disables the anisotropic
+    //       path entirely and every pixel takes the square kernel it always took
+    //   w = unused
     // In the constant buffer rather than as literals so the bound can be swept while the game runs: it is
     // the last suspect standing for the faceted banding, and a suspect that needs a rebuild per trial is a
     // suspect that never gets tested.
@@ -307,7 +309,7 @@ float SampleShadowPCF4(float2 uv, float2 uvCentre, float2 grad, float2 gradTexel
 // mostly from the frustum's lateral spread at its far edge, not from how long the slice is, so moving the
 // split only trades the near cascades (already ~36x oversampled) for almost nothing.
 float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texelUv, bool isActor,
-                        float kernelScale) {
+                        float kernelScale, float anisoTaps) {
     // Spacing is a tunable radius in texels, NOT a free parameter: each bilinear tap already spans a 2x2
     // texel quad, so a radius of one texel puts those quads edge to edge and covers 4x4 contiguously, and
     // anything WIDER leaves texels between the quads sampled by nothing -- a regular hole in the kernel,
@@ -319,11 +321,48 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // they share a cascade, so they share its texel -- so it is formed once here rather than four times
     // inside them.
     float2 gradTexel = grad * texelUv;
-    float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
-    sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
-    sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
-    sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
-    return sum * 0.25;
+
+    // The square kernel, unchanged, and the only one built when the anisotropic path is off. `[branch]` on a
+    // value that is uniform across a draw whenever the feature is off, so a build that does not use it pays
+    // one jump and none of the rest.
+    [branch]
+    if (anisoTaps <= 1.0) {
+        float sum = SampleShadowPCF4(uv + float2(-d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+        sum += SampleShadowPCF4(uv + float2(d, -d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+        sum += SampleShadowPCF4(uv + float2(-d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+        sum += SampleShadowPCF4(uv + float2(d, d), uv, grad, gradTexel, z, slice, texelUv, isActor);
+        return sum * 0.25;
+    }
+
+    // Stretched along the direction the receiver recedes from the light, which is the direction the gradient
+    // already points in: grad is depth per unit uv, so it is steepest exactly where the surface runs away
+    // fastest, and that is the axis the map's texel steps are magnified along. Normalising it costs one
+    // rsqrt and needs no extra uniform.
+    //
+    // A row of quads along that axis, two texels apart so they tile it with no gap, and the row is two quads
+    // deep across it -- the perpendicular direction is sampled perfectly well and gets no widening at all.
+    // That asymmetry is the whole point: widening in both directions would smear the edges that are correct
+    // in order to fix the one that is not.
+    //
+    // `[loop]` and not `[unroll]`, for the same reason the layer lookup below is a loop: unrolled, the whole
+    // quad appears once per iteration in the compiled shader, and this file is compiled by FXC inside a
+    // frame the first time each material draws.
+    float mag = length(grad);
+    float2 axis = mag > 1e-6 ? (grad / mag) : float2(1.0, 0.0);
+    float2 perp = float2(-axis.y, axis.x);
+    float2 across = perp * d;
+    uint taps = (uint)anisoTaps;
+    float sum = 0.0;
+    [loop]
+    for (uint i = 0; i < taps; i++) {
+        // Centred on the sample point, so the kernel stays symmetric about the pixel it is shading rather
+        // than reaching only one way along the light.
+        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * 2.0;
+        float2 along = axis * offsetAlong;
+        sum += SampleShadowPCF4(uv + along + across, uv, grad, gradTexel, z, slice, texelUv, isActor);
+        sum += SampleShadowPCF4(uv + along - across, uv, grad, gradTexel, z, slice, texelUv, isActor);
+    }
+    return sum / (2.0 * (float)taps);
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
@@ -373,6 +412,9 @@ struct ShadowProjection {
     // Multiplies the PCF kernel's reach. 1 everywhere unless the plane gradient overshot its bound and the
     // soft falloff is on, in which case it is limit/gradient -- see ShadowPlaneGradient.
     float kernelScale;
+    // How many bilinear quads the kernel lays along the receding direction. 1 is the square kernel, which is
+    // what every pixel gets while the anisotropic path is off.
+    float anisoTaps;
 };
 
 // The direction the light travels, which every cascade shares.
@@ -435,9 +477,10 @@ float3 ShadowNormalOffset(float3 normalWs, float3 lightAxis) {
 // construction -- so the radius cancels and the gradient is a property of the surface and the light, not of
 // the cascade looking at it. Checked numerically against pairs of cascades with independent radii and
 // centres: the two agree to 2e-10 relative, which is the arithmetic's own noise.
-// Returns the gradient in xy and the kernel scale the bound leaves behind in z -- see the note at the
+// Returns the bounded gradient in xy, the kernel scale the bound leaves behind in z, and in w how many
+// bilinear quads the kernel should lay along the direction the receiver recedes -- see the notes at the
 // bottom of the body.
-float3 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
+float4 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
     float3 dpx = ddx(p);
     float3 dpy = ddy(p);
     // The uv and depth derivatives, each missing its cascade's own scale factor: uv carries 0.5/radius and
@@ -477,7 +520,38 @@ float3 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
     if (shadow_plane.y > 0.5 && mag > lim) {
         kernelScale = lim / mag;
     }
-    return float3(clamp(grad, -lim, lim), kernelScale);
+
+    // How many quads the kernel needs along the direction this receiver recedes from the light.
+    //
+    // This is the projective-aliasing term, and it is a different animal from everything else in this file.
+    // Acne is a false comparison and a bias fixes it. This is a SAMPLING limit: on a surface turning edge-on
+    // to the light the map has almost no resolution along the direction the surface recedes, so the shadow
+    // boundary quantises into steps of one texel over the sine of the angle. At the bound above -- about
+    // eighty-three degrees -- that is eight texels per step, and at eighty-seven it is twenty. No bias moves
+    // them, because nothing is mis-compared: the boundary is being drawn at a resolution that does not exist.
+    // Those steps, crossed at an angle by a shadow's edge, are the teeth.
+    //
+    // What CAN be done is average over a whole step instead of resolving it, which turns a hard staircase
+    // into a soft directional gradient -- the same information, presented as a penumbra rather than as
+    // saw-teeth. That needs the kernel widened along the receding direction and NOT across it, where the map
+    // samples perfectly well and a wider kernel would only smear a good edge.
+    //
+    // The magnitude is read straight off the gradient, which already measures exactly this: |grad| is
+    // (2/5)cot(alpha), so |grad|/0.4 is cot(alpha), which for a grazing surface is the step magnification
+    // 1/sin(alpha) to within a percent or two. Taken from the RAW magnitude, before the bound above, because
+    // the bound is about how far the depth correction may be trusted and this is about how far the sampling
+    // is stretched -- two different questions that happened to share a number.
+    //
+    // Widening is spent on MORE quads rather than on wider spacing, which is not a detail: each bilinear
+    // quad spans two texels, so quads set two texels apart tile the run contiguously, and anything further
+    // leaves texels between them sampled by nothing. That is a regular hole in the kernel, and it reads on
+    // screen as a grid -- trading teeth for stripes. The count is what widens; the spacing never does.
+    float anisoTaps = 1.0;
+    if (shadow_plane.z > 1.0) {
+        float magRaw = length(grad);
+        anisoTaps = clamp(round(magRaw / 0.4), 1.0, shadow_plane.z);
+    }
+    return float4(clamp(grad, -lim, lim), kernelScale, anisoTaps);
 }
 
 // Everything about a lookup EXCEPT the gradient, which the caller fills in. No derivatives here, which is
@@ -487,7 +561,7 @@ float3 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
 // `ndcZ` comes back separately because the gradient needs the depth as projected, while the struct carries
 // it with the cascade's constant bias already taken off.
 ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float depthBias, uint cascade,
-                               float sliceBase, float3 gradScale) {
+                               float sliceBase, float4 gradScale) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -499,6 +573,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
     o.uv = uv;
     o.grad = gradScale.xy;
     o.kernelScale = gradScale.z;
+    o.anisoTaps = gradScale.w;
     o.z = ndc.z - depthBias;
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
@@ -523,7 +598,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, float
 float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = abs(shadow_filter.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor, p.kernelScale);
+        lit = SampleShadowPCF16(p.uv, p.grad, p.z, p.slice, p.texelUv, isActor, p.kernelScale, p.anisoTaps);
     }
     return lit;
 }
@@ -569,7 +644,7 @@ float ShadowActorTexelUvAt(uint cascade) {
     return v;
 }
 
-ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float3 gradScale) {
+ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float4 gradScale) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     float depthBias = shadow_depth_bias.x;
@@ -685,8 +760,8 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         float3 sample = worldPos + offsetDir * ShadowTexelWorldAt(cascade);
         // xy is the bounded gradient, z the kernel scale its bound left behind (1 unless the soft falloff
         // is on and the gradient overshot). Both travel together into every projection this pixel makes.
-        float3 grad = ShadowPlaneGradient(sample, lightX, lightY, lightAxis);
-        gradOut = grad;
+        float4 grad = ShadowPlaneGradient(sample, lightX, lightY, lightAxis);
+        gradOut = grad.xyz;
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from

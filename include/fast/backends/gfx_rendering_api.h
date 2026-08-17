@@ -332,7 +332,9 @@ class GfxRenderingAPI {
     // See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT for what the bound is and why it is settable at all --
     // short version, it is the last suspect standing for the faceted banding and a suspect that needs a
     // rebuild per trial never gets tested.
-    virtual void SetShadowMapPlaneBias(float gradientLimit, bool softFalloff) {
+    virtual void SetShadowMapPlaneBias(float gradientLimit, bool softFalloff, int maxAnisoTaps) {
+        // 1 is "off", and the shader reads it as such; below that would divide the kernel away.
+        mShadowMaxAnisoTaps = maxAnisoTaps < 1 ? 1 : maxAnisoTaps;
         // A bound at or below zero would kill the plane correction outright and, with the falloff on, divide
         // the kernel away with it. Held off zero rather than rejected: sweeping it down to nothing is a
         // legitimate half of the experiment, and the floor only stops it reaching the degenerate case.
@@ -430,6 +432,7 @@ class GfxRenderingAPI {
     float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
     float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
     float mShadowPlaneGradientLimit = SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT;
+    int mShadowMaxAnisoTaps = SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS;
     bool mShadowPlaneSoftFalloff = SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF != 0;
     float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
     float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;

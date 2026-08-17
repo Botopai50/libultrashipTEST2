@@ -523,6 +523,34 @@
 // light, which is the same reason the incidence band gave for easing off there.
 #define SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF 0
 
+// Most bilinear quads the PCF kernel may lay along the direction a receiver recedes from the light.
+// 1 disables the anisotropic path outright, and every pixel takes the square kernel it always took.
+//
+// This is the only term in this file aimed at PROJECTIVE ALIASING rather than at acne, and the distinction
+// decides everything about it. Acne is a false comparison, and a bias fixes it -- which is what every other
+// constant here is. Projective aliasing is a sampling limit: on a surface turning edge-on to the light the
+// map has almost no resolution along the direction that surface recedes, so the shadow boundary quantises
+// into steps of one texel over the sine of the angle. At eighty-three degrees that is eight texels a step;
+// at eighty-seven, twenty. No bias moves them, because nothing is mis-compared -- the boundary is drawn at a
+// resolution that does not exist. Crossed at an angle by a shadow's edge, those steps are the teeth.
+//
+// A step cannot be resolved, but it can be AVERAGED over, which turns a hard staircase into a soft
+// directional gradient: the same missing information, presented as a penumbra instead of as saw-teeth. That
+// wants the kernel widened along the receding direction and nowhere else -- across it the map samples
+// perfectly well, and widening there would only smear an edge that was correct.
+//
+// The count is what widens, never the spacing. Each bilinear quad spans two texels, so quads two texels
+// apart tile the run contiguously; spreading four quads over eight texels instead leaves the texels between
+// them sampled by nothing, which is a regular hole in the kernel and reads on screen as a grid. That would
+// trade teeth for stripes.
+//
+// Costs two bilinear quads per step, against the square kernel's four in total -- so 4 here is twice the
+// fetches of the old kernel, and only on the pixels whose gradient asks for it. OFF by default (1) because
+// it is a candidate, not a settled fix: the diagnosis it rests on -- that these teeth are a sampling limit
+// rather than a bias failure -- was inferred from the gradient view and has not been confirmed against a
+// resolution sweep, which is what would prove it.
+#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 1
+
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //

@@ -72,7 +72,8 @@ struct PerShadowCB {
     // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
     float shadow_actor_texel_uv[4];
     // x = the receiver-plane gradient's bound, y = 1 to narrow the kernel by the overshoot instead of only
-    // truncating the gradient, z and w unused. See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT.
+    // truncating the gradient, z = most quads the kernel may lay along the receding direction (1 = off),
+    // w unused. See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT and SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS.
     float shadow_plane[4];
 };
 
