@@ -364,7 +364,18 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // Spaced so the row spans the stretch, never wider than the no-gap setting. Below that the row simply
     // draws in: at a stretch of one it is about a texel across, which is the square kernel again, reached
     // continuously rather than by switching.
-    float anisoSpacing = min(max(shadow_aniso.x, 0.05), anisoStretch / (float)taps);
+    //
+    // kernelScale multiplies this, and leaving it out was a defect with a visible signature. That factor is
+    // the plane bound's taper: where the receiver's gradient overshoots the bound, the depth correction each
+    // tap carries is truncated, and the residue every tap suffers is its DISTANCE from the sample point
+    // times how far the gradient overshot. The taper exists to hold that product still by pulling the taps
+    // in -- and it was pulling in only the two across the row, never the row itself.
+    //
+    // Which is backwards, because the row lies along the direction depth runs away fastest. So on exactly
+    // the grazing surfaces where the correction stops being exact, the kernel was reaching furthest along
+    // the worst axis with a truncated correction, and the residue came out as regular banding at the row's
+    // own period. Striping with a period is a sampling structure, not geometry, and this is the structure.
+    float anisoSpacing = min(max(shadow_aniso.x, 0.05), anisoStretch / (float)taps) * kernelScale;
     float sum = 0.0;
     [loop]
     for (uint i = 0; i < taps; i++) {
