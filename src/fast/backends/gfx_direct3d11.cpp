@@ -2774,20 +2774,38 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     // The slope is also the cache key below, so a value changed while the game runs rebuilds the state on
     // its own -- no extra invalidation needed for this one.
     float slope = mShadowSlopeBias;
-    const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
-                               (lightViewProj[8] * lightViewProj[8]));
-    if (sx > 1e-9f) {
-        const float texelWorld = 2.0f / (sx * (float)resolution);
-        if (texelWorld > 1e-6f) {
-            const float cap = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD / texelWorld;
-            if (cap < slope) {
-                slope = cap;
-            }
-        }
-    }
     slope = std::floor((slope * 8.0f) + 0.5f) / 8.0f; // eighths, so a hair of drift rebuilds nothing
     if (slope < 0.0f) {
         slope = 0.0f;
+    }
+
+    // The ceiling, enforced where D3D actually enforces it.
+    //
+    // What the rasterizer applies is SlopeScaledDepthBias * MaxDepthSlope, and MaxDepthSlope is how fast
+    // the polygon's depth changes per pixel OF THE SHADOW MAP. On a surface facing the light that is nearly
+    // nothing, which is the whole point of a slope-scaled term. On one raking away from it the depth crosses
+    // a texel in a single step and the slope is enormous -- and the product with it is what gets written
+    // into the map.
+    //
+    // This used to be bounded by reducing the MULTIPLIER, on the reasoning that a texel's worth of depth is
+    // what the slope amounts to. That reasoning holds only while the surface is not grazing, which is the
+    // one case the bound exists for: capping a multiplier does not cap a product whose other factor is
+    // unbounded. So a wall at eighty-five degrees was written into the depth map displaced by whatever its
+    // own slope happened to be, and no receiver-side correction can reach a depth that was already wrong
+    // when it was stored.
+    //
+    // DepthBiasClamp is the hardware's bound on exactly that product, and it was left at zero -- which in
+    // D3D means "no clamp", not "no bias". Setting it puts the ceiling where it was always meant to be. The
+    // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD in this cascade's own depth units: the projection scales the
+    // light's unit x axis by 1/radius, so sx IS 1/radius, and a cascade's depth range is five radii by
+    // construction.
+    float depthBiasClamp = 0.0f;
+    const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
+                               (lightViewProj[8] * lightViewProj[8]));
+    if (sx > 1e-9f) {
+        depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sx / 5.0f;
+        // Quantised for the same reason the slope is: a value drifting by a hair must not rebuild the state.
+        depthBiasClamp = std::floor((depthBiasClamp * 4096.0f) + 0.5f) / 4096.0f;
     }
 
     // Both facings recorded. Front-face culling was tried here and removed: it does remove self-shadowing
@@ -2795,7 +2813,8 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     // be compared against itself -- but it needs the caster to HAVE a far side, and this game's scenery is
     // largely modelled from one side only. Those surfaces have nothing left once their front is culled and
     // stop casting entirely.
-    if (mShadowRasterizerCascade[slice] == nullptr || mShadowRasterizerCascadeSlope[slice] != slope) {
+    if (mShadowRasterizerCascade[slice] == nullptr || mShadowRasterizerCascadeSlope[slice] != slope ||
+        mShadowRasterizerCascadeClamp[slice] != depthBiasClamp) {
         D3D11_RASTERIZER_DESC rast_desc;
         ZeroMemory(&rast_desc, sizeof(rast_desc));
         rast_desc.FillMode = D3D11_FILL_SOLID;
@@ -2803,6 +2822,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         rast_desc.DepthClipEnable = FALSE;
         rast_desc.DepthBias = 0;
         rast_desc.SlopeScaledDepthBias = slope;
+        rast_desc.DepthBiasClamp = depthBiasClamp;
         ComPtr<ID3D11RasterizerState> built;
         if (FAILED(mDevice->CreateRasterizerState(&rast_desc, built.GetAddressOf()))) {
             // Not fatal: the shared state is the same thing with the base slope, so the cascade keeps the
@@ -2812,6 +2832,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         }
         mShadowRasterizerCascade[slice] = built;
         mShadowRasterizerCascadeSlope[slice] = slope;
+        mShadowRasterizerCascadeClamp[slice] = depthBiasClamp;
     }
     return mShadowRasterizerCascade[slice].Get();
 }

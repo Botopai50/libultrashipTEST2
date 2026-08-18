@@ -288,6 +288,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // hysteresis makes rare; null means "use the shared state above".
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowRasterizerCascade[SHADOW_MAP_MAX_SLICES];
     float mShadowRasterizerCascadeSlope[SHADOW_MAP_MAX_SLICES] = {};
+    // The depth-bias clamp each cascade's state was built with. Part of the cache key alongside the slope,
+    // because it varies per cascade -- it is the world ceiling expressed in that cascade's depth range.
+    float mShadowRasterizerCascadeClamp[SHADOW_MAP_MAX_SLICES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
     // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
