@@ -565,7 +565,7 @@
 // it is a candidate, not a settled fix: the diagnosis it rests on -- that these teeth are a sampling limit
 // rather than a bias failure -- was inferred from the gradient view and has not been confirmed against a
 // resolution sweep, which is what would prove it.
-#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 5
+#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 8
 
 // Whether the hard edge's ramp is measured in screen pixels instead of in coverage. 0 keeps the old
 // behaviour exactly.
@@ -593,7 +593,7 @@
 // 1.0 overlaps the tents by half and the dip goes. What it costs is reach -- the row is taps * spacing
 // texels long either way, so this covers half the span the old spacing did for the same tap count. Density
 // and reach trade against each other here, and buying both means more taps.
-#define SHADOW_MAP_DEFAULT_ANISO_SPACING 1.0f
+#define SHADOW_MAP_DEFAULT_ANISO_SPACING 2.0f
 
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.

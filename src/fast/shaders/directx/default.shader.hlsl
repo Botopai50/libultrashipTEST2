@@ -595,7 +595,18 @@ float4 ShadowPlaneGradient(float3 p, float3 lx, float3 ly, float3 lz) {
     // Zero means the anisotropic path is off, which is uniform across the draw.
     float anisoStretch = 0.0;
     if (shadow_plane.z > 1.0) {
-        anisoStretch = clamp(length(grad) / 0.4, 1.0, shadow_plane.z);
+        // Bounded by the REACH the row can actually cover, which is its tap count times its spacing -- not
+        // by the tap count alone. Capping at the count was an arithmetic mistake with a decisive
+        // consequence: spacing is min(setting, stretch/taps), so a stretch that could never exceed the count
+        // forced the spacing to one texel or less and the row to `taps` texels of reach, whatever either
+        // setting said.
+        //
+        // That is why widening the row never did anything. The step it has to average over is one texel
+        // over the sine of the angle -- around fourteen texels on a wall this grazing -- and five taps
+        // capped this way reach five. No value of any control could close that, because the cap was
+        // upstream of all of them.
+        float reach = shadow_plane.z * max(shadow_aniso.x, 0.05);
+        anisoStretch = clamp(length(grad) / 0.4, 1.0, max(reach, 1.0));
     }
     return float4(clamp(grad, -lim, lim), kernelScale, anisoStretch);
 }
