@@ -565,7 +565,7 @@
 // it is a candidate, not a settled fix: the diagnosis it rests on -- that these teeth are a sampling limit
 // rather than a bias failure -- was inferred from the gradient view and has not been confirmed against a
 // resolution sweep, which is what would prove it.
-#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 8
+#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 12
 
 // Whether the hard edge's ramp is measured in screen pixels instead of in coverage. 0 keeps the old
 // behaviour exactly.

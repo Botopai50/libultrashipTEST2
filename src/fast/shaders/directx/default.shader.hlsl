@@ -376,26 +376,42 @@ float SampleShadowPCF16(float2 uv, float2 grad, float z, float slice, float texe
     // the worst axis with a truncated correction, and the residue came out as regular banding at the row's
     // own period. Striping with a period is a sampling structure, not geometry, and this is the structure.
     float anisoSpacing = min(max(shadow_aniso.x, 0.05), anisoStretch / (float)taps) * kernelScale;
+    // Weighted, not averaged, and the difference is the whole look.
+    //
+    // A flat average is a BOX filter, and a box has an abrupt end. Convolved with a shadow boundary it does
+    // produce a ramp, but the ramp's slope jumps where the box's end crosses the boundary -- so as the
+    // surface varies by a texel the half-coverage contour does not slide, it HOPS. Threshold that for a cel
+    // edge and every hop is a kink: the line comes out scribbled rather than drawn, which is exactly the
+    // artefact this weighting exists to remove. Widening a box does not help, because the discontinuity is
+    // at its ends however far apart they are.
+    //
+    // The weight below goes to zero smoothly at both ends and has zero slope there too, so no tap enters or
+    // leaves the sum abruptly and the contour moves continuously with the surface. It costs nothing: same
+    // taps, same fetches, three arithmetic operations per column.
+    //
+    // What it does cost is nominal reach. The outer taps count for little, so the EFFECTIVE span is around
+    // three fifths of taps * spacing -- which is why the defaults buy more span than the step strictly
+    // needs, and why raising the tap count is the way to answer a step this does not cover.
     float sum = 0.0;
+    float weightSum = 0.0;
+    const float halfSpan = max(((float)taps - 1.0) * 0.5, 1e-6);
     [loop]
     for (uint i = 0; i < taps; i++) {
         // Centred on the sample point, so the kernel stays symmetric about the pixel it is shading rather
         // than reaching only one way along the light.
-        // Two texels puts the quads edge to edge, since each bilinear tap spans a 2x2 footprint -- the
-        // widest spacing that leaves no texel unsampled. It is not the SMOOTHEST, though, and that is the
-        // difference this value exists for: a bilinear tap weights its footprint as a tent, so tents that
-        // merely touch still dip between their centres, and the row reads as a line of separate samples
-        // rather than as one smear. Closing them to a texel overlaps the tents by half and the dip goes.
-        //
-        // What it costs is reach: the row is taps * spacing texels long either way, so halving the spacing
-        // halves the span the same tap count covers. Density and reach trade against each other here, and
-        // more of both is more taps.
-        float offsetAlong = ((float)i - ((float)taps - 1.0) * 0.5) * texelUv * anisoSpacing;
+        float step01 = (float)i - ((float)taps - 1.0) * 0.5;
+        float offsetAlong = step01 * texelUv * anisoSpacing;
         float2 along = axis * offsetAlong;
-        sum += SampleShadowPCF4(uv + along + across, uv, grad, gradTexel, z, slice, texelUv, isActor);
-        sum += SampleShadowPCF4(uv + along - across, uv, grad, gradTexel, z, slice, texelUv, isActor);
+        // Normalised position across the row, then the smooth compact weight. Squared so the falloff is
+        // flat at the ends rather than merely zero there.
+        float tNorm = step01 / halfSpan;
+        float wBase = saturate(1.0 - (tNorm * tNorm));
+        float w = wBase * wBase;
+        weightSum += 2.0 * w;
+        sum += w * SampleShadowPCF4(uv + along + across, uv, grad, gradTexel, z, slice, texelUv, isActor);
+        sum += w * SampleShadowPCF4(uv + along - across, uv, grad, gradTexel, z, slice, texelUv, isActor);
     }
-    return sum / (2.0 * (float)taps);
+    return sum / max(weightSum, 1e-6);
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
