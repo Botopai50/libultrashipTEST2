@@ -4275,6 +4275,11 @@ void Interpreter::RenderShadowMap() {
     }
     const float ly[3] = { lz[1] * lx[2] - lz[2] * lx[1], lz[2] * lx[0] - lz[0] * lx[2], lz[0] * lx[1] - lz[1] * lx[0] };
 
+    // Advanced here rather than at the top of the frame: the early exits above leave without rendering a
+    // pass at all, and a counter that moved on those would let a cascade's turn come round while nothing was
+    // drawn -- so a half-rate cascade would sometimes go a whole cycle without a rebuild.
+    mShadowMapFrameCounter++;
+
     float matrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
     float splits[SHADOW_MAP_MAX_CASCADES] = {};
     float nearDist = 0.0f;
@@ -4283,6 +4288,18 @@ void Interpreter::RenderShadowMap() {
     for (int c = 0; c < mShadowMapCascadeCount; c++) {
         const float farDist = mShadowMapSplits[c] > nearDist ? mShadowMapSplits[c] : nearDist + 1.0f;
         splits[c] = farDist;
+
+        // Snapshot of the parking state, for the update-rate freeze at the foot of this loop.
+        //
+        // The fit below mutates the held centre and radius as it goes, and on a frozen frame those mutations
+        // have to be undone with the matrix. They are one description of the same cascade: the held centre
+        // is what the containment test measures drift against, and if it advanced while the matrix was
+        // rolled back, the next frame would be asking "does the cascade at C_new still cover this" about a
+        // slice that is actually projected from C_old. It would answer yes and be wrong at the edges.
+        const float parkedRadius = mShadowMapCascadeRadius[c];
+        const float parkedCenter[3] = { mShadowMapCascadeCenter[c][0], mShadowMapCascadeCenter[c][1],
+                                        mShadowMapCascadeCenter[c][2] };
+        const bool parkedValid = mShadowMapCascadeCenterValid[c];
 
         // Sphere around this slice of the view axis: centred at its midpoint, with a radius that also
         // covers the frustum's lateral spread. Half the slice length is a deliberate over-estimate --
@@ -4445,6 +4462,33 @@ void Interpreter::RenderShadowMap() {
         m[13] = -(eye[0] * ly[0] + eye[1] * ly[1] + eye[2] * ly[2]) * sy;
         m[14] = (-(eye[0] * lz[0] + eye[1] * lz[1] + eye[2] * lz[2]) - zNear) * sz;
         m[15] = 1.0f;
+
+        // Held cascades: freeze the whole thing, matrix included.
+        //
+        // The divisor says how often this cascade is rebuilt. On a frame it is not due, the fitted matrix
+        // above is thrown away and the one it was last DRAWN with is written back -- because the slice still
+        // holds depths rendered through that matrix, and reading them through any other projects the shadow
+        // from a light that has since moved. A stale shadow is a frame late; a mismatched one is in the
+        // wrong place, which is a worse thing to ship for the same saving.
+        //
+        // Nothing else needs to know. With the matrix identical to last frame's, the content key and the
+        // backend's reuse test both conclude the slice already holds what a redraw would produce, and the
+        // draw is skipped without a second mechanism to keep in step with this one.
+        const int divisor = mShadowMapCascadeDivisor[c] < 1 ? 1 : mShadowMapCascadeDivisor[c];
+        const bool due = (divisor <= 1) || ((mShadowMapFrameCounter % (uint32_t)divisor) == 0);
+        if (!due && mShadowMapHeldValid[c]) {
+            memcpy(m, &mShadowMapHeldMatrices[c * 16], 16 * sizeof(float));
+            // ...and with it the parking state the fit just advanced, so the two keep describing the same
+            // cascade (see the snapshot at the top of this loop).
+            mShadowMapCascadeRadius[c] = parkedRadius;
+            for (int i = 0; i < 3; i++) {
+                mShadowMapCascadeCenter[c][i] = parkedCenter[i];
+            }
+            mShadowMapCascadeCenterValid[c] = parkedValid;
+        } else {
+            memcpy(&mShadowMapHeldMatrices[c * 16], m, 16 * sizeof(float));
+            mShadowMapHeldValid[c] = true;
+        }
 
         nearDist = farDist;
     }

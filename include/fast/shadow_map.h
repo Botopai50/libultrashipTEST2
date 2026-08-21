@@ -595,6 +595,34 @@
 // and reach trade against each other here, and buying both means more taps.
 #define SHADOW_MAP_DEFAULT_ANISO_SPACING 2.0f
 
+// How often each cascade is rebuilt, as a divisor of the frame rate: 1 rebuilds every frame, 2 every other
+// frame, and so on. At 60 fps the defaults below run the near and mid cascades at 60 Hz and the far one at
+// 30 Hz.
+//
+// The far cascade is the one worth halving. It covers the largest area for the same number of texels, so
+// its content changes the least per frame -- a tree three thousand units away moves a fraction of a texel
+// between frames, while the near cascade's shadows track the player directly and any hitch there is seen.
+// It is also the most expensive slice to fill, because its footprint sweeps in the most casters.
+//
+// Skipping a rebuild means freezing that cascade's MATRIX too, not just declining to draw. The slice still
+// holds depths rendered through the matrix it was last drawn with, and reading them through a matrix that
+// has since moved with the camera projects the shadow from where the light used to be. That is not a stale
+// shadow but a misplaced one -- a worse artefact than the cost being saved. The interpreter therefore
+// writes back the held matrix on skipped frames, which has the useful side effect of making the existing
+// content-key reuse test skip the draw on its own: a cascade whose matrix and caster list are unchanged is
+// already known to hold what a redraw would produce.
+//
+// The cost of a divisor above 1 is shadow lag under motion, worst when the camera turns quickly. Keep the
+// near cascade at 1; it is the one the eye is on.
+#define SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0 1
+#define SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1 1
+#define SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2 2
+
+// Highest divisor the menu offers. Beyond about four the lag is visible on anything that moves, and the
+// saving has already flattened out -- a cascade drawn every fourth frame costs a quarter of its full rate,
+// and every further step buys a smaller fraction of a smaller number.
+#define SHADOW_MAP_MAX_CASCADE_DIVISOR 4
+
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //

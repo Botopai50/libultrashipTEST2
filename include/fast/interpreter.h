@@ -513,7 +513,7 @@ class Interpreter {
                             float edgeHardnessFar, float minIncidence, float fullIncidence, float minHardnessScale,
                             float depthBiasWorld, float slopeBias, float planeGradientLimit, bool planeSoftFalloff,
                             int maxAnisoTaps, bool edgeScreenWidth,
-                            float anisoSpacing) {
+                            float anisoSpacing, const int cascadeDivisors[SHADOW_MAP_MAX_CASCADES]) {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
@@ -527,9 +527,19 @@ class Interpreter {
         // moment after the switch, which is a wait the player can watch rather than one that stops the
         // picture. Nothing downstream needs to know: this is the same state as the mode being off.
         mShadowMapEnabled = enabled && (mRapi == nullptr || !mRapi->ShaderPrewarmInProgress());
-        mShadowMapCascadeCount = cascadeCount < 1                         ? 1
-                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
-                                                                          : cascadeCount;
+        const int clampedCascades = cascadeCount < 1                         ? 1
+                                    : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
+                                                                             : cascadeCount;
+        // Drop every held matrix when the cascade layout changes: cascade N is now fitted to a different
+        // span than the matrix saved under it, so freezing to that matrix would project the wrong band.
+        // Clearing makes the next frame refit and redraw regardless of whose turn it was -- one frame of
+        // full cost, paid on a transition. (The disable path unparks below, for the same reason.)
+        if (clampedCascades != mShadowMapCascadeCount) {
+            for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+                mShadowMapHeldValid[i] = false;
+            }
+        }
+        mShadowMapCascadeCount = clampedCascades;
         mShadowMapResolution = resolution;
         // Never finer than the world layer (see shadow_map.h); the backend clamps it again, but keeping the
         // two in order here means the value the interpreter reasons with is the one that will be used.
@@ -542,6 +552,11 @@ class Interpreter {
         if (lightDir != nullptr) {
             for (int i = 0; i < 3; i++) {
                 mShadowMapLightDir[i] = lightDir[i];
+            }
+        }
+        if (cascadeDivisors != nullptr) {
+            for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+                mShadowMapCascadeDivisor[i] = cascadeDivisors[i] < 1 ? 1 : cascadeDivisors[i];
             }
         }
         mShadowMapBlendFraction = blendFraction;
@@ -577,6 +592,10 @@ class Interpreter {
             // the moment the mode went off, and the next enable could be a different scene entirely.
             for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
                 mShadowMapCascadeCenterValid[c] = false;
+                // The update-rate freeze parks the same cascade a second way, by matrix, and it has to be
+                // let go here too -- a held matrix outliving a disable would freeze the next enable to
+                // wherever the camera stood when the mode went off.
+                mShadowMapHeldValid[c] = false;
             }
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
                 mShadowAlphaCasters[l].clear();
@@ -1053,6 +1072,21 @@ class Interpreter {
     bool mShadowMapEnabled = false;   // app-pushed AND its shaders are ready
     bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
+    // SOH [Enhancement] How often each cascade is rebuilt, as a frame divisor: 1 is every frame, 2 is every
+    // other, and so on. The depth pass costs per slice, and the far cascade is the one paying most for the
+    // least -- it covers thousands of units, so what it holds barely changes between two frames.
+    //
+    // Skipping a rebuild means the slice keeps the depths it already has, and that is only correct if the
+    // MATRIX is kept with them. A retained depth map read through a matrix that moved is a shadow projected
+    // from where the light used to be, which is worse than a stale shadow: it is a wrong one. So a skipped
+    // cascade is frozen whole -- the previous frame's matrix is written back over the fitted one, and the
+    // reuse machinery then sees an unchanged matrix and skips the draw on its own.
+    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0,
+                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
+                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2 };
+    float mShadowMapHeldMatrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
+    bool mShadowMapHeldValid[SHADOW_MAP_MAX_CASCADES] = {};
+    uint32_t mShadowMapFrameCounter = 0;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
