@@ -509,8 +509,7 @@ class Interpreter {
     // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
     void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, int actorResolution, const float splits[4],
                             const float lightDir[3], float blendFraction, float strength, float minCasterSize,
-                            float debugMode, float edgeHardness, float edgeHardnessFar,
-                            const int cascadeDivisors[SHADOW_MAP_MAX_CASCADES]) {
+                            float debugMode, const int cascadeDivisors[SHADOW_MAP_MAX_CASCADES]) {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
@@ -560,8 +559,6 @@ class Interpreter {
         mShadowMapStrength = strength;
         mShadowMapMinCasterSize = minCasterSize;
         mShadowMapDebug = debugMode;
-        mShadowMapEdgeHardness = edgeHardness;
-        mShadowMapEdgeHardnessFar = edgeHardnessFar;
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
@@ -1082,8 +1079,6 @@ class Interpreter {
     float mShadowMapStrength = SHADOW_MAP_DEFAULT_STRENGTH;
     float mShadowMapMinCasterSize = SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE;
     float mShadowMapDebug = 0.0f;
-    float mShadowMapEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
-    float mShadowMapEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
     // Per-frame budget on captured casters. A pathological scene must cost a dropped shadow, not an
     // unbounded allocation; 9 floats per triangle makes this a little over a million triangles.
     static constexpr size_t kShadowMapCasterBudgetFloats = 12u * 1024u * 1024u;

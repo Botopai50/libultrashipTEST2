@@ -3176,10 +3176,8 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
 }
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                             float blendFraction, float strength, float debugMode,
-                                             float edgeHardness, float edgeHardnessFar) {
-    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, strength, debugMode,
-                                        edgeHardness, edgeHardnessFar);
+                                             float blendFraction, float strength, float debugMode) {
+    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, strength, debugMode);
 
     ZeroMemory(&mPerShadowCbData, sizeof(mPerShadowCbData));
     const int count = mShadowCascadesActive;
@@ -3187,10 +3185,10 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     mPerShadowCbData.shadow_params[1] = mShadowBlendFraction;
     mPerShadowCbData.shadow_params[2] = 0.0f;
     mPerShadowCbData.shadow_params[3] = mShadowStrength;
-    mPerShadowCbData.shadow_filter[0] = mShadowMaxViewDepth;
-    mPerShadowCbData.shadow_filter[1] = mShadowDebug;
-    mPerShadowCbData.shadow_filter[2] = mShadowEdgeHardness;
-    mPerShadowCbData.shadow_filter[3] = mShadowEdgeHardnessFar;
+    mPerShadowCbData.shadow_range[0] = mShadowMaxViewDepth;
+    mPerShadowCbData.shadow_range[1] = mShadowDebug;
+    mPerShadowCbData.shadow_range[2] = 0.0f;
+    mPerShadowCbData.shadow_range[3] = 0.0f;
     for (int i = 0; i < 3; i++) {
         mPerShadowCbData.shadow_actor_min[i] = mShadowActorBoundsMin[i];
         mPerShadowCbData.shadow_actor_max[i] = mShadowActorBoundsMax[i];

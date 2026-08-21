@@ -291,8 +291,7 @@ class GfxRenderingAPI {
     // units (used to pick a cascade and to size its blend band). Stored here rather than in each
     // backend so the members are available to every per-draw uniform path, exactly like the toon ones.
     virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                    float blendFraction, float strength, float debugMode, float edgeHardness,
-                                    float edgeHardnessFar) {
+                                    float blendFraction, float strength, float debugMode) {
         mShadowCascadesActive = cascadeCount < 0 ? 0
                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                          : cascadeCount;
@@ -309,8 +308,6 @@ class GfxRenderingAPI {
         mShadowBlendFraction = blendFraction;
         mShadowStrength = strength;
         mShadowDebug = debugMode;
-        mShadowEdgeHardness = edgeHardness;
-        mShadowEdgeHardnessFar = edgeHardnessFar;
     }
 
     // SOH [Enhancement] Turns the shadow map's GPU timing on WITHOUT the cascade-bounds debug view.
@@ -392,8 +389,6 @@ class GfxRenderingAPI {
     float mShadowDebug = 0.0f;
     // Timing only -- read by the backend's timer, never by a shader. See SetShadowMapProfiling.
     bool mShadowProfile = false;
-    float mShadowEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
-    float mShadowEdgeHardnessFar = SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR;
     // Inverted until a frame says otherwise, so every test against it fails and the actor layer is skipped.
     // Zero until a frame says otherwise, which reads as "no cascade reaches anywhere" and costs nothing.
     float mShadowMaxViewDepth = 0.0f;

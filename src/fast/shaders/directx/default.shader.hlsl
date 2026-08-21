@@ -141,13 +141,13 @@ cbuffer PerShadowCB : register(b3) {
     //     3 the receiver normal, as a colour
     //     4 where that normal came from: green = the draw's vertex normal (brightness = its interpolated
     //       length), red = a face normal recovered from screen derivatives
-    //     5 the filter's raw coverage, before the hardening remap rewrites it
+    //     5 the coverage the depth comparison produced, which is also what the shaded picture uses
     //     7 cascade index, red/green/blue from nearest to furthest
     //     (6, 8 and 9 read values that no longer exist -- they showed the receiver-plane gradient, the
     //      incidence taper and the anisotropic kernel's reach, all removed with the machinery they measured)
-    // z = edge hardness near, w = edge hardness in the furthest cascade, ramped between across the ladder
-    //     (see SHADOW_MAP_DEFAULT_EDGE_HARDNESS).
-    float4 shadow_filter;
+    // z, w = unused. Kept float4-shaped because HLSL gives each cbuffer element its own 16-byte register
+    //     anyway, so shrinking this saves nothing and is one more chance to get the C++ layout wrong.
+    float4 shadow_range;
     // World-space bounds of the ACTOR caster layer. Everything in that layer is inside this box, so a
     // receiver with no part of the box behind it along the light cannot be shadowed by it -- see the test in
     // ShadowLitLayers. An empty layer arrives inverted and fails every test, which is what "no characters"
@@ -326,7 +326,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
 float ShadowSample(ShadowProjection p, bool isActor) {
-    float lit = abs(shadow_filter.y - 1.0) < 0.5 ? 0.0 : 1.0;
+    float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
         lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
     }
@@ -385,28 +385,6 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
     return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
 }
 
-// Which band of the cascade ladder this depth falls in, normalised 0 (nearest) to 1 (furthest).
-//
-// Used to ramp the edge hardness with distance, because the artefact it fights is not one size: the kernel
-// is three texels wide in every cascade, but a texel of the near one is a fraction of a world unit and one
-// of the far one is several, so a single hardness leaves the near edge crisp and the far edge metres wide.
-// Literal indices only, same constraint as ShadowSplitAt, and a single return over a pre-initialised local.
-float ShadowLadderFraction(float viewDepth) {
-    float band = 0.0;
-    uint count = (uint)shadow_params.x;
-    if (count > 1) {
-        float step = 0.0;
-        if (viewDepth > shadow_splits.x) {
-            step = 1.0;
-        }
-        if (viewDepth > shadow_splits.y) {
-            step = 2.0;
-        }
-        band = saturate(step / (float)(count - 1));
-    }
-    return band;
-}
-
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
 // no cascades were rendered this frame, which is the only case where the answer is not read.
 //
@@ -458,7 +436,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
         // the boxes themselves rather than from the split ladder -- a cascade's box overshoots its band by a
         // long way, and cutting at the split would take real shadows with it (a low sun throws them well
         // past the band that cast them).
-        if (viewDepth <= shadow_filter.x) {
+        if (viewDepth <= shadow_range.x) {
             ShadowProjection primary = ShadowProjectAt(worldPos, cascade, 0.0);
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
@@ -876,8 +854,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // The vertex normal when the draw has one, and a recovered face normal when it does not. The
         // attribute arrives zeroed on unlit geometry (see the vbo packing), so its length is the test.
         //
-        // Nothing on the shipping path reads this any more -- the shadow term is a depth comparison and a
-        // threshold, neither of which needs a normal. It survives for diagnostic views 3 and 4, and it is
+        // Nothing on the shipping path reads this any more -- the shadow term is a depth comparison and
+        // nothing else, which needs no normal. It survives for diagnostic views 3 and 4, and it is
         // kept because of what those two showed: a recovered face normal is constant across a triangle, so
         // anything downstream that thresholds it prints that triangle's outline, and view 4 is how you find
         // out whether a receiver has a real normal at all. Any future work here will want to ask that
@@ -901,30 +879,19 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float2 shadowLayers =
             ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
-        // The filter's own output, before the hardening below rewrites it. Debug mode 5 paints this, and the
-        // pair (mode 5 against the shaded picture) is what separates the two halves of the pipeline: a
-        // boundary that is already faceted here was drawn by the comparison or by the map, and one that is
-        // smooth here and faceted on screen was drawn by the threshold.
+        // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
+        // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
+        //
+        // There used to be a threshold here that remapped coverage through a narrow ramp centred on half,
+        // to collapse the gradient into a cel edge, with near and far strengths ramped across the cascade
+        // ladder. It is gone with the rest of the mitigations. The edge that is left is the bilinear ramp
+        // across one texel of whichever cascade the pixel landed in, which is hard near the camera and
+        // softens with distance because the texel does -- unmediated, which is the point.
+        //
+        // Kept as its own name so debug mode 5 and the shaded picture read the same value. They are now
+        // literally the same number, which is worth stating: if the two disagree in SHAPE, something below
+        // this line is lying.
         float shadowCoverage = shadowLit;
-        // Harden the edge. What the filter returns is COVERAGE -- how much of the kernel is occluded -- and
-        // shading with it directly spreads that ramp across the whole kernel, which is the blur. Remapping
-        // it through a narrow ramp centred on half coverage collapses the gradient into an edge instead.
-        //
-        // This keeps something that simply narrowing the kernel throws away: every tap is bilinear, so
-        // coverage varies smoothly BETWEEN texels, and the half-coverage contour is a piecewise-linear curve
-        // through the grid rather than a staircase along it. Hardening preserves that sub-texel placement.
-        // A narrow ramp rather than a step, so a pixel or two of antialiasing survives on screen.
-        //
-        // At hardness 0 the lerp weight is 0 and this is exactly the value that came in -- not an
-        // approximation of it, which is why the remap is blended in rather than being fed a widening band.
-        float shadowHardness = saturate(lerp(shadow_filter.z, shadow_filter.w,
-                                             ShadowLadderFraction(input.position.w)));
-        // Now remap. What the filter returned is coverage; a narrow ramp centred on half coverage collapses
-        // that gradient into an edge. 0.03 is in coverage units, which keeps a pixel or two of
-        // antialiasing on a boundary that is well sampled and rather more on one that is not.
-        float shadowBand = lerp(0.5, 0.03, shadowHardness);
-        float shadowHard = smoothstep(0.5 - shadowBand, 0.5 + shadowBand, shadowLit);
-        shadowLit = lerp(shadowLit, shadowHard, shadowHardness);
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
@@ -942,15 +909,18 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //     triangle, so anything thresholding it prints that triangle's outline exactly. Dark green is
         //     the subtler version: an interpolated normal sagging towards the 1e-4 test.
         //   3 next, to see it directly. Flat facets of colour on a surface that should be smooth confirm it.
-        //   5 against the shaded picture. This is the fork. Faceted here too -> the depth comparison or the
-        //     map itself drew it, and no amount of work on the threshold will reach it. Smooth here and
-        //     faceted on screen -> the cel threshold drew it, and the hardness controls are what to look at.
+        //   5 to see the shadow term with nothing else multiplied into it. Nothing rewrites coverage any
+        //     more, so this and the shaded picture are the same number -- which means a boundary that is
+        //     faceted on screen is faceted HERE, in what the depth comparison returned, and the cause is
+        //     upstream of everything in this file: the map's own resolution, the matrix it was drawn with,
+        //     or the depth pass's bias. Nothing downstream can be blamed for it, because there is nothing
+        //     downstream left.
         //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
         //     mesh artefact at all.
         //
         // None of these is a shipping path: each replaces the shaded colour outright. `[branch]` because the
         // mode is a uniform, so a build with the channel off pays one jump and none of the arithmetic.
-        uint shadowDebugMode = (uint)(shadow_filter.y + 0.5);
+        uint shadowDebugMode = (uint)(shadow_range.y + 0.5);
         @if(o_fog)
             // Take the fog off the diagnostic. The block below writes a colour that MEANS something, and the
             // fog blend further down would then wash it towards the fog colour in proportion to distance --
@@ -977,8 +947,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // position is being used instead -- constant per triangle by construction.
             texel.rgb = (shadowNLen > 1e-4) ? float3(0.0, saturate(shadowNLen), 0.0) : float3(1.0, 0.0, 0.0);
         } else if (shadowDebugMode == 5) {
-            // The filter's raw coverage, before the hardening remap. This is the fork: faceted here means
-            // the fault is upstream of the threshold, smooth here means the threshold made it.
+            // The coverage the depth comparison produced. Nothing rewrites it before shading now, so this
+            // view and the shaded picture carry the same number -- see the reading order above.
             texel.rgb = float3(shadowCoverage, shadowCoverage, shadowCoverage);
         } else if (shadowDebugMode == 7) {
             // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands

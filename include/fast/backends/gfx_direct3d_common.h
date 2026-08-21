@@ -58,9 +58,8 @@ struct PerShadowCB {
     float shadow_texel_uv[4];    // one texel in UV terms (1/resolution), per cascade
     // x = active cascade count (0 = no shadow map), y = blend fraction, z unused, w = strength
     float shadow_params[4];
-    // x = furthest view depth any cascade's footprint reaches, y = debug mode, z = edge hardness,
-    // w = hardness in the far cascade.
-    float shadow_filter[4];
+    // x = furthest view depth any cascade's footprint reaches, y = debug mode, z and w unused.
+    float shadow_range[4];
     // World-space bounds of the ACTOR caster layer, xyz used and w ignored. An empty layer is sent as an
     // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
     float shadow_actor_min[4];
@@ -200,7 +199,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
-                            float strength, float debugMode, float edgeHardness, float edgeHardnessFar) override;
+                            float strength, float debugMode) override;
 
     // SOH [Enhancement] FXAA post-process pass. Null until first used; mFxaaFailed latches a compile or
     // creation failure so a broken pipeline is attempted once and not once per frame.
