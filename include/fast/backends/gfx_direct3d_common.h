@@ -55,7 +55,6 @@ struct PerShadowCB {
     float shadow_view_proj[SHADOW_MAP_MAX_CASCADES][16];
     float shadow_splits[4];      // far distance of each cascade, world units
     float shadow_texel_world[4]; // world size of one texel, per cascade
-    float shadow_texel_uv[4];    // one texel in UV terms (1/resolution), per cascade
     // x = active cascade count (0 = no shadow map), y = blend fraction, z unused, w = strength
     float shadow_params[4];
     // x = furthest view depth any cascade's footprint reaches, y = debug mode, z and w unused.
@@ -64,9 +63,6 @@ struct PerShadowCB {
     // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
     float shadow_actor_min[4];
     float shadow_actor_max[4];
-    // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
-    // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
-    float shadow_actor_texel_uv[4];
 };
 
 struct PerDrawCB {

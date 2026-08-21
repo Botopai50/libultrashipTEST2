@@ -56,13 +56,11 @@ else
   exit 2
 fi
 
-# Every option set is built twice where it makes a difference: the shadow kernel exists in a Shader Model
-# 4.0 form that fetches its four texels one at a time, and a 4.1 form that gathers the 2x2 footprint in one
-# instruction. The renderer picks between them from the adapter's feature level, so BOTH have to compile --
-# and each only compiles against its own profile, which is the point of pairing them here.
+# One profile, Shader Model 4.0, which is what the renderer now compiles everything against. The shadow
+# kernel used to have a second 4.1 form so it could use Texture2DArray.Gather, and every option set was built
+# twice to keep both honest; SampleCmpLevelZero does the same fetch at 4.0, so there is one form again.
 fail=0
-for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sa:4_0" "san:4_0" \
-             "sg:4_1" "tsg:4_1" "sfg:4_1" "ts2g:4_1" "sag:4_1" "sang:4_1"; do
+for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sa:4_0" "san:4_0"; do
   opts="${combo%%:*}"
   model="${combo##*:}"
   "$WORK/prism_driver" "$SHADER" "$SHADER_DIR" "$opts" > "$WORK/v.hlsl"

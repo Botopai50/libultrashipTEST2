@@ -4291,6 +4291,8 @@ void Interpreter::RenderShadowMap() {
         // rolled back, the next frame would be asking "does the cascade at C_new still cover this" about a
         // slice that is actually projected from C_old. It would answer yes and be wrong at the edges.
         const float parkedRadius = mShadowMapCascadeRadius[c];
+        const float parkedDepthBack = mShadowMapCascadeDepthBack[c];
+        const float parkedDepthRange = mShadowMapCascadeDepthRange[c];
         const float parkedCenter[3] = { mShadowMapCascadeCenter[c][0], mShadowMapCascadeCenter[c][1],
                                         mShadowMapCascadeCenter[c][2] };
         const bool parkedValid = mShadowMapCascadeCenterValid[c];
@@ -4330,10 +4332,20 @@ void Interpreter::RenderShadowMap() {
             // stay where it is while the view slides inside it (see SHADOW_MAP_CASCADE_PARK_MARGIN). The
             // quantisation then rounds that up again; the two stack, and only the margin is guaranteed.
             //
-            // Cascade 0 asks for no margin and so is fitted exactly as before -- byte for byte the same
-            // matrices it produced before any of this existed. The last one asks for the most, because it is
-            // the one a turn of the camera throws furthest and the one whose texel is already coarsest.
-            const float margin = SHADOW_MAP_PARK_MARGIN_FOR(c, mShadowMapCascadeCount);
+            // The last one asks for the most, because it is the one a turn of the camera throws furthest and
+            // the one whose texel is already coarsest.
+            //
+            // Floored at one texel's worth, which the snapping below makes mandatory rather than nice to
+            // have: "the texture is 1 pixel larger in width and height when using this technique -- this
+            // keeps shadow coordinates from indexing outside of the shadow map". Snapping moves the centre
+            // by up to a texel, so the sphere it was fitted to can end up a texel past the cascade edge.
+            // A texel is 2R/resolution, so covering it costs 2/resolution of relative radius -- half a
+            // thousandth at 4096, against a cascade that would otherwise clip shadows at its own border.
+            //
+            // The park margins already swamp this on the cascades that have one. Cascade 0 asks for none,
+            // which is exactly where the guard was missing.
+            const float texelMargin = mShadowMapResolution > 0 ? 2.0f / (float)mShadowMapResolution : 0.0f;
+            const float margin = std::max(SHADOW_MAP_PARK_MARGIN_FOR(c, mShadowMapCascadeCount), texelMargin);
             const float target = radius * (1.0f + margin);
             const float step = std::exp2(std::floor(std::log2(target)) - 3.0f);
             const float quantized = std::ceil(target / step) * step;
@@ -4402,36 +4414,140 @@ void Interpreter::RenderShadowMap() {
             }
         }
 
-        // Pull the eye back far enough that casters above the slice still fall inside the depth range.
-        // Margin proportional to the cascade rather than a fixed distance: a flat 1000 units of slack was
-        // most of the depth range for a near cascade, and a D16 map spends its precision on whatever range
-        // it is given. Scaling with the radius keeps every cascade's precision comparable.
-        const float back = radius * 3.0f;
+        // Fit the near and far planes to the casters that are actually in this cascade.
+        //
+        // "The more closely together the planes are, the more precise the values in the depth buffer" -- and
+        // this is a D16 map, so that is not a refinement. The range used to be a flat five radii whatever was
+        // in front of the light: for the far cascade that is about 20000 world units over 65536 steps, a
+        // third of a unit per step. Shadow acne IS depth quantised over a texel, so a depth quantum that
+        // large is the acne the slope bias then has to pay to hide.
+        //
+        // Method follows the article's third option -- the one it calls proper. The four SIDE planes of the
+        // light frustum are already known (they are the cascade's own square), so the scene's bounds are
+        // measured against those and only the depth of what survives sets the near and far planes. Boxes
+        // outside the footprint contribute nothing, which is the whole point: a pillar a thousand units to
+        // the side must not stretch this cascade's depth range.
+        //
+        // Every caster group is walked, opaque and alpha, both layers. That is not thoroughness for its own
+        // sake -- the near plane is derived FROM these bounds, so anything drawn but not measured here would
+        // be clipped out of the map, and a caster that silently stops casting is a worse bug than a loose
+        // range. The two layers share one matrix per cascade, so one fit has to cover both.
+        //
+        // The XY test is a box-onto-axis projection, which is conservative: it can include a box that only
+        // overlaps the cascade's bounding square without touching the cascade, never exclude one that does.
+        // Conservative in the direction that keeps casters, which is the only direction that is safe.
+        float castNear = 1e30f;  // smallest light-space depth, relative to the cascade centre
+        float castFar = -1e30f;  // largest
+        {
+            auto measure = [&](const float bmin[3], const float bmax[3]) {
+                const float bc[3] = { (bmin[0] + bmax[0]) * 0.5f, (bmin[1] + bmax[1]) * 0.5f,
+                                      (bmin[2] + bmax[2]) * 0.5f };
+                const float bh[3] = { (bmax[0] - bmin[0]) * 0.5f, (bmax[1] - bmin[1]) * 0.5f,
+                                      (bmax[2] - bmin[2]) * 0.5f };
+                const float d[3] = { bc[0] - center[0], bc[1] - center[1], bc[2] - center[2] };
+                const float cx = (d[0] * lx[0]) + (d[1] * lx[1]) + (d[2] * lx[2]);
+                const float ex = (bh[0] * std::fabs(lx[0])) + (bh[1] * std::fabs(lx[1])) + (bh[2] * std::fabs(lx[2]));
+                if (std::fabs(cx) - ex > radius) {
+                    return; // wholly to one side of the cascade
+                }
+                const float cy = (d[0] * ly[0]) + (d[1] * ly[1]) + (d[2] * ly[2]);
+                const float ey = (bh[0] * std::fabs(ly[0])) + (bh[1] * std::fabs(ly[1])) + (bh[2] * std::fabs(ly[2]));
+                if (std::fabs(cy) - ey > radius) {
+                    return;
+                }
+                const float cz = (d[0] * lz[0]) + (d[1] * lz[1]) + (d[2] * lz[2]);
+                const float ez = (bh[0] * std::fabs(lz[0])) + (bh[1] * std::fabs(lz[1])) + (bh[2] * std::fabs(lz[2]));
+                castNear = std::min(castNear, cz - ez);
+                castFar = std::max(castFar, cz + ez);
+            };
+            auto measureChunks = [&](const std::vector<ShadowCasterChunk>& chunks) {
+                for (const ShadowCasterChunk& ch : chunks) {
+                    measure(ch.min, ch.max);
+                }
+            };
+            auto measureAlpha = [&](const ShadowAlphaCasters& list) {
+                for (const ShadowAlphaRange& r : list.ranges) {
+                    measure(r.min, r.max);
+                }
+            };
+            measureChunks(mShadowWorldChunks);
+            measureChunks(mShadowSceneryChunks);
+            measureChunks(mShadowActorChunks);
+            measureAlpha(mShadowAlphaWorldCache);
+            measureAlpha(mShadowAlphaSceneryReady);
+            measureAlpha(mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS]);
+        }
+
+        // Held with hysteresis, exactly like the radius above and for the same reason: the fit moves a little
+        // whenever anything in the scene moves, and a depth range that moves is a matrix that moves, which
+        // un-parks the cascade and redraws it every frame. Fitting tighter is worth nothing if it costs the
+        // reuse. Grow the moment the fit no longer fits, shrink only once it is clearly smaller.
+        float back;
+        float depthRange;
+        if (castFar > castNear) {
+            // A margin, in both directions. The near side needs it because DepthClipEnable is off and a
+            // caster exactly on the plane would be clamped rather than drawn; the far side because the box
+            // measured here is an over-estimate of the geometry inside it, not the geometry itself.
+            const float pad = std::max((castFar - castNear) * 0.05f, 1.0f);
+            const float step = std::exp2(std::floor(std::log2(std::max((castFar - castNear) + (2.0f * pad), 1e-3f))) -
+                                         3.0f);
+            float& heldBack = mShadowMapCascadeDepthBack[c];
+            float& heldRange = mShadowMapCascadeDepthRange[c];
+            // heldRange is the "have we fitted this yet" flag, not heldBack: a legitimate back is negative
+            // whenever every caster sits beyond the cascade centre along the light, so zero says nothing
+            // about it. A range is always positive.
+            const bool fitted = heldRange > 0.0f;
+            // Eye first. It has to sit at or behind the nearest caster, since depth 0 is the eye plane.
+            const float wantBack = -castNear + pad;
+            if (!fitted || wantBack > heldBack || wantBack < heldBack - (2.0f * step)) {
+                heldBack = std::ceil(wantBack / step) * step;
+            }
+            // Then the far plane, measured from the eye that was just settled rather than from the fit that
+            // asked for it. Deriving it from the raw fit instead was a defect with a specific cost: rounding
+            // can leave the eye further back than asked, and the far plane then has to reach further than the
+            // span alone -- so a correction applied after the hysteresis would track castFar directly, move
+            // the matrix every frame, and un-park the cascade. Held, it does not.
+            const float wantRange = heldBack + castFar + pad;
+            if (!fitted || wantRange > heldRange || wantRange < heldRange - (2.0f * step)) {
+                heldRange = std::ceil(wantRange / step) * step;
+            }
+            back = heldBack;
+            depthRange = heldRange;
+        } else {
+            // Nothing to cast in this cascade. The slice will be cleared and left, so the range only has to
+            // be valid -- the radius-based heuristic this replaces serves as the fallback.
+            back = radius * 3.0f;
+            depthRange = back + (radius * 2.0f);
+            mShadowMapCascadeDepthBack[c] = 0.0f;
+            mShadowMapCascadeDepthRange[c] = 0.0f;
+        }
         const float eye[3] = { center[0] - lz[0] * back, center[1] - lz[1] * back, center[2] - lz[2] * back };
         const float zNear = 0.0f;
-        const float zFar = back + radius * 2.0f;
+        const float zFar = depthRange;
 
         // How far down the view axis this cascade's footprint can still reach. The receiver shader answers
         // "lit" without projecting at all past the furthest of these -- see SetShadowMapReach.
         //
-        // Measured from the BOX, not from the split, and the difference is not small: the box is 2R by 2R by
-        // the depth range, and the depth range is five radii, so it overshoots its own band by thousands of
-        // units. Cutting at the split would delete real shadows -- a low sun throws them well past the band
-        // that cast them, which is exactly the geometry this range exists to catch.
+        // Measured from the BOX, not from the split, and the difference is not small: the box overshoots its
+        // own band along the light by however deep the depth range is. Cutting at the split would delete real
+        // shadows -- a low sun throws them well past the band that cast them, which is exactly the geometry
+        // this range exists to catch.
         //
         // Standard box-onto-an-axis bound: the centre projects to a point and the half-extents project to a
-        // radius. The box is centred half a radius behind the cascade centre along the light (the eye sits
-        // 3R back and the range runs 5R, so the middle is at 2.5R from the eye), with half-extents R, R and
-        // 2.5R along the three light axes.
+        // radius. The box runs from the eye (back behind the cascade centre) to the far plane, so its middle
+        // sits at depthRange/2 - back along the light and its half-extent there is depthRange/2. Both come
+        // from the fitted range above rather than from a multiple of the radius, so this tightens with it.
+        const float boxHalfDepth = depthRange * 0.5f;
+        const float boxOffset = boxHalfDepth - back;
         {
-            const float boxCentre[3] = { center[0] - lz[0] * radius * 0.5f, center[1] - lz[1] * radius * 0.5f,
-                                         center[2] - lz[2] * radius * 0.5f };
+            const float boxCentre[3] = { center[0] + lz[0] * boxOffset, center[1] + lz[1] * boxOffset,
+                                         center[2] + lz[2] * boxOffset };
             const float along = ((boxCentre[0] - nearC[0]) * viewDir[0]) + ((boxCentre[1] - nearC[1]) * viewDir[1]) +
                                 ((boxCentre[2] - nearC[2]) * viewDir[2]);
             const float spread =
                 radius * std::fabs((lx[0] * viewDir[0]) + (lx[1] * viewDir[1]) + (lx[2] * viewDir[2])) +
                 radius * std::fabs((ly[0] * viewDir[0]) + (ly[1] * viewDir[1]) + (ly[2] * viewDir[2])) +
-                radius * 2.5f * std::fabs((lz[0] * viewDir[0]) + (lz[1] * viewDir[1]) + (lz[2] * viewDir[2]));
+                boxHalfDepth * std::fabs((lz[0] * viewDir[0]) + (lz[1] * viewDir[1]) + (lz[2] * viewDir[2]));
             shadowReach = std::max(shadowReach, along + spread);
         }
 
@@ -4475,6 +4591,8 @@ void Interpreter::RenderShadowMap() {
             // ...and with it the parking state the fit just advanced, so the two keep describing the same
             // cascade (see the snapshot at the top of this loop).
             mShadowMapCascadeRadius[c] = parkedRadius;
+            mShadowMapCascadeDepthBack[c] = parkedDepthBack;
+            mShadowMapCascadeDepthRange[c] = parkedDepthRange;
             for (int i = 0; i < 3; i++) {
                 mShadowMapCascadeCenter[c][i] = parkedCenter[i];
             }

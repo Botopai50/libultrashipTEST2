@@ -66,8 +66,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: prism_driver <shader.hlsl> <shaders-root> [options]\n"
                      "  options: any of 't' (toon), 's' (shadow map), 'f' (fog), '2' (two cycle),\n"
-                     "           'a' (alpha threshold), 'n' (noise dither),\n"
-                     "           'g' (gathered shadow kernel; needs a 4_1 target)\n";
+                     "           'a' (alpha threshold), 'n' (noise dither)\n";
         return 2;
     }
     gShaderDir = argv[2];
@@ -87,9 +86,6 @@ int main(int argc, char** argv) {
     cc.opt_shadow_map = has('s');
     cc.opt_fog = has('f');
     cc.opt_2cyc = has('2');
-    // Not a CCFeatures field: it follows the adapter's feature level, not the material. 'g' selects the
-    // gathered kernel, which needs Shader Model 4.1 -- validate.sh raises the target profile to match.
-    const bool shadowGather = has('g');
     // The alpha cutoff has two placements -- hoisted above the shading, or left in the tail where the noise
     // dither can still move alpha under it -- so both need building. Neither was reachable before.
     cc.opt_alpha_threshold = has('a');
@@ -125,7 +121,6 @@ int main(int argc, char** argv) {
         { "o_shadow_map", cc.opt_shadow_map },
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         { "o_shadow_actor_cascades", SHADOW_MAP_ACTOR_CASCADES },
-        { "o_shadow_gather", shadowGather },
         { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc.used_blend, bool, 2) },

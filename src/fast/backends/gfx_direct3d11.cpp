@@ -108,19 +108,6 @@ void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t hei
     }
 }
 namespace {
-// SOH [Enhancement] Shader model the scene shaders are built against.
-//
-// Texture2DArray.Gather returns a whole 2x2 texel footprint in ONE instruction, which is what lets the
-// shadow kernel cost four texture instructions instead of sixteen for identical output. It first exists in
-// Shader Model 4.1, and this renderer accepts adapters down to feature level 10_0, which only has 4.0 -- so
-// the shader carries both kernels behind o_shadow_gather and this picks between them.
-//
-// Written exactly once, in Init, straight after the device comes up and before any shader is built; read
-// from the prewarm threads afterwards, which is why it must never move again. Declared up here so the probe
-// below can sit beside it; the profile strings it selects live with the rest of the compile machinery
-// further down.
-bool sShadowGather = false;
-
 // Does this machine actually build and load that kernel?
 //
 // The feature level says Shader Model 4.1 is available and that is the documented home of
@@ -261,31 +248,6 @@ float4 PSMain(VOut i) : SV_TARGET {
 }
 )HLSL";
 
-bool ShadowGatherProbe(pD3DCompile compileFn, ID3D11Device* device) {
-    if (compileFn == nullptr || device == nullptr) {
-        return false;
-    }
-    static const char kProbe[] = "Texture2DArray<float> t : register(t0);\n"
-                                 "SamplerState s : register(s0);\n"
-                                 "float4 PSMain(float4 p : SV_POSITION) : SV_TARGET {\n"
-                                 "    return t.Gather(s, float3(p.xy, 0.0));\n"
-                                 "}\n";
-    ComPtr<ID3DBlob> ps, err;
-    if (FAILED(compileFn(kProbe, sizeof(kProbe) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_1", 0, 0,
-                         ps.GetAddressOf(), err.GetAddressOf())) ||
-        ps == nullptr) {
-        SPDLOG_WARN("Shadow map: Texture2DArray.Gather did not compile at ps_4_1 ({}). Using the 4.0 kernel.",
-                    err != nullptr ? (const char*)err->GetBufferPointer() : "(no message)");
-        return false;
-    }
-    ComPtr<ID3D11PixelShader> shader;
-    if (FAILED(
-            device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, shader.GetAddressOf()))) {
-        SPDLOG_WARN("Shadow map: the driver would not load a ps_4_1 gather shader. Using the 4.0 kernel.");
-        return false;
-    }
-    return true;
-}
 } // namespace
 
 static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRenderer) {
@@ -402,19 +364,6 @@ void GfxRenderingAPIDX11::Init() {
 
     // SOH [Enhancement] Which shadow kernel this session gets, settled here and never again.
     //
-    // It decides the profile every scene shader is compiled against and the seed their disk cache is keyed
-    // by, so it has to be fixed before the first shader is built and must not move while any of them are
-    // alive. This is the earliest point where both things it depends on exist: the device (for its feature
-    // level, and to be asked whether it will load the result) and the compiler.
-    //
-    // Feature level 10_1 is Shader Model 4.1, which is where Texture2DArray.Gather begins. Below it -- or if
-    // the probe says no -- the kernel falls back to fetching its four texels one at a time, for the same
-    // picture at four times the texture instructions.
-    sShadowGather = mFeatureLevel >= D3D_FEATURE_LEVEL_10_1 && ShadowGatherProbe(mD3dCompile, mDevice.Get());
-    SPDLOG_INFO("Shadow map kernel: {} (feature level {:#x})",
-                sShadowGather ? "gathered 2x2 footprints, Shader Model 4.1" : "one fetch per texel, Shader Model 4.0",
-                (unsigned)mFeatureLevel);
-
     // Create the swap chain
     mWindowBackend->CreateSwapChain(mDevice.Get(), [this]() {
         mFrameBuffers[0].render_target_view.Reset();
@@ -631,20 +580,21 @@ constexpr UINT kShaderCompileFlags = D3DCOMPILE_DEBUG;
 constexpr UINT kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
-// Profile the shaders are compiled against, and the seed their disk cache is keyed by. Both follow
-// sShadowGather: only the shadow kernel needs Shader Model 4.1, but FXC parses the whole file for each entry
-// point, so an intrinsic the profile does not have is an error whether or not that entry point can reach it
-// -- which is exactly how a shadow-only mistake takes down the vertex compile first. And the two builds must
-// never share a cache entry: the SOURCE differs only for shadow variants, but the BYTECODE differs for every
-// one of them, and 4_1 bytecode handed to a 10_0 device fails to create.
+// Profile the shaders are compiled against, and the seed their disk cache is keyed by.
+//
+// Shader Model 4.0, unconditionally. The shadow kernel used to be the one thing here that wanted 4.1 --
+// Texture2DArray.Gather begins there -- which cost a startup probe, two kernels in the template, a
+// per-session profile switch and a cache seed to keep the two bytecodes apart. SampleCmpLevelZero fetches
+// the same 2x2 footprint AND compares AND blends it, and exists at 4.0, so all of that is gone and every
+// device the renderer accepts takes the same path.
 const char* ShaderProfileVs() {
-    return sShadowGather ? "vs_4_1" : "vs_4_0";
+    return "vs_4_0";
 }
 const char* ShaderProfilePs() {
-    return sShadowGather ? "ps_4_1" : "ps_4_0";
+    return "ps_4_0";
 }
 uint64_t ShaderCacheSeed() {
-    return (uint64_t)kShaderCompileFlags ^ (sShadowGather ? 0x9E37u : 0u);
+    return (uint64_t)kShaderCompileFlags;
 }
 
 constexpr uint32_t kShaderCacheMagic = 0x53535546; // 'FUSS'
@@ -2493,19 +2443,20 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
         return false;
     }
 
-    // Plain point sampler, not a comparison one. The shader fetches the stored depths and compares them
-    // itself, and that is a choice rather than a limitation now that the profile can be 4_1: a comparison
-    // sampler tests all four texels of its footprint against ONE depth, and the per-texel depth here is the
-    // receiver-plane bias -- the thing that keeps a sixteen-tap kernel free of acne without paying for it in
-    // peter panning. Gather buys back the fetch count without giving that up (see SampleShadowPCF4).
-    //
-    // Point filtering is also the only correct setting for a hand-rolled comparison: blending stored depths
-    // and comparing once is not the same as comparing per texel and averaging, and only the latter produces
-    // a real penumbra. Gather ignores the filter mode entirely -- it always returns the bilinear footprint
-    // -- but it does honour the addressing below, which is why the border still reads as "nothing occludes".
+    // The receiver reads this through a comparison sampler (see SampleShadowPCF4 in the shader), so the
+    // filter below is a comparison filter and the addressing is what supplies "nothing occludes" outside the
+    // map. It was a point sampler with a hand-rolled compare for as long as the receiver carried a
+    // per-texel depth to compare against; it no longer does.
     D3D11_SAMPLER_DESC samp_desc;
     ZeroMemory(&samp_desc, sizeof(samp_desc));
-    samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    // A COMPARISON filter, which is what makes the receiver's lookup one instruction: the unit fetches the
+    // 2x2 footprint, tests each texel against the reference depth, and blends the four results by the
+    // sub-texel position. LINEAR here is that blend -- it filters the comparison RESULTS, not the stored
+    // depths, which is the ordering a PCF tap requires and the reason a plain linear sampler would be wrong.
+    samp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    // LESS_EQUAL against the receiver's own depth: 1 where the stored depth is at or behind it, which is
+    // "this texel does not occlude". Matches the border below, so outside the map everything reads as lit.
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
     // Clamp to a "nothing occludes" border: outside a cascade's footprint nothing is known to occlude, and
     // wrapping would fold a distant part of the map back over the edge. 1.0 is the far plane, so any
     // receiver compares as lit against it.
@@ -2514,7 +2465,6 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
     samp_desc.BorderColor[0] = samp_desc.BorderColor[1] = 1.0f;
     samp_desc.BorderColor[2] = samp_desc.BorderColor[3] = 1.0f;
-    samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER; // unused without a comparison filter
     samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(mDevice->CreateSamplerState(&samp_desc, mShadowMapSampler.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the comparison sampler.");
@@ -2752,19 +2702,17 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, i
 }
 
 // SOH [Enhancement] Cascaded shadow maps: this cascade's rasterizer state, differing from the shared one
-// only in the slope-scaled depth bias.
+// only in what bounds its slope-scaled depth bias.
 //
-// That bias is a multiple of the polygon's depth gradient ACROSS A TEXEL, so its world-space effect scales
-// with the texel -- and a texel of the far cascade is several world units, which made this the largest
-// single source of shadows detaching from their casters at distance. It cannot be capped in the shader the
-// way the normal offset is, because the rasterizer reads it from the pipeline state, not per pixel. So each
-// cascade gets its own state with the multiplier reduced to whatever keeps its own texel under the world
-// ceiling. Near cascades are nowhere near it and keep the base value untouched.
+// The slope term is a multiple of the polygon's depth gradient across a texel, and what the rasterizer
+// actually writes is that multiplier times the polygon's own gradient -- unbounded on a surface raking away
+// from the light, which is where a shadow detaching from its caster comes from. The bound belongs on the
+// PRODUCT, and DepthBiasClamp is the hardware's bound on exactly that, so each cascade gets its own state
+// carrying the ceiling converted into that cascade's depth units.
 //
-// The texel size comes out of the matrix rather than being plumbed in: the projection scales the light's
-// unit x axis by 1/radius, so that column's length IS 1/radius, and one texel spans 2*radius/resolution.
-// The result is quantised before it is compared, so a value drifting by a hair does not rebuild the state;
-// combined with the radius hysteresis, rebuilds happen once in a great while rather than per frame.
+// The conversion comes out of the matrix rather than being plumbed in, and the result is quantised before it
+// is compared, so a value drifting by a hair does not rebuild the state; combined with the depth-range
+// hysteresis in the fit, rebuilds happen once in a great while rather than per frame.
 ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice, int resolution,
                                                                        const float lightViewProj[16]) {
     if (slice < 0 || slice >= SHADOW_MAP_MAX_SLICES || resolution <= 0) {
@@ -2797,14 +2745,19 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     //
     // DepthBiasClamp is the hardware's bound on exactly that product, and it was left at zero -- which in
     // D3D means "no clamp", not "no bias". Setting it puts the ceiling where it was always meant to be. The
-    // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD in this cascade's own depth units: the projection scales the
-    // light's unit x axis by 1/radius, so sx IS 1/radius, and a cascade's depth range is five radii by
-    // construction.
+    // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD expressed in this cascade's own NDC depth units.
+    //
+    // Read off the matrix's THIRD column rather than derived from the radius. The projection scales the
+    // light's unit z axis by 1/(zFar - zNear), so that column's length IS the world-to-NDC-depth factor --
+    // one multiply, exactly right, whatever the range happens to be. It used to be computed as sx/5 on the
+    // reasoning that a cascade's depth range is five radii by construction; that stopped being true when the
+    // near and far planes started being fitted to the casters, and a ceiling derived from an assumption the
+    // projection no longer satisfies is a ceiling in the wrong place.
     float depthBiasClamp = 0.0f;
-    const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
-                               (lightViewProj[8] * lightViewProj[8]));
-    if (sx > 1e-9f) {
-        depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sx / 5.0f;
+    const float sz = std::sqrt((lightViewProj[2] * lightViewProj[2]) + (lightViewProj[6] * lightViewProj[6]) +
+                               (lightViewProj[10] * lightViewProj[10]));
+    if (sz > 1e-9f) {
+        depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sz;
         // Quantised for the same reason the slope is: a value drifting by a hair must not rebuild the state.
         depthBiasClamp = std::floor((depthBiasClamp * 4096.0f) + 0.5f) / 4096.0f;
     }
@@ -3208,9 +3161,6 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         if (sx > 1e-9f && mShadowResolution > 0) {
             const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
             mPerShadowCbData.shadow_texel_world[c] = texelWorld;
-            mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
-            mPerShadowCbData.shadow_actor_texel_uv[c] =
-                1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
     }
     mShadowCbDirty = true;
@@ -3622,8 +3572,6 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         { "o_shadow_actor_cascades", SHADOW_MAP_ACTOR_CASCADES },
         // Whether the shadow kernel may fetch a 2x2 footprint per instruction. A property of the adapter,
         // not of the material, so it is the same for every shader in a session -- it selects a kernel, it
-        // does not add a variant. See sShadowGather.
-        { "o_shadow_gather", sShadowGather },
         // Spliced in rather than uploaded: it is a fixed policy value, and having it as a literal lets the
         // compiler fold the smoothstep that uses it.
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
