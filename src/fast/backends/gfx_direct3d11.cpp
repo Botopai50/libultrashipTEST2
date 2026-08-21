@@ -2476,7 +2476,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // physical distance in every cascade. The slope term stays: being relative to the polygon's own
     // gradient is exactly right, and it is the same relative amount whatever the range.
     rast_desc.DepthBias = 0;
-    rast_desc.SlopeScaledDepthBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
+    rast_desc.SlopeScaledDepthBias = SHADOW_MAP_SLOPE_BIAS;
     if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
         return false;
@@ -2771,9 +2771,10 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         return mShadowRasterizerState.Get();
     }
 
-    // The slope is also the cache key below, so a value changed while the game runs rebuilds the state on
-    // its own -- no extra invalidation needed for this one.
-    float slope = mShadowSlopeBias;
+    // Fixed, not settable. This is the ONE offset the shadow map has: the receiver compares against the
+    // stored depth directly, so without a slope-scaled bias here every surface shadows itself and the whole
+    // scene stripes. See SHADOW_MAP_SLOPE_BIAS.
+    float slope = SHADOW_MAP_SLOPE_BIAS;
     slope = std::floor((slope * 8.0f) + 0.5f) / 8.0f; // eighths, so a hair of drift rebuilds nothing
     if (slope < 0.0f) {
         slope = 0.0f;
@@ -3175,50 +3176,21 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
 }
 
 void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                             float blendFraction, float normalOffset, float strength,
-                                             float filterWidth, float debugMode, float edgeHardness,
-                                             float edgeHardnessFar) {
-    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, normalOffset, strength,
-                                        filterWidth, debugMode, edgeHardness, edgeHardnessFar);
+                                             float blendFraction, float strength, float debugMode,
+                                             float edgeHardness, float edgeHardnessFar) {
+    GfxRenderingAPI::SetShadowMapParams(viewProj, splitDistances, cascadeCount, blendFraction, strength, debugMode,
+                                        edgeHardness, edgeHardnessFar);
 
     ZeroMemory(&mPerShadowCbData, sizeof(mPerShadowCbData));
     const int count = mShadowCascadesActive;
     mPerShadowCbData.shadow_params[0] = (float)count;
     mPerShadowCbData.shadow_params[1] = mShadowBlendFraction;
-    mPerShadowCbData.shadow_params[2] = mShadowNormalOffset;
+    mPerShadowCbData.shadow_params[2] = 0.0f;
     mPerShadowCbData.shadow_params[3] = mShadowStrength;
-    mPerShadowCbData.shadow_filter[0] = mShadowFilterWidth;
+    mPerShadowCbData.shadow_filter[0] = mShadowMaxViewDepth;
     mPerShadowCbData.shadow_filter[1] = mShadowDebug;
     mPerShadowCbData.shadow_filter[2] = mShadowEdgeHardness;
     mPerShadowCbData.shadow_filter[3] = mShadowEdgeHardnessFar;
-    // Guarded rather than trusted: these come straight from user settings, and the shader divides the band
-    // between them with smoothstep, which returns garbage if the two ever cross.
-    {
-        float minInc = mShadowMinIncidence < 0.0f ? 0.0f : (mShadowMinIncidence > 1.0f ? 1.0f : mShadowMinIncidence);
-        float fullInc =
-            mShadowFullIncidence < 0.0f ? 0.0f : (mShadowFullIncidence > 1.0f ? 1.0f : mShadowFullIncidence);
-        if (fullInc < minInc + 1e-3f) {
-            fullInc = minInc + 1e-3f;
-        }
-        float floorScale = mShadowMinHardnessScale < 0.0f
-                               ? 0.0f
-                               : (mShadowMinHardnessScale > 1.0f ? 1.0f : mShadowMinHardnessScale);
-        mPerShadowCbData.shadow_incidence[0] = minInc;
-        mPerShadowCbData.shadow_incidence[1] = fullInc;
-        mPerShadowCbData.shadow_incidence[2] = floorScale;
-        // The reach bound rides in the incidence block's spare slot rather than growing the buffer for one
-        // float. It is not an incidence value and has nothing to do with the three beside it; see
-        // SetShadowMapReach.
-        mPerShadowCbData.shadow_incidence[3] = mShadowMaxViewDepth;
-    }
-    mPerShadowCbData.shadow_plane[0] = mShadowPlaneGradientLimit;
-    mPerShadowCbData.shadow_plane[1] = mShadowPlaneSoftFalloff ? 1.0f : 0.0f;
-    mPerShadowCbData.shadow_plane[2] = (float)mShadowMaxAnisoTaps;
-    mPerShadowCbData.shadow_plane[3] = mShadowEdgeScreenWidth ? 1.0f : 0.0f;
-    mPerShadowCbData.shadow_aniso[0] = mShadowAnisoSpacing;
-    mPerShadowCbData.shadow_aniso[1] = 0.0f;
-    mPerShadowCbData.shadow_aniso[2] = 0.0f;
-    mPerShadowCbData.shadow_aniso[3] = 0.0f;
     for (int i = 0; i < 3; i++) {
         mPerShadowCbData.shadow_actor_min[i] = mShadowActorBoundsMin[i];
         mPerShadowCbData.shadow_actor_max[i] = mShadowActorBoundsMax[i];
@@ -3237,30 +3209,11 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         const float sx = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
         if (sx > 1e-9f && mShadowResolution > 0) {
             const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
-            // Capped, because the shader multiplies this by the normal offset (in texels) to push the
-            // receiver off its own surface -- and a texel of the far cascade is several world units, so an
-            // offset measured in texels runs away with distance. Two texels is a third of a unit in the
-            // near cascade and nearly twelve in the far one, which is the shadow lifting clean off what
-            // cast it. Peter panning that grows the further you get is exactly this term.
-            //
-            // Capped rather than made constant: acne appears at the scale of the map's own resolution, so
-            // the offset has to track the texel while the texel is small. The cap only bites once tracking
-            // it would cost more than the acne it prevents.
-            const float offsetCap = mShadowNormalOffset > 1e-4f
-                                        ? SHADOW_MAP_MAX_NORMAL_OFFSET_WORLD / mShadowNormalOffset
-                                        : texelWorld;
-            mPerShadowCbData.shadow_texel_world[c] = texelWorld < offsetCap ? texelWorld : offsetCap;
+            mPerShadowCbData.shadow_texel_world[c] = texelWorld;
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
             mPerShadowCbData.shadow_actor_texel_uv[c] =
                 1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
-
-        // Depth bias, in world units, converted into this cascade's NDC depth. The projection scales the
-        // light's unit z axis by 1/(zFar - zNear), so the length of that column IS the conversion factor --
-        // the same trick the texel size uses, and it keeps one tuning number meaning one physical distance
-        // in every cascade instead of drifting by a factor of fifty between the near and far ones.
-        const float sz = std::sqrt(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
-        mPerShadowCbData.shadow_depth_bias[c] = mShadowDepthBiasWorld * sz;
     }
     mShadowCbDirty = true;
 }

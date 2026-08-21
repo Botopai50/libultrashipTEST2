@@ -56,14 +56,11 @@ struct PerShadowCB {
     float shadow_splits[4];      // far distance of each cascade, world units
     float shadow_texel_world[4]; // world size of one texel, per cascade
     float shadow_texel_uv[4];    // one texel in UV terms (1/resolution), per cascade
-    float shadow_depth_bias[4];  // constant bias in NDC depth, per cascade (world units / depth range)
-    // x = active cascade count (0 = no shadow map), y = blend fraction, z = normal offset, w = strength
+    // x = active cascade count (0 = no shadow map), y = blend fraction, z unused, w = strength
     float shadow_params[4];
-    // x = PCF kernel radius in texels, y = debug mode, z = edge hardness, w = hardness in the far cascade.
+    // x = furthest view depth any cascade's footprint reaches, y = debug mode, z = edge hardness,
+    // w = hardness in the far cascade.
     float shadow_filter[4];
-    // x = incidence at which a scenery receiver takes the shadow in full, y = incidence at which the edge
-    // hardening reaches full strength, z = the floor that hardening tapers to between the two, w unused.
-    float shadow_incidence[4];
     // World-space bounds of the ACTOR caster layer, xyz used and w ignored. An empty layer is sent as an
     // inverted box, which every test against it fails -- so "no characters" needs no separate flag.
     float shadow_actor_min[4];
@@ -71,12 +68,6 @@ struct PerShadowCB {
     // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
     // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
     float shadow_actor_texel_uv[4];
-    // x = the receiver-plane gradient's bound, y = 1 to narrow the kernel by the overshoot instead of only
-    // truncating the gradient, z = most quads the kernel may lay along the receding direction (1 = off),
-    // w unused. See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT and SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS.
-    float shadow_plane[4];
-    // x = spacing between the anisotropic kernel's quads, in texels; y, z, w reserved.
-    float shadow_aniso[4];
 };
 
 struct PerDrawCB {
@@ -209,8 +200,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
-                            float normalOffset, float strength, float filterWidth, float debugMode,
-                            float edgeHardness, float edgeHardnessFar) override;
+                            float strength, float debugMode, float edgeHardness, float edgeHardnessFar) override;
 
     // SOH [Enhancement] FXAA post-process pass. Null until first used; mFxaaFailed latches a compile or
     // creation failure so a broken pipeline is attempted once and not once per frame.

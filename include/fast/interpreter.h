@@ -508,12 +508,9 @@ class Interpreter {
     // stops capturing and stops rendering the pass when this is false. lightDir is the world-space
     // direction the light travels (from the sky toward the ground), the same key the cel shading picks.
     void SetShadowMapParams(bool enabled, int cascadeCount, int resolution, int actorResolution, const float splits[4],
-                            const float lightDir[3], float blendFraction, float normalOffset, float strength,
-                            float filterWidth, float minCasterSize, float debugMode, float edgeHardness,
-                            float edgeHardnessFar, float minIncidence, float fullIncidence, float minHardnessScale,
-                            float depthBiasWorld, float slopeBias, float planeGradientLimit, bool planeSoftFalloff,
-                            int maxAnisoTaps, bool edgeScreenWidth,
-                            float anisoSpacing, const int cascadeDivisors[SHADOW_MAP_MAX_CASCADES]) {
+                            const float lightDir[3], float blendFraction, float strength, float minCasterSize,
+                            float debugMode, float edgeHardness, float edgeHardnessFar,
+                            const int cascadeDivisors[SHADOW_MAP_MAX_CASCADES]) {
         // Getting ahead of the compiler. Every receiver in the scene needs a variant it has never needed
         // before the moment this turns on, and each is otherwise compiled inside the frame that first draws
         // it. Asked only on the transition, and only of a backend that wants to act on it.
@@ -560,22 +557,11 @@ class Interpreter {
             }
         }
         mShadowMapBlendFraction = blendFraction;
-        mShadowMapNormalOffset = normalOffset;
         mShadowMapStrength = strength;
-        mShadowMapFilterWidth = filterWidth;
         mShadowMapMinCasterSize = minCasterSize;
         mShadowMapDebug = debugMode;
         mShadowMapEdgeHardness = edgeHardness;
         mShadowMapEdgeHardnessFar = edgeHardnessFar;
-        // Straight through to the backend rather than held here. Nothing in the cascade fit reads them --
-        // they only ever reach the receiver's shader -- so there is no reason for the interpreter to carry
-        // a copy that could drift out of step with the one the constant buffer holds.
-        if (mRapi != nullptr) {
-            mRapi->SetShadowMapIncidence(minIncidence, fullIncidence, minHardnessScale);
-            mRapi->SetShadowMapBias(depthBiasWorld, slopeBias);
-            mRapi->SetShadowMapPlaneBias(planeGradientLimit, planeSoftFalloff, maxAnisoTaps, edgeScreenWidth,
-                                         anisoSpacing);
-        }
         if (!enabled) {
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
@@ -1093,9 +1079,7 @@ class Interpreter {
                                                         SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels
     float mShadowMapBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
-    float mShadowMapNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
     float mShadowMapStrength = SHADOW_MAP_DEFAULT_STRENGTH;
-    float mShadowMapFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
     float mShadowMapMinCasterSize = SHADOW_MAP_DEFAULT_MIN_CASTER_SIZE;
     float mShadowMapDebug = 0.0f;
     float mShadowMapEdgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;

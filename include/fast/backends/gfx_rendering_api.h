@@ -291,8 +291,8 @@ class GfxRenderingAPI {
     // units (used to pick a cascade and to size its blend band). Stored here rather than in each
     // backend so the members are available to every per-draw uniform path, exactly like the toon ones.
     virtual void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount,
-                                    float blendFraction, float normalOffset, float strength, float filterWidth,
-                                    float debugMode, float edgeHardness, float edgeHardnessFar) {
+                                    float blendFraction, float strength, float debugMode, float edgeHardness,
+                                    float edgeHardnessFar) {
         mShadowCascadesActive = cascadeCount < 0 ? 0
                                 : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
                                                                          : cascadeCount;
@@ -307,44 +307,10 @@ class GfxRenderingAPI {
             }
         }
         mShadowBlendFraction = blendFraction;
-        mShadowNormalOffset = normalOffset;
         mShadowStrength = strength;
-        mShadowFilterWidth = filterWidth;
         mShadowDebug = debugMode;
         mShadowEdgeHardness = edgeHardness;
         mShadowEdgeHardnessFar = edgeHardnessFar;
-    }
-
-    // The incidence band that governs what a SCENERY receiver does as it turns edge-on to the light. Its own
-    // entry point rather than three more arguments on the call above, which already takes ten and is invoked
-    // from half a dozen early-exit paths in the cascade fit -- every one of which would have to grow with it
-    // for no reason, since none of them has anything to say about this.
-    virtual void SetShadowMapIncidence(float minIncidence, float fullIncidence, float minHardnessScale) {
-        mShadowMinIncidence = minIncidence;
-        mShadowFullIncidence = fullIncidence;
-        mShadowMinHardnessScale = minHardnessScale;
-    }
-
-    // The receiver-plane gradient's bound, and whether overshooting it narrows the filter kernel as well as
-    // truncating the gradient. Its own entry point for the same reason the incidence band has one: nothing
-    // in the cascade fit reads either, they only ever reach the receiver's shader.
-    //
-    // See SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT for what the bound is and why it is settable at all --
-    // short version, it is the last suspect standing for the faceted banding and a suspect that needs a
-    // rebuild per trial never gets tested.
-    virtual void SetShadowMapPlaneBias(float gradientLimit, bool softFalloff, int maxAnisoTaps,
-                                       bool edgeScreenWidth, float anisoSpacing) {
-        // Held off zero: the kernel multiplies by it, and a spacing of nothing collapses every quad onto
-        // the same point, which is the square kernel with extra fetches.
-        mShadowAnisoSpacing = anisoSpacing < 0.05f ? 0.05f : anisoSpacing;
-        mShadowEdgeScreenWidth = edgeScreenWidth;
-        // 1 is "off", and the shader reads it as such; below that would divide the kernel away.
-        mShadowMaxAnisoTaps = maxAnisoTaps < 1 ? 1 : maxAnisoTaps;
-        // A bound at or below zero would kill the plane correction outright and, with the falloff on, divide
-        // the kernel away with it. Held off zero rather than rejected: sweeping it down to nothing is a
-        // legitimate half of the experiment, and the floor only stops it reaching the degenerate case.
-        mShadowPlaneGradientLimit = gradientLimit < 0.01f ? 0.01f : gradientLimit;
-        mShadowPlaneSoftFalloff = softFalloff;
     }
 
     // SOH [Enhancement] Turns the shadow map's GPU timing on WITHOUT the cascade-bounds debug view.
@@ -399,16 +365,6 @@ class GfxRenderingAPI {
         }
     }
 
-    // The two biases that were compile-time constants. depthBiasWorld is a flat offset in world units,
-    // divided into each cascade's own depth range on upload; slopeBias multiplies the polygon's own depth
-    // gradient and is handed to the rasterizer. Separate from SetShadowMapParams for the same reason as the
-    // incidence band: that call already takes ten arguments and is made from half a dozen early-exit paths
-    // that have nothing to say about these.
-    virtual void SetShadowMapBias(float depthBiasWorld, float slopeBias) {
-        mShadowDepthBiasWorld = depthBiasWorld;
-        mShadowSlopeBias = slopeBias;
-    }
-
   protected:
     // SOH [Enhancement] Mipmapping (see GFX_MIPMAP_MIN_TEXTURE_SIZE). Off until the application asks, so a
     // host that never pushes these keeps exactly the single-level uploads it had before.
@@ -432,9 +388,7 @@ class GfxRenderingAPI {
     float mShadowSplits[SHADOW_MAP_MAX_CASCADES] = {};
     int mShadowCascadesActive = 0;
     float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
-    float mShadowNormalOffset = SHADOW_MAP_DEFAULT_NORMAL_OFFSET;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;
-    float mShadowFilterWidth = SHADOW_MAP_DEFAULT_FILTER_WIDTH;
     float mShadowDebug = 0.0f;
     // Timing only -- read by the backend's timer, never by a shader. See SetShadowMapProfiling.
     bool mShadowProfile = false;
@@ -445,17 +399,7 @@ class GfxRenderingAPI {
     float mShadowMaxViewDepth = 0.0f;
     float mShadowActorBoundsMin[3] = { 1e30f, 1e30f, 1e30f };
     float mShadowActorBoundsMax[3] = { -1e30f, -1e30f, -1e30f };
-    float mShadowMinIncidence = SHADOW_MAP_MIN_INCIDENCE;
-    float mShadowFullIncidence = SHADOW_MAP_FULL_INCIDENCE;
-    float mShadowMinHardnessScale = SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE;
-    float mShadowPlaneGradientLimit = SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT;
-    int mShadowMaxAnisoTaps = SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS;
-    bool mShadowEdgeScreenWidth = SHADOW_MAP_DEFAULT_EDGE_SCREEN_WIDTH != 0;
-    float mShadowAnisoSpacing = SHADOW_MAP_DEFAULT_ANISO_SPACING;
     int mShadowViewSlice = 0;
-    bool mShadowPlaneSoftFalloff = SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF != 0;
-    float mShadowDepthBiasWorld = SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD;
-    float mShadowSlopeBias = SHADOW_MAP_DEFAULT_SLOPE_BIAS;
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

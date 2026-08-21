@@ -4155,8 +4155,8 @@ void Interpreter::RenderShadowMap() {
     if (!mRapi->ShadowMapConfigure(mShadowMapCascadeCount, mShadowMapResolution, mShadowMapActorResolution)) {
         // Backend could not give us the maps; report no cascades so the main pass does not sample a
         // texture that was never filled.
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
@@ -4164,16 +4164,16 @@ void Interpreter::RenderShadowMap() {
             mShadowSceneryReady.size() + mShadowAlphaWorldCache.verts.size() +
             mShadowAlphaSceneryReady.verts.size() + mShadowAlphaReady[SHADOW_MAP_LAYER_ACTORS].verts.size() <
         9) {
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
 
     float invVp[4][4];
     if (!ShadowInvertMatrix(mRsp->P_matrix, invVp)) {
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
@@ -4181,8 +4181,8 @@ void Interpreter::RenderShadowMap() {
     // Two points on the view axis give the camera position and the direction it looks.
     float nearC[3], farC[3];
     if (!ShadowUnproject(invVp, 0.0f, 0.0f, 0.0f, nearC) || !ShadowUnproject(invVp, 0.0f, 0.0f, 1.0f, farC)) {
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
@@ -4224,8 +4224,8 @@ void Interpreter::RenderShadowMap() {
     float viewDir[3] = { farC[0] - nearC[0], farC[1] - nearC[1], farC[2] - nearC[2] };
     float viewLen = std::sqrt(viewDir[0] * viewDir[0] + viewDir[1] * viewDir[1] + viewDir[2] * viewDir[2]);
     if (viewLen < 1e-6f) {
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
@@ -4238,8 +4238,8 @@ void Interpreter::RenderShadowMap() {
     float lz[3] = { mShadowMapLightDir[0], mShadowMapLightDir[1], mShadowMapLightDir[2] };
     float lzLen = std::sqrt(lz[0] * lz[0] + lz[1] * lz[1] + lz[2] * lz[2]);
     if (lzLen < 1e-6f) {
-        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction, mShadowMapNormalOffset,
-                                  mShadowMapStrength, mShadowMapFilterWidth, mShadowMapDebug,
+        mRapi->SetShadowMapParams(nullptr, nullptr, 0, mShadowMapBlendFraction,
+                                  mShadowMapStrength, mShadowMapDebug,
                                   mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
         return;
     }
@@ -4777,7 +4777,7 @@ void Interpreter::RenderShadowMap() {
     // thousandth of the reach is far below anything a shadow occupies and removes the question.
     mRapi->SetShadowMapReach(shadowReach * 1.001f);
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
-                              mShadowMapNormalOffset, mShadowMapStrength, mShadowMapFilterWidth,
+                              mShadowMapStrength,
                               mShadowMapDebug, mShadowMapEdgeHardness, mShadowMapEdgeHardnessFar);
 }
 

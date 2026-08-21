@@ -185,55 +185,26 @@
 // Expressed as a fraction so the band scales with each cascade's size.
 #define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.1f
 
-// Depth bias for the shadow comparison, in WORLD UNITS and applied in the shader, not handed to the rasterizer.
-//
-// The rasterizer's own constant bias counts smallest representable depth increments, and each cascade
-// covers a different depth range -- so one setting means wildly different distances per cascade. At 150
-// increments the near cascade got about 1.3 world units and the far one about 70, which detached distant
-// shadows from their casters and, worse, placed the SAME shadow in a different spot in each cascade: at a
-// cascade transition you could see both copies at once, metres apart.
-//
-// Expressed in world units and divided by each cascade's own depth range at upload time, one value means
-// the same physical offset everywhere. The slope term stays with the rasterizer, where being relative to
-// the polygon's own gradient is exactly what it should be.
-// 0.60, about a hundredth of the player's height (he is roughly 60 world units). Still small, and still not
-// the thing removing acne: that is the receiver plane bias in the shader, which compares each tap against
-// the depth the receiver's OWN plane would have at that tap rather than at the kernel's centre, exactly and
-// without a margin.
-//
-// It sat at 0.05 while the kernel was square and every tap stayed within a texel or two of the sample point.
-// The anisotropic kernel stretches the row along the direction a receiver recedes, which is precisely the
-// direction depth runs away fastest, so the outermost taps now sit much further from the point whose depth
-// they are compared against -- and where the plane correction is bounded, that residue has to be absorbed
-// somewhere. Twelve times a very small number is still a small number: at a hundredth of a character's
-// height the detachment stays under what an eye picks out as a gap.
-//
-// It was 4.0, from before the plane bias existed, when this and the slope term were carrying the whole load
-// between them (the normal offset is off in the tuned configuration). Every one of those units was also a
-// unit of shadow sliding away from whatever cast it along the light ray, so cutting it back is bought
-// contact, not lost protection. What remains covers the cases the plane correction cannot reach on its own:
-// a silhouette, where the derivative straddles two surfaces and the correction is clamped.
-#define SHADOW_MAP_DEFAULT_DEPTH_BIAS_WORLD 0.60f
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
 // texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
 // light and large on one edge-on to it, which is where depth runs away across a texel and acne appears.
 // Being relative to the TEXEL is the part that misbehaved, since a texel of the far cascade is several
 // world units, and that is now handled per cascade by the ceiling below.
 //
-// 1.0: one polygon gradient across one texel, which is the least this term can be and still mean anything.
-// It has been 4.0 and, before that, 2.0 -- both from the era when the biases here were the only defence
-// against acne. The receiver plane bias in the shader took that job over, and it does it without displacing
-// anything, so the two rasterizer-side terms are now a backstop rather than the mechanism.
+// This is the ONLY offset in the system, and it is fixed rather than settable. Everything downstream
+// compares a receiver's depth against the stored depth directly -- no constant bias, no normal offset, no
+// receiver-plane correction -- so without this every surface shadows itself and the scene stripes. That is
+// geometry, not a preference, which is why it is not a knob.
 //
-// Kept above zero rather than switched off, because the two do not overlap completely: the plane correction
-// is recovered from screen-space derivatives, and at a silhouette -- where the pixel quad straddles two
-// surfaces -- it is meaningless and gets clamped. This is what covers that, and being relative to the
-// polygon's own gradient it costs almost nothing on the surfaces facing the light, where a shadow's contact
-// point is read most closely.
+// It is also the cheapest place for the offset to live. Being relative to the polygon's gradient it is
+// nearly nothing on a surface facing the light, which is where a shadow's contact point is read most
+// closely, and large only on one edge-on to it, where depth runs across a texel in a step and acne would
+// otherwise appear.
 //
-// The per-cascade ceiling below still applies and now binds even less than before: at a quarter of the old
-// multiplier, a texel would have to be four times coarser to reach it.
-#define SHADOW_MAP_DEFAULT_SLOPE_BIAS 1.0f
+// 1.0 is one polygon gradient across one texel, the least this term can be and still mean anything. It has
+// been 4.0 and 2.0 in earlier revisions, when a stack of other bias terms sat on top of it; with those gone
+// this may well need to move. It is a starting point, not a tuned value.
+#define SHADOW_MAP_SLOPE_BIAS 1.0f
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is
@@ -244,9 +215,9 @@
 
 // Ceiling on what that slope term may displace a receiver by, in WORLD units.
 //
-// The rasterizer takes one slope value per state, not per draw, so this cannot be capped inside the shader
-// the way the normal offset is -- the backend builds a separate rasterizer state per cascade instead, each
-// with the slope reduced to whatever keeps its own texel under this ceiling.
+// The rasterizer takes one slope value per state, not per draw, so this cannot be capped per pixel -- the
+// backend builds a separate rasterizer state per cascade instead, each with the slope reduced to whatever
+// keeps its own texel under this ceiling.
 //
 // 32.0, which at the default cascade ladder and resolution does not bind on ANY cascade: the far one would
 // need a texel over eight world units to reach it, and it sits at about six. So this is a guard rail rather
@@ -260,34 +231,6 @@
 // little panning and cost the acne protection the far cascade needs.
 #define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 32.0f
 
-// How far along the surface normal the receiver is nudged before the comparison, in cascade texels.
-// This is the term that actually removes the striped self-shadowing (acne) on grazing and curved surfaces,
-// where a depth-only bias cannot: it moves the sample sideways off the shadow-casting surface itself rather
-// than sliding it along the light ray, still inside the same polygon.
-// Scaling with the texel is what makes one value work across cascades -- acne appears at the scale of the
-// map's own resolution, so the push has to be measured in the same unit.
-// The shader scales this by the sine of the angle between the surface and the light, so it is the offset at
-// a fully grazing angle, not everywhere. That is where acne lives; a surface square to the light needs
-// nothing and now pays nothing.
-// Zero in the tuned configuration, which is a choice and not a fallback. Sideways is the cheapest direction
-// to move a sample -- it leaves the light ray and so buys acne removal without detachment -- but it moves the
-// sample off the surface in world space, and where two surfaces meet that pulls the shadow out of the corner.
-// The constant bias absorbs the work instead: it detaches, but it detaches evenly, and an even offset reads
-// as a soft contact where a missing corner reads as a mistake. Raise this if acne returns on curved
-// geometry; the corners are what it costs.
-#define SHADOW_MAP_DEFAULT_NORMAL_OFFSET 0.0f
-
-// Ceiling on that push, in WORLD units, applied per cascade before the shader sees it.
-//
-// Measuring the offset in texels is right while a texel is small, but a texel of the far cascade is several
-// world units, so two of them is nearly twelve -- and the shader moves the receiver's sample that far
-// towards the light before comparing. The shadow lifts off whatever cast it, by more the further away the
-// receiver is, because the cascade it lands in is coarser. That is peter panning that grows with distance.
-//
-// The ceiling only matters when the offset is on. Off, as the tuned configuration has it, nothing here
-// binds: the shader multiplies by an offset of zero and the sample stays exactly on the surface.
-#define SHADOW_MAP_MAX_NORMAL_OFFSET_WORLD 3.0f
-
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
 // above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches
 // every shadow towards infinity, which reads as wrong long before it is geometrically wrong -- and it also
@@ -298,27 +241,6 @@
 // it looks -- a shadow's boundary quantises into steps of one texel over the sine of the angle between the
 // receiver and the light, so a sun held higher is also a sun whose shadows are sampled better.
 #define SHADOW_MAP_DEFAULT_MIN_ELEVATION 0.60f
-
-// Radius of the PCF kernel, in cascade texels. The filter is sixteen fetches whatever this is; the value
-// only says how far apart they sit, so it trades edge softness against fetch coverage at no extra cost.
-//
-// Four bilinear taps at +/- this radius, each already spanning a 2x2 texel quad, so the kernel covers
-// 2*(1+radius) texels across. At 1.0 the quads sit edge to edge and cover 4x4; above that they separate and
-// leave texels sampled by nothing, which reads on screen as a grid, so the shader clamps there.
-//
-// 0.4, which is where two pieces of player feedback bracket it rather than where a calculation puts it:
-// 0.25 read as stair-stepped, 0.5 read as smeared, so this sits nearer the end that was complained about
-// twice. Sweep it live -- it is a CVar and needs no rebuild.
-//
-// 0.25 failing was itself a correction. I had argued that bilinear taps cannot stair-step at any spacing;
-// that was wrong. A bilinear tap removes the hardness WITHIN a texel and does nothing about the staircase
-// BETWEEN texels, because the shadow edge is quantised to the texel grid either way and a one-texel ramp
-// only rounds each step's corner. Hiding a staircase needs a kernel spanning several texels.
-//
-// So sharper distant shadows are not available from the filter. That is a texel problem, and both cures are
-// priced: halve Graphics.ShadowMap.Split2 to halve the far cascade's texel at the cost of range, or double
-// Graphics.ShadowMap.Resolution to halve every texel at the cost of four times the memory.
-#define SHADOW_MAP_DEFAULT_FILTER_WIDTH 0.6f
 
 // Smallest caster the actor layer will accept, as the largest side of its world-space bounding box.
 // Ground clutter -- grass tufts, flowers, small debris -- is armed as a caster like anything else, and at
@@ -442,158 +364,8 @@
 // SHADOW_MAP_DEFAULT_EDGE_HARDNESS for the old uniform behaviour.
 #define SHADOW_MAP_DEFAULT_EDGE_HARDNESS_FAR 0.6f
 
-// How squarely the light must strike a surface for the shadow map to be trusted on it, as the cosine of
-// the angle between the surface normal and the light. Below this the shadow term is faded out entirely.
-//
-// This is NOT softening an artefact away -- it is declining to use data that carries no information. The
-// failure it addresses is projective aliasing, and it is a different animal from acne. Acne is a false
-// comparison, which the receiver plane bias fixes exactly. Projective aliasing is a sampling limit: on a
-// surface turning edge-on to the light the shadow map has almost no resolution along the direction the
-// surface recedes, so the shadow BOUNDARY quantises into steps of texel / sin(angle). At sixty degrees off
-// that is under two world units on the middle cascade; at five degrees it is seventeen; at two, forty-two,
-// which is a character's whole height. Those are the teeth. No bias moves them, because nothing is
-// mis-compared -- the boundary is simply being drawn at a resolution that does not exist.
-//
-// Fading it out there is the physically right answer rather than a retreat: a surface edge-on to the light
-// receives almost no light, so it can carry almost no shadow. Illumination and shadow-map resolution both
-// go to zero together, and the term stops mattering exactly where it stops being computable.
-//
-// 0.35 is about seventy degrees off the normal, past which the step is already several world units.
-#define SHADOW_MAP_MIN_INCIDENCE 0.35f
-
-// Incidence at which the edge may be hardened all the way, as the same cosine. Between this and
-// SHADOW_MAP_MIN_INCIDENCE the hardening tapers off, so the shadow keeps a proportionate amount of the
-// filter's own gradient instead of being cut to an edge.
-//
-// The threshold is only as trustworthy as the contour it traces, and that contour degrades with incidence
-// long before it stops carrying information altogether: the boundary quantises into steps of one texel over
-// the sine of the angle, so it is already a couple of world units out at sixty degrees. Drawing a hard line
-// through that prints the steps as facets. Keeping part of the blur exactly there -- and only there -- is
-// what stops them, and it costs nothing on the surfaces where the boundary is well sampled, which is where
-// the hard edge was wanted in the first place.
-//
-// 0.85 is about thirty-two degrees off the normal. Above it the step is under two world units, which the
-// hardening can trace without showing a facet.
-#define SHADOW_MAP_FULL_INCIDENCE 0.85f
-
-// Floor under the incidence taper, as a fraction of the configured hardness.
-//
-// The taper exists because a hard contour on an undersampled boundary prints its steps as facets. But
-// tapering to nothing was too far: the threshold does two things at once, and only one of them is the
-// problem. It clips the faint tail of the penumbra, where the filter reports a sliver of occlusion and the
-// shadow reads as a smear rather than a shadow, and it saturates the core, where a feature narrower than
-// the kernel can never reach full coverage and comes out grey. Neither of those needs a hard edge -- both
-// are contrast, and a ramp that keeps most of its width still delivers them.
-//
-// Only the last stretch towards a step is what draws facets. So the taper bottoms out here instead of at
-// zero, and it was 0.4 of the configured hardness for exactly that reason.
-//
-// 1.0 now, which is the taper turned OFF, and that is a consequence of the anisotropic kernel rather than a
-// change of mind. The taper's whole premise is that a grazing boundary is too coarsely sampled to draw a
-// hard line through. That premise held while the kernel was square: along the direction such a surface
-// recedes there was no filtering worth the name. With the kernel stretched along exactly that direction the
-// boundary is no longer coarsely sampled, and the taper is then paying for a problem that has been solved
-// somewhere else -- it gives up the hard edge on the surfaces that most need one.
-//
-// Raise this only WITH the anisotropic samples on. Without them 1.0 hands the teeth straight back, which is
-// what the taper was built to prevent.
-#define SHADOW_MAP_MIN_EDGE_HARDNESS_SCALE 1.0f
-
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
-
-// Bound on the receiver-plane gradient, in the cascade's own normalised units.
-//
-// The gradient is how fast the receiver's depth moves per unit of shadow-map uv, and the PCF kernel uses it
-// to compare each tap against the receiver's own plane AT that tap rather than at the kernel's centre. It
-// has to be bounded: at a silhouette the pixel quad straddles two surfaces, the derivative it is recovered
-// from means nothing, and an unbounded correction there punches a hole straight through the shadow.
-//
-// 3.2 is where that bound has always sat. A surface at forty-five degrees to the light has a gradient of
-// 2/5 by construction -- the cascade's radius cancels between the uv scale and the depth scale -- so 3.2 is
-// eight times that, about eighty-three degrees, past which a receiver is edge-on enough that the constant
-// and normal-offset terms are the right tools.
-//
-// Settable because it is a SUSPECT, not because it wants tuning. The diagnostic views put the shape-wrong
-// artefact upstream of the threshold (the hardening is off) and upstream of the normal (every receiver has
-// a vertex normal), and the gradient view then showed this bound binding on exactly the faces that carry
-// the banding. That is correlation; sweeping the bound live is what turns it into cause or clears it.
-#define SHADOW_MAP_DEFAULT_PLANE_GRADIENT_LIMIT 5.50f
-
-// Whether exceeding that bound also narrows the filter kernel. 0 keeps the old behaviour exactly.
-//
-// Truncating the gradient does not make the correction safe, it makes it WRONG in a specific way: the taps
-// then compare against a plane flatter than the surface they sit on, and the error grows with how far out
-// the tap is. So the kernel's outer taps disagree with its centre and the disagreement reads as banded
-// self-shadowing -- which is acne manufactured by the very term that exists to prevent it.
-//
-// The error is the product of two things, the kernel's reach and how far the gradient overshoots. The
-// correction cannot fix the second, so this shrinks the first by exactly the overshoot: the kernel is
-// scaled by limit/gradient once past the limit, which holds that product at the value it had AT the limit.
-// Bounded error instead of a truncated plane, and continuous in the gradient rather than switching
-// behaviour at a threshold -- which matters because a threshold on a per-face quantity is what draws a
-// mesh's own faces onto the screen.
-//
-// What it costs is filter width on steeply inclined surfaces: as the gradient runs away the kernel collapses
-// towards a single bilinear tap, so those surfaces get a harder shadow edge. They also receive almost no
-// light, which is the same reason the incidence band gave for easing off there.
-#define SHADOW_MAP_DEFAULT_PLANE_SOFT_FALLOFF 1
-
-// Most bilinear quads the PCF kernel may lay along the direction a receiver recedes from the light.
-// 1 disables the anisotropic path outright, and every pixel takes the square kernel it always took.
-//
-// This is the only term in this file aimed at PROJECTIVE ALIASING rather than at acne, and the distinction
-// decides everything about it. Acne is a false comparison, and a bias fixes it -- which is what every other
-// constant here is. Projective aliasing is a sampling limit: on a surface turning edge-on to the light the
-// map has almost no resolution along the direction that surface recedes, so the shadow boundary quantises
-// into steps of one texel over the sine of the angle. At eighty-three degrees that is eight texels a step;
-// at eighty-seven, twenty. No bias moves them, because nothing is mis-compared -- the boundary is drawn at a
-// resolution that does not exist. Crossed at an angle by a shadow's edge, those steps are the teeth.
-//
-// A step cannot be resolved, but it can be AVERAGED over, which turns a hard staircase into a soft
-// directional gradient: the same missing information, presented as a penumbra instead of as saw-teeth. That
-// wants the kernel widened along the receding direction and nowhere else -- across it the map samples
-// perfectly well, and widening there would only smear an edge that was correct.
-//
-// The count is what widens, never the spacing. Each bilinear quad spans two texels, so quads two texels
-// apart tile the run contiguously; spreading four quads over eight texels instead leaves the texels between
-// them sampled by nothing, which is a regular hole in the kernel and reads on screen as a grid. That would
-// trade teeth for stripes.
-//
-// Costs two bilinear quads per step, against the square kernel's four in total -- so 4 here is twice the
-// fetches of the old kernel, and only on the pixels whose gradient asks for it. OFF by default (1) because
-// it is a candidate, not a settled fix: the diagnosis it rests on -- that these teeth are a sampling limit
-// rather than a bias failure -- was inferred from the gradient view and has not been confirmed against a
-// resolution sweep, which is what would prove it.
-#define SHADOW_MAP_DEFAULT_MAX_ANISO_TAPS 12
-
-// Whether the hard edge's ramp is measured in screen pixels instead of in coverage. 0 keeps the old
-// behaviour exactly.
-//
-// The hardening remaps coverage through a narrow ramp centred on half, and that ramp has always been 0.03
-// wide in COVERAGE. Coverage is not what an eye reads, though, and how many screen pixels 0.03 spans
-// depends entirely on how fast coverage moves across the surface. On a floor square to the light that can
-// be a fraction of a pixel, which aliases into a crawling jagged line; on a wall raking away from it the
-// same number spreads over many pixels and reads as a smudge on an edge that was asked to be hard. One
-// constant cannot serve both, because it is not measuring the quantity that decides the look.
-//
-// fwidth(coverage) is coverage per screen pixel, so the ramp becomes about three quarters of a pixel
-// everywhere: a hard edge carrying just enough antialiasing not to crawl, identical on the floor and on the
-// wall. For a cel-shaded look this is the difference between an edge that is CRISP and one that is merely
-// narrow.
-#define SHADOW_MAP_DEFAULT_EDGE_SCREEN_WIDTH 0
-
-// Spacing between the anisotropic kernel's quads, in texels.
-//
-// Two puts them edge to edge, since each bilinear tap spans a 2x2 footprint -- the widest spacing that
-// leaves no texel unsampled, and where this started. It is not the smoothest, though, and that is what this
-// exists to fix: a bilinear tap weights its footprint as a tent, so tents that merely touch still dip
-// between their centres and the row reads as a line of separate samples rather than as one smear.
-//
-// 1.0 overlaps the tents by half and the dip goes. What it costs is reach -- the row is taps * spacing
-// texels long either way, so this covers half the span the old spacing did for the same tap count. Density
-// and reach trade against each other here, and buying both means more taps.
-#define SHADOW_MAP_DEFAULT_ANISO_SPACING 2.0f
 
 // How often each cascade is rebuilt, as a divisor of the frame rate: 1 rebuilds every frame, 2 every other
 // frame, and so on. At 60 fps the defaults below run the near and mid cascades at 60 Hz and the far one at
@@ -626,26 +398,25 @@
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //
-// Worth saying plainly, because it is the lesson every constant above was tuned without: NONE of them can
-// localise an artefact. They all act on the output of the depth comparison, and at that point a term that
-// is wrong is indistinguishable from a term that is right but badly scaled -- both are just a number that
-// came out too dark. So a shape-wrong artefact (faceted, triangular, stepped edges, as opposed to a shadow
-// in the wrong place) sends you tuning, and tuning can only trade it against a different artefact. The
-// history of this file is largely that loop.
+// Worth saying plainly, because it is the lesson a long line of removed constants was tuned without: a
+// setting cannot localise an artefact. Every one of them acted on the output of the depth comparison, and
+// at that point a term that is wrong is indistinguishable from a term that is right but badly scaled --
+// both are just a number that came out too dark. So a shape-wrong artefact (faceted, triangular, stepped
+// edges, as opposed to a shadow in the wrong place) sends you tuning, and tuning can only trade it against
+// a different artefact. That loop is why the receiver is now a depth comparison and a threshold and
+// nothing else: a baseline that can be reasoned about beats a stack of mitigations that cannot.
 //
-// Views 3 and up exist to break it. They print the shader's INPUTS unshaded, so the question stops being
-// "does this setting help" and becomes "is this value the shape of the thing on screen":
+// The views print the shader's INPUTS unshaded, so the question stops being "does this setting help" and
+// becomes "is this value the shape of the thing on screen":
 //   1  everything outside a cascade's footprint painted occluded    (output)
 //   2  the two caster layers separated by colour                    (output)
-//   3  the normal every bias is built on                            (input)
+//   3  the receiver normal                                          (input)
 //   4  where that normal came from, vertex or recovered face        (input)
 //   5  the filter's raw coverage, before the hardening remap        (input)
-//   6  the receiver-plane gradient, and where its clamp binds       (input)
 //   7  the cascade each pixel sampled                               (input)
-//   8  the edge hardness after the incidence taper                  (input)
-//   9  the PCF kernel's effective reach, red where it is zero       (input)
-// The shader's PSMain carries the reading order -- which view to check first, and what each answer rules
-// out. Keep this bound in step with the arms implemented there.
-#define SHADOW_MAP_MAX_DEBUG_VIEW 9
+// 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
+// unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
+// check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
+#define SHADOW_MAP_MAX_DEBUG_VIEW 7
 
 #endif // FAST_SHADOW_MAP_H
