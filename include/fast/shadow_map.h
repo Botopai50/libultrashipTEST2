@@ -383,7 +383,7 @@
 //   2  the two caster layers separated by colour                    (output)
 //   3  the receiver normal                                          (input)
 //   4  where that normal came from, vertex or recovered face        (input)
-//   5  the filter's raw coverage, before the hardening remap        (input)
+//   5  the filter's raw coverage, before threshold and weight       (input)
 //   7  the cascade each pixel sampled                               (input)
 // 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
 // unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to

@@ -144,7 +144,7 @@ cbuffer PerShadowCB : register(b3) {
     //     3 the receiver normal, as a colour
     //     4 where that normal came from: green = the draw's vertex normal (brightness = its interpolated
     //       length), red = a face normal recovered from screen derivatives
-    //     5 the coverage the depth comparison produced, BEFORE the incidence weight scales it
+    //     5 the filter's raw coverage, BEFORE the cel threshold and the incidence weight rewrite it
     //     7 cascade index, red/green/blue from nearest to furthest
     //     (6, 8 and 9 read values that no longer exist -- they showed the receiver-plane gradient, the
     //      incidence taper and the anisotropic kernel's reach, all removed with the machinery they measured)
@@ -336,10 +336,69 @@ ShadowProjection ShadowProject(float3 p, float3 normalWs, float3 lightAxis, floa
 // upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
-float ShadowSample(ShadowProjection p, bool isActor) {
+// The filter proper: a grid of bilinear taps, weighted smoothly, stretched along the direction the receiver
+// runs away from the light.
+//
+// THREE things are being asked of one kernel, and they are not three kernels.
+//
+// 1. Width. One bilinear tap softens WITHIN a texel and does nothing about the staircase BETWEEN texels, so
+//    the map's grid arrives on screen as stair-stepping. A grid of taps one texel apart spreads the step
+//    over enough pixels to stop reading as a staircase.
+//
+// 2. Smooth weights, not a flat average. A flat average is a BOX, and a box has an abrupt end: convolved
+//    with a shadow boundary it does make a ramp, but the ramp's slope JUMPS where the box's edge crosses the
+//    boundary, so as the surface varies by a texel the half-coverage contour does not slide, it hops.
+//    Threshold that for a cel edge and every hop is a kink -- the line comes out scribbled rather than
+//    drawn. That is not a hypothetical; it is what the previous attempt at this looked like. The weight
+//    below goes to zero smoothly at the rim AND has zero slope there, so no tap enters or leaves the sum
+//    abruptly and the contour moves continuously. It costs three arithmetic operations per tap.
+//
+// 3. Projective aliasing. On a surface turning edge-on to the light the map has almost no resolution along
+//    the direction the surface recedes, so the boundary quantises into steps of one texel over the sine of
+//    the angle -- eight texels per step at eighty-three degrees, twenty at eighty-seven. No bias reaches
+//    those, because nothing is being mis-compared: the boundary is being drawn at a resolution that does not
+//    exist. What CAN be done is average over a whole step instead of resolving it, which turns a hard
+//    staircase into a soft gradient in the same direction -- the same missing information, presented as
+//    penumbra instead of saw-teeth. So the grid's spacing ALONG that direction stretches and its spacing
+//    ACROSS it does not, because across it the map samples perfectly well and widening would only smear an
+//    edge that was already right.
+//
+// `stretch` is continuous and the tap COUNT is fixed. Deriving a count per pixel is what printed mesh
+// triangles onto the screen last time: the stretch comes from a planar function, so it is constant across a
+// triangle, and rounding a per-triangle constant to an integer thresholds it -- which draws that triangle's
+// outline exactly. A clamp leaves the value continuous where a round does not; only the slope kinks, and a
+// kink does not draw an outline.
+//
+// `[loop]`, not `[unroll]`. Unrolled, the whole quad appears nine times in the compiled shader, and this
+// file is compiled by FXC INSIDE a frame the first time each material draws -- its size is the hitch felt
+// when new geometry rotates into view.
+float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isActor, float2 axis, float stretch) {
+    float2 across = float2(-axis.y, axis.x);
+    float sum = 0.0;
+    float weightSum = 0.0;
+    [loop]
+    for (uint i = 0; i < 9; i++) {
+        // -1, 0, +1 on each side of the sample point.
+        float a = (float)(i % 3) - 1.0;
+        float b = (float)(i / 3) - 1.0;
+        // One texel across, `stretch` texels along.
+        float2 offset = ((axis * (a * stretch)) + (across * b)) * texelUv;
+        // Smooth compact weight over the unit disc: (1 - r^2)^2, which is zero AND flat at the rim. `a` is
+        // normalised by the stretch so the falloff follows the kernel's real shape rather than pinching the
+        // stretched axis back to a circle.
+        float r2 = saturate(((a * a) + (b * b)) * 0.5);
+        float w = 1.0 - r2;
+        w *= w;
+        sum += w * SampleShadowPCF4(uv + offset, z, slice, texelUv, isActor);
+        weightSum += w;
+    }
+    return sum / max(weightSum, 1e-6);
+}
+
+float ShadowSample(ShadowProjection p, bool isActor, float2 axis, float stretch) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
+        lit = SampleShadowPCF(p.uv, p.z, p.slice, p.texelUv, isActor, axis, stretch);
     }
     return lit;
 }
@@ -445,6 +504,40 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // The direction the light travels, shared by every cascade. Taken once here: the depth bias reads it
         // for every projection this pixel makes, and the actor slab test below reads it again.
         float3 lightAxis = ShadowLightAxis();
+
+        // Which way, on the map, this receiver runs away from the light -- and how fast.
+        //
+        // Taken from the receiver's NORMAL and the light's own basis, not from screen-space derivatives of
+        // the projected position. That is not a shortcut, it is the more correct of the two. A derivative
+        // reads across the pixel quad, so at a silhouette -- where the quad straddles two surfaces -- it
+        // measures the step between them and returns a direction belonging to neither. The plane's slope in
+        // light space is exact wherever the normal is: for a plane with normal N, depth varies with the two
+        // lateral axes as -(N.lx)/(N.lz) and -(N.ly)/(N.lz), so the direction of steepest recede is just
+        // (N.lx, N.ly) and its magnitude is the tangent of the angle to the light.
+        //
+        // It is also the same tangent the depth bias uses (see ShadowDepthBias), which is not a coincidence:
+        // how far the receiver's depth travels across a texel and how far the kernel must reach to average
+        // over a quantisation step are the same geometry asked two ways.
+        //
+        // The y flip is the projection's: uv is (ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5), so the light's +y
+        // is the map's -y. Getting this backwards would stretch the kernel across the step instead of along
+        // it -- smearing the edge that was already correct and leaving the one that was not.
+        float2 shadowAxis = float2(1.0, 0.0);
+        float shadowStretch = 1.0;
+        {
+            float3 lightX = normalize(shadow_view_proj[0]._11_21_31);
+            float3 lightY = normalize(shadow_view_proj[0]._12_22_32);
+            float2 nxy = float2(dot(normalWs, lightX), dot(normalWs, lightY));
+            float lateral = length(nxy);
+            if (lateral > 1e-5) {
+                shadowAxis = float2(nxy.x, -nxy.y) / lateral;
+            }
+            // Clamped, not rounded, and bounded at four: past that the kernel is averaging over more ground
+            // than the shadow it is trying to draw, and a wall keeping a soft boundary is worth more than one
+            // whose shadow has been smeared into nothing.
+            float ndotl = saturate(abs(dot(normalWs, lightAxis)));
+            shadowStretch = clamp(lateral / max(ndotl, 0.1), 1.0, 4.0);
+        }
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -573,7 +666,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
                     // have its own. Equal to the world layer's whenever the two are the same size.
                     p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
-                float s = ShadowSample(p, isActor);
+                float s = ShadowSample(p, isActor, shadowAxis, shadowStretch);
                 if (isActor) {
                     lit.y = isPartner ? lerp(lit.y, s, t) : s;
                 } else {
@@ -890,18 +983,28 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x,
                                               input.worldPos.w > 0.5);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
-        // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
-        // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
-        //
-        // There used to be a threshold here that remapped coverage through a narrow ramp centred on half,
-        // to collapse the gradient into a cel edge, with near and far strengths ramped across the cascade
-        // ladder. It is gone with the rest of the mitigations. The edge that is left is the bilinear ramp
-        // across one texel of whichever cascade the pixel landed in, which is hard near the camera and
-        // softens with distance because the texel does -- unmediated, which is the point.
-        //
-        // Kept as its own name because debug mode 5 prints it and the shading scales it. The two are NOT the
-        // same number -- the incidence weight below sits between them -- and mode 5 is the one that is raw.
+        // What the filter returned is COVERAGE -- what fraction of the kernel is occluded -- and debug mode 5
+        // prints exactly this, before anything below rewrites it.
         float shadowCoverage = shadowLit;
+
+        // Collapse that gradient back into an edge.
+        //
+        // Shading with coverage directly spreads the filter's whole ramp across the picture, which is the
+        // blur. Remapping it through a narrow ramp centred on half coverage turns it back into a boundary --
+        // and crucially it keeps what widening the filter bought: every tap is bilinear and the taps are
+        // weighted smoothly, so coverage varies continuously BETWEEN texels and the half-coverage contour is
+        // a smooth curve through the grid rather than a staircase along it. The threshold reads that
+        // sub-texel placement. Widen and then threshold is not a round trip; it is how a hard edge gets to
+        // be placed more finely than the map's own grid.
+        //
+        // A ramp rather than a step, so a pixel or two of antialiasing survives and the line does not crawl
+        // as the camera moves. 0.12 is in coverage units: about a quarter of the filter's transition, which
+        // on a 4x4-texel kernel is roughly one texel of softness left in.
+        //
+        // This is also where the previous attempt went wrong, and it was not the threshold's fault. It was
+        // being fed a BOX-filtered coverage, whose contour hops rather than slides, and a threshold on a
+        // hopping contour draws a scribbled line. The kernel above is smooth for this reason.
+        shadowLit = smoothstep(0.5 - 0.12, 0.5 + 0.12, shadowLit);
 
         // How square-on this receiver is to the light, which is what the shadow's darkness is weighted by.
         //
@@ -950,16 +1053,16 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //     triangle, so anything thresholding it prints that triangle's outline exactly. Dark green is
         //     the subtler version: an interpolated normal sagging towards the 1e-4 test.
         //   3 next, to see it directly. Flat facets of colour on a surface that should be smooth confirm it.
-        //   5 to see what the depth comparison returned, with nothing multiplied into it. A boundary that
-        //     is faceted HERE was drawn by the comparison or by the map itself -- its resolution, the matrix
-        //     it was drawn with, or the depth pass's bias -- and no work on this side of it will help.
+        //   5 to see what the filter returned, before anything remaps it. This is the fork. A boundary that
+        //     is already faceted HERE was drawn by the comparison or by the map itself -- its resolution, the
+        //     matrix it was drawn with, or the depth pass's bias -- and no work downstream will reach it. One
+        //     that is smooth here and hard-edged badly on screen was drawn by the threshold.
         //
-        //     One thing DOES sit between this view and the shaded picture, and it is deliberately not shown:
-        //     the incidence weight (see shadowIncidence above), which scales the shadow's darkness by how
-        //     square-on the surface is to the light. So the two are no longer the same number. Where the
-        //     shaded picture has less shadow than this view does, that weight is the reason and the surface
-        //     is near tangent to the light. There is no view for it -- if one is ever wanted, this is the
-        //     term it should print.
+        //     TWO things sit between this view and the shaded picture, and neither has a view of its own: the
+        //     cel threshold, which remaps coverage through a narrow ramp centred on half, and the incidence
+        //     weight, which scales the shadow's darkness by how square-on the surface is to the light. So
+        //     where the shaded picture has LESS shadow than this view, suspect the weight and a surface near
+        //     tangent to the light; where its boundary is sharper or kinkier, suspect the threshold.
         //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
         //     mesh artefact at all.
         //
