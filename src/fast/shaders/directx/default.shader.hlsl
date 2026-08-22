@@ -317,10 +317,9 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 // upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
-// The filter proper: a grid of bilinear taps, weighted smoothly, stretched along the direction the receiver
-// runs away from the light.
+// The filter proper: a square grid of bilinear taps, weighted smoothly.
 //
-// THREE things are being asked of one kernel, and they are not three kernels.
+// TWO things are being asked of one kernel.
 //
 // 1. Width. One bilinear tap softens WITHIN a texel and does nothing about the staircase BETWEEN texels, so
 //    the map's grid arrives on screen as stair-stepping. A grid of taps one texel apart spreads the step
@@ -334,27 +333,21 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 //    below goes to zero smoothly at the rim AND has zero slope there, so no tap enters or leaves the sum
 //    abruptly and the contour moves continuously. It costs three arithmetic operations per tap.
 //
-// 3. Projective aliasing. On a surface turning edge-on to the light the map has almost no resolution along
-//    the direction the surface recedes, so the boundary quantises into steps of one texel over the sine of
-//    the angle -- eight texels per step at eighty-three degrees, twenty at eighty-seven. No bias reaches
-//    those, because nothing is being mis-compared: the boundary is being drawn at a resolution that does not
-//    exist. What CAN be done is average over a whole step instead of resolving it, which turns a hard
-//    staircase into a soft gradient in the same direction -- the same missing information, presented as
-//    penumbra instead of saw-teeth. So the grid's spacing ALONG that direction stretches and its spacing
-//    ACROSS it does not, because across it the map samples perfectly well and widening would only smear an
-//    edge that was already right.
+// The grid is SQUARE. It was stretched along the direction the receiver recedes from the light, on the
+// reasoning that projective aliasing is a directional sampling limit and wants a directional average --
+// which is sound, and which produced worse shapes than it removed. Smearing coverage along one axis and then
+// thresholding it draws the smear: the boundary comes out as elongated wedges with pointed tips, following
+// the recede direction. Trading a stepped edge for a spiked one is not a trade worth making, and the spikes
+// were more legible than the steps.
 //
-// `stretch` is continuous and the tap COUNT is fixed. Deriving a count per pixel is what printed mesh
-// triangles onto the screen last time: the stretch comes from a planar function, so it is constant across a
-// triangle, and rounding a per-triangle constant to an integer thresholds it -- which draws that triangle's
-// outline exactly. A clamp leaves the value continuous where a round does not; only the slope kinks, and a
-// kink does not draw an outline.
+// The stretch also came from the receiver's normal, which made it the last quantity in this file that varied
+// per triangle on a flat-shaded wall. Everything else that read that normal has already been withdrawn for
+// printing the mesh; this is the same lesson arriving one term later.
 //
 // `[loop]`, not `[unroll]`. Unrolled, the whole quad appears nine times in the compiled shader, and this
 // file is compiled by FXC INSIDE a frame the first time each material draws -- its size is the hitch felt
 // when new geometry rotates into view.
-float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isActor, float2 axis, float stretch) {
-    float2 across = float2(-axis.y, axis.x);
+float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isActor) {
     float sum = 0.0;
     float weightSum = 0.0;
     [loop]
@@ -362,8 +355,8 @@ float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isAct
         // -1, 0, +1 on each side of the sample point.
         float a = (float)(i % 3) - 1.0;
         float b = (float)(i / 3) - 1.0;
-        // One texel across, `stretch` texels along.
-        float2 offset = ((axis * (a * stretch)) + (across * b)) * texelUv;
+        // One texel apart in each direction.
+        float2 offset = float2(a, b) * texelUv;
         // Smooth compact weight, (1 - r^2)^2 -- zero AND flat where it reaches zero, which is what keeps the
         // half-coverage contour sliding instead of hopping.
         //
@@ -385,10 +378,10 @@ float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isAct
     return sum / max(weightSum, 1e-6);
 }
 
-float ShadowSample(ShadowProjection p, bool isActor, float2 axis, float stretch) {
+float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF(p.uv, p.z, p.slice, p.texelUv, isActor, axis, stretch);
+        lit = SampleShadowPCF(p.uv, p.z, p.slice, p.texelUv, isActor);
     }
     return lit;
 }
@@ -483,8 +476,7 @@ uint ShadowCascadeIndex(float viewDepth) {
 // `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
-float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride,
-                       bool wantActors) {
+float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     float2 lit = float2(1.0, 1.0);
@@ -495,39 +487,6 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // for every projection this pixel makes, and the actor slab test below reads it again.
         float3 lightAxis = ShadowLightAxis();
 
-        // Which way, on the map, this receiver runs away from the light -- and how fast.
-        //
-        // Taken from the receiver's NORMAL and the light's own basis, not from screen-space derivatives of
-        // the projected position. That is not a shortcut, it is the more correct of the two. A derivative
-        // reads across the pixel quad, so at a silhouette -- where the quad straddles two surfaces -- it
-        // measures the step between them and returns a direction belonging to neither. The plane's slope in
-        // light space is exact wherever the normal is: for a plane with normal N, depth varies with the two
-        // lateral axes as -(N.lx)/(N.lz) and -(N.ly)/(N.lz), so the direction of steepest recede is just
-        // (N.lx, N.ly) and its magnitude is the tangent of the angle to the light.
-        //
-        // This steers the kernel's WIDTH, never the boundary's position, and that distinction is what keeps
-        // it here after the depth bias was moved out. A per-triangle blur width is a seam you have to look
-        // for; a per-triangle boundary offset breaks the shadow's outline into segments at every mesh edge.
-        //
-        // The y flip is the projection's: uv is (ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5), so the light's +y
-        // is the map's -y. Getting this backwards would stretch the kernel across the step instead of along
-        // it -- smearing the edge that was already correct and leaving the one that was not.
-        float2 shadowAxis = float2(1.0, 0.0);
-        float shadowStretch = 1.0;
-        {
-            float3 lightX = normalize(shadow_view_proj[0]._11_21_31);
-            float3 lightY = normalize(shadow_view_proj[0]._12_22_32);
-            float2 nxy = float2(dot(normalWs, lightX), dot(normalWs, lightY));
-            float lateral = length(nxy);
-            if (lateral > 1e-5) {
-                shadowAxis = float2(nxy.x, -nxy.y) / lateral;
-            }
-            // Clamped, not rounded, and bounded at four: past that the kernel is averaging over more ground
-            // than the shadow it is trying to draw, and a wall keeping a soft boundary is worth more than one
-            // whose shadow has been smeared into nothing.
-            float ndotl = saturate(abs(dot(normalWs, lightAxis)));
-            shadowStretch = clamp(lateral / max(ndotl, 0.1), 1.0, 4.0);
-        }
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -656,7 +615,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
                     // have its own. Equal to the world layer's whenever the two are the same size.
                     p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
-                float s = ShadowSample(p, isActor, shadowAxis, shadowStretch);
+                float s = ShadowSample(p, isActor);
                 if (isActor) {
                     lit.y = isPartner ? lerp(lit.y, s, t) : s;
                 } else {
@@ -970,8 +929,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x,
-                                              input.worldPos.w > 0.5);
+        float2 shadowLayers =
+            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the filter returned is COVERAGE -- what fraction of the kernel is occluded -- and debug mode 5
         // prints exactly this, before anything below rewrites it.

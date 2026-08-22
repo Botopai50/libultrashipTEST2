@@ -214,11 +214,11 @@
 // mesh's own edges. Written into the map instead, one consistent depth comes out and every receiver reads it
 // the same way, so nothing about receiver geometry can fragment the line.
 //
-// 3.0 rather than the 1.0 it sat at while a receiver-side term carried the load. One gradient across one
-// texel is the theoretical minimum with no margin for the depth buffer's own rounding, and this is now the
-// only geometric term. The per-cascade DepthBiasClamp still bounds the product in world units, so raising
-// the multiplier cannot run away on a grazing polygon.
-#define SHADOW_MAP_SLOPE_BIAS 3.0f
+// 2.0: one gradient across one texel is the theoretical minimum with no margin for the depth buffer's own
+// rounding, and twice it leaves as much margin as it spends. It was briefly 3.0 on the reasoning that the
+// ceiling below would catch any overshoot -- which was true, and useless, because that ceiling was set
+// fourteen times higher than anything this term legitimately needs.
+#define SHADOW_MAP_SLOPE_BIAS 2.0f
 
 // Flat offset in units of the depth buffer's smallest step, beside the slope term.
 //
@@ -239,23 +239,22 @@
 // casts nothing at all. Too much of this game is built that way for the trade to be worth it, so the depth
 // pass records both facings.
 
-// Ceiling on what that slope term may displace a receiver by, in WORLD units.
+// Ceiling on what the slope term may displace a caster by, in WORLD units, applied as DepthBiasClamp.
 //
-// The rasterizer takes one slope value per state, not per draw, so this cannot be capped per pixel -- the
-// backend builds a separate rasterizer state per cascade instead, each with the slope reduced to whatever
-// keeps its own texel under this ceiling.
+// The rasterizer writes SlopeScaledDepthBias * MaxDepthSlope, and MaxDepthSlope is unbounded: on a polygon
+// raking away from the light the depth crosses a texel in one step. Only a clamp on the PRODUCT bounds that,
+// which is what this is.
 //
-// 32.0, which at the default cascade ladder and resolution does not bind on ANY cascade: the far one would
-// need a texel over eight world units to reach it, and it sits at about six. So this is a guard rail rather
-// than a working part -- it exists for configurations with much coarser texels, a raised Split3 or a
-// lowered Resolution, where the term would otherwise run away.
+// 3.0, and the number is arrived at rather than picked. What the offset legitimately needs is one texel
+// times the tangent of the angle to the light; in the cascade a character stands in, a texel is about a
+// fifth of a world unit, so even at eighty-five degrees that is 2.3 units. Three covers it.
 //
-// It was 3.0, then 6.0, and both were too tight. The mistake in each was pricing this term as though it
-// cost everywhere, when it scales with the polygon's own gradient: near zero on a surface facing the light,
-// which is where a shadow's contact point is read closely, and large only on grazing surfaces, where the
-// contact is at a shallow angle and displacement along the ray barely shows. Capping it there bought very
-// little panning and cost the acne protection the far cascade needs.
-#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 32.0f
+// It was 32, from when this was a guard rail against a term that never approached it. Once the slope
+// multiplier was raised to carry the offset on its own, the product started reaching for that ceiling and
+// found half of Link's height waiting -- and his shadow detached from his feet. A ceiling set far above
+// what the thing beneath it can legitimately want is not a guard rail; it is an invitation that only gets
+// accepted once something else changes.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 3.0f
 
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
 // above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches
