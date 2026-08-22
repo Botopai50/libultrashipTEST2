@@ -4380,18 +4380,20 @@ void Interpreter::RenderShadowMap() {
             const float texelMargin = mShadowMapResolution > 0 ? 2.0f / (float)mShadowMapResolution : 0.0f;
             const float margin = std::max(SHADOW_MAP_PARK_MARGIN_FOR(c, mShadowMapCascadeCount), texelMargin);
             const float target = radius * (1.0f + margin);
-            // Rounded up to a sixteenth of the radius' own magnitude, not an eighth.
+            // An eighth of the radius' own magnitude, and this is a STABILITY number, not a tightness one.
             //
-            // This rounding is pure waste: whatever it adds is cascade covering nothing, spreading the same
-            // texels over more ground and making every one of them coarser. An eighth could add up to 12.5
-            // per cent on top of the park margin, so the two together could leave a cascade a quarter larger
-            // than the view needs -- and a coarser texel is both a steppier edge and a bigger depth quantum,
-            // which is the precision this whole change is about.
+            // It is tempting to read it as waste -- whatever the rounding adds is cascade covering nothing,
+            // spreading the same texels over more ground -- and to shave it. That was tried, at a sixteenth,
+            // and it is the wrong trade. A finer step gives the held radius twice as many values to land on,
+            // so it changes twice as often, and every change RESIZES THE TEXEL GRID. The snapping below
+            // quantises the cascade's centre in units of one texel: change the texel and every shadow in the
+            // scene re-quantises at once, which is seen as the whole picture's shadows jolting rather than
+            // as anything getting tighter. The paragraph above this one says exactly that and I read it as a
+            // description of the past rather than a constraint on the present.
             //
-            // A sixteenth halves that. What it costs is that the held radius has more values to land on, so
-            // it changes a little more often and the cascade re-parks slightly more often with it. That is a
-            // few more redraws against a permanently tighter fit.
-            const float step = std::exp2(std::floor(std::log2(target)) - 4.0f);
+            // Six per cent of radius is not what makes an edge look stepped. A grid that keeps changing
+            // length is.
+            const float step = std::exp2(std::floor(std::log2(target)) - 3.0f);
             const float quantized = std::ceil(target / step) * step;
             float& held = mShadowMapCascadeRadius[c];
             if (held <= 0.0f || target > held || target < held - 2.0f * step) {
