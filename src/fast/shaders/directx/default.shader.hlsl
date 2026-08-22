@@ -144,7 +144,7 @@ cbuffer PerShadowCB : register(b3) {
     //     3 the receiver normal, as a colour
     //     4 where that normal came from: green = the draw's vertex normal (brightness = its interpolated
     //       length), red = a face normal recovered from screen derivatives
-    //     5 the filter's raw coverage, BEFORE the cel threshold and the incidence weight rewrite it
+    //     5 the filter's raw coverage, BEFORE the cel threshold remaps it
     //     7 cascade index, red/green/blue from nearest to furthest
     //     (6, 8 and 9 read values that no longer exist -- they showed the receiver-plane gradient, the
     //      incidence taper and the anisotropic kernel's reach, all removed with the machinery they measured)
@@ -1032,36 +1032,23 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // hopping contour draws a scribbled line. The kernel above is smooth for this reason.
         shadowLit = smoothstep(0.5 - 0.20, 0.5 + 0.20, shadowLit);
 
-        // How square-on this receiver is to the light, which is what the shadow's darkness is weighted by.
+        // No incidence weight on the shadow's darkness, and this is the second time that idea has been
+        // tried and withdrawn here.
         //
-        // This is the article's own remedy for projective aliasing, and it is the only one it offers beyond
-        // "do the perspective-aliasing techniques": "Projective aliasing occurs when the surface normal is
-        // orthogonal to the light; these surfaces should be receiving less light based on diffuse lighting
-        // equations."
+        // The article's remedy for projective aliasing is that a surface edge-on to the light "should be
+        // receiving less light based on diffuse lighting equations", so the artefact hides itself. Nothing in
+        // this path carries a diffuse term -- the cel relight is objects-only and is half-Lambert besides --
+        // so the weight was applied to the shadow instead, as abs(dot(N, lightAxis)).
         //
-        // The reasoning is that the artefact hides itself. Teeth appear where the surface runs parallel to
-        // the light rays, because that is where the map has no resolution along the direction the surface
-        // recedes -- and a surface parallel to the light rays is a surface receiving almost no light from it,
-        // so there should be nothing there to draw a hard boundary ON. It hides nothing here because nothing
-        // in this path carries a diffuse term: the cel relight is objects-only, so the static scene is albedo
-        // times shadow, and the relight itself is half-Lambert, which maps an orthogonal normal to the MIDDLE
-        // of its ramp rather than to zero. Both of those deliberately remove the falloff the argument needs.
+        // What that misses is where the normal comes from. On a flat-shaded wall it is constant across a
+        // triangle and steps at every shared edge, so multiplying the shadow's DARKNESS by it paints the
+        // mesh: triangular patches at different brightnesses, with the gradient inside each one that an
+        // interpolated normal gives. That is not a subtle failure, it is the artefact this whole file has
+        // been chasing, reintroduced by the fix for it -- and every warning about it was already written in
+        // these comments before I added the term.
         //
-        // So the weight is applied here instead, to the shadow rather than to the light. Same shape, one
-        // multiply.
-        //
-        // The MAGNITUDE of the incidence, not the signed dot. The receiver's normal cannot be trusted to
-        // point outward -- a face normal recovered from screen derivatives comes out either way depending on
-        // winding and which way screen y runs -- and the signed form would then read a surface facing away
-        // from the light as one facing it. The magnitude is the same on both sides and only collapses where
-        // the surface is genuinely tangent, which is exactly the band the teeth live in.
-        //
-        // No threshold and no band, which is what separates this from the incidence taper that used to live
-        // here and was removed. That one smoothstepped between two tunable bounds about twenty and sixty
-        // degrees apart, and a falloff that wide put a ring of unshadowed surface around anything curved.
-        // cos itself is 0.71 at forty-five degrees and 0.05 at eighty-seven: it barely touches a surface that
-        // is lit at all, and only empties out at true tangency.
-        float shadowIncidence = saturate(abs(dot(shadowN, ShadowLightAxis())));
+        // A per-pixel quantity may steer where a shadow's EDGE falls, within limits. It may not steer how
+        // dark the shadow is, because that is what an eye reads directly.
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
@@ -1084,11 +1071,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //     matrix it was drawn with, or the depth pass's bias -- and no work downstream will reach it. One
         //     that is smooth here and hard-edged badly on screen was drawn by the threshold.
         //
-        //     TWO things sit between this view and the shaded picture, and neither has a view of its own: the
-        //     cel threshold, which remaps coverage through a narrow ramp centred on half, and the incidence
-        //     weight, which scales the shadow's darkness by how square-on the surface is to the light. So
-        //     where the shaded picture has LESS shadow than this view, suspect the weight and a surface near
-        //     tangent to the light; where its boundary is sharper or kinkier, suspect the threshold.
+        //     ONE thing sits between this view and the shaded picture: the cel threshold, which remaps
+        //     coverage through a narrow ramp centred on half. Nothing scales the shadow's DARKNESS per pixel
+        //     any more -- a weight that did was painting the mesh's own triangles onto the walls.
         //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
         //     mesh artefact at all.
         //
@@ -1132,7 +1117,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
                                shadowDebugCascade == 2 ? 1.0 : 0.0);
         } else {
-            texel.rgb *= lerp(1.0 - (shadow_params.w * shadowIncidence), 1.0, shadowLit);
+            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }
     @end
 
