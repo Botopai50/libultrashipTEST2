@@ -321,9 +321,11 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 //
 // TWO things are being asked of one kernel.
 //
-// 1. Width. One bilinear tap softens WITHIN a texel and does nothing about the staircase BETWEEN texels, so
-//    the map's grid arrives on screen as stair-stepping. A grid of taps one texel apart spreads the step
-//    over enough pixels to stop reading as a staircase.
+// 1. Width, and a lot of it. One bilinear tap softens WITHIN a texel and does nothing about the staircase
+//    BETWEEN texels, so the map's grid arrives on screen as stair-stepping. What hides that grid is not
+//    resolution -- games ship clean shadows off far smaller maps than this one -- it is blur wide enough
+//    that no single texel boundary is legible in the result. Five by five at a texel and a half reaches
+//    eight texels across, twice the span of the 3x3 it replaces.
 //
 // 2. Smooth weights, not a flat average. A flat average is a BOX, and a box has an abrupt end: convolved
 //    with a shadow boundary it does make a ramp, but the ramp's slope JUMPS where the box's edge crosses the
@@ -351,25 +353,31 @@ float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isAct
     float sum = 0.0;
     float weightSum = 0.0;
     [loop]
-    for (uint i = 0; i < 9; i++) {
-        // -1, 0, +1 on each side of the sample point.
-        float a = (float)(i % 3) - 1.0;
-        float b = (float)(i / 3) - 1.0;
-        // One texel apart in each direction.
-        float2 offset = float2(a, b) * texelUv;
+    for (uint i = 0; i < 25; i++) {
+        // -2 .. +2 on each side of the sample point.
+        float a = (float)(i % 5) - 2.0;
+        float b = (float)(i / 5) - 2.0;
+        // A texel and a half apart, so the grid's outermost taps sit three texels out and their footprints
+        // reach four -- eight texels across in total, twice what a 3x3 at one texel spacing covered.
+        //
+        // Spacing is bounded by the footprint, not by taste: each bilinear tap spans two texels, so taps
+        // more than two apart leave texels between them that nothing samples, and that hole reads on screen
+        // as a grid laid over the ground -- trading a stepped edge for a striped one. One and a half keeps a
+        // quarter-texel of overlap.
+        float2 offset = float2(a, b) * (texelUv * 1.5);
         // Smooth compact weight, (1 - r^2)^2 -- zero AND flat where it reaches zero, which is what keeps the
         // half-coverage contour sliding instead of hopping.
         //
-        // The 0.25 is the whole kernel. It normalises so that the FURTHEST taps in the grid, the four
-        // corners at a^2 + b^2 == 2, land at r^2 = 0.5 and still carry a quarter of the centre's weight; the
-        // falloff reaches zero at r^2 == 1, one ring outside the grid, where there is no tap to receive it.
+        // The divisor is twice the corner distance, and that factor of two is the whole kernel. The corners
+        // sit at a^2 + b^2 == 8, so dividing by 16 lands them at r^2 == 0.5 where they still carry a
+        // sixtieth of the total; the falloff reaches zero at r^2 == 1, outside the grid, where no tap is
+        // waiting to receive it.
         //
-        // It was 0.5, and that put the corners exactly ON the zero. Four of the nine taps were fetched and
-        // then multiplied by nothing, and the centre alone carried half the total -- a nine-tap kernel that
-        // sampled like a five-tap one and blurred like barely more than a single tap. The threshold below
-        // then squeezed what little remained back out, and the result on screen was indistinguishable from
-        // no filter at all. Correct now: 23.5 percent at the centre, nothing wasted.
-        float r2 = saturate(((a * a) + (b * b)) * 0.25);
+        // Divide by the corner distance itself and the corners land exactly ON the zero: fetched, then
+        // multiplied by nothing. That was the state this shipped in once -- four of nine taps wasted and
+        // half the weight on the centre, which blurs like barely more than a single tap and leaves the
+        // threshold nothing to work with. Check any change here against the corner weight.
+        float r2 = saturate(((a * a) + (b * b)) / 16.0);
         float w = 1.0 - r2;
         w *= w;
         sum += w * SampleShadowPCF4(uv + offset, z, slice, texelUv, isActor);
