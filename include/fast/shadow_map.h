@@ -239,22 +239,27 @@
 // casts nothing at all. Too much of this game is built that way for the trade to be worth it, so the depth
 // pass records both facings.
 
-// Ceiling on what the slope term may displace a caster by, in WORLD units, applied as DepthBiasClamp.
+// Ceiling on what the slope term may displace a caster by, in TEXELS of the cascade doing the writing,
+// applied as DepthBiasClamp.
 //
 // The rasterizer writes SlopeScaledDepthBias * MaxDepthSlope, and MaxDepthSlope is unbounded: on a polygon
-// raking away from the light the depth crosses a texel in one step. Only a clamp on the PRODUCT bounds that,
-// which is what this is.
+// raking away from the light the depth crosses a texel in one step. Only a clamp on the PRODUCT bounds it.
 //
-// 3.0, and the number is arrived at rather than picked. What the offset legitimately needs is one texel
-// times the tangent of the angle to the light; in the cascade a character stands in, a texel is about a
-// fifth of a world unit, so even at eighty-five degrees that is 2.3 units. Three covers it.
+// In texels rather than world units, because that is the unit the requirement is proportional to. What the
+// offset needs is one texel times the tangent of the angle to the light: the tangent is geometry and is the
+// same everywhere, the texel is not. At the default ladder and 4096 a texel is a fifth of a world unit in
+// the near cascade and three and a half in the far one, so the same angle wants eighteen times more offset
+// out there.
 //
-// It was 32, from when this was a guard rail against a term that never approached it. Once the slope
-// multiplier was raised to carry the offset on its own, the product started reaching for that ceiling and
-// found half of Link's height waiting -- and his shadow detached from his feet. A ceiling set far above
-// what the thing beneath it can legitimately want is not a guard rail; it is an invitation that only gets
-// accepted once something else changes.
-#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 3.0f
+// A single world constant was tried at both ends and failed at both. At 32 it was half of Link's height in
+// the cascade he stands in, and his shadow floated off his feet; at 3 the far cascade was starved from
+// forty-five degrees onward and the walls striped with acne. Same line, opposite failures, because the
+// quantity it was written in is not the one the requirement scales with.
+//
+// Eight covers the tangent out to about eighty-two degrees. Past that a surface is edge-on enough that no
+// offset helps, because nothing is being mis-compared -- the boundary is being drawn at a resolution that
+// does not exist.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_TEXELS 8.0f
 
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
 // above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches

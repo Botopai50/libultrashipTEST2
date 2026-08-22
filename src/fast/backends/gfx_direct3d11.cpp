@@ -2744,21 +2744,30 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     // own slope happened to be, and no receiver-side correction can reach a depth that was already wrong
     // when it was stored.
     //
-    // DepthBiasClamp is the hardware's bound on exactly that product, and it was left at zero -- which in
-    // D3D means "no clamp", not "no bias". Setting it puts the ceiling where it was always meant to be. The
-    // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD expressed in this cascade's own NDC depth units.
+    // DepthBiasClamp is the hardware's bound on exactly that product, and it is computed PER CASCADE from
+    // that cascade's own texel rather than from one world-space number.
     //
-    // Read off the matrix's THIRD column rather than derived from the radius. The projection scales the
-    // light's unit z axis by 1/(zFar - zNear), so that column's length IS the world-to-NDC-depth factor --
-    // one multiply, exactly right, whatever the range happens to be. It used to be computed as sx/5 on the
-    // reasoning that a cascade's depth range is five radii by construction; that stopped being true when the
-    // near and far planes started being fitted to the casters, and a ceiling derived from an assumption the
-    // projection no longer satisfies is a ceiling in the wrong place.
+    // What the offset legitimately needs is one texel times the tangent of the angle to the light. The
+    // tangent is a property of the geometry and is the same everywhere; the texel is not. At the default
+    // ladder and 4096 it is a fifth of a world unit in the near cascade and three and a half in the far one,
+    // so the same angle needs eighteen times more offset out there. One constant cannot serve both: set for
+    // the near cascade it starves the far one and the walls stripe with acne, and set for the far one it is
+    // half of Link's height up close and his shadow floats.
+    //
+    // Both of those have now happened, one after the other, from the same line -- which is the argument for
+    // expressing the ceiling in the unit the requirement is actually proportional to. Eight texels covers
+    // the tangent out to about eighty-two degrees; past that a surface is edge-on enough that no offset
+    // helps, because nothing is being mis-compared.
     float depthBiasClamp = 0.0f;
+    const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
+                               (lightViewProj[8] * lightViewProj[8]));
     const float sz = std::sqrt((lightViewProj[2] * lightViewProj[2]) + (lightViewProj[6] * lightViewProj[6]) +
                                (lightViewProj[10] * lightViewProj[10]));
-    if (sz > 1e-9f) {
-        depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sz;
+    if (sx > 1e-9f && sz > 1e-9f) {
+        // The projection scales the light's unit x axis by 1/radius, so sx IS 1/radius and one texel spans
+        // 2*radius/resolution. sz is the world-to-NDC-depth factor, from the third column the same way.
+        const float texelWorld = 2.0f / (sx * (float)resolution);
+        depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_TEXELS * texelWorld * sz;
         // Quantised for the same reason the slope is: a value drifting by a hair must not rebuild the state.
         depthBiasClamp = std::floor((depthBiasClamp * 4096.0f) + 0.5f) / 4096.0f;
     }
