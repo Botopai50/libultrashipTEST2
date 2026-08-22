@@ -383,10 +383,19 @@ float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isAct
         float b = (float)(i / 3) - 1.0;
         // One texel across, `stretch` texels along.
         float2 offset = ((axis * (a * stretch)) + (across * b)) * texelUv;
-        // Smooth compact weight over the unit disc: (1 - r^2)^2, which is zero AND flat at the rim. `a` is
-        // normalised by the stretch so the falloff follows the kernel's real shape rather than pinching the
-        // stretched axis back to a circle.
-        float r2 = saturate(((a * a) + (b * b)) * 0.5);
+        // Smooth compact weight, (1 - r^2)^2 -- zero AND flat where it reaches zero, which is what keeps the
+        // half-coverage contour sliding instead of hopping.
+        //
+        // The 0.25 is the whole kernel. It normalises so that the FURTHEST taps in the grid, the four
+        // corners at a^2 + b^2 == 2, land at r^2 = 0.5 and still carry a quarter of the centre's weight; the
+        // falloff reaches zero at r^2 == 1, one ring outside the grid, where there is no tap to receive it.
+        //
+        // It was 0.5, and that put the corners exactly ON the zero. Four of the nine taps were fetched and
+        // then multiplied by nothing, and the centre alone carried half the total -- a nine-tap kernel that
+        // sampled like a five-tap one and blurred like barely more than a single tap. The threshold below
+        // then squeezed what little remained back out, and the result on screen was indistinguishable from
+        // no filter at all. Correct now: 23.5 percent at the centre, nothing wasted.
+        float r2 = saturate(((a * a) + (b * b)) * 0.25);
         float w = 1.0 - r2;
         w *= w;
         sum += w * SampleShadowPCF4(uv + offset, z, slice, texelUv, isActor);
@@ -998,13 +1007,15 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // be placed more finely than the map's own grid.
         //
         // A ramp rather than a step, so a pixel or two of antialiasing survives and the line does not crawl
-        // as the camera moves. 0.12 is in coverage units: about a quarter of the filter's transition, which
-        // on a 4x4-texel kernel is roughly one texel of softness left in.
+        // as the camera moves. 0.20 is in coverage units -- about two fifths of the filter's transition, so
+        // roughly a texel and a half of softness is kept rather than the whole width being squeezed back
+        // out. Threshold too narrowly and the widening buys nothing visible: the edge returns to the map's
+        // own grid and stair-steps exactly as it did before, which is the failure this number decides.
         //
         // This is also where the previous attempt went wrong, and it was not the threshold's fault. It was
         // being fed a BOX-filtered coverage, whose contour hops rather than slides, and a threshold on a
         // hopping contour draws a scribbled line. The kernel above is smooth for this reason.
-        shadowLit = smoothstep(0.5 - 0.12, 0.5 + 0.12, shadowLit);
+        shadowLit = smoothstep(0.5 - 0.20, 0.5 + 0.20, shadowLit);
 
         // How square-on this receiver is to the light, which is what the shadow's darkness is weighted by.
         //
