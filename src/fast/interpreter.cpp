@@ -4347,7 +4347,18 @@ void Interpreter::RenderShadowMap() {
             const float texelMargin = mShadowMapResolution > 0 ? 2.0f / (float)mShadowMapResolution : 0.0f;
             const float margin = std::max(SHADOW_MAP_PARK_MARGIN_FOR(c, mShadowMapCascadeCount), texelMargin);
             const float target = radius * (1.0f + margin);
-            const float step = std::exp2(std::floor(std::log2(target)) - 3.0f);
+            // Rounded up to a sixteenth of the radius' own magnitude, not an eighth.
+            //
+            // This rounding is pure waste: whatever it adds is cascade covering nothing, spreading the same
+            // texels over more ground and making every one of them coarser. An eighth could add up to 12.5
+            // per cent on top of the park margin, so the two together could leave a cascade a quarter larger
+            // than the view needs -- and a coarser texel is both a steppier edge and a bigger depth quantum,
+            // which is the precision this whole change is about.
+            //
+            // A sixteenth halves that. What it costs is that the held radius has more values to land on, so
+            // it changes a little more often and the cascade re-parks slightly more often with it. That is a
+            // few more redraws against a permanently tighter fit.
+            const float step = std::exp2(std::floor(std::log2(target)) - 4.0f);
             const float quantized = std::ceil(target / step) * step;
             float& held = mShadowMapCascadeRadius[c];
             if (held <= 0.0f || target > held || target < held - 2.0f * step) {

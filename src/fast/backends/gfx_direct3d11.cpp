@@ -2550,8 +2550,25 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     mShadowResolution = 0;
     mShadowActorResolution = 0;
 
-    // TYPELESS so the same slices can be a depth target (D16_UNORM) while writing and a texture
-    // (R16_UNORM) while sampling.
+    // TYPELESS so the same slices can be a depth target (D32_FLOAT) while writing and a texture
+    // (R32_FLOAT) while sampling.
+    //
+    // 32 bits, not 16. A texel stores ONE depth for the patch of world it covers, and how finely it can say
+    // that number is what decides whether a surface can tell itself apart from what is in front of it. At 16
+    // bits a cascade's depth range is cut into 65536 steps -- across a two-thousand-unit range that is three
+    // hundredths of a world unit per step, and everything the bias has to hide comes out of that. At 32 bits
+    // the mantissa alone gives sixteen million, four decimal places finer, and most of what the bias was
+    // paying for stops existing.
+    //
+    // It costs double the memory: five slices at 4096 are 160 MB at 16 bits and 320 MB at 32. That is real,
+    // and the resolution setting is the lever if it is too much -- 2048 at 32 bits is 80 MB, less than the
+    // 16-bit map it replaces, and trades texel size for depth precision. Those are different artefacts:
+    // texel size gives stepped edges, depth precision gives acne.
+    //
+    // FLOAT rather than 24-bit UNORM, at the same four bytes. The projection here is orthographic, so depth
+    // is linear across the range: float gives a 24-bit mantissa near the far plane, matching D24, and far
+    // more than that near the near plane where D24's steps stay the same size. It is never worse and often
+    // better, and it needs no stencil bolted to it.
     D3D11_TEXTURE2D_DESC tex_desc;
     ZeroMemory(&tex_desc, sizeof(tex_desc));
     tex_desc.Width = (UINT)resolution;
@@ -2559,7 +2576,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     tex_desc.MipLevels = 1;
     // Twice the slices: the world layer occupies [0, cascadeCount) and the actor layer the rest.
     tex_desc.ArraySize = (UINT)SHADOW_MAP_SLICES_FOR(cascadeCount);
-    tex_desc.Format = DXGI_FORMAT_R16_TYPELESS;
+    tex_desc.Format = DXGI_FORMAT_R32_TYPELESS;
     tex_desc.SampleDesc.Count = 1;
     tex_desc.Usage = D3D11_USAGE_DEFAULT;
     tex_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
@@ -2599,7 +2616,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
             (mShadowActorSplit && i >= cascadeCount) ? mShadowActorTexture.Get() : mShadowMapTexture.Get();
         D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
         ZeroMemory(&dsv_desc, sizeof(dsv_desc));
-        dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
+        dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
         dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
         dsv_desc.Texture2DArray.MipSlice = 0;
         dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
@@ -2616,7 +2633,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format = DXGI_FORMAT_R16_UNORM;
+    srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
     srv_desc.Texture2DArray.MostDetailedMip = 0;
     srv_desc.Texture2DArray.MipLevels = 1;
@@ -2648,7 +2665,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
             for (int i = cascadeCount; i < sliceCount; i++) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
                 ZeroMemory(&dsv_desc, sizeof(dsv_desc));
-                dsv_desc.Format = DXGI_FORMAT_D16_UNORM;
+                dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
                 dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
                 dsv_desc.Texture2DArray.MipSlice = 0;
                 dsv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
