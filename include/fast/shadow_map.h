@@ -201,36 +201,19 @@
 // closely, and large only on one edge-on to it, where depth runs across a texel in a step and acne would
 // otherwise appear.
 //
-// 2.0, not 1.0. One gradient across one texel is the theoretical minimum -- it covers exactly how much the
-// receiver's depth varies across the texel whose depth was stored, with NOTHING left over for the depth
-// buffer's own rounding. Zero margin on a term that is fighting quantisation is not a bias, it is a coin
-// toss, and it showed as acne over every large flat surface. Twice the minimum leaves as much margin as it
-// spends, and being relative to the polygon's gradient it still costs almost nothing on the surfaces facing
-// the light where a shadow's contact point is read closely.
-#define SHADOW_MAP_SLOPE_BIAS 2.0f
-
-// Constant depth bias, in units of the depth buffer's own smallest step, handed to the rasterizer.
+// A backstop, not the mechanism. The offset that actually keeps a surface from shadowing itself is computed
+// per pixel on the receiver, from the angle between the light and that pixel's normal -- see ShadowDepthBias
+// in the shader, and the note there for why a fixed number cannot do this job.
 //
-// This exists because the slope term structurally cannot cover the case that needs covering. The article's
-// own description of it: it "has the effect of applying a large bias to a polygon that is viewed edge-on to
-// the light direction, but NOT applying any bias to a polygon facing the light directly". A floor lit from
-// most of the way overhead is close to that second case -- the slope term goes to nearly nothing there --
-// and a floor is exactly where a large unbroken sheet of acne is seen.
+// This one stays because it covers a case the receiver side cannot see: the CASTER's own slope. A polygon
+// stored edge-on to the light crosses a texel in one step, and what is written into the map is already off
+// by that much before any receiver reads it. Being relative to the polygon's own gradient it is nearly
+// nothing on the surfaces facing the light, which is where a shadow's contact point is read closely.
 //
-// What is left over at that angle is not geometric, it is numeric: the map is D16, so a stored depth is
-// rounded to one part in 65536 of the cascade's range whatever the polygon is doing. A term proportional to
-// slope cannot see that, because it is not proportional to slope. This is the floor under it.
-//
-// Counted in depth-buffer steps rather than world units on purpose, and that is only reasonable now that the
-// near and far planes are fitted to the casters (see the fit in RenderShadowMap). One step is the range over
-// 65536, so with a range of a few thousand units it is a few hundredths of a world unit, and 64 of them is
-// well under one -- against a far-cascade texel several units across. On the old fixed range of five radii
-// the same count would have meant several units in the near cascade and dozens in the far one.
-//
-// The rasterizer applies it, not the shader. The shader used to carry a constant bias in world units and
-// that is what this replaces; when it was removed, the rasterizer's was still zero because the shader had
-// been doing the job, and nothing was left holding it.
-#define SHADOW_MAP_DEPTH_BIAS_UNITS 64
+// 1.0 is one gradient across one texel. It was briefly 2.0, with a constant term beside it, when this was
+// being asked to carry the whole job on its own; it is not, so it goes back to the minimum that means
+// anything.
+#define SHADOW_MAP_SLOPE_BIAS 1.0f
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is

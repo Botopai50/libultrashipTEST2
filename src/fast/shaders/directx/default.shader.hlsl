@@ -267,7 +267,41 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
+// The depth offset that keeps a surface from shadowing itself, measured from the ANGLE between the light and
+// this pixel's normal.
+//
+// Acne is the receiver's depth being compared against a stored depth that was quantised over a whole texel.
+// How far the receiver's own depth travels across that texel is not a constant -- it is the texel's width
+// times the tangent of the angle between the surface and the light. Facing the light square on, the depth
+// barely moves and almost nothing is needed; edge-on it runs away, and so must the offset. A fixed number
+// has to be large enough for the worst angle in the scene and is then far too large everywhere else, which
+// is peter panning bought for nothing.
+//
+// Scaled by the CASCADE'S OWN texel, so the same expression means the right physical distance in each of
+// them: a near-cascade texel is a fraction of a world unit and a far one is several. Nothing here is a
+// magic number in world units -- change the resolution or the split distances and this follows.
+//
+// The MAGNITUDE of the incidence, not the signed dot. A face normal recovered from screen derivatives points
+// either way depending on winding and which way screen y runs, and the signed form would read a surface
+// facing away from the light as one facing it -- handing the largest offset to the surfaces that need the
+// least. The magnitude is the same on both sides and only grows where the surface is genuinely tangent.
+//
+// Two clamps, both load-bearing. The floor is what covers the flat case, where the angle term goes to zero
+// but the depth buffer's own rounding does not -- a D16 map quantises every stored depth whatever the
+// polygon is doing. The ceiling stops the tangent running to infinity at true tangency, where it would
+// push the comparison so far that the surface stops receiving any shadow at all.
+float ShadowDepthBias(float3 normalWs, float3 lightAxis, float texelWorld, float depthScale) {
+    float ndotl = saturate(abs(dot(normalWs, lightAxis)));
+    float sinTheta = sqrt(saturate(1.0 - (ndotl * ndotl)));
+    float tanTheta = sinTheta / max(ndotl, 0.1); // 0.1 caps the tangent near ten, about 84 degrees
+    // In texels, then into this cascade's depth units. texelWorld is one texel as a world distance and
+    // depthScale is world-to-NDC-depth, so their product is one texel expressed as depth.
+    float biasTexels = min(1.0 + tanTheta, 8.0);
+    return biasTexels * texelWorld * depthScale;
+}
+
+ShadowProjection ShadowProject(float3 p, float3 normalWs, float3 lightAxis, float4x4 viewProj, float texelUv,
+                               float texelWorld, uint cascade, float sliceBase) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -275,9 +309,13 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
     // NDC -> texture space (y flips: NDC is +up, textures are +down).
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
+    // World-to-NDC-depth for THIS cascade, read off its own matrix rather than plumbed in: the projection
+    // scales the light's unit z axis by 1/(zFar - zNear), so that column's length is exactly that factor.
+    float depthScale = length(viewProj._13_23_33);
+
     ShadowProjection o;
     o.uv = uv;
-    o.z = ndc.z;
+    o.z = ndc.z - ShadowDepthBias(normalWs, lightAxis, texelWorld, depthScale);
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
     o.inside = (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) ? 1.0 : 0.0;
@@ -345,7 +383,7 @@ float ShadowActorTexelUvAt(uint cascade) {
     return v;
 }
 
-ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 p, float3 normalWs, float3 lightAxis, uint cascade, float sliceBase) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
@@ -355,7 +393,7 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
         viewProj = shadow_view_proj[2];
         texelUv = shadow_texel_uv.z;
     }
-    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
+    return ShadowProject(p, normalWs, lightAxis, viewProj, texelUv, ShadowTexelWorldAt(cascade), cascade, sliceBase);
 }
 
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
@@ -396,13 +434,17 @@ uint ShadowCascadeIndex(float viewDepth) {
 // `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
-float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors) {
+float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float layerStride,
+                       bool wantActors) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     float2 lit = float2(1.0, 1.0);
     uint count = (uint)shadow_params.x;
     if (count > 0) {
         uint cascade = ShadowCascadeIndex(viewDepth);
+        // The direction the light travels, shared by every cascade. Taken once here: the depth bias reads it
+        // for every projection this pixel makes, and the actor slab test below reads it again.
+        float3 lightAxis = ShadowLightAxis();
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -410,7 +452,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
         // long way, and cutting at the split would take real shadows with it (a low sun throws them well
         // past the band that cast them).
         if (viewDepth <= shadow_range.x) {
-            ShadowProjection primary = ShadowProjectAt(worldPos, cascade, 0.0);
+            ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, lightAxis, cascade, 0.0);
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -433,7 +475,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                partner = ShadowProjectAt(worldPos, pc, 0.0);
+                partner = ShadowProjectAt(worldPos, normalWs, lightAxis, pc, 0.0);
             }
 
             // Can the actor layer possibly shadow this point at all?
@@ -449,10 +491,6 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             // only thing that has to hold is the direction of the error: the box may be grown, never shrunk.
             bool actorsPossible = false;
             if (wantActors) {
-                // The direction the light travels, shared by every cascade (see ShadowLightAxis). Taken here
-                // rather than at the top of the block because the slab test below is its only reader, and
-                // scenery outside the actor box skips all of it.
-                float3 lightAxis = ShadowLightAxis();
                 // Everything that can move a lookup off the exact light ray, in world units. The kernel is one
                 // bilinear quad, which spans two texels, so it reaches one texel from the sample point; two is
                 // that with room to spare. Scaled by the LARGEST cascade's texel, because which cascade this
@@ -849,8 +887,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers =
-            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
+        float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, shadowN, input.position.w, shadow_params.x,
+                                              input.worldPos.w > 0.5);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
