@@ -201,19 +201,36 @@
 // closely, and large only on one edge-on to it, where depth runs across a texel in a step and acne would
 // otherwise appear.
 //
-// A backstop, not the mechanism. The offset that actually keeps a surface from shadowing itself is computed
-// per pixel on the receiver, from the angle between the light and that pixel's normal -- see ShadowDepthBias
-// in the shader, and the note there for why a fixed number cannot do this job.
+// The one depth offset in the system, applied by the rasterizer as the caster is written into the map.
 //
-// This one stays because it covers a case the receiver side cannot see: the CASTER's own slope. A polygon
-// stored edge-on to the light crosses a texel in one step, and what is written into the map is already off
-// by that much before any receiver reads it. Being relative to the polygon's own gradient it is nearly
-// nothing on the surfaces facing the light, which is where a shadow's contact point is read closely.
+// It is angle-dependent, which is what this needs: what a receiver has to be offset by is how far its own
+// depth travels across the texel whose depth was stored, and that is the tangent of the angle to the light.
+// A slope-scaled bias is exactly that quantity, taken from the polygon's own depth gradient.
 //
-// 1.0 is one gradient across one texel. It was briefly 2.0, with a constant term beside it, when this was
-// being asked to carry the whole job on its own; it is not, so it goes back to the minimum that means
-// anything.
-#define SHADOW_MAP_SLOPE_BIAS 1.0f
+// The angle is read from the CASTER at write time and not from the receiver at read time, and that is the
+// whole reason this lives here. A receiver-side version was tried: it reads the shaded pixel's normal, which
+// on a flat-shaded wall is constant across a triangle and steps at every shared edge, so each face compared
+// against a differently offset depth and the shadow's boundary broke into triangular segments along the
+// mesh's own edges. Written into the map instead, one consistent depth comes out and every receiver reads it
+// the same way, so nothing about receiver geometry can fragment the line.
+//
+// 3.0 rather than the 1.0 it sat at while a receiver-side term carried the load. One gradient across one
+// texel is the theoretical minimum with no margin for the depth buffer's own rounding, and this is now the
+// only geometric term. The per-cascade DepthBiasClamp still bounds the product in world units, so raising
+// the multiplier cannot run away on a grazing polygon.
+#define SHADOW_MAP_SLOPE_BIAS 3.0f
+
+// Flat offset in units of the depth buffer's smallest step, beside the slope term.
+//
+// The slope term goes to nearly nothing on a polygon facing the light, and what is left there is not
+// geometric but numeric: a D16 map rounds every stored depth to one part in 65536 of the cascade's range
+// whatever the polygon is doing. This is the floor under that, and it is uniform across a surface, so unlike
+// anything derived from a normal it cannot break a boundary into facets.
+//
+// Counted in depth steps rather than world units, which is only meaningful because the near and far planes
+// are fitted to the casters: one step is the range over 65536, so 32 of them stay a small fraction of a
+// world unit in every cascade.
+#define SHADOW_MAP_DEPTH_BIAS_UNITS 32
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is

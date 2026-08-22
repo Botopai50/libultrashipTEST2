@@ -267,56 +267,26 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-// The depth offset that keeps a surface from shadowing itself, measured from the ANGLE between the light and
-// this pixel's normal.
+// No depth offset here, and the reason is the shape of the artefact it caused rather than anything wrong
+// with the idea.
 //
-// Acne is the receiver's depth being compared against a stored depth that was quantised over a whole texel.
-// How far the receiver's own depth travels across that texel is not a constant -- it is the texel's width
-// times the tangent of the angle between the surface and the light. Facing the light square on, the depth
-// barely moves and almost nothing is needed; edge-on it runs away, and so must the offset. A fixed number
-// has to be large enough for the worst angle in the scene and is then far too large everywhere else, which
-// is peter panning bought for nothing.
+// An angle-dependent bias belongs in this system -- how far a receiver's depth travels across the texel
+// whose depth was stored IS the tangent of its angle to the light, and a flat number cannot express that.
+// What it must not do is depend on the RECEIVER's normal, because on a flat-shaded wall that normal is
+// constant across a triangle and steps at every shared edge. Each face then compares against a differently
+// offset depth, so the shadow's boundary lands somewhere different on each one and the line breaks into
+// triangular segments at the mesh's own edges. On a grazing wall -- exactly where those segments appear --
+// a small depth offset moves the boundary a long way, so the break is wide.
 //
-// Scaled by the CASCADE'S OWN texel, so the same expression means the right physical distance in each of
-// them: a near-cascade texel is a fraction of a world unit and a far one is several. Nothing here is a
-// magic number in world units -- change the resolution or the split distances and this follows.
+// Thresholding cannot repair that. The threshold decides where coverage crosses one half; if coverage
+// arrives already displaced by a different amount per triangle, a sharper line is drawn through each
+// displacement rather than one line through all of them. It makes the break crisper.
 //
-// The MAGNITUDE of the incidence, not the signed dot. A face normal recovered from screen derivatives points
-// either way depending on winding and which way screen y runs, and the signed form would read a surface
-// facing away from the light as one facing it -- handing the largest offset to the surfaces that need the
-// least. The magnitude is the same on both sides and only grows where the surface is genuinely tangent.
-//
-// Two clamps, both load-bearing. The floor is what covers the flat case, where the angle term goes to zero
-// but the depth buffer's own rounding does not -- a D16 map quantises every stored depth whatever the
-// polygon is doing. The ceiling stops the tangent running to infinity at true tangency, where it would
-// push the comparison so far that the surface stops receiving any shadow at all.
-float ShadowDepthBias(float3 normalWs, float3 lightAxis, float texelWorld, float depthScale) {
-    float ndotl = saturate(abs(dot(normalWs, lightAxis)));
-    float sinTheta = sqrt(saturate(1.0 - (ndotl * ndotl)));
-    float tanTheta = sinTheta / max(ndotl, 0.1); // 0.1 caps the tangent near ten, about 84 degrees
-    // In texels, then into this cascade's depth units. texelWorld is one texel as a world distance and
-    // depthScale is world-to-NDC-depth, so their product is one texel expressed as depth.
-    float biasTexels = min(1.0 + tanTheta, 8.0);
-
-    // Capped in WORLD units as well as in texels, and this second cap is the one that matters.
-    //
-    // Measuring the offset in texels is right -- acne appears at the scale of the map's own grid, so the
-    // offset has to track that grid. What it must not do is track it all the way out. A texel of the near
-    // cascade is a fifth of a world unit and a texel of the far one is nearly four, so the same eight texels
-    // are 1.6 units up close and 29 at distance -- and Link is about sixty units tall. An offset of 29 units
-    // does not bias a shadow, it deletes it: everything shorter than that along the light stops casting
-    // entirely, and what remains is eaten into. That is a shadow fading out with distance, which is exactly
-    // what it looked like.
-    //
-    // Three units is invisible as panning at this scale -- a twentieth of Link's height -- and it is the
-    // same ceiling the normal-offset term used to carry for the same reason. The cost is that the far
-    // cascade gets less than one texel of offset where the texel formula asked for eight, so acne can come
-    // back there; a shadow that is slightly speckled at distance is worth more than no shadow at all.
-    return min(biasTexels * texelWorld, 3.0) * depthScale;
-}
-
-ShadowProjection ShadowProject(float3 p, float3 normalWs, float3 lightAxis, float4x4 viewProj, float texelUv,
-                               float texelWorld, uint cascade, float sliceBase) {
+// The offset lives in the depth pass instead, as the rasterizer's slope-scaled bias -- which is the same
+// angle dependence, taken from the CASTER polygon as it is written into the map. Applied at write time it
+// produces one consistent stored depth that every receiver reads the same way, so it cannot break a
+// boundary along receiver geometry. See SHADOW_MAP_SLOPE_BIAS.
+ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -324,13 +294,9 @@ ShadowProjection ShadowProject(float3 p, float3 normalWs, float3 lightAxis, floa
     // NDC -> texture space (y flips: NDC is +up, textures are +down).
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
-    // World-to-NDC-depth for THIS cascade, read off its own matrix rather than plumbed in: the projection
-    // scales the light's unit z axis by 1/(zFar - zNear), so that column's length is exactly that factor.
-    float depthScale = length(viewProj._13_23_33);
-
     ShadowProjection o;
     o.uv = uv;
-    o.z = ndc.z - ShadowDepthBias(normalWs, lightAxis, texelWorld, depthScale);
+    o.z = ndc.z;
     o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
     o.inside = (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) ? 1.0 : 0.0;
@@ -466,7 +432,7 @@ float ShadowActorTexelUvAt(uint cascade) {
     return v;
 }
 
-ShadowProjection ShadowProjectAt(float3 p, float3 normalWs, float3 lightAxis, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
@@ -476,7 +442,7 @@ ShadowProjection ShadowProjectAt(float3 p, float3 normalWs, float3 lightAxis, ui
         viewProj = shadow_view_proj[2];
         texelUv = shadow_texel_uv.z;
     }
-    return ShadowProject(p, normalWs, lightAxis, viewProj, texelUv, ShadowTexelWorldAt(cascade), cascade, sliceBase);
+    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
 }
 
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
@@ -539,9 +505,9 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // lateral axes as -(N.lx)/(N.lz) and -(N.ly)/(N.lz), so the direction of steepest recede is just
         // (N.lx, N.ly) and its magnitude is the tangent of the angle to the light.
         //
-        // It is also the same tangent the depth bias uses (see ShadowDepthBias), which is not a coincidence:
-        // how far the receiver's depth travels across a texel and how far the kernel must reach to average
-        // over a quantisation step are the same geometry asked two ways.
+        // This steers the kernel's WIDTH, never the boundary's position, and that distinction is what keeps
+        // it here after the depth bias was moved out. A per-triangle blur width is a seam you have to look
+        // for; a per-triangle boundary offset breaks the shadow's outline into segments at every mesh edge.
         //
         // The y flip is the projection's: uv is (ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5), so the light's +y
         // is the map's -y. Getting this backwards would stretch the kernel across the step instead of along
@@ -569,7 +535,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
         // long way, and cutting at the split would take real shadows with it (a low sun throws them well
         // past the band that cast them).
         if (viewDepth <= shadow_range.x) {
-            ShadowProjection primary = ShadowProjectAt(worldPos, normalWs, lightAxis, cascade, 0.0);
+            ShadowProjection primary = ShadowProjectAt(worldPos, cascade, 0.0);
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -592,7 +558,7 @@ float2 ShadowLitLayers(float3 worldPos, float3 normalWs, float viewDepth, float 
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                partner = ShadowProjectAt(worldPos, normalWs, lightAxis, pc, 0.0);
+                partner = ShadowProjectAt(worldPos, pc, 0.0);
             }
 
             // Can the actor layer possibly shadow this point at all?
