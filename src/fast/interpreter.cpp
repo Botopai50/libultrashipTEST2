@@ -4020,22 +4020,38 @@ void Interpreter::RenderShadowMap() {
     // one frame of lag on character shadows.
     {
         if (mShadowWorldKeyAccum != 0) {
+            const bool changed = mShadowWorldKeyAccum != mShadowWorldKeyCached;
             if (mShadowWorldCapture) {
-                // A rebuild was pending and this frame captured it: adopt it and stop capturing.
-                mShadowMapWorldCache.swap(mShadowMapCasters[SHADOW_MAP_LAYER_WORLD]);
-                mShadowAlphaWorldCache.swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_WORLD]);
-                mShadowWorldKeyCached = mShadowWorldKeyAccum;
-                mShadowWorldCapture = false;
-                // The one place the cached lists change. Everything downstream reads the counter instead of
-                // the megabytes behind it (see ShadowMapCascadeContentKey).
-                mShadowWorldCacheGeneration++;
-                BuildShadowWorldChunks(); // the spans index into the list that was just swapped in
-                mShadowWorldRebuilds++;
-            } else if (mShadowWorldKeyAccum != mShadowWorldKeyCached) {
+                // A capture was armed and this frame recorded it. Adopt it only if it is actually different
+                // -- staying armed through a settled scene would otherwise swap in an identical list and
+                // bump the generation, forcing every cascade to redraw the map it already had.
+                if (changed) {
+                    mShadowMapWorldCache.swap(mShadowMapCasters[SHADOW_MAP_LAYER_WORLD]);
+                    mShadowAlphaWorldCache.swap(mShadowAlphaCasters[SHADOW_MAP_LAYER_WORLD]);
+                    mShadowWorldKeyCached = mShadowWorldKeyAccum;
+                    // The one place the cached lists change. Everything downstream reads the counter instead
+                    // of the megabytes behind it (see ShadowMapCascadeContentKey).
+                    mShadowWorldCacheGeneration++;
+                    BuildShadowWorldChunks(); // the spans index into the list that was just swapped in
+                    mShadowWorldRebuilds++;
+                    // It moved, so expect it to move again.
+                    mShadowWorldSettle = SHADOW_MAP_WORLD_SETTLE_FRAMES;
+                }
+                // Stay armed while the scene is still settling. Arming for exactly one frame is what caps a
+                // continuously moving caster at half rate: it can only ever be captured on the frame AFTER
+                // the one that noticed, so it alternates. Holding the arm across a short run of frames lets
+                // the capture land on the same frames the movement does.
+                if (mShadowWorldSettle > 0) {
+                    mShadowWorldSettle--;
+                    mShadowWorldCapture = true;
+                } else {
+                    mShadowWorldCapture = false;
+                }
+            } else if (changed) {
                 // Different geometry ran this frame than the cache was built from. The frame is already past
-                // the point where it could have been captured, so arm the rebuild for the next one -- the
-                // cache is one frame stale across a room change, the same lag the actors carry permanently.
+                // the point where it could have been captured, so arm the rebuild for the next one.
                 mShadowWorldCapture = true;
+                mShadowWorldSettle = SHADOW_MAP_WORLD_SETTLE_FRAMES;
             }
         }
         // A zero signature means no world casters were bracketed at all this frame (paused, a cutscene, a
