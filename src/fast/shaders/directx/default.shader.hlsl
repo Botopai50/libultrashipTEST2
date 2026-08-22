@@ -297,7 +297,22 @@ float ShadowDepthBias(float3 normalWs, float3 lightAxis, float texelWorld, float
     // In texels, then into this cascade's depth units. texelWorld is one texel as a world distance and
     // depthScale is world-to-NDC-depth, so their product is one texel expressed as depth.
     float biasTexels = min(1.0 + tanTheta, 8.0);
-    return biasTexels * texelWorld * depthScale;
+
+    // Capped in WORLD units as well as in texels, and this second cap is the one that matters.
+    //
+    // Measuring the offset in texels is right -- acne appears at the scale of the map's own grid, so the
+    // offset has to track that grid. What it must not do is track it all the way out. A texel of the near
+    // cascade is a fifth of a world unit and a texel of the far one is nearly four, so the same eight texels
+    // are 1.6 units up close and 29 at distance -- and Link is about sixty units tall. An offset of 29 units
+    // does not bias a shadow, it deletes it: everything shorter than that along the light stops casting
+    // entirely, and what remains is eaten into. That is a shadow fading out with distance, which is exactly
+    // what it looked like.
+    //
+    // Three units is invisible as panning at this scale -- a twentieth of Link's height -- and it is the
+    // same ceiling the normal-offset term used to carry for the same reason. The cost is that the far
+    // cascade gets less than one texel of offset where the texel formula asked for eight, so acne can come
+    // back there; a shadow that is slightly speckled at distance is worth more than no shadow at all.
+    return min(biasTexels * texelWorld, 3.0) * depthScale;
 }
 
 ShadowProjection ShadowProject(float3 p, float3 normalWs, float3 lightAxis, float4x4 viewProj, float texelUv,
