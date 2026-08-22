@@ -1057,19 +1057,6 @@ class Interpreter {
     // per frame would be worth avoiding.
     uint64_t mShadowWorldCacheGeneration = 0;
     bool mShadowWorldCapture = true;  // capture the world layer this frame (rebuild pending)
-    // SOH [Enhancement] How many more frames to keep capturing after the world signature last changed.
-    //
-    // The cache is armed on the frame a change is DETECTED and captured on the next one, because by the time
-    // the signature is known the frame has already drawn past the point where it could have been recorded.
-    // For a room change -- one event, one frame of lag -- that is fine and it is what the design was built
-    // for. For something that moves every frame it is not: arm, capture, arm, capture, and the geometry
-    // reaches the map on every OTHER frame. Thirty hertz, with no setting anywhere saying so.
-    //
-    // So a change keeps the capture armed for a short run of frames rather than a single one. While anything
-    // is actually moving the signature keeps changing, the window keeps being refilled, and the capture
-    // happens every frame -- which is the cost the cache exists to avoid, paid only while there is something
-    // to see for it. When the movement stops the window drains and the cache goes back to being free.
-    uint8_t mShadowWorldSettle = 0;
     bool mShadowMapEnabled = false;   // app-pushed AND its shaders are ready
     bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
