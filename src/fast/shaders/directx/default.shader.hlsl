@@ -98,12 +98,18 @@ cbuffer PerToonCB : register(b2) {
 // (SHADER_MAX_TEXTURES) so it never collides with a texel sampler, and its cbuffer takes b3 (b0 per-frame,
 // b1 per-draw, b2 toon). Only the receiver variant declares any of this.
 @if(o_shadow_map)
-// Read through a SamplerComparisonState: the hardware compares each texel of the 2x2 footprint against the
-// reference depth and blends the results, which is a PCF tap in one instruction (see SampleShadowPCF4).
+// A plain sampler, compared by hand in SampleShadowPCF4, NOT a SamplerComparisonState.
+//
+// The hardware comparison unit would do the fetch, the four compares and the blend in one instruction, and
+// that is genuinely what it is for -- but comparison sampling of a texture ARRAY is a Shader Model 4.1
+// feature, and this renderer accepts adapters down to feature level 10_0. Compiled at ps_4_0 it is
+// "error X4532: cannot map expression to ps_4_0 instruction set", which surfaces as a failed shader compile
+// in the middle of a frame and takes the process down. It was tried and reverted for exactly that.
+//
 // The element type is explicit because the fetch has to come back as one float, not a float4 to be
 // truncated.
 Texture2DArray<float> g_shadowMap : register(t6);
-SamplerComparisonState g_shadowSampler : register(s6);
+SamplerState g_shadowSampler : register(s6);
 
 // SOH [Enhancement] The ACTOR caster layer, which may live in an array of its own at its own resolution
 // (see fast/shadow_map.h). While the two layers are the same size the backend binds the SAME view here, so
@@ -113,7 +119,7 @@ SamplerComparisonState g_shadowSampler : register(s6);
 // lookup, both textures are referenced statically, and no index is dynamic -- so this stays inside what
 // ps_4_0 will map.
 Texture2DArray<float> g_shadowMapActors : register(t7);
-SamplerComparisonState g_shadowActorSampler : register(s7);
+SamplerState g_shadowActorSampler : register(s7);
 
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
@@ -122,6 +128,7 @@ cbuffer PerShadowCB : register(b3) {
     row_major float4x4 shadow_view_proj[@{o_shadow_max_cascades}];
     float4 shadow_splits;      // far distance of each cascade, world units
     float4 shadow_texel_world; // world size of one texel, per cascade
+    float4 shadow_texel_uv;    // one texel in UV terms (1/resolution), per cascade
     // x = active cascade count (0 = no shadow map this frame), y = cross-fade band as a fraction of the
     // cascade, z unused, w = darkness where fully occluded.
     float4 shadow_params;
@@ -150,49 +157,70 @@ cbuffer PerShadowCB : register(b3) {
     // should do.
     float4 shadow_actor_min;
     float4 shadow_actor_max;
+    // One texel of the ACTOR layer in UV terms, per cascade. Equal to shadow_texel_uv while the two layers
+    // share a resolution; separate once that layer is sized on its own (see fast/shadow_map.h).
+    float4 shadow_actor_texel_uv;
 }
 
-// One bilinear PCF tap, done by the hardware's shadow-comparison unit.
+// Bilinear PCF over the four texels surrounding the sample point: fetch each, compare each, then weight the
+// RESULTS by the sub-texel position. Comparing first and filtering after is the whole point -- filtering the
+// stored depths and comparing once would give a wrong penumbra.
 //
-// SampleCmpLevelZero fetches the 2x2 footprint, compares EACH texel against the reference depth, and blends
-// the four results by the sub-texel position -- in one instruction. That ordering is the whole point of a
-// PCF tap and it is what the hand-rolled version here used to spell out: filtering stored depths and then
-// comparing once gives a wrong penumbra, comparing first and filtering after gives a right one.
+// Done by hand because the hardware unit that does exactly this cannot be reached here: see the sampler
+// declaration above for why a SamplerComparisonState is not an option at ps_4_0 on a texture array.
 //
-// This is the path the hardware has a dedicated unit for, and it replaces a page of arithmetic: the texel
-// grid was reconstructed from a uv, floored, four depths fetched, compared with step() and weighted with a
-// dot. Same output, and now it also runs on Shader Model 4.0 -- Gather needed 4.1, which is why this file
-// used to carry two kernels and the backend probed for one at startup.
+// The sampler filters point-wise on purpose, which is the other half of that ordering: a linear sampler
+// would blend the stored depths before this code ever compared them.
 //
-// It was rejected once, on the grounds that a comparison sampler can only test all four texels against ONE
-// depth while the receiver-plane bias needed a different depth per texel. That bias is gone, and with it
-// the objection: there is exactly one reference depth now.
-//
-// The comparison itself is LESS_EQUAL on the sampler, so the result is the fraction of the footprint whose
-// stored depth is at or behind the receiver -- 1 where nothing occludes, which is also what the 1.0 border
-// gives outside the map.
-//
-// An if/else STATEMENT, not a ternary, and that is not style. ps_4_0 encodes the texture and sampler slots
-// into the sample instruction itself, so a select between two different (texture, sampler) pairs has to
-// become two instructions under flow control -- which a statement gives it and an expression does not.
-// Written as a ternary this is "error X4532: cannot map expression to ps_4_0 instruction set", and the
-// shader fails to compile at RUNTIME, in the middle of a frame, taking the process with it. The declaration
-// above says "selected with a branch" for this reason.
-float SampleShadowPCF4(float2 uv, float z, float slice, bool isActor) {
-    float lit;
+// The offsets have to be a full texel apart and land on texel centres. An earlier version kept half-texel
+// quincunx offsets that suited a comparison sampler, where every fetch already straddles four texels;
+// against a point sampler those four taps usually land inside the SAME texel, return the same value, and
+// average to exactly one hard sample -- no filtering at all, which is what made edges stair-step.
+float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor) {
+    // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
+    float2 texelPos = uv / texelUv - 0.5;
+    float2 baseTexel = floor(texelPos);
+    float2 subTexel = texelPos - baseTexel;
+    float2 uv00 = (baseTexel + 0.5) * texelUv;
+
+    // Component order is Gather's: w is the texel at (0,0) from uv00, z is (1,0), x is (0,1), y is (1,1).
+    // Holding all four as one float4 is the point of this shape -- the compare and the blend are then single
+    // vector instructions instead of four scalar comparisons and three lerps.
+    //
+    // Selected with a branch, not a ternary: ps_4_0 encodes the texture and sampler slots into the sample
+    // instruction, so choosing between two (texture, sampler) pairs has to be flow control.
+    float4 stored;
     if (isActor) {
-        lit = g_shadowMapActors.SampleCmpLevelZero(g_shadowActorSampler, float3(uv, slice), z);
+        stored.w = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00, slice), 0);
+        stored.z = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+        stored.x = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+        stored.y =
+            g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
     } else {
-        lit = g_shadowMap.SampleCmpLevelZero(g_shadowSampler, float3(uv, slice), z);
+        stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, slice), 0);
+        stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+        stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+        stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
     }
-    return lit;
+
+    // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
+    // texel does not occlude -- for all four at once. One reference depth for the whole quad: the offset
+    // that keeps a surface from shadowing itself is applied by the rasterizer during the depth pass, not
+    // here (see SHADOW_MAP_SLOPE_BIAS).
+    float4 lit = step(z, stored);
+
+    // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
+    // dot it is one instruction instead of three dependent ones.
+    float2 inv = 1.0 - subTexel;
+    float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
+    return dot(lit, weights);
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
 // what the border-clamped sampler returns, but checking here avoids the fetch entirely.
 // NOTE ON INDEXING: ps_4_0 has no instruction for reading a vector component by a runtime value, so
-// nothing below may write shadow_splits[c] or shadow_texel_world[c] with a non-literal c. Doing so does not
+// nothing below may write shadow_splits[c] or shadow_texel_uv[c] with a non-literal c. Doing so does not
 // just fail -- the compiler first treats the expression as the whole float4, which shows up as
 // "implicit truncation of vector type" warnings, and only then reports "cannot map expression to ps_4_0".
 // Every access here is therefore a literal .x/.y/.z/.w behind a small selector.
@@ -221,6 +249,7 @@ float ShadowSplitAt(uint c) {
 struct ShadowProjection {
     float2 uv;
     float z; // ndc depth of the receiver
+    float texelUv;
     float slice;  // texture-array slice, this layer's offset included
     float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
 };
@@ -238,7 +267,7 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-ShadowProjection ShadowProject(float3 p, float4x4 viewProj, uint cascade, float sliceBase) {
+ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -249,6 +278,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, uint cascade, float 
     ShadowProjection o;
     o.uv = uv;
     o.z = ndc.z;
+    o.texelUv = texelUv;
     o.slice = sliceBase + (float)cascade;
     o.inside = (clip.w > 0.0 && all(abs(ndc.xy) <= 1.0) && ndc.z >= 0.0 && ndc.z <= 1.0) ? 1.0 : 0.0;
     return o;
@@ -271,7 +301,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, uint cascade, float 
 float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF4(p.uv, p.z, p.slice, isActor);
+        lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
     }
     return lit;
 }
@@ -305,14 +335,27 @@ float ShadowTexelWorldAt(uint cascade) {
     return v;
 }
 
+float ShadowActorTexelUvAt(uint cascade) {
+    float v = shadow_actor_texel_uv.z;
+    if (cascade == 0) {
+        v = shadow_actor_texel_uv.x;
+    } else if (cascade == 1) {
+        v = shadow_actor_texel_uv.y;
+    }
+    return v;
+}
+
 ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
     float4x4 viewProj = shadow_view_proj[0];
+    float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
         viewProj = shadow_view_proj[1];
+        texelUv = shadow_texel_uv.y;
     } else if (cascade == 2) {
         viewProj = shadow_view_proj[2];
+        texelUv = shadow_texel_uv.z;
     }
-    return ShadowProject(p, viewProj, cascade, sliceBase);
+    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
 }
 
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
@@ -485,12 +528,12 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                 // One layer further along the array. Adding the stride to the finished slice is the same number
                 // a separate lookup would have built from scratch -- the slice is sliceBase + cascade either
                 // way, and both terms are small exact integers.
-                //
-                // The projection is shared with the world layer whatever size that layer's map is: uv and
-                // depth are normalised, and the comparison sampler takes its footprint from the texture it
-                // is reading, so a differently sized actor layer needs nothing said about it here.
                 if (isActor) {
                     p.slice += layerStride;
+                    // The projection is shared with the world layer -- uv and depth are normalised, so they
+                    // do not care how big the map is -- but the kernel walks in TEXELS, and that layer may
+                    // have its own. Equal to the world layer's whenever the two are the same size.
+                    p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
                 float s = ShadowSample(p, isActor);
                 if (isActor) {

@@ -582,11 +582,14 @@ constexpr UINT kShaderCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 
 // Profile the shaders are compiled against, and the seed their disk cache is keyed by.
 //
-// Shader Model 4.0, unconditionally. The shadow kernel used to be the one thing here that wanted 4.1 --
-// Texture2DArray.Gather begins there -- which cost a startup probe, two kernels in the template, a
-// per-session profile switch and a cache seed to keep the two bytecodes apart. SampleCmpLevelZero fetches
-// the same 2x2 footprint AND compares AND blends it, and exists at 4.0, so all of that is gone and every
-// device the renderer accepts takes the same path.
+// Shader Model 4.0, unconditionally, which is the floor this renderer accepts (feature level 10_0).
+//
+// Nothing in the shader may need 4.1. Two things have wanted it and neither survived: Texture2DArray.Gather,
+// which used to fetch a 2x2 footprint in one instruction behind a startup probe and a per-session profile
+// switch, and comparison sampling of the cascade array, which would have done the whole PCF tap in one
+// instruction. Both were removed rather than bringing the profile switch back, because the switch is not
+// free: it needs a probe shader, two kernels in the template, and a cache seed to keep the two bytecodes
+// apart -- and a mistake in any of it is a compile failure inside a frame on somebody else's machine.
 const char* ShaderProfileVs() {
     return "vs_4_0";
 }
@@ -2443,20 +2446,19 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
         return false;
     }
 
-    // The receiver reads this through a comparison sampler (see SampleShadowPCF4 in the shader), so the
-    // filter below is a comparison filter and the addressing is what supplies "nothing occludes" outside the
-    // map. It was a point sampler with a hand-rolled compare for as long as the receiver carried a
-    // per-texel depth to compare against; it no longer does.
+    // A POINT sampler with no comparison function: the receiver fetches four depths and compares them
+    // itself (see SampleShadowPCF4 in the shader). A comparison sampler would fold all of that into one
+    // instruction and is what the hardware has a unit for -- but comparison sampling of a texture ARRAY
+    // needs Shader Model 4.1, and this renderer accepts adapters down to feature level 10_0. It was tried
+    // and reverted: at ps_4_0 the shader fails to compile at runtime and the process goes down with it.
+    //
+    // Point filtering is also the only correct setting for a hand-rolled comparison. Blending stored depths
+    // and comparing once is not the same as comparing per texel and averaging, and only the latter is a
+    // penumbra -- a linear filter here would do the blending before the shader ever compared anything.
     D3D11_SAMPLER_DESC samp_desc;
     ZeroMemory(&samp_desc, sizeof(samp_desc));
-    // A COMPARISON filter, which is what makes the receiver's lookup one instruction: the unit fetches the
-    // 2x2 footprint, tests each texel against the reference depth, and blends the four results by the
-    // sub-texel position. LINEAR here is that blend -- it filters the comparison RESULTS, not the stored
-    // depths, which is the ordering a PCF tap requires and the reason a plain linear sampler would be wrong.
-    samp_desc.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
-    // LESS_EQUAL against the receiver's own depth: 1 where the stored depth is at or behind it, which is
-    // "this texel does not occlude". Matches the border below, so outside the map everything reads as lit.
-    samp_desc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL;
+    samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER; // unused without a comparison filter
     // Clamp to a "nothing occludes" border: outside a cascade's footprint nothing is known to occlude, and
     // wrapping would fold a distant part of the map back over the edge. 1.0 is the far plane, so any
     // receiver compares as lit against it.
@@ -2467,7 +2469,7 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     samp_desc.BorderColor[2] = samp_desc.BorderColor[3] = 1.0f;
     samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(mDevice->CreateSamplerState(&samp_desc, mShadowMapSampler.GetAddressOf()))) {
-        SPDLOG_ERROR("Shadow map: could not create the comparison sampler.");
+        SPDLOG_ERROR("Shadow map: could not create the depth sampler.");
         return false;
     }
 
@@ -3161,6 +3163,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         if (sx > 1e-9f && mShadowResolution > 0) {
             const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
             mPerShadowCbData.shadow_texel_world[c] = texelWorld;
+            mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
+            mPerShadowCbData.shadow_actor_texel_uv[c] =
+                1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
     }
     mShadowCbDirty = true;
