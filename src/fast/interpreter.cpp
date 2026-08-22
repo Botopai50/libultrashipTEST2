@@ -2048,6 +2048,23 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     // fewer batches than triangles, and it costs nothing at all outside the bracket.
     if (mShadowMapEnabled && mRdp->shadow_world_caster) {
         uint64_t h = mShadowWorldKeyAccum ^ ((uint64_t)(uintptr_t)vertices + (uint64_t)n_vertices * 0x9E3779B9u);
+        // The object-to-world matrix, folded in beside the batch's identity.
+        //
+        // Without it this signature says WHICH display lists were drawn and nothing about where they ended
+        // up -- and on this hardware that is exactly the wrong half. A moving object's vertices live in a
+        // fixed list in object space and the matrix is what moves them, so a door swinging or a platform
+        // travelling re-submits the identical address and the identical count every frame. The signature
+        // did not move, the cache was not rebuilt, its span hashes did not change, the cascade's reuse key
+        // did not change, and the slice was never redrawn: the shadow froze in place while the object left
+        // it behind. Characters never showed it because their layer is rebuilt from scratch every frame.
+        //
+        // It costs sixteen floats per BATCH, not per triangle -- the reason this lives on the batch path at
+        // all -- and it cannot cost the cache its life: this is the world matrix, so it moves when the
+        // object does and stays put when only the camera does.
+        if (mRsp->modelview_matrix_stack_size > 0) {
+            h = ShadowHashBytes(h, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                                16 * sizeof(float));
+        }
         h *= 0xFF51AFD7ED558CCDull;
         h ^= h >> 33;
         // Never let the running value land on 0: that is the "no world casters drawn at all this frame"
