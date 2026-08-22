@@ -201,10 +201,36 @@
 // closely, and large only on one edge-on to it, where depth runs across a texel in a step and acne would
 // otherwise appear.
 //
-// 1.0 is one polygon gradient across one texel, the least this term can be and still mean anything. It has
-// been 4.0 and 2.0 in earlier revisions, when a stack of other bias terms sat on top of it; with those gone
-// this may well need to move. It is a starting point, not a tuned value.
-#define SHADOW_MAP_SLOPE_BIAS 1.0f
+// 2.0, not 1.0. One gradient across one texel is the theoretical minimum -- it covers exactly how much the
+// receiver's depth varies across the texel whose depth was stored, with NOTHING left over for the depth
+// buffer's own rounding. Zero margin on a term that is fighting quantisation is not a bias, it is a coin
+// toss, and it showed as acne over every large flat surface. Twice the minimum leaves as much margin as it
+// spends, and being relative to the polygon's gradient it still costs almost nothing on the surfaces facing
+// the light where a shadow's contact point is read closely.
+#define SHADOW_MAP_SLOPE_BIAS 2.0f
+
+// Constant depth bias, in units of the depth buffer's own smallest step, handed to the rasterizer.
+//
+// This exists because the slope term structurally cannot cover the case that needs covering. The article's
+// own description of it: it "has the effect of applying a large bias to a polygon that is viewed edge-on to
+// the light direction, but NOT applying any bias to a polygon facing the light directly". A floor lit from
+// most of the way overhead is close to that second case -- the slope term goes to nearly nothing there --
+// and a floor is exactly where a large unbroken sheet of acne is seen.
+//
+// What is left over at that angle is not geometric, it is numeric: the map is D16, so a stored depth is
+// rounded to one part in 65536 of the cascade's range whatever the polygon is doing. A term proportional to
+// slope cannot see that, because it is not proportional to slope. This is the floor under it.
+//
+// Counted in depth-buffer steps rather than world units on purpose, and that is only reasonable now that the
+// near and far planes are fitted to the casters (see the fit in RenderShadowMap). One step is the range over
+// 65536, so with a range of a few thousand units it is a few hundredths of a world unit, and 64 of them is
+// well under one -- against a far-cascade texel several units across. On the old fixed range of five radii
+// the same count would have meant several units in the near cascade and dozens in the far one.
+//
+// The rasterizer applies it, not the shader. The shader used to carry a constant bias in world units and
+// that is what this replaces; when it was removed, the rasterizer's was still zero because the shader had
+// been doing the job, and nothing was left holding it.
+#define SHADOW_MAP_DEPTH_BIAS_UNITS 64
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is

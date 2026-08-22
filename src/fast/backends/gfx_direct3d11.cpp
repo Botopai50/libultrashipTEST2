@@ -2424,11 +2424,11 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // it should do. The far side is safe too: a caster clamped to the far value never wins a comparison it
     // should lose, so nothing gains a shadow it should not have.
     rast_desc.DepthClipEnable = FALSE;
-    // No constant bias here. It is applied in the shader instead, in world units divided by each
-    // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different
-    // physical distance in every cascade. The slope term stays: being relative to the polygon's own
-    // gradient is exactly right, and it is the same relative amount whatever the range.
-    rast_desc.DepthBias = 0;
+    // Both bias terms, because they cover different failures: the slope term scales with how edge-on the
+    // polygon is and covers the depth variation across a texel, and the constant term is a flat floor in
+    // depth-buffer steps that covers the buffer's own rounding -- which the slope term cannot see, and which
+    // is all that is left on a surface facing the light.
+    rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
     rast_desc.SlopeScaledDepthBias = SHADOW_MAP_SLOPE_BIAS;
     if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
@@ -2776,7 +2776,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         rast_desc.FillMode = D3D11_FILL_SOLID;
         rast_desc.CullMode = D3D11_CULL_NONE;
         rast_desc.DepthClipEnable = FALSE;
-        rast_desc.DepthBias = 0;
+        rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
         rast_desc.SlopeScaledDepthBias = slope;
         rast_desc.DepthBiasClamp = depthBiasClamp;
         ComPtr<ID3D11RasterizerState> built;
