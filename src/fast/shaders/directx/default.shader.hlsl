@@ -98,15 +98,11 @@ cbuffer PerToonCB : register(b2) {
 // (SHADER_MAX_TEXTURES) so it never collides with a texel sampler, and its cbuffer takes b3 (b0 per-frame,
 // b1 per-draw, b2 toon). Only the receiver variant declares any of this.
 @if(o_shadow_map)
-// A plain sampler, compared by hand in SampleShadowPCF4, NOT a SamplerComparisonState.
-//
-// The hardware comparison unit would do the fetch, the four compares and the blend in one instruction, and
-// that is genuinely what it is for -- but comparison sampling of a texture ARRAY is a Shader Model 4.1
-// feature, and this renderer accepts adapters down to feature level 10_0. Compiled at ps_4_0 it is
-// "error X4532: cannot map expression to ps_4_0 instruction set", which surfaces as a failed shader compile
-// in the middle of a frame and takes the process down. It was tried and reverted for exactly that.
-//
-// The element type is explicit because the fetch has to come back as one float, not a float4 to be
+// Declared <float> and read with a plain sampler, then compared in the shader, rather than through a
+// SamplerComparisonState. Comparison sampling would fold a filtered 2x2 into every fetch for free; what it
+// costs is the individual results, and the diagnostic views want the raw coverage the comparisons produced
+// rather than a number the hardware already averaged. Gather (see SampleShadowPCF4) buys the fetch count
+// back. The element type is explicit because the fetch has to come back as one float, not a float4 to be
 // truncated.
 Texture2DArray<float> g_shadowMap : register(t6);
 SamplerState g_shadowSampler : register(s6);
@@ -117,7 +113,8 @@ SamplerState g_shadowSampler : register(s6);
 //
 // Selected with a branch rather than by duplicating the kernel: `isActor` is uniform for the whole of a
 // lookup, both textures are referenced statically, and no index is dynamic -- so this stays inside what
-// ps_4_0 will map.
+// ps_4_0 will map, which duplicating eighty lines of tuned filtering by hand would have risked getting
+// subtly wrong instead.
 Texture2DArray<float> g_shadowMapActors : register(t7);
 SamplerState g_shadowActorSampler : register(s7);
 
@@ -144,7 +141,7 @@ cbuffer PerShadowCB : register(b3) {
     //     3 the receiver normal, as a colour
     //     4 where that normal came from: green = the draw's vertex normal (brightness = its interpolated
     //       length), red = a face normal recovered from screen derivatives
-    //     5 the filter's raw coverage, BEFORE the cel threshold remaps it
+    //     5 the coverage the depth comparison produced, which is also what the shaded picture uses
     //     7 cascade index, red/green/blue from nearest to furthest
     //     (6, 8 and 9 read values that no longer exist -- they showed the receiver-plane gradient, the
     //      incidence taper and the anisotropic kernel's reach, all removed with the machinery they measured)
@@ -162,20 +159,35 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_actor_texel_uv;
 }
 
-// Bilinear PCF over the four texels surrounding the sample point: fetch each, compare each, then weight the
-// RESULTS by the sub-texel position. Comparing first and filtering after is the whole point -- filtering the
-// stored depths and comparing once would give a wrong penumbra.
+// One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
+// and then comparing once is not the same thing as comparing per texel and averaging the results, and only
+// the latter gives a correct penumbra.
+// Receiver plane depth bias: compare against the depth the RECEIVER'S OWN PLANE would have at the texel
+// being tapped, not the depth it has at the centre of the kernel.
 //
-// Done by hand because the hardware unit that does exactly this cannot be reached here: see the sampler
-// declaration above for why a SamplerComparisonState is not an option at ps_4_0 on a texture array.
+// This is the root cause of acne under a wide filter, and every bias in this file up to now has been
+// treating the symptom. A PCF tap reads stored depth one or more texels away from the sample point but
+// compares it against the receiver's depth AT the sample point. On a surface tilted with respect to the
+// light those two are not the same number, and the difference grows with both the tilt and the kernel
+// width -- so the sixteen-tap filter was itself manufacturing the acne that the constant, slope and normal
+// biases were then paying to hide, which is why they had to be so large and why they cost peter panning.
 //
-// The sampler filters point-wise on purpose, which is the other half of that ordering: a linear sampler
-// would blend the stored depths before this code ever compared them.
+// `grad` is how fast the receiver's depth changes per unit of shadow-map uv, so this recovers the plane's
+// own depth at the tap and compares like with like. Nothing is displaced: the correction is exact for a
+// flat receiver and needs no margin, which is what makes it free of panning.
+// Four taps in a quincunx around the centre, written out rather than looped over a local array: a local
+// array can land in an indexable temp register, which ps_4_0 refuses to map. The slice is cast explicitly
+// -- it is a texture coordinate and has to arrive as a float, and leaving that implicit is what produces
+// the truncation warnings.
+// Bilinear PCF over the four texels surrounding the sample point: compare each, then weight the RESULTS by
+// the sub-texel position. Comparing first and filtering after is the whole point -- filtering the stored
+// depths and comparing once would give a wrong penumbra.
 //
-// The offsets have to be a full texel apart and land on texel centres. An earlier version kept half-texel
-// quincunx offsets that suited a comparison sampler, where every fetch already straddles four texels;
-// against a point sampler those four taps usually land inside the SAME texel, return the same value, and
-// average to exactly one hard sample -- no filtering at all, which is what made edges stair-step.
+// The offsets have to be a full texel apart, and land on texel centres. An earlier version kept the
+// half-texel quincunx offsets that suited a hardware comparison sampler, where every fetch already
+// straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
+// return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
+// edges stair-step.
 float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
@@ -183,12 +195,24 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     float2 subTexel = texelPos - baseTexel;
     float2 uv00 = (baseTexel + 0.5) * texelUv;
 
-    // Component order is Gather's: w is the texel at (0,0) from uv00, z is (1,0), x is (0,1), y is (1,1).
-    // Holding all four as one float4 is the point of this shape -- the compare and the blend are then single
-    // vector instructions instead of four scalar comparisons and three lerps.
+    // Component order below is Gather's own, and the fetch-by-fetch path is written to match it: w is the
+    // texel at (0,0) from uv00, z is (1,0), x is (0,1), y is (1,1). Holding all four as one float4 is the
+    // point of this function's shape -- the compare and the blend are then single vector instructions
+    // instead of four scalar comparisons and three lerps, and the kernel runs this sixteen times.
+@if(o_shadow_gather)
+    // One instruction for all four depths. Gather returns exactly the 2x2 footprint bilinear filtering
+    // would have used, so this reads the same four texels the four fetches below read -- and every texel is
+    // still compared on its own, against its own point on the receiver plane, and still weighted by hand.
+    // The output is identical; only the number of texture instructions changes, sixteen to four across the
+    // whole kernel.
     //
-    // Selected with a branch, not a ternary: ps_4_0 encodes the texture and sampler slots into the sample
-    // instruction, so choosing between two (texture, sampler) pairs has to be flow control.
+    // Sampled at the CENTRE of the quad rather than at a texel, deliberately. The footprint the hardware
+    // picks is decided in fixed point, and asking at a texel centre puts that decision half a texel from a
+    // boundary in each direction -- orders of magnitude more margin than the hardware's sub-texel precision
+    // -- so the four texels are the computed ones and not their neighbours.
+    float4 stored = isActor ? g_shadowMapActors.Gather(g_shadowActorSampler, float3(uv00 + texelUv * 0.5, slice))
+                            : g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, slice));
+@else
     float4 stored;
     if (isActor) {
         stored.w = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00, slice), 0);
@@ -202,6 +226,7 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
         stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
         stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
     }
+@end
 
     // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
     // texel does not occlude -- for all four at once. One reference depth for the whole quad: the offset
@@ -210,7 +235,9 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     float4 lit = step(z, stored);
 
     // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
-    // dot it is one instruction instead of three dependent ones.
+    // dot it is one instruction instead of three dependent ones. Comparing first and filtering after is the
+    // whole point of the kernel -- filtering the stored depths and comparing once would give a wrong
+    // penumbra -- and that ordering is unchanged: `lit` is already the comparison result.
     float2 inv = 1.0 - subTexel;
     float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
     return dot(lit, weights);
@@ -267,25 +294,6 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-// No depth offset here, and the reason is the shape of the artefact it caused rather than anything wrong
-// with the idea.
-//
-// An angle-dependent bias belongs in this system -- how far a receiver's depth travels across the texel
-// whose depth was stored IS the tangent of its angle to the light, and a flat number cannot express that.
-// What it must not do is depend on the RECEIVER's normal, because on a flat-shaded wall that normal is
-// constant across a triangle and steps at every shared edge. Each face then compares against a differently
-// offset depth, so the shadow's boundary lands somewhere different on each one and the line breaks into
-// triangular segments at the mesh's own edges. On a grazing wall -- exactly where those segments appear --
-// a small depth offset moves the boundary a long way, so the break is wide.
-//
-// Thresholding cannot repair that. The threshold decides where coverage crosses one half; if coverage
-// arrives already displaced by a different amount per triangle, a sharper line is drawn through each
-// displacement rather than one line through all of them. It makes the break crisper.
-//
-// The offset lives in the depth pass instead, as the rasterizer's slope-scaled bias -- which is the same
-// angle dependence, taken from the CASTER polygon as it is written into the map. Applied at write time it
-// produces one consistent stored depth that every receiver reads the same way, so it cannot break a
-// boundary along receiver geometry. See SHADOW_MAP_SLOPE_BIAS.
 ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
@@ -317,79 +325,10 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 // upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
-// The filter proper: a square grid of bilinear taps, weighted smoothly.
-//
-// TWO things are being asked of one kernel.
-//
-// 1. Width, and a lot of it. One bilinear tap softens WITHIN a texel and does nothing about the staircase
-//    BETWEEN texels, so the map's grid arrives on screen as stair-stepping. What hides that grid is not
-//    resolution -- games ship clean shadows off far smaller maps than this one -- it is blur wide enough
-//    that no single texel boundary is legible in the result. Five by five at a texel and a half reaches
-//    eight texels across, twice the span of the 3x3 it replaces.
-//
-// 2. Smooth weights, not a flat average. A flat average is a BOX, and a box has an abrupt end: convolved
-//    with a shadow boundary it does make a ramp, but the ramp's slope JUMPS where the box's edge crosses the
-//    boundary, so as the surface varies by a texel the half-coverage contour does not slide, it hops.
-//    Threshold that for a cel edge and every hop is a kink -- the line comes out scribbled rather than
-//    drawn. That is not a hypothetical; it is what the previous attempt at this looked like. The weight
-//    below goes to zero smoothly at the rim AND has zero slope there, so no tap enters or leaves the sum
-//    abruptly and the contour moves continuously. It costs three arithmetic operations per tap.
-//
-// The grid is SQUARE. It was stretched along the direction the receiver recedes from the light, on the
-// reasoning that projective aliasing is a directional sampling limit and wants a directional average --
-// which is sound, and which produced worse shapes than it removed. Smearing coverage along one axis and then
-// thresholding it draws the smear: the boundary comes out as elongated wedges with pointed tips, following
-// the recede direction. Trading a stepped edge for a spiked one is not a trade worth making, and the spikes
-// were more legible than the steps.
-//
-// The stretch also came from the receiver's normal, which made it the last quantity in this file that varied
-// per triangle on a flat-shaded wall. Everything else that read that normal has already been withdrawn for
-// printing the mesh; this is the same lesson arriving one term later.
-//
-// `[loop]`, not `[unroll]`. Unrolled, the whole quad appears nine times in the compiled shader, and this
-// file is compiled by FXC INSIDE a frame the first time each material draws -- its size is the hitch felt
-// when new geometry rotates into view.
-float SampleShadowPCF(float2 uv, float z, float slice, float texelUv, bool isActor) {
-    float sum = 0.0;
-    float weightSum = 0.0;
-    [loop]
-    for (uint i = 0; i < 25; i++) {
-        // -2 .. +2 on each side of the sample point.
-        float a = (float)(i % 5) - 2.0;
-        float b = (float)(i / 5) - 2.0;
-        // A texel and a half apart, so the grid's outermost taps sit three texels out and their footprints
-        // reach four -- eight texels across in total, twice what a 3x3 at one texel spacing covered.
-        //
-        // Spacing is bounded by the footprint, not by taste: each bilinear tap spans two texels, so taps
-        // more than two apart leave texels between them that nothing samples, and that hole reads on screen
-        // as a grid laid over the ground -- trading a stepped edge for a striped one. One and a half keeps a
-        // quarter-texel of overlap.
-        float2 offset = float2(a, b) * (texelUv * 1.5);
-        // Smooth compact weight, (1 - r^2)^2 -- zero AND flat where it reaches zero, which is what keeps the
-        // half-coverage contour sliding instead of hopping.
-        //
-        // The divisor is twice the corner distance, and that factor of two is the whole kernel. The corners
-        // sit at a^2 + b^2 == 8, so dividing by 16 lands them at r^2 == 0.5 where they still carry a
-        // sixtieth of the total; the falloff reaches zero at r^2 == 1, outside the grid, where no tap is
-        // waiting to receive it.
-        //
-        // Divide by the corner distance itself and the corners land exactly ON the zero: fetched, then
-        // multiplied by nothing. That was the state this shipped in once -- four of nine taps wasted and
-        // half the weight on the centre, which blurs like barely more than a single tap and leaves the
-        // threshold nothing to work with. Check any change here against the corner weight.
-        float r2 = saturate(((a * a) + (b * b)) / 16.0);
-        float w = 1.0 - r2;
-        w *= w;
-        sum += w * SampleShadowPCF4(uv + offset, z, slice, texelUv, isActor);
-        weightSum += w;
-    }
-    return sum / max(weightSum, 1e-6);
-}
-
 float ShadowSample(ShadowProjection p, bool isActor) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF(p.uv, p.z, p.slice, p.texelUv, isActor);
+        lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
     }
     return lit;
 }
@@ -491,10 +430,6 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
     uint count = (uint)shadow_params.x;
     if (count > 0) {
         uint cascade = ShadowCascadeIndex(viewDepth);
-        // The direction the light travels, shared by every cascade. Taken once here: the depth bias reads it
-        // for every projection this pixel makes, and the actor slab test below reads it again.
-        float3 lightAxis = ShadowLightAxis();
-
 
         // Past the furthest point any cascade's footprint reaches, there is nothing to look up and the
         // answer is already the one `lit` holds. The bound is computed where the cascades are built, from
@@ -541,6 +476,10 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             // only thing that has to hold is the direction of the error: the box may be grown, never shrunk.
             bool actorsPossible = false;
             if (wantActors) {
+                // The direction the light travels, shared by every cascade (see ShadowLightAxis). Taken here
+                // rather than at the top of the block because the slab test below is its only reader, and
+                // scenery outside the actor box skips all of it.
+                float3 lightAxis = ShadowLightAxis();
                 // Everything that can move a lookup off the exact light ray, in world units. The kernel is one
                 // bilinear quad, which spans two texels, so it reaches one texel from the sample point; two is
                 // that with room to spare. Scaled by the LARGEST cascade's texel, because which cascade this
@@ -619,8 +558,8 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                 if (isActor) {
                     p.slice += layerStride;
                     // The projection is shared with the world layer -- uv and depth are normalised, so they
-                    // do not care how big the map is -- but the kernel walks in TEXELS, and that layer may
-                    // have its own. Equal to the world layer's whenever the two are the same size.
+                    // do not care how big the map is -- but the filter kernel walks in TEXELS, and that layer
+                    // may have its own. Equal to the world layer's whenever the two are the same size.
                     p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
                 float s = ShadowSample(p, isActor);
@@ -940,48 +879,19 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float2 shadowLayers =
             ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
-        // What the filter returned is COVERAGE -- what fraction of the kernel is occluded -- and debug mode 5
-        // prints exactly this, before anything below rewrites it.
+        // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
+        // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
+        //
+        // There used to be a threshold here that remapped coverage through a narrow ramp centred on half,
+        // to collapse the gradient into a cel edge, with near and far strengths ramped across the cascade
+        // ladder. It is gone with the rest of the mitigations. The edge that is left is the bilinear ramp
+        // across one texel of whichever cascade the pixel landed in, which is hard near the camera and
+        // softens with distance because the texel does -- unmediated, which is the point.
+        //
+        // Kept as its own name so debug mode 5 and the shaded picture read the same value. They are now
+        // literally the same number, which is worth stating: if the two disagree in SHAPE, something below
+        // this line is lying.
         float shadowCoverage = shadowLit;
-
-        // Collapse that gradient back into an edge.
-        //
-        // Shading with coverage directly spreads the filter's whole ramp across the picture, which is the
-        // blur. Remapping it through a narrow ramp centred on half coverage turns it back into a boundary --
-        // and crucially it keeps what widening the filter bought: every tap is bilinear and the taps are
-        // weighted smoothly, so coverage varies continuously BETWEEN texels and the half-coverage contour is
-        // a smooth curve through the grid rather than a staircase along it. The threshold reads that
-        // sub-texel placement. Widen and then threshold is not a round trip; it is how a hard edge gets to
-        // be placed more finely than the map's own grid.
-        //
-        // A ramp rather than a step, so a pixel or two of antialiasing survives and the line does not crawl
-        // as the camera moves. 0.20 is in coverage units -- about two fifths of the filter's transition, so
-        // roughly a texel and a half of softness is kept rather than the whole width being squeezed back
-        // out. Threshold too narrowly and the widening buys nothing visible: the edge returns to the map's
-        // own grid and stair-steps exactly as it did before, which is the failure this number decides.
-        //
-        // This is also where the previous attempt went wrong, and it was not the threshold's fault. It was
-        // being fed a BOX-filtered coverage, whose contour hops rather than slides, and a threshold on a
-        // hopping contour draws a scribbled line. The kernel above is smooth for this reason.
-        shadowLit = smoothstep(0.5 - 0.20, 0.5 + 0.20, shadowLit);
-
-        // No incidence weight on the shadow's darkness, and this is the second time that idea has been
-        // tried and withdrawn here.
-        //
-        // The article's remedy for projective aliasing is that a surface edge-on to the light "should be
-        // receiving less light based on diffuse lighting equations", so the artefact hides itself. Nothing in
-        // this path carries a diffuse term -- the cel relight is objects-only and is half-Lambert besides --
-        // so the weight was applied to the shadow instead, as abs(dot(N, lightAxis)).
-        //
-        // What that misses is where the normal comes from. On a flat-shaded wall it is constant across a
-        // triangle and steps at every shared edge, so multiplying the shadow's DARKNESS by it paints the
-        // mesh: triangular patches at different brightnesses, with the gradient inside each one that an
-        // interpolated normal gives. That is not a subtle failure, it is the artefact this whole file has
-        // been chasing, reintroduced by the fix for it -- and every warning about it was already written in
-        // these comments before I added the term.
-        //
-        // A per-pixel quantity may steer where a shadow's EDGE falls, within limits. It may not steer how
-        // dark the shadow is, because that is what an eye reads directly.
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
@@ -999,14 +909,12 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         //     triangle, so anything thresholding it prints that triangle's outline exactly. Dark green is
         //     the subtler version: an interpolated normal sagging towards the 1e-4 test.
         //   3 next, to see it directly. Flat facets of colour on a surface that should be smooth confirm it.
-        //   5 to see what the filter returned, before anything remaps it. This is the fork. A boundary that
-        //     is already faceted HERE was drawn by the comparison or by the map itself -- its resolution, the
-        //     matrix it was drawn with, or the depth pass's bias -- and no work downstream will reach it. One
-        //     that is smooth here and hard-edged badly on screen was drawn by the threshold.
-        //
-        //     ONE thing sits between this view and the shaded picture: the cel threshold, which remaps
-        //     coverage through a narrow ramp centred on half. Nothing scales the shadow's DARKNESS per pixel
-        //     any more -- a weight that did was painting the mesh's own triangles onto the walls.
+        //   5 to see the shadow term with nothing else multiplied into it. Nothing rewrites coverage any
+        //     more, so this and the shaded picture are the same number -- which means a boundary that is
+        //     faceted on screen is faceted HERE, in what the depth comparison returned, and the cause is
+        //     upstream of everything in this file: the map's own resolution, the matrix it was drawn with,
+        //     or the depth pass's bias. Nothing downstream can be blamed for it, because there is nothing
+        //     downstream left.
         //   7 to rule out cascade selection entirely -- if the shape follows a cascade boundary it is not a
         //     mesh artefact at all.
         //
@@ -1039,9 +947,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // position is being used instead -- constant per triangle by construction.
             texel.rgb = (shadowNLen > 1e-4) ? float3(0.0, saturate(shadowNLen), 0.0) : float3(1.0, 0.0, 0.0);
         } else if (shadowDebugMode == 5) {
-            // The coverage the depth comparison produced, raw. The shaded picture scales this by the
-            // incidence weight, so the two differ where a surface is near tangent to the light -- see the
-            // reading order above.
+            // The coverage the depth comparison produced. Nothing rewrites it before shading now, so this
+            // view and the shaded picture carry the same number -- see the reading order above.
             texel.rgb = float3(shadowCoverage, shadowCoverage, shadowCoverage);
         } else if (shadowDebugMode == 7) {
             // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands

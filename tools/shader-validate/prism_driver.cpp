@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: prism_driver <shader.hlsl> <shaders-root> [options]\n"
                      "  options: any of 't' (toon), 's' (shadow map), 'f' (fog), '2' (two cycle),\n"
                      "           'a' (alpha threshold), 'n' (noise dither),\n"
-                     "           'O' (opaque -- build the NO-alpha combiner instead of the alpha one)\n";
+                     "           'g' (gathered shadow kernel; needs a 4_1 target)\n";
         return 2;
     }
     gShaderDir = argv[2];
@@ -79,11 +79,7 @@ int main(int argc, char** argv) {
     // expand into something representative.
     cc.c[0][0][0] = cc.c[1][0][0] = SHADER_TEXEL0;
     cc.c[0][1][0] = cc.c[1][1][0] = SHADER_TEXEL0A;
-    // Opaque geometry is a DIFFERENT shader, not the same one with a channel ignored: without alpha the
-    // vertex inputs are float3 instead of float4 and several combiner paths expand differently. Every
-    // option set used to be built with alpha on, so half the shapes the game compiles were never seen here
-    // -- and the variant that took the game down was one of them.
-    cc.opt_alpha = !has('O');
+    cc.opt_alpha = true;
     cc.usedTextures[0] = true;
     cc.numInputs = 1;
     cc.do_single[0][0] = cc.do_single[0][1] = cc.do_single[1][0] = cc.do_single[1][1] = true;
@@ -91,6 +87,9 @@ int main(int argc, char** argv) {
     cc.opt_shadow_map = has('s');
     cc.opt_fog = has('f');
     cc.opt_2cyc = has('2');
+    // Not a CCFeatures field: it follows the adapter's feature level, not the material. 'g' selects the
+    // gathered kernel, which needs Shader Model 4.1 -- validate.sh raises the target profile to match.
+    const bool shadowGather = has('g');
     // The alpha cutoff has two placements -- hoisted above the shading, or left in the tail where the noise
     // dither can still move alpha under it -- so both need building. Neither was reachable before.
     cc.opt_alpha_threshold = has('a');
@@ -126,6 +125,7 @@ int main(int argc, char** argv) {
         { "o_shadow_map", cc.opt_shadow_map },
         { "o_shadow_max_cascades", SHADOW_MAP_MAX_CASCADES },
         { "o_shadow_actor_cascades", SHADOW_MAP_ACTOR_CASCADES },
+        { "o_shadow_gather", shadowGather },
         { "o_textures", M_ARRAY(cc.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc.used_blend, bool, 2) },

@@ -575,11 +575,6 @@ class Interpreter {
             // the moment the mode went off, and the next enable could be a different scene entirely.
             for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
                 mShadowMapCascadeCenterValid[c] = false;
-                // The fitted depth range is parked state too: it is held with hysteresis across frames, and
-                // holding one from a scene that is no longer loaded would fit this cascade to geometry that
-                // has gone.
-                mShadowMapCascadeDepthBack[c] = 0.0f;
-                mShadowMapCascadeDepthRange[c] = 0.0f;
                 // The update-rate freeze parks the same cascade a second way, by matrix, and it has to be
                 // let go here too -- a held matrix outliving a disable would freeze the next enable to
                 // wherever the camera stood when the mode went off.
@@ -1057,19 +1052,6 @@ class Interpreter {
     // per frame would be worth avoiding.
     uint64_t mShadowWorldCacheGeneration = 0;
     bool mShadowWorldCapture = true;  // capture the world layer this frame (rebuild pending)
-    // SOH [Enhancement] How many more frames to keep capturing after the world signature last changed.
-    //
-    // The cache is armed on the frame a change is DETECTED and captured on the next one, because by the time
-    // the signature is known the frame has already drawn past the point where it could have been recorded.
-    // For a room change -- one event, one frame of lag -- that is fine and it is what the design was built
-    // for. For something that moves every frame it is not: arm, capture, arm, capture, and the geometry
-    // reaches the map on every OTHER frame. Thirty hertz, with no setting anywhere saying so.
-    //
-    // So a change keeps the capture armed for a short run of frames rather than a single one. While anything
-    // is actually moving the signature keeps changing, the window keeps being refilled, and the capture
-    // happens every frame -- which is the cost the cache exists to avoid, paid only while there is something
-    // to see for it. When the movement stops the window drains and the cache goes back to being free.
-    uint8_t mShadowWorldSettle = 0;
     bool mShadowMapEnabled = false;   // app-pushed AND its shaders are ready
     bool mShadowMapRequested = false; // what the application last asked for, ready or not
     int mShadowMapCascadeCount = SHADOW_MAP_DEFAULT_CASCADES;
@@ -1106,13 +1088,6 @@ class Interpreter {
     // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
     // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
     float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
-    // SOH [Enhancement] The cascade's light-space depth range, fitted to the casters that actually fall in
-    // its footprint rather than to a multiple of its radius. `Back` is how far behind the cascade centre the
-    // light's eye sits, `Range` is near-to-far; both are held with hysteresis so the matrix does not move
-    // every frame and the parking above survives (see the fit in RenderShadowMap). Zero means "not fitted
-    // yet", which falls back to the radius-based heuristic.
-    float mShadowMapCascadeDepthBack[SHADOW_MAP_MAX_CASCADES] = {};
-    float mShadowMapCascadeDepthRange[SHADOW_MAP_MAX_CASCADES] = {};
     // Where each cascade is currently parked, and whether anything is parked there yet. Held across frames
     // for as long as the cascade still contains the sphere the frame fits, which is what allows a slice to
     // be reused while the camera moves -- see the containment test in RenderShadowMap.

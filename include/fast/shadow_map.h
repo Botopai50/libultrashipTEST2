@@ -201,36 +201,10 @@
 // closely, and large only on one edge-on to it, where depth runs across a texel in a step and acne would
 // otherwise appear.
 //
-// The one depth offset in the system, applied by the rasterizer as the caster is written into the map.
-//
-// It is angle-dependent, which is what this needs: what a receiver has to be offset by is how far its own
-// depth travels across the texel whose depth was stored, and that is the tangent of the angle to the light.
-// A slope-scaled bias is exactly that quantity, taken from the polygon's own depth gradient.
-//
-// The angle is read from the CASTER at write time and not from the receiver at read time, and that is the
-// whole reason this lives here. A receiver-side version was tried: it reads the shaded pixel's normal, which
-// on a flat-shaded wall is constant across a triangle and steps at every shared edge, so each face compared
-// against a differently offset depth and the shadow's boundary broke into triangular segments along the
-// mesh's own edges. Written into the map instead, one consistent depth comes out and every receiver reads it
-// the same way, so nothing about receiver geometry can fragment the line.
-//
-// 2.0: one gradient across one texel is the theoretical minimum with no margin for the depth buffer's own
-// rounding, and twice it leaves as much margin as it spends. It was briefly 3.0 on the reasoning that the
-// ceiling below would catch any overshoot -- which was true, and useless, because that ceiling was set
-// fourteen times higher than anything this term legitimately needs.
-#define SHADOW_MAP_SLOPE_BIAS 2.0f
-
-// Flat offset in units of the depth buffer's smallest step, beside the slope term.
-//
-// The slope term goes to nearly nothing on a polygon facing the light, and what is left there is not
-// geometric but numeric: a D16 map rounds every stored depth to one part in 65536 of the cascade's range
-// whatever the polygon is doing. This is the floor under that, and it is uniform across a surface, so unlike
-// anything derived from a normal it cannot break a boundary into facets.
-//
-// Counted in depth steps rather than world units, which is only meaningful because the near and far planes
-// are fitted to the casters: one step is the range over 65536, so 32 of them stay a small fraction of a
-// world unit in every cascade.
-#define SHADOW_MAP_DEPTH_BIAS_UNITS 32
+// 1.0 is one polygon gradient across one texel, the least this term can be and still mean anything. It has
+// been 4.0 and 2.0 in earlier revisions, when a stack of other bias terms sat on top of it; with those gone
+// this may well need to move. It is a starting point, not a tuned value.
+#define SHADOW_MAP_SLOPE_BIAS 1.0f
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is
@@ -239,27 +213,23 @@
 // casts nothing at all. Too much of this game is built that way for the trade to be worth it, so the depth
 // pass records both facings.
 
-// Ceiling on what the slope term may displace a caster by, in TEXELS of the cascade doing the writing,
-// applied as DepthBiasClamp.
+// Ceiling on what that slope term may displace a receiver by, in WORLD units.
 //
-// The rasterizer writes SlopeScaledDepthBias * MaxDepthSlope, and MaxDepthSlope is unbounded: on a polygon
-// raking away from the light the depth crosses a texel in one step. Only a clamp on the PRODUCT bounds it.
+// The rasterizer takes one slope value per state, not per draw, so this cannot be capped per pixel -- the
+// backend builds a separate rasterizer state per cascade instead, each with the slope reduced to whatever
+// keeps its own texel under this ceiling.
 //
-// In texels rather than world units, because that is the unit the requirement is proportional to. What the
-// offset needs is one texel times the tangent of the angle to the light: the tangent is geometry and is the
-// same everywhere, the texel is not. At the default ladder and 4096 a texel is a fifth of a world unit in
-// the near cascade and three and a half in the far one, so the same angle wants eighteen times more offset
-// out there.
+// 32.0, which at the default cascade ladder and resolution does not bind on ANY cascade: the far one would
+// need a texel over eight world units to reach it, and it sits at about six. So this is a guard rail rather
+// than a working part -- it exists for configurations with much coarser texels, a raised Split3 or a
+// lowered Resolution, where the term would otherwise run away.
 //
-// A single world constant was tried at both ends and failed at both. At 32 it was half of Link's height in
-// the cascade he stands in, and his shadow floated off his feet; at 3 the far cascade was starved from
-// forty-five degrees onward and the walls striped with acne. Same line, opposite failures, because the
-// quantity it was written in is not the one the requirement scales with.
-//
-// Eight covers the tangent out to about eighty-two degrees. Past that a surface is edge-on enough that no
-// offset helps, because nothing is being mis-compared -- the boundary is being drawn at a resolution that
-// does not exist.
-#define SHADOW_MAP_MAX_SLOPE_BIAS_TEXELS 8.0f
+// It was 3.0, then 6.0, and both were too tight. The mistake in each was pricing this term as though it
+// cost everywhere, when it scales with the polygon's own gradient: near zero on a surface facing the light,
+// which is where a shadow's contact point is read closely, and large only on grazing surfaces, where the
+// contact is at a shallow angle and displacement along the ray barely shows. Capping it there bought very
+// little panning and cost the acne protection the far cascade needs.
+#define SHADOW_MAP_MAX_SLOPE_BIAS_WORLD 32.0f
 
 // Floor on how low the key light may sit before the cascades are built from it, as the sine of its angle
 // above the horizon (0 = the horizon itself, 1 = straight overhead). A light near the horizon stretches
@@ -387,22 +357,6 @@
 // and every further step buys a smaller fraction of a smaller number.
 #define SHADOW_MAP_MAX_CASCADE_DIVISOR 4
 
-// How many frames the world-caster capture stays armed after the last change to its signature.
-//
-// The capture is armed when a change is detected and recorded on the following frame -- the signature is
-// only complete once the frame has drawn, by which point it is too late to record that frame. Armed for
-// exactly one frame, a caster that moves continuously is therefore captured on every OTHER frame: it
-// changes, arms, is captured, changes again, arms again. Half rate, from a mechanism whose whole purpose is
-// to decide when NOT to redraw.
-//
-// Holding the arm for a short run of frames after the last change fixes it: while something is moving the
-// signature keeps changing, the window keeps being refilled, and the capture lands on every frame. When the
-// movement stops the window drains and the cache costs nothing again.
-//
-// Six frames is a tenth of a second at sixty -- long enough to bridge an object that pauses mid-animation
-// without holding the capture open behind a scene that has genuinely settled.
-#define SHADOW_MAP_WORLD_SETTLE_FRAMES 6
-
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //
@@ -420,7 +374,7 @@
 //   2  the two caster layers separated by colour                    (output)
 //   3  the receiver normal                                          (input)
 //   4  where that normal came from, vertex or recovered face        (input)
-//   5  the filter's raw coverage, before threshold and weight       (input)
+//   5  the filter's raw coverage, before the hardening remap        (input)
 //   7  the cascade each pixel sampled                               (input)
 // 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
 // unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
