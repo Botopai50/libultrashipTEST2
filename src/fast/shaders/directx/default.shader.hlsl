@@ -171,9 +171,21 @@ cbuffer PerShadowCB : register(b3) {
 // The comparison itself is LESS_EQUAL on the sampler, so the result is the fraction of the footprint whose
 // stored depth is at or behind the receiver -- 1 where nothing occludes, which is also what the 1.0 border
 // gives outside the map.
+//
+// An if/else STATEMENT, not a ternary, and that is not style. ps_4_0 encodes the texture and sampler slots
+// into the sample instruction itself, so a select between two different (texture, sampler) pairs has to
+// become two instructions under flow control -- which a statement gives it and an expression does not.
+// Written as a ternary this is "error X4532: cannot map expression to ps_4_0 instruction set", and the
+// shader fails to compile at RUNTIME, in the middle of a frame, taking the process with it. The declaration
+// above says "selected with a branch" for this reason.
 float SampleShadowPCF4(float2 uv, float z, float slice, bool isActor) {
-    return isActor ? g_shadowMapActors.SampleCmpLevelZero(g_shadowActorSampler, float3(uv, slice), z)
-                   : g_shadowMap.SampleCmpLevelZero(g_shadowSampler, float3(uv, slice), z);
+    float lit;
+    if (isActor) {
+        lit = g_shadowMapActors.SampleCmpLevelZero(g_shadowActorSampler, float3(uv, slice), z);
+    } else {
+        lit = g_shadowMap.SampleCmpLevelZero(g_shadowSampler, float3(uv, slice), z);
+    }
+    return lit;
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).

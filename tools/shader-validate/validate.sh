@@ -56,11 +56,15 @@ else
   exit 2
 fi
 
+# Both halves of the alpha split are built. 'O' is the opaque combiner, whose vertex inputs are float3
+# where the alpha one's are float4; the game compiles plenty of these and none of them used to be checked.
+#
 # One profile, Shader Model 4.0, which is what the renderer now compiles everything against. The shadow
 # kernel used to have a second 4.1 form so it could use Texture2DArray.Gather, and every option set was built
 # twice to keep both honest; SampleCmpLevelZero does the same fetch at 4.0, so there is one form again.
 fail=0
-for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sa:4_0" "san:4_0"; do
+for combo in ":4_0" "t:4_0" "s:4_0" "ts:4_0" "sf:4_0" "ts2:4_0" "sa:4_0" "san:4_0" \
+             "O:4_0" "sO:4_0" "tsO:4_0" "sfO:4_0" "ts2O:4_0" "sf2O:4_0"; do
   opts="${combo%%:*}"
   model="${combo##*:}"
   "$WORK/prism_driver" "$SHADER" "$SHADER_DIR" "$opts" > "$WORK/v.hlsl"

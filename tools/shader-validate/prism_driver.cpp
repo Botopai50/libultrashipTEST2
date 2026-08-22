@@ -66,7 +66,8 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: prism_driver <shader.hlsl> <shaders-root> [options]\n"
                      "  options: any of 't' (toon), 's' (shadow map), 'f' (fog), '2' (two cycle),\n"
-                     "           'a' (alpha threshold), 'n' (noise dither)\n";
+                     "           'a' (alpha threshold), 'n' (noise dither),\n"
+                     "           'O' (opaque -- build the NO-alpha combiner instead of the alpha one)\n";
         return 2;
     }
     gShaderDir = argv[2];
@@ -78,7 +79,11 @@ int main(int argc, char** argv) {
     // expand into something representative.
     cc.c[0][0][0] = cc.c[1][0][0] = SHADER_TEXEL0;
     cc.c[0][1][0] = cc.c[1][1][0] = SHADER_TEXEL0A;
-    cc.opt_alpha = true;
+    // Opaque geometry is a DIFFERENT shader, not the same one with a channel ignored: without alpha the
+    // vertex inputs are float3 instead of float4 and several combiner paths expand differently. Every
+    // option set used to be built with alpha on, so half the shapes the game compiles were never seen here
+    // -- and the variant that took the game down was one of them.
+    cc.opt_alpha = !has('O');
     cc.usedTextures[0] = true;
     cc.numInputs = 1;
     cc.do_single[0][0] = cc.do_single[0][1] = cc.do_single[1][0] = cc.do_single[1][1] = true;
