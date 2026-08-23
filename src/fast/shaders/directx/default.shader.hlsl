@@ -1091,9 +1091,15 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // Scenery only. The mask folds both caster layers together, and a character must never be
         // shadowed by the actor layer -- itself included -- so reading it would paint a character with its
         // own shadow. Characters keep the layered path, which already skips that layer for them.
+        //
+        // Declared out here because the diagnostic views read the two layers apart (view 2 colours which
+        // one occludes), and the mask folds them into a single number. So a view being on also DISABLES
+        // the mask below: an instrument that shows something other than what the frame computed is worse
+        // than no instrument. shadow_range.y carries the view number; 0 is "shade normally".
+        float2 shadowLayers = float2(1.0, 1.0);
         float shadowLit = 1.0;
         bool haveShadow = false;
-        if (shadow_mask.x > 0.5 && input.worldPos.w > 0.5) {
+        if (shadow_mask.x > 0.5 && input.worldPos.w > 0.5 && shadow_range.y < 0.5) {
             float2 maskSample =
                 g_shadowMask.SampleLevel(g_shadowMaskSampler, screenSpace.xy * shadow_mask.yz, 0).xy;
             // Same tolerance the mask's own blur used, so a pixel the blur was willing to mix is a pixel
@@ -1106,9 +1112,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             }
         }
         if (!haveShadow) {
-            float2 shadowLayers =
-                ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
-                                input.worldPos.w > 0.5, screenSpace.xy);
+            shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                                           input.worldPos.w > 0.5, screenSpace.xy);
             shadowLit = min(shadowLayers.x, shadowLayers.y);
         }
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
