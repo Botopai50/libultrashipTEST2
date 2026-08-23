@@ -357,6 +357,22 @@
 // and every further step buys a smaller fraction of a smaller number.
 #define SHADOW_MAP_MAX_CASCADE_DIVISOR 4
 
+// How many frames the world-caster capture stays armed after the last change to its signature.
+//
+// The capture is armed when a change is detected and recorded on the following frame -- the signature is
+// only complete once the frame has drawn, by which point it is too late to record that frame. Armed for
+// exactly one frame, a caster that moves continuously is therefore captured on every OTHER frame: it
+// changes, arms, is captured, changes again, arms again. Half rate, from a mechanism whose whole purpose is
+// to decide when NOT to redraw.
+//
+// Holding the arm for a short run of frames after the last change fixes it: while something is moving the
+// signature keeps changing, the window keeps being refilled, and the capture lands on every frame. When the
+// movement stops the window drains and the cache costs nothing again.
+//
+// Six frames is a tenth of a second at sixty -- long enough to bridge an object that pauses mid-animation
+// without holding the capture open behind a scene that has genuinely settled.
+#define SHADOW_MAP_WORLD_SETTLE_FRAMES 6
+
 // Highest debug view the receiver shader recognises. The application passes a view number through
 // GfxRenderingAPI::SetShadowMapParams; anything outside 0..this shades normally.
 //
