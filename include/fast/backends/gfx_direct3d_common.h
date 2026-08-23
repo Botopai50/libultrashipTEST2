@@ -238,6 +238,13 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     ID3D11RasterizerState* ShadowRasterizerForCascade(int slice, int resolution, const float lightViewProj[16]);
     void ShadowMapInvalidateOpenSlice();
     void ShadowMapBindForReading();
+    // SOH [Enhancement] Filterable shadow maps (technique 1). Compiling the fullscreen resolve/blur
+    // pipeline, allocating the moment array for a mode, and running the two over every slice the depth
+    // pass redrew. All three are no-ops in SHADOW_MAP_FILTER_DEPTH.
+    bool CreateShadowMomentPipeline();
+    bool CreateShadowMomentTargets(int mode, int resolution, int sliceCount);
+    void ShadowMomentResolveAndBlur();
+    void ShadowMomentRelease();
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -338,6 +345,51 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // array rather than no shadows.
     int mShadowActorResolution = 0;
     bool mShadowActorSplit = false;
+
+    // SOH [Enhancement] Filterable shadow maps (technique 1 -- see fast/shadow_map.h).
+    //
+    // A second array holding a quantity whose AVERAGE is meaningful, so the map itself can be blurred --
+    // which raw depth cannot be, since the mean of two depths is a surface at neither. Written by a resolve
+    // pass that reads the depth slice after the depth pass has closed it, then blurred in place through the
+    // scratch below, and sampled by the receiver instead of the depth array.
+    //
+    // Allocated only when a filterable mode is asked for AND it fits the memory ceiling (see
+    // SHADOW_MAP_MOMENT_BUDGET_MB). Null means the mode is unavailable this frame and the receiver stays on
+    // depth and PCF, which is a fallback rather than a failure.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMomentTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMomentSrv;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMomentRtv[SHADOW_MAP_MAX_SLICES];
+    // One slice's worth of scratch for the separable blur: the horizontal pass writes here and the vertical
+    // pass writes back over the slice. An array of one, not a plain 2D texture, so the same shader reads
+    // both with the same declaration and only the slice index differs.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowBlurTexture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowBlurSrv;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowBlurRtv;
+    // Fullscreen resolve/blur pipeline. The vertex shader takes no buffer and no layout -- it builds a
+    // covering triangle from SV_VertexID -- so there is nothing here but the three shader objects, their
+    // constant buffer and a sampler.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowMomentVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMomentResolvePs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMomentBlurPs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowMomentCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowMomentSampler;
+    // Cull NONE, so the covering triangle's winding cannot matter. Worth its own state rather than
+    // borrowing the frame's: the viewport transform flips the sign of a triangle's winding, and
+    // reasoning about which way a fullscreen triangle faces is exactly the kind of thing that renders
+    // nothing at all and gives no error.
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mShadowMomentRasterState;
+    // Which filter mode the arrays above were built for, so a change to the setting rebuilds them. 0 is
+    // SHADOW_MAP_FILTER_DEPTH, which means "not allocated".
+    int mShadowMomentMode = 0;
+    // Resolution the moment array was built at, which tracks the world layer's.
+    int mShadowMomentResolution = 0;
+    // Whether the moment pipeline compiled. Separate from the mode, because a compile failure must not be
+    // retried every frame.
+    bool mShadowMomentPipelineReady = false;
+    bool mShadowMomentPipelineFailed = false;
+    // Slices the depth pass redrew this frame and which therefore need resolving and blurring again. A
+    // parked slice keeps the moments it already holds, exactly as it keeps the depths.
+    bool mShadowSliceMomentDirty[SHADOW_MAP_MAX_SLICES] = {};
     bool mShadowPipelineReady = false;
     bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
     bool mShadowPassActive = false;     // between BeginCascade and EndPass

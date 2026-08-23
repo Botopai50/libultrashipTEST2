@@ -461,6 +461,29 @@
 #define SHADOW_MAP_FILTER_MAX 3
 #define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_DEPTH
 
+// Ceiling on what the filterable modes may allocate for their moment array, in megabytes.
+//
+// This is the constraint that decides whether a filterable mode is usable at all, and it is severe. The
+// depth array stores one 16-bit value per texel; the moment array stores one to four 32- or 16-bit ones, so
+// it is two to four times larger than a map that is already 160 MB across five slices at 4096. Measured:
+//
+//               4096      2048      1024
+//   depth D16   160 MB     40 MB     10 MB
+//   ESM  R32F   320 MB     80 MB     20 MB
+//   VSM  RG32F  640 MB    160 MB     40 MB
+//   MSM  RGBA16 640 MB    160 MB     40 MB
+//
+// So a filterable mode at the default resolution asks for between a third and two thirds of a gigabyte on
+// top of what the shadow map already costs, which is not a thing to allocate because a checkbox was ticked.
+// The backend refuses above this ceiling, says so in the log, and leaves the mode reporting as unavailable
+// -- which falls back to depth and PCF rather than to no shadows.
+//
+// 192 admits every mode at 2048 and below, and admits none at 4096. That is the honest shape of the trade:
+// these modes buy a soft edge with memory, and the resolution has to come down to pay for it. Halving the
+// resolution costs a factor of two in texel size, which the blur then more than gives back -- which is the
+// whole argument for the technique.
+#define SHADOW_MAP_MOMENT_BUDGET_MB 192
+
 // ESM's exponent. The stored value is exp(k*d) and the test is exp(-k*z) * stored, so k sets how sharply
 // the reconstructed step falls off: too low and the shadow washes out into a gradient, too high and the
 // exponential overflows the storage format and the shadow returns to a hard edge with acne on top.

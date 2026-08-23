@@ -2576,6 +2576,490 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     return true;
 }
 
+// SOH [Enhancement] Filterable shadow maps (technique 1 -- see fast/shadow_map.h).
+//
+// Depth cannot be blurred: the mean of two depths is a surface at neither of them, so a blurred depth map
+// compares wrong everywhere. These three passes store something whose mean IS meaningful, blur that, and
+// leave the receiver doing one bilinear fetch -- which is the point, because the receiver is compiled by
+// FXC inside the frame a material first draws, so taps added there are paid twice.
+static const char* kShadowMomentShaderSource = R"(
+cbuffer ShadowMomentCB : register(b0) {
+    // x = slice to read, y = filter mode, z = ESM exponent, w = unused
+    float4 momentParams;
+    // xy = one blur step in UV (one axis per pass), z = blur radius in texels, w = unused
+    float4 blurParams;
+};
+
+Texture2DArray<float> g_depthSlices : register(t0);
+Texture2DArray<float4> g_momentSlices : register(t1);
+SamplerState g_momentSampler : register(s0);
+
+struct VSOutput {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+// A covering triangle built from the vertex id: no vertex buffer, no input layout, nothing to bind. Three
+// vertices reaching past the target cover it with one primitive, which also avoids the diagonal seam a
+// two-triangle quad puts down the middle where the two halves' derivatives disagree.
+VSOutput VSMain(uint id : SV_VertexID) {
+    VSOutput o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.position = float4((o.uv * float2(2.0, -2.0)) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+// Depth -> the quantity that survives averaging. One-to-one with the slice, so the fetch is point-sampled:
+// there is nothing to filter here, and filtering would only blur the input to the blur.
+float4 PSResolve(VSOutput input) : SV_TARGET {
+    float d = g_depthSlices.SampleLevel(g_momentSampler, float3(input.uv, momentParams.x), 0);
+    int mode = (int)momentParams.y;
+    if (mode == 1) {
+        // ESM. Storing exp(k*d) is what makes the average meaningful: the receiver's test becomes a ratio
+        // of exponentials, and a ratio of averages is still a usable estimate where an average of
+        // comparisons is not.
+        return float4(exp(momentParams.z * d), 0.0, 0.0, 0.0);
+    }
+    if (mode == 2) {
+        // VSM: the first two power moments, from which Chebyshev bounds the lit fraction.
+        return float4(d, d * d, 0.0, 0.0);
+    }
+    // MSM: four power moments.
+    float d2 = d * d;
+    return float4(d, d2, d2 * d, d2 * d2);
+}
+
+// One axis of a separable Gaussian, run twice per slice: horizontally into the scratch, then vertically
+// back over the slice.
+//
+// [loop] rather than [unroll] because the radius is a runtime value. Unlike the receiver, this shader is
+// compiled once at startup, so its size is not costing a frame -- but a bounded loop is still the right
+// shape for a radius that changes from a slider.
+float4 PSBlur(VSOutput input) : SV_TARGET {
+    float radius = max(blurParams.z, 0.0);
+    int taps = (int)ceil(radius);
+    float slice = momentParams.x;
+    float4 sum = g_momentSlices.SampleLevel(g_momentSampler, float3(input.uv, slice), 0);
+    float weightSum = 1.0;
+    // Sigma at half the radius puts the kernel's last tap at two sigma, where the weight is small enough
+    // that truncating the tail there does not show up as a ring around the penumbra.
+    float sigma = max(radius * 0.5, 1e-4);
+    float denom = 2.0 * sigma * sigma;
+    [loop]
+    for (int i = 1; i <= taps; i++) {
+        float w = exp(-((float)(i * i)) / denom);
+        float2 offset = blurParams.xy * (float)i;
+        sum += w * g_momentSlices.SampleLevel(g_momentSampler, float3(input.uv + offset, slice), 0);
+        sum += w * g_momentSlices.SampleLevel(g_momentSampler, float3(input.uv - offset, slice), 0);
+        weightSum += 2.0 * w;
+    }
+    return sum / weightSum;
+}
+)";
+
+// Matches kShadowMomentShaderSource's cbuffer. Two float4s, which is already a multiple of 16 bytes.
+struct ShadowMomentCB {
+    float momentParams[4];
+    float blurParams[4];
+};
+
+// Bytes per texel of the moment array, by mode. All three store floats, and MSM's is the choice worth
+// explaining because the published technique does not.
+//
+// ESM must be float: exp(k*d) leaves any normalised range immediately. VSM must be float because the
+// variance is a difference of two nearly equal numbers, which 16-bit unorm loses entirely.
+//
+// MSM is normally packed into 16-bit unorm through a quantisation matrix that spreads the four moments --
+// which cluster hard, since d, d^2, d^3 and d^4 of a value in [0,1] are not independent -- across the
+// storage range. That transform and its inverse are two more pieces of delicate, untested arithmetic
+// between the depth pass and the shadow, and getting either subtly wrong produces a wrong shadow rather
+// than an error. Storing the raw moments in 32-bit float sidesteps it: four times the memory, and no
+// quantisation to be wrong about. The ceiling below then confines this mode to lower resolutions, which is
+// the honest price and is reported in the log rather than hidden.
+static int ShadowMomentBytesPerTexel(int mode) {
+    switch (mode) {
+        case SHADOW_MAP_FILTER_ESM:
+            return 4; // R32_FLOAT
+        case SHADOW_MAP_FILTER_VSM:
+            return 8; // R32G32_FLOAT
+        case SHADOW_MAP_FILTER_MSM:
+            return 16; // R32G32B32A32_FLOAT
+        default:
+            return 0;
+    }
+}
+
+static DXGI_FORMAT ShadowMomentFormat(int mode) {
+    switch (mode) {
+        case SHADOW_MAP_FILTER_ESM:
+            return DXGI_FORMAT_R32_FLOAT;
+        case SHADOW_MAP_FILTER_VSM:
+            return DXGI_FORMAT_R32G32_FLOAT;
+        case SHADOW_MAP_FILTER_MSM:
+            return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+void GfxRenderingAPIDX11::ShadowMomentRelease() {
+    for (int i = 0; i < SHADOW_MAP_MAX_SLICES; i++) {
+        mShadowMomentRtv[i].Reset();
+        mShadowSliceMomentDirty[i] = false;
+    }
+    mShadowMomentSrv.Reset();
+    mShadowMomentTexture.Reset();
+    mShadowBlurSrv.Reset();
+    mShadowBlurRtv.Reset();
+    mShadowBlurTexture.Reset();
+    mShadowMomentMode = SHADOW_MAP_FILTER_DEPTH;
+    mShadowMomentResolution = 0;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMomentPipeline() {
+    if (mShadowMomentPipelineReady) {
+        return true;
+    }
+    if (mShadowMomentPipelineFailed) {
+        return false; // compiled once and failed; do not retry every frame
+    }
+    mShadowMomentPipelineFailed = true; // cleared again only on full success
+
+#if DEBUG_D3D
+    UINT compile_flags = D3DCOMPILE_DEBUG;
+#else
+    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vs, resolvePs, blurPs, err;
+    const size_t sourceLength = strlen(kShadowMomentShaderSource);
+    if (FAILED(mD3dCompile(kShadowMomentShaderSource, sourceLength, nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+                           compile_flags, 0, vs.GetAddressOf(), err.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: moment vertex shader failed to compile: {}",
+                     err ? (const char*)err->GetBufferPointer() : "no error blob");
+        return false;
+    }
+    if (FAILED(mD3dCompile(kShadowMomentShaderSource, sourceLength, nullptr, nullptr, nullptr, "PSResolve", "ps_4_0",
+                           compile_flags, 0, resolvePs.GetAddressOf(), err.ReleaseAndGetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: moment resolve shader failed to compile: {}",
+                     err ? (const char*)err->GetBufferPointer() : "no error blob");
+        return false;
+    }
+    if (FAILED(mD3dCompile(kShadowMomentShaderSource, sourceLength, nullptr, nullptr, nullptr, "PSBlur", "ps_4_0",
+                           compile_flags, 0, blurPs.GetAddressOf(), err.ReleaseAndGetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: moment blur shader failed to compile: {}",
+                     err ? (const char*)err->GetBufferPointer() : "no error blob");
+        return false;
+    }
+    if (FAILED(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
+                                           mShadowMomentVs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(resolvePs->GetBufferPointer(), resolvePs->GetBufferSize(), nullptr,
+                                          mShadowMomentResolvePs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(blurPs->GetBufferPointer(), blurPs->GetBufferSize(), nullptr,
+                                          mShadowMomentBlurPs.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment pipeline's shader objects.");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cb_desc;
+    ZeroMemory(&cb_desc, sizeof(cb_desc));
+    static_assert(sizeof(ShadowMomentCB) % 16 == 0, "constant buffers must be a multiple of 16 bytes");
+    cb_desc.ByteWidth = sizeof(ShadowMomentCB);
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(mDevice->CreateBuffer(&cb_desc, nullptr, mShadowMomentCb.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment constant buffer.");
+        return false;
+    }
+
+    // LINEAR, unlike the depth map's sampler, and that difference is the entire technique: a filterable
+    // quantity is one the hardware may interpolate for free, which is what moves the softening off the
+    // receiver's tap count.
+    //
+    // CLAMP rather than BORDER because a border colour cannot express "nothing occludes" for all three
+    // modes at once -- it is 1.0 for VSM's first moment but exp(k) for ESM. It never comes up: the receiver
+    // tests the footprint and skips the fetch entirely outside it.
+    D3D11_SAMPLER_DESC samp_desc;
+    ZeroMemory(&samp_desc, sizeof(samp_desc));
+    samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(mDevice->CreateSamplerState(&samp_desc, mShadowMomentSampler.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment sampler.");
+        return false;
+    }
+
+    D3D11_RASTERIZER_DESC rast_desc;
+    ZeroMemory(&rast_desc, sizeof(rast_desc));
+    rast_desc.FillMode = D3D11_FILL_SOLID;
+    rast_desc.CullMode = D3D11_CULL_NONE;
+    rast_desc.DepthClipEnable = TRUE;
+    if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowMomentRasterState.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment rasterizer state.");
+        return false;
+    }
+
+    mShadowMomentPipelineFailed = false;
+    mShadowMomentPipelineReady = true;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMomentTargets(int mode, int resolution, int sliceCount) {
+    if (mode == SHADOW_MAP_FILTER_DEPTH) {
+        ShadowMomentRelease();
+        return true; // not an error: this mode simply has no moment array
+    }
+    if (mode == mShadowMomentMode && resolution == mShadowMomentResolution && mShadowMomentTexture != nullptr) {
+        return true;
+    }
+    ShadowMomentRelease();
+
+    const int bytesPerTexel = ShadowMomentBytesPerTexel(mode);
+    const DXGI_FORMAT format = ShadowMomentFormat(mode);
+    if (bytesPerTexel == 0 || format == DXGI_FORMAT_UNKNOWN || resolution <= 0 || sliceCount <= 0) {
+        return false;
+    }
+
+    // The ceiling, and the reason this mode is not simply always available. The array is one to four times
+    // the size of a depth map that is already 160 MB at the default resolution, so at 4096 every mode here
+    // asks for a third to two thirds of a gigabyte. Refused rather than allocated, and the caller falls
+    // back to depth and PCF -- worse looking than asked for, but not "no shadows".
+    const double megabytes = ((double)resolution * (double)resolution * (double)bytesPerTexel *
+                             (double)(sliceCount + 1)) / (1024.0 * 1024.0);
+    if (megabytes > (double)SHADOW_MAP_MOMENT_BUDGET_MB) {
+        SPDLOG_WARN("Shadow map: the filterable mode wants {:.0f} MB at {}x{} across {} slices, over the "
+                    "{} MB ceiling. Falling back to depth and PCF -- lower the shadow resolution to use it.",
+                    megabytes, resolution, resolution, sliceCount, SHADOW_MAP_MOMENT_BUDGET_MB);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC tex_desc;
+    ZeroMemory(&tex_desc, sizeof(tex_desc));
+    tex_desc.Width = (UINT)resolution;
+    tex_desc.Height = (UINT)resolution;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = (UINT)sliceCount;
+    tex_desc.Format = format;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(mDevice->CreateTexture2D(&tex_desc, nullptr, mShadowMomentTexture.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the {}x{} x{} moment array.", resolution, resolution, sliceCount);
+        ShadowMomentRelease();
+        return false;
+    }
+    for (int i = 0; i < sliceCount; i++) {
+        D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+        ZeroMemory(&rtv_desc, sizeof(rtv_desc));
+        rtv_desc.Format = format;
+        rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        rtv_desc.Texture2DArray.MipSlice = 0;
+        rtv_desc.Texture2DArray.FirstArraySlice = (UINT)i;
+        rtv_desc.Texture2DArray.ArraySize = 1;
+        if (FAILED(mDevice->CreateRenderTargetView(mShadowMomentTexture.Get(), &rtv_desc,
+                                                   mShadowMomentRtv[i].GetAddressOf()))) {
+            SPDLOG_ERROR("Shadow map: could not create the moment target for slice {}.", i);
+            ShadowMomentRelease();
+            return false;
+        }
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv_desc.Texture2DArray.MostDetailedMip = 0;
+    srv_desc.Texture2DArray.MipLevels = 1;
+    srv_desc.Texture2DArray.FirstArraySlice = 0;
+    srv_desc.Texture2DArray.ArraySize = (UINT)sliceCount;
+    if (FAILED(mDevice->CreateShaderResourceView(mShadowMomentTexture.Get(), &srv_desc,
+                                                 mShadowMomentSrv.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment array resource view.");
+        ShadowMomentRelease();
+        return false;
+    }
+
+    // One slice of scratch for the separable blur. An array of one rather than a plain 2D texture, so the
+    // blur shader reads it through the same declaration as the moment array and only the slice differs.
+    D3D11_TEXTURE2D_DESC blur_desc = tex_desc;
+    blur_desc.ArraySize = 1;
+    if (FAILED(mDevice->CreateTexture2D(&blur_desc, nullptr, mShadowBlurTexture.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment blur scratch.");
+        ShadowMomentRelease();
+        return false;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC blur_rtv = {};
+    blur_rtv.Format = format;
+    blur_rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+    blur_rtv.Texture2DArray.MipSlice = 0;
+    blur_rtv.Texture2DArray.FirstArraySlice = 0;
+    blur_rtv.Texture2DArray.ArraySize = 1;
+    D3D11_SHADER_RESOURCE_VIEW_DESC blur_srv = srv_desc;
+    blur_srv.Texture2DArray.ArraySize = 1;
+    if (FAILED(mDevice->CreateRenderTargetView(mShadowBlurTexture.Get(), &blur_rtv, mShadowBlurRtv.GetAddressOf())) ||
+        FAILED(mDevice->CreateShaderResourceView(mShadowBlurTexture.Get(), &blur_srv, mShadowBlurSrv.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow map: could not create the moment blur scratch's views.");
+        ShadowMomentRelease();
+        return false;
+    }
+
+    mShadowMomentMode = mode;
+    mShadowMomentResolution = resolution;
+    // The array is fresh and holds undefined memory. Every slice has to be resolved once before it can be
+    // sampled, and the depth slices it resolves FROM are already valid -- parked or not -- so this is
+    // correct as well as necessary. Without it, enabling the mode in a scene that is standing still shows
+    // whatever was in that memory: no slice would be redrawn, so none would be marked dirty.
+    for (int i = 0; i < sliceCount; i++) {
+        mShadowSliceMomentDirty[i] = true;
+    }
+    SPDLOG_INFO("Shadow map: filterable mode {} ready at {}x{} across {} slices ({:.0f} MB).", mode, resolution,
+                resolution, sliceCount, megabytes);
+    return true;
+}
+
+// Run the resolve and the two blur axes over every slice the depth pass redrew this frame.
+//
+// Only the redrawn ones: a parked slice keeps the moments it already holds, exactly as it keeps the depths
+// it was drawn with. That is what stops this costing three fullscreen passes per slice per frame in a scene
+// that is standing still.
+void GfxRenderingAPIDX11::ShadowMomentResolveAndBlur() {
+    if (mShadowMomentTexture == nullptr || !mShadowMomentPipelineReady || mShadowMapSrv == nullptr) {
+        return;
+    }
+    // World cascades only -- see the note in ShadowMapConfigure for why the actor layer is not resolved.
+    const int sliceCount = mShadowCascadeCount;
+    const float resolution = (float)mShadowMomentResolution;
+    if (resolution <= 0.0f) {
+        return;
+    }
+
+    // Nothing was redrawn, so every slice still holds the moments resolved from the depths it still holds.
+    // Checked before anything is touched: this is the common case in a settled scene, and it must cost
+    // nothing and disturb nothing.
+    bool anyDirty = false;
+    for (int i = 0; i < sliceCount; i++) {
+        anyDirty = anyDirty || mShadowSliceMomentDirty[i];
+    }
+    if (!anyDirty) {
+        return;
+    }
+
+    // This runs from ShadowMapEndPass on both of its paths, one of which has already put the frame's target
+    // and viewport back. So the state these passes overwrite is saved here and restored below rather than
+    // left to the caller -- a fullscreen pass that silently keeps the render target is a black frame.
+    ComPtr<ID3D11RenderTargetView> savedRtv;
+    ComPtr<ID3D11DepthStencilView> savedDsv;
+    mContext->OMGetRenderTargets(1, savedRtv.GetAddressOf(), savedDsv.GetAddressOf());
+    UINT savedViewportCount = 1;
+    D3D11_VIEWPORT savedViewport;
+    mContext->RSGetViewports(&savedViewportCount, &savedViewport);
+
+    // Fixed for the whole run: nothing here has vertices, and the states are the same for all six passes.
+    mContext->IASetInputLayout(nullptr);
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->VSSetShader(mShadowMomentVs.Get(), nullptr, 0);
+    mContext->RSSetState(mShadowMomentRasterState.Get());
+    mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    mContext->OMSetDepthStencilState(nullptr, 0);
+    mContext->PSSetSamplers(0, 1, mShadowMomentSampler.GetAddressOf());
+    mContext->VSSetConstantBuffers(0, 1, mShadowMomentCb.GetAddressOf());
+    mContext->PSSetConstantBuffers(0, 1, mShadowMomentCb.GetAddressOf());
+
+    D3D11_VIEWPORT viewport;
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width = resolution;
+    viewport.Height = resolution;
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &viewport);
+
+    ID3D11ShaderResourceView* const nullSrv[2] = { nullptr, nullptr };
+    ID3D11RenderTargetView* const nullRtv[1] = { nullptr };
+
+    auto writeConstants = [&](float slice, float mode, float exponent, float stepX, float stepY, float radius) {
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (FAILED(mContext->Map(mShadowMomentCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+            return false;
+        }
+        ShadowMomentCB data;
+        data.momentParams[0] = slice;
+        data.momentParams[1] = mode;
+        data.momentParams[2] = exponent;
+        data.momentParams[3] = 0.0f;
+        data.blurParams[0] = stepX;
+        data.blurParams[1] = stepY;
+        data.blurParams[2] = radius;
+        data.blurParams[3] = 0.0f;
+        memcpy(ms.pData, &data, sizeof(data));
+        mContext->Unmap(mShadowMomentCb.Get(), 0);
+        return true;
+    };
+
+    const float mode = (float)mShadowMomentMode;
+    const float exponent = mShadowQuality.esmExponent;
+    const float radius = mShadowQuality.blurRadius;
+    const float texel = 1.0f / resolution;
+
+    for (int slice = 0; slice < sliceCount; slice++) {
+        if (!mShadowSliceMomentDirty[slice] || mShadowMomentRtv[slice] == nullptr) {
+            continue;
+        }
+        mShadowSliceMomentDirty[slice] = false;
+
+        // Resolve: read the depth slice, write the moments. The depth array is readable here because the
+        // depth pass has already unbound its targets -- this runs from ShadowMapEndPass, after that.
+        if (!writeConstants((float)slice, mode, exponent, 0.0f, 0.0f, 0.0f)) {
+            continue;
+        }
+        mContext->OMSetRenderTargets(1, mShadowMomentRtv[slice].GetAddressOf(), nullptr);
+        mContext->PSSetShader(mShadowMomentResolvePs.Get(), nullptr, 0);
+        mContext->PSSetShaderResources(0, 1, mShadowMapSrv.GetAddressOf());
+        mContext->Draw(3, 0);
+        mContext->PSSetShaderResources(0, 1, nullSrv);
+
+        if (radius <= 0.0f) {
+            continue; // the format alone does nothing; it is the blur that softens the edge
+        }
+
+        // Horizontal, into the scratch. The moment ARRAY is the source, so it must not also be a target.
+        mContext->OMSetRenderTargets(1, nullRtv, nullptr);
+        if (!writeConstants((float)slice, mode, exponent, texel, 0.0f, radius)) {
+            continue;
+        }
+        mContext->OMSetRenderTargets(1, mShadowBlurRtv.GetAddressOf(), nullptr);
+        mContext->PSSetShader(mShadowMomentBlurPs.Get(), nullptr, 0);
+        mContext->PSSetShaderResources(1, 1, mShadowMomentSrv.GetAddressOf());
+        mContext->Draw(3, 0);
+        mContext->PSSetShaderResources(1, 1, nullSrv);
+
+        // Vertical, back over the slice. Slice 0 now, because the source is the one-slice scratch.
+        mContext->OMSetRenderTargets(1, nullRtv, nullptr);
+        if (!writeConstants(0.0f, mode, exponent, 0.0f, texel, radius)) {
+            continue;
+        }
+        mContext->OMSetRenderTargets(1, mShadowMomentRtv[slice].GetAddressOf(), nullptr);
+        mContext->PSSetShaderResources(1, 1, mShadowBlurSrv.GetAddressOf());
+        mContext->Draw(3, 0);
+        mContext->PSSetShaderResources(1, 1, nullSrv);
+    }
+
+    // Put back what the frame was drawing into. The rasterizer state goes back too: the cull-none state
+    // these passes use would otherwise stay bound and every following draw would render its back faces.
+    mContext->OMSetRenderTargets(1, savedRtv.GetAddressOf(), savedDsv.Get());
+    if (savedViewportCount > 0) {
+        mContext->RSSetViewports(1, &savedViewport);
+    }
+    mContext->RSSetState(mRasterizerState.Get());
+    // The per-draw path caches what it last bound; these passes bound a shader and a layout behind its
+    // back, so the next ordinary draw has to be made to set them again.
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+}
+
 bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolution, int actorResolution) {
     if (mShadowMapTexture != nullptr && cascadeCount == mShadowCascadeCount && resolution == mShadowResolution &&
         actorResolution == mShadowActorResolution) {
@@ -2748,7 +3232,36 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, i
     if (!CreateShadowMapPipeline()) {
         return false;
     }
-    return CreateShadowMapTargets(cascadeCount, resolution, actorResolution);
+    if (!CreateShadowMapTargets(cascadeCount, resolution, actorResolution)) {
+        return false;
+    }
+
+    // SOH [Enhancement] Filterable shadow maps (technique 1). Everything below is optional: a failure here
+    // leaves mShadowMomentTexture null, which the shader reads as depth-and-PCF -- the arrangement that
+    // exists when the mode was never asked for. So none of it may fail the configure.
+    //
+    // The WORLD layer only -- cascadeCount slices, not SHADOW_MAP_SLICES_FOR(cascadeCount). Two reasons,
+    // and either alone would be enough:
+    //
+    // The actor layer can live in a different texture at a different resolution (see mShadowActorSplit),
+    // and the resolve reads the world array; pointing it at actor slices would resolve them from the wrong
+    // surface. And that layer's content changes every frame by definition, so it would pay the resolve and
+    // both blur axes every frame -- for characters, whose shadows are short and whose edges are the ones
+    // this technique helps least.
+    //
+    // So the receiver reads moments for the world layer and stays on depth and PCF for the actor layer.
+    // The staircase this technique exists for is on walls, stairs and roofs, all of which are world.
+    {
+        const int requested = mShadowQuality.filterMode;
+        if (requested == SHADOW_MAP_FILTER_DEPTH) {
+            ShadowMomentRelease();
+        } else if (CreateShadowMomentPipeline()) {
+            if (!CreateShadowMomentTargets(requested, resolution, cascadeCount)) {
+                ShadowMomentRelease(); // over the ceiling, or the device refused; fall back to depth
+            }
+        }
+    }
+    return true;
 }
 
 // SOH [Enhancement] Cascaded shadow maps: this cascade's rasterizer state, differing from the shared one
@@ -2885,6 +3398,13 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         memcmp(mShadowSliceMatrix[slice], lightViewProj, 16 * sizeof(float)) == 0) {
         mShadowCurrentSlice = -1; // nothing is open, so nothing may be invalidated by a stray submit
         return false;
+    }
+
+    // SOH [Enhancement] Filterable shadow maps (technique 1): this slice IS being redrawn, so whatever
+    // moments were resolved from it are now stale. Set here rather than in the pass's exit, because both
+    // reuse tests above return early and a parked slice must keep the moments it already holds.
+    if (slice < mShadowCascadeCount) {
+        mShadowSliceMomentDirty[slice] = true;
     }
 
     if (!mShadowPassActive) {
@@ -3233,7 +3753,11 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             q.jitterTemporal ? (float)((double)mShadowQualityFrame * 0.6180339887498949 -
                                        (long long)((double)mShadowQualityFrame * 0.6180339887498949))
                              : 0.0f;
-        mPerShadowCbData.shadow_jitter[2] = (float)q.filterMode;
+        // The EFFECTIVE mode, not the requested one: the moment array may have been refused for
+        // memory (see SHADOW_MAP_MOMENT_BUDGET_MB) or failed to compile, and the shader must then be
+        // told to read depth. Configure runs before this every frame, so the pointer is current.
+        mPerShadowCbData.shadow_jitter[2] =
+            mShadowMomentTexture != nullptr ? (float)mShadowMomentMode : (float)SHADOW_MAP_FILTER_DEPTH;
         mPerShadowCbData.shadow_jitter[3] = q.esmExponent;
         mPerShadowCbData.shadow_filter[0] = q.bleedReduction;
         mPerShadowCbData.shadow_filter[1] = q.screenSpace ? 1.0f : 0.0f;
@@ -3401,6 +3925,10 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     // the maps it is reusing are just as valid as freshly drawn ones -- returning early here would leave
     // the shader sampling whatever happened to be bound and the shadows would vanish while nothing moved.
     if (!mShadowPassActive) {
+        // Still resolve: a newly allocated moment array has every slice marked dirty and no pass will open
+        // to redraw them, so without this, enabling a filterable mode in a settled scene samples undefined
+        // memory. It returns immediately when nothing is dirty, which is this path's usual case.
+        ShadowMomentResolveAndBlur();
         ShadowMapBindForReading();
         return;
     }
@@ -3432,6 +3960,12 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mLastDepthMask = -1;
     mLastZmodeDecal = -1;
 
+    // SOH [Enhancement] Filterable shadow maps (technique 1): the depth slices are closed and readable
+    // now, which is the earliest point the resolve may run. Before BindForReading, because that hands the
+    // receiver whichever array it is going to sample. It saves and restores the target and viewport it
+    // needs, so it is safe here, after they have already been put back.
+    ShadowMomentResolveAndBlur();
+
     ShadowMapBindForReading();
 }
 
@@ -3445,6 +3979,18 @@ void GfxRenderingAPIDX11::ShadowMapBindForReading() {
         if (mShadowActorSrv != nullptr) {
             mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 1, 1, mShadowActorSrv.GetAddressOf());
             mContext->PSSetSamplers(SHADER_MAX_TEXTURES + 1, 1, mShadowMapSampler.GetAddressOf());
+        }
+        // SOH [Enhancement] Filterable shadow maps (technique 1). Its own slot rather than reinterpreting
+        // the depth one: the two hold different formats and want different filtering -- point for a
+        // hand-rolled comparison, linear for a quantity the hardware may average -- so they are two
+        // bindings and the shader picks by mode.
+        //
+        // Unbound when the mode is off, which matters: leaving a stale view bound while the shader has been
+        // told to read depth would have the two disagree about what slot 8 holds.
+        ID3D11ShaderResourceView* momentSrv = mShadowMomentSrv.Get();
+        mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 2, 1, &momentSrv);
+        if (momentSrv != nullptr) {
+            mContext->PSSetSamplers(SHADER_MAX_TEXTURES + 2, 1, mShadowMomentSampler.GetAddressOf());
         }
     }
 }

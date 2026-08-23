@@ -118,6 +118,21 @@ SamplerState g_shadowSampler : register(s6);
 Texture2DArray<float> g_shadowMapActors : register(t7);
 SamplerState g_shadowActorSampler : register(s7);
 
+// SOH [Enhancement] Filterable shadow maps (technique 1 -- see fast/shadow_map.h). Holds a quantity whose
+// AVERAGE is meaningful -- exp(k*d) for ESM, the first two or four power moments for VSM and MSM -- so the
+// MAP can be blurred and the receiver stays one bilinear fetch.
+//
+// Its own slot rather than reinterpreting the depth one: the formats differ and so does the filtering that
+// is correct for each. Point is the only correct setting for a hand-rolled comparison; linear is the whole
+// point of a filterable quantity.
+//
+// WORLD LAYER ONLY. The actor layer keeps depth and PCF -- it lives in a different texture when the two
+// resolutions are split, and it is redrawn every frame, so it would pay the resolve and both blur axes
+// every frame for the shadows this technique helps least. The backend allocates only the world cascades,
+// so this array's slice index IS the cascade index.
+Texture2DArray<float4> g_shadowMoments : register(t8);
+SamplerState g_shadowMomentSampler : register(s8);
+
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
 // subtly wrong. Layout matches the PerShadowCB C++ struct exactly.
@@ -348,6 +363,71 @@ float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool 
     return sum / (float)taps;
 }
 
+// SOH [Enhancement] Recover the lit fraction from stored moments (technique 1 -- see fast/shadow_map.h).
+//
+// One bilinear fetch, already averaged by the blur and by the hardware, turned back into coverage. This is
+// where a filterable map pays off: the softness came from a blur over the map, so nothing here loops.
+float ShadowMomentLit(float4 m, float z, int mode, float exponent, float bleed) {
+    if (mode == 1) {
+        // ESM. The stored average of exp(k*d) against exp(k*z) for this receiver. Saturated because the
+        // estimate runs above one wherever the blur averaged in something nearer than this receiver -- an
+        // overshoot, not an occlusion.
+        return saturate(exp(-exponent * z) * m.x);
+    }
+
+    if (mode == 2) {
+        // VSM. Chebyshev's inequality on the first two moments bounds the lit fraction from above.
+        float mean = m.x;
+        float variance = max(m.y - (mean * mean), 1.0e-6);
+        float diff = z - mean;
+        float bound = variance / (variance + (diff * diff));
+        // In front of the mean nothing can occlude, and the bound is not the answer there.
+        float lit = (z <= mean) ? 1.0 : bound;
+        // The bound is loose where two occluders at different depths share a texel, which is seen as a
+        // shadow going translucent in its middle. Rescaling the low tail away is the standard remedy.
+        return saturate((lit - bleed) / max(1.0 - bleed, 1.0e-4));
+    }
+
+    // MSM, four power moments (Peters & Klein). Solves for the tightest bound consistent with all four,
+    // which is what holds up under the overlapping occluders VSM bleeds through.
+    //
+    // Biased a hair towards the moments of a flat fully lit surface first: a texel whose casters are all at
+    // one depth -- most of an empty map -- makes the system below exactly degenerate.
+    float4 b = lerp(m, float4(0.0, 0.375, 0.0, 0.375), 6.0e-5);
+
+    // Cholesky of the Hankel matrix the moments form, solved in place.
+    float d22 = b.y - (b.x * b.x);
+    float l32d22 = b.z - (b.x * b.y);
+    float d33d22 = ((b.w - (b.y * b.y)) * d22) - (l32d22 * l32d22);
+    float invD22 = 1.0 / max(d22, 1.0e-9);
+    float l32 = l32d22 * invD22;
+
+    float3 c;
+    c.x = 1.0;
+    c.y = z - b.x;
+    c.z = (z * z) - b.y - (l32 * c.y);
+    c.y *= invD22;
+    c.z *= d22 / max(d33d22, 1.0e-9);
+    c.y -= l32 * c.z;
+    c.x -= dot(c.yz, b.xy);
+
+    // Roots of c.z t^2 + c.y t + c.x, ordered.
+    float safeC2 = (c.z < 0.0) ? min(c.z, -1.0e-9) : max(c.z, 1.0e-9);
+    float p = c.y / safeC2;
+    float q = c.x / safeC2;
+    // Clamped at zero rather than trusted: a moment set the blur has pushed slightly out of validity gives
+    // a negative discriminant, and a NaN here would spread through the whole shaded pixel.
+    float root = sqrt(max((p * p * 0.25) - q, 0.0));
+    float z1 = (-p * 0.5) - root;
+    float z2 = (-p * 0.5) + root;
+
+    float4 sw = (z2 < z) ? float4(z1, z, 1.0, 1.0) : ((z1 < z) ? float4(z, z1, 0.0, 1.0) : float4(0.0, 0.0, 0.0, 0.0));
+    float denom = (z2 - sw.y) * (z - z1);
+    float quotient = ((sw.x * z2) - (b.x * (sw.x + z2)) + b.y) / ((abs(denom) < 1.0e-9) ? 1.0e-9 : denom);
+    float occluded = saturate(sw.z + (sw.w * quotient));
+    return saturate(((1.0 - occluded) - bleed) / max(1.0 - bleed, 1.0e-4));
+}
+
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
 // what the border-clamped sampler returns, but checking here avoids the fetch entirely.
@@ -433,7 +513,16 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
+        // SOH [Enhancement] Filterable modes replace the whole kernel with one fetch (technique 1). World
+        // layer only -- see the note on g_shadowMoments. The mode arrives already reduced to what the
+        // backend could actually allocate, so a refused mode reads as 0 here and takes the depth path.
+        int filterMode = (int)shadow_jitter.z;
+        if (filterMode > 0 && !isActor) {
+            float4 stored = g_shadowMoments.SampleLevel(g_shadowMomentSampler, float3(p.uv, p.slice), 0);
+            lit = ShadowMomentLit(stored, p.z, filterMode, shadow_jitter.w, shadow_filter.x);
+        } else {
+            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
+        }
     }
     return lit;
 }
