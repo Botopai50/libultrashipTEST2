@@ -313,18 +313,32 @@
 #define SHADOW_MAP_CASTER_SHADOW_HEIGHT 1200.0f
 
 // How far the key light may swing before the cascades are rebuilt around the new direction, as the cosine
-// of the angle (0.9994 is about two degrees).
+// of the angle. 0.999999 is about a twelfth of a degree.
 //
-// The cascade centre is snapped to whole texels along the LIGHT's own axes, which is what stops shadow
-// edges shimmering as the camera moves. That only works if those axes hold still: the game's environment
-// light turns continuously with the time of day, and a basis that turns with it is a grid that turns with
-// it, so the snapping is measuring against a ruler that keeps rotating and every edge trembles.
+// The cascade centre is snapped to whole texels along the LIGHT's own axes, which is what stops shadow edges
+// shimmering as the camera moves. That only works if those axes hold still: the game's environment light
+// turns continuously with the time of day, and a basis that turns with it is a grid that turns with it, so
+// the snapping would be measuring against a ruler that keeps rotating.
 //
-// Held with hysteresis rather than quantized, for the same reason the cascade radius is: a quantized
-// direction flips between two neighbouring steps whenever it sits near a boundary. The cost is that the
-// whole shadow grid re-aligns in one step when the threshold is crossed, so the threshold wants to stay
-// small enough that the step is not visible.
-#define SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS 0.9994f
+// So the direction is held, and released in one step when it has drifted past this threshold. The cost is
+// that the whole grid re-aligns at once when that happens -- and this number decides whether that step is a
+// detail or the loudest thing on screen.
+//
+// It was 0.9994, about two degrees, and two degrees is enormous. What moves is the shadow's TIP, by roughly
+// the caster's height over sin squared of the sun's elevation, times the angle: at the default elevation
+// floor that is 5.7 world units for Link, 19 for a wall, and 57 for a castle tower -- Link's whole height,
+// arriving in a single frame, once every eighty frames. The jump scales with the caster, which is exactly
+// why it reads as "everything except the actors": a character's shadow is short and its own movement covers
+// the step, while the architecture's shadow is long and visibly jolts.
+//
+// A twelfth of a degree puts those at 0.23, 0.78 and 2.34 units, under one texel of the cascade the
+// architecture is usually in, and it fires every three frames instead of every eighty. That reads as motion
+// rather than as a jolt.
+//
+// Firing more often costs cascade rebuilds, and measurement says that cost is already spent: profiling this
+// scene showed all five slices redrawn on 60 of 60 frames during play, so the cascades were never being held
+// still by this anyway. It was buying grid stability alone, and buying far more than the shimmer was worth.
+#define SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS 0.999999f
 
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
