@@ -198,6 +198,14 @@ cbuffer PerShadowCB : register(b3) {
     // pixel in UV, w = how far the mask's stored depth may differ from this receiver's before the mask is
     // judged to describe a different surface.
     float4 shadow_mask;
+    // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). The magnitudes arrive already zeroed when
+    // their switch is off, so the shader multiplies rather than branches.
+    //   acne0: x = corrections enabled, y = normal offset in texels, z = light offset in world units,
+    //          w = depth bias in world units along the light
+    //   acne1: x = scale by how edge-on the surface is, y = the ceiling on that scale,
+    //          z = apply in the ordinary receiver too, w = unused
+    float4 shadow_acne0;
+    float4 shadow_acne1;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -617,6 +625,57 @@ uint ShadowCascadeIndex(float viewDepth) {
     return cascade;
 }
 
+// SOH [Enhancement] The cascade's world-to-depth scale, for turning a bias in world units into one in the
+// cascade's own normalised depth. The projection is orthographic and row-vector, so the light axis column's
+// LENGTH is exactly that factor. Literal indices only, same constraint as ShadowSplitAt.
+float ShadowDepthScaleAt(uint cascade) {
+    float3 axis = shadow_view_proj[2]._13_23_33;
+    if (cascade == 0) {
+        axis = shadow_view_proj[0]._13_23_33;
+    } else if (cascade == 1) {
+        axis = shadow_view_proj[1]._13_23_33;
+    }
+    return length(axis);
+}
+
+// How much the corrections are scaled by this surface's angle to the light (see fast/shadow_map.h).
+//
+// Acne is a grazing-angle problem: a surface facing the light has none of it, and one edge-on to the light
+// has depth running away across a texel. 1/(N.L) is that relationship, and the ceiling is not optional --
+// it runs to infinity as the surface turns edge-on, and an unbounded offset there lands the sample in a
+// different part of the scene entirely.
+float ShadowAcneSlope(float3 normal) {
+    if (shadow_acne1.x < 0.5) {
+        return 1.0;
+    }
+    float ndl = saturate(dot(normal, -ShadowLightAxis()));
+    return min(1.0 / max(ndl, 1.0e-3), shadow_acne1.y);
+}
+
+// Move the sample point off the surface before it is projected.
+//
+// The normal offset is the one that is correct in principle: the error being corrected is a displacement in
+// world space, so the correction is one too -- and being ALONG THE SURFACE rather than along the light, it
+// does not detach a shadow from the foot of its caster. The light offset does detach it, which is why it is
+// off by default and why it is a separate switch.
+float3 ShadowAcneMovePoint(float3 world, float3 normal, float texelWorld, float slope) {
+    if (shadow_acne0.x < 0.5) {
+        return world;
+    }
+    float3 moved = world + (normal * (texelWorld * shadow_acne0.y * slope));
+    return moved + (-ShadowLightAxis() * (shadow_acne0.z * slope));
+}
+
+// Depth bias, in the cascade's normalised depth, from a distance in world units along the light. Subtracted
+// from the receiver's depth, so it moves the receiver TOWARDS the light -- the direction that stops a
+// surface comparing as occluded by itself.
+float ShadowAcneDepthBias(uint cascade, float slope) {
+    if (shadow_acne0.x < 0.5) {
+        return 0.0;
+    }
+    return shadow_acne0.w * slope * ShadowDepthScaleAt(cascade);
+}
+
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
 // Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
 // moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
@@ -632,7 +691,7 @@ uint ShadowCascadeIndex(float viewDepth) {
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
 float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors,
-                       float2 pixel) {
+                       float2 pixel, float3 normal) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     float2 lit = float2(1.0, 1.0);
@@ -646,7 +705,18 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
         // long way, and cutting at the split would take real shadows with it (a low sun throws them well
         // past the band that cast them).
         if (viewDepth <= shadow_range.x) {
-            ShadowProjection primary = ShadowProjectAt(worldPos, cascade, 0.0);
+            // SOH [Enhancement] Acne corrections (see fast/shadow_map.h). Gated on their own switch here:
+            // the ordinary receiver reads the exact surface the depth pass rasterised, so it does not
+            // normally need them -- unlike the screen-space mask, which reconstructs its position.
+            float3 samplePos = worldPos;
+            float acneDepthBias = 0.0;
+            if (shadow_acne1.z > 0.5) {
+                float slope = ShadowAcneSlope(normal);
+                samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), slope);
+                acneDepthBias = ShadowAcneDepthBias(cascade, slope);
+            }
+            ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0);
+            primary.z -= acneDepthBias;
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -669,7 +739,8 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                partner = ShadowProjectAt(worldPos, pc, 0.0);
+                partner = ShadowProjectAt(samplePos, pc, 0.0);
+                partner.z -= acneDepthBias;
             }
 
             // Can the actor layer possibly shadow this point at all?
@@ -1113,7 +1184,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         }
         if (!haveShadow) {
             shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
-                                           input.worldPos.w > 0.5, screenSpace.xy);
+                                           input.worldPos.w > 0.5, screenSpace.xy, shadowN);
             shadowLit = min(shadowLayers.x, shadowLayers.y);
         }
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and

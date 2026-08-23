@@ -3249,6 +3249,8 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_jitter;
     float4 shadow_filter;
     float4 shadow_mask;
+    float4 shadow_acne0;
+    float4 shadow_acne1;
 };
 
 Texture2DArray<float> g_shadowMap : register(t6);
@@ -3280,7 +3282,57 @@ VSOutput VSFullscreen(uint id : SV_VertexID) {
 // A compact copy of the receiver's cascade lookup: no actor-box slab test, no debug views, no jitter. The
 // mask is resolved for world geometry, which receives both caster layers, so both are sampled -- world
 // from the moment array when a filterable mode is on, the actor layer always from depth.
-float MaskSampleLayer(float3 world, float viewDepth, uint cascade, float sliceBase, bool isActor) {
+// The direction the light travels, shared by every cascade.
+float3 MaskLightAxis() {
+    return normalize(shadow_view_proj[0]._13_23_33);
+}
+
+// Acne corrections, the same three the receiver carries (see fast/shadow_map.h). Duplicated here rather
+// than shared because this shader is a separate compilation unit handed to FXC as its own string; the
+// receiver's copy is in default.shader.hlsl and the two must be kept in step.
+//
+// They matter far more here than there. The receiver reads the exact surface the depth pass rasterised;
+// this reconstructs its position by unprojecting a screen-resolution depth buffer, so the point it asks
+// about is off the surface by that buffer's quantisation -- measured along the VIEW ray, which on ground
+// seen at a grazing angle is many world units of sliding along the surface.
+float MaskAcneSlope(float3 normal) {
+    if (shadow_acne1.x < 0.5) {
+        return 1.0;
+    }
+    float ndl = saturate(dot(normal, -MaskLightAxis()));
+    return min(1.0 / max(ndl, 1.0e-3), shadow_acne1.y);
+}
+
+float3 MaskAcneMovePoint(float3 world, float3 normal, float texelWorld, float slope) {
+    if (shadow_acne0.x < 0.5) {
+        return world;
+    }
+    float3 moved = world + (normal * (texelWorld * shadow_acne0.y * slope));
+    return moved + (-MaskLightAxis() * (shadow_acne0.z * slope));
+}
+
+float MaskTexelWorldAt(uint cascade) {
+    float v = shadow_texel_world.z;
+    if (cascade == 0) {
+        v = shadow_texel_world.x;
+    } else if (cascade == 1) {
+        v = shadow_texel_world.y;
+    }
+    return v;
+}
+
+float MaskDepthScaleAt(uint cascade) {
+    float3 axis = shadow_view_proj[2]._13_23_33;
+    if (cascade == 0) {
+        axis = shadow_view_proj[0]._13_23_33;
+    } else if (cascade == 1) {
+        axis = shadow_view_proj[1]._13_23_33;
+    }
+    return length(axis);
+}
+
+float MaskSampleLayer(float3 world, float viewDepth, uint cascade, float sliceBase, bool isActor,
+                      float depthBias) {
     float4x4 vp = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
@@ -3292,7 +3344,7 @@ float MaskSampleLayer(float3 world, float viewDepth, uint cascade, float sliceBa
     }
     float4 lightClip = mul(float4(world, 1.0), vp);
     float2 uv = (lightClip.xy * float2(0.5, -0.5)) + 0.5;
-    float z = lightClip.z;
+    float z = lightClip.z - depthBias;
     if (any(uv < 0.0) || any(uv > 1.0) || z < 0.0 || z > 1.0) {
         return 1.0; // outside this cascade's footprint nothing is known to occlude
     }
@@ -3348,17 +3400,29 @@ float MaskSampleLayer(float3 world, float viewDepth, uint cascade, float sliceBa
 // against G and uses R only where they agree -- which is what covers the surfaces the prepass never had.
 float4 PSResolve(VSOutput input) : SV_TARGET {
     float deviceDepth = g_sceneDepth.SampleLevel(g_maskSampler, input.uv, 0);
-    // Nothing was drawn here. A far-plane depth unprojects to a point on the horizon and would resolve a
-    // meaningless term, so it is marked as "no depth" and every receiver disagrees with it.
-    if (deviceDepth >= 1.0) {
-        return float4(1.0, -1.0, 0.0, 0.0);
-    }
     float2 ndc = float2((input.uv.x * 2.0) - 1.0, 1.0 - (input.uv.y * 2.0));
     float4 world4 = mul(float4(ndc, deviceDepth, 1.0), invCameraViewProj);
-    if (abs(world4.w) < 1.0e-9) {
+    float3 world = world4.xyz / (abs(world4.w) < 1.0e-9 ? 1.0e-9 : world4.w);
+
+    // The surface normal, recovered from how the reconstructed position changes across the pixel quad.
+    // This shader has a depth buffer and no vertex normals, and a face normal is what the offset wants
+    // anyway: flat across a triangle, and exact for the flat ground most of this is correcting.
+    //
+    // Taken HERE, before any branch, because ddx/ddy are undefined under non-uniform control flow -- the
+    // pixels of a quad must all reach them. The early exits below come after, which is why the unprojection
+    // above guards its divide instead of returning.
+    float3 faceNormal = normalize(cross(ddx(world), ddy(world)));
+    // Face the light's side. The cross product's sign follows the quad's screen-space winding, which says
+    // nothing about which way the surface points.
+    if (dot(faceNormal, -MaskLightAxis()) < 0.0) {
+        faceNormal = -faceNormal;
+    }
+
+    // Nothing was drawn here. A far-plane depth unprojects to a point on the horizon and would resolve a
+    // meaningless term, so it is marked as "no depth" and every receiver disagrees with it.
+    if (deviceDepth >= 1.0 || abs(world4.w) < 1.0e-9) {
         return float4(1.0, -1.0, 0.0, 0.0);
     }
-    float3 world = world4.xyz / world4.w;
     float viewDepth = mul(float4(world, 1.0), cameraViewProj).w;
 
     uint count = (uint)shadow_params.x;
@@ -3375,11 +3439,16 @@ float4 PSResolve(VSOutput input) : SV_TARGET {
     }
     cascade = min(cascade, count - 1);
 
-    float worldLit = MaskSampleLayer(world, viewDepth, cascade, 0.0, false);
+    // Acne corrections. Unconditional here, unlike in the receiver: this path is the one that needs them.
+    float slope = MaskAcneSlope(faceNormal);
+    float3 samplePos = MaskAcneMovePoint(world, faceNormal, MaskTexelWorldAt(cascade), slope);
+    float depthBias = (shadow_acne0.x < 0.5) ? 0.0 : (shadow_acne0.w * slope * MaskDepthScaleAt(cascade));
+
+    float worldLit = MaskSampleLayer(samplePos, viewDepth, cascade, 0.0, false, depthBias);
     // The actor layer is shorter than the world layer, so a cascade past its end has no slice to read.
     float actorLit = 1.0;
     if (cascade < (uint))" SHADOW_MAP_STR(SHADOW_MAP_ACTOR_CASCADES) R"() {
-        actorLit = MaskSampleLayer(world, viewDepth, cascade, shadow_params.x, true);
+        actorLit = MaskSampleLayer(samplePos, viewDepth, cascade, shadow_params.x, true, depthBias);
     }
     return float4(min(worldLit, actorLit), viewDepth, 0.0, 0.0);
 }
@@ -3700,16 +3769,52 @@ void GfxRenderingAPIDX11::ShadowMaskDrawCasters(const float* worldXyz, size_t ve
     // The world layer's buffers, which the light's passes filled moments ago with these very pointers.
     const int layer = SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + slotIndex;
 
-    // Only the cache-hit path, deliberately: this pass never uploads. If the buffer does not already hold
-    // this list -- a frame where the light's passes were all reused and never bound it, say -- the prepass
-    // simply lacks that geometry, and every pixel it would have covered disagrees with the mask's stored
-    // depth and falls back to sampling the cascades. A hole in the mask is a slower pixel, not a wrong one.
-    if (mShadowLastCasterPtr[layer] != worldXyz || mShadowLastCasterCount[layer] != vertexCount ||
-        mShadowCasterVb[layer] == nullptr) {
-        return;
-    }
     const UINT stride = 3 * sizeof(float);
     const UINT offset = 0;
+
+    // Usually a rebind and a draw: the light's passes ran moments ago with these very pointers, so the
+    // buffer already holds this list.
+    //
+    // It uploads when it does not, and skipping that was a real bug rather than a saving. On a frame where
+    // every cascade was reused, or where the world cache was rebuilt and moved, the buffer holds something
+    // else -- the prepass then drew nothing, the resolve marked every pixel "no depth", and the receiver
+    // fell back to the cascades. Which is correct per pixel, and reads as the whole ground flickering
+    // between two different-looking shadow paths from one frame to the next.
+    if (mShadowLastCasterPtr[layer] != worldXyz || mShadowLastCasterCount[layer] != vertexCount ||
+        mShadowCasterVb[layer] == nullptr) {
+        if (mShadowCasterVb[layer] == nullptr || mShadowCasterVbVertices[layer] < vertexCount) {
+            size_t capacity = mShadowCasterVbVertices[layer] ? mShadowCasterVbVertices[layer] : 128u * 1024u;
+            while (capacity < vertexCount) {
+                capacity *= 2;
+            }
+            D3D11_BUFFER_DESC vb_desc;
+            ZeroMemory(&vb_desc, sizeof(vb_desc));
+            vb_desc.Usage = D3D11_USAGE_DYNAMIC;
+            vb_desc.ByteWidth = (UINT)(capacity * 3 * sizeof(float));
+            vb_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            vb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            ComPtr<ID3D11Buffer> grown;
+            if (FAILED(mDevice->CreateBuffer(&vb_desc, nullptr, grown.GetAddressOf()))) {
+                return; // the mask simply lacks this geometry; the receiver falls back for those pixels
+            }
+            mShadowCasterVb[layer] = grown;
+            mShadowCasterVbVertices[layer] = capacity;
+            mShadowLastCasterPtr[layer] = nullptr;
+            mShadowLastCasterCount[layer] = 0;
+        }
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(ms));
+        if (FAILED(mContext->Map(mShadowCasterVb[layer].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+            return;
+        }
+        memcpy(ms.pData, worldXyz, vertexCount * 3 * sizeof(float));
+        mContext->Unmap(mShadowCasterVb[layer].Get(), 0);
+        // Recorded, so the next frame's light pass sees the buffer already holds this list and skips its
+        // own upload -- the cache is shared, and this pass filling it is as good as that one filling it.
+        mShadowLastCasterPtr[layer] = worldXyz;
+        mShadowLastCasterCount[layer] = vertexCount;
+    }
+
     mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
     mContext->Draw((UINT)vertexCount, 0);
 }
@@ -4348,6 +4453,21 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_filter[1] = q.screenSpace ? 1.0f : 0.0f;
         mPerShadowCbData.shadow_filter[2] = q.blurRadius;
         mPerShadowCbData.shadow_filter[3] = 0.0f;
+
+        // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). Each magnitude is zeroed when its own
+        // switch is off, so the shader multiplies by it rather than branching on a second flag.
+        const ShadowMapAcne& acne = q.acne;
+        mPerShadowCbData.shadow_acne0[0] = acne.enabled ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne0[1] = acne.normalOffset ? acne.normalTexels : 0.0f;
+        mPerShadowCbData.shadow_acne0[2] = acne.lightOffset ? acne.lightWorld : 0.0f;
+        mPerShadowCbData.shadow_acne0[3] = acne.depthBias ? acne.depthWorld : 0.0f;
+        mPerShadowCbData.shadow_acne1[0] = acne.slopeScaled ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne1[1] = acne.slopeMax;
+        // The ordinary receiver only applies these when asked. It reads the exact surface the depth pass
+        // rasterised, so it does not normally have the problem the mask has.
+        mPerShadowCbData.shadow_acne1[2] = (acne.enabled && acne.onReceiver) ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne1[3] = 0.0f;
+
         mShadowQualityFrame++;
     }
 

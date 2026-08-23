@@ -78,6 +78,12 @@ struct PerShadowCB {
     // w = how far the mask's stored depth may differ from the receiver's before the mask is judged to
     // describe a different surface and the receiver falls back to sampling the cascades.
     float shadow_mask[4];
+    // SOH [Enhancement] Shadow acne (see shadow_map.h). Magnitudes arrive already zeroed when their switch
+    // is off, so the shaders multiply rather than branch.
+    //   acne0: x enabled, y normal offset (texels), z light offset (world), w depth bias (world)
+    //   acne1: x slope-scaled, y slope ceiling, z apply in the ordinary receiver, w unused
+    float shadow_acne0[4];
+    float shadow_acne1[4];
 };
 
 // SOH [Enhancement] Screen-space shadow mask (technique 5). Layout must match the ShadowMaskCB cbuffer in

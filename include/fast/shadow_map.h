@@ -672,6 +672,119 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
     splits[count - 1] = farDistance;
 }
 
+// --- Shadow acne -----------------------------------------------------------------------------------
+//
+// A surface shadowing itself. The depth pass records a surface at one depth; the receiver asks about the
+// same surface and gets an answer a fraction off, and half the texels come back "occluded". At a grazing
+// view angle the striping projects into long rays converging at the horizon, which is why it reads as a
+// starburst on the ground rather than as stripes.
+//
+// The system's ONLY defence until now was the rasterizer's slope-scaled bias (SHADOW_MAP_SLOPE_BIAS),
+// applied while the depth map is written. That is enough for the ordinary receiver, whose world position
+// is the interpolated vertex position -- the exact surface the depth pass rasterised.
+//
+// It is NOT enough for the screen-space mask, and that is a difference in kind rather than in degree. The
+// mask reconstructs its position by unprojecting a screen-resolution depth buffer, so the point it asks
+// about is off the real surface by the depth buffer's own quantisation -- and that error is measured along
+// the VIEW ray. On ground seen at a grazing angle, a fraction of a depth step is many world units of
+// sliding along the surface, which dwarfs a bias sized for the light's own rasterisation.
+//
+// So the corrections below exist, they are per-technique, and they are off by default: the ordinary
+// receiver does not need them and paying for them there would be spending on a problem it does not have.
+//
+// Each is a different place to intervene, and they compose:
+//
+//   Normal offset -- move the sample point off the surface along its own normal, before projecting. The
+//                    only one that is correct in principle rather than a fudge: the error being corrected
+//                    is a displacement in world space, and this is a displacement in world space. Costs
+//                    nothing at the contact point, because the offset is along the surface, not along the
+//                    light -- so it does not detach a shadow from its caster the way a depth bias does.
+//
+//   Light offset  -- move the sample point toward the light. Simple, and the classic cause of "peter
+//                    panning": push far enough to clear the acne and a shadow visibly parts from the foot
+//                    of the thing casting it.
+//
+//   Depth bias    -- subtract from the receiver's depth after projecting. Cheapest, and the least
+//                    discriminating: it acts the same on a surface facing the light, where there was
+//                    never any acne to remove, as on one edge-on to it.
+//
+//   Slope scaling -- multiply whichever of the above are on by how edge-on the surface is to the light.
+//                    Acne is a grazing-angle problem, so scaling by the angle spends the correction where
+//                    it is needed and nearly nothing where it is not.
+
+// Whether the corrections run at all.
+//
+// ON by default, which is a deliberate reversal of how everything else here defaults. The screen-space
+// mask is not merely improved by these -- it is unusable without them: reconstructing a receiver from a
+// screen-resolution depth buffer stripes the entire ground with the shadow map's own texel grid, which at
+// a grazing view angle reads as rays converging on the horizon. Shipping the mask with its correction off
+// would be shipping it broken.
+//
+// It costs nothing when the mask is off, because the ordinary receiver only applies these when asked
+// separately (see SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER, which stays off).
+#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 1
+
+// Normal offset, in multiples of the sampled cascade's texel. Expressed in texels rather than world units
+// because the error it corrects is itself a texel-sized quantity -- a fixed world offset would be far too
+// large in the near cascade and far too small in the far one.
+#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET 1
+#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS 1.5f
+#define SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS 8.0f
+
+// Offset toward the light, in world units. Off by default: it is the one that costs peter panning, and the
+// normal offset above reaches the same place without that cost.
+#define SHADOW_MAP_DEFAULT_ACNE_LIGHT_OFFSET 0
+#define SHADOW_MAP_DEFAULT_ACNE_LIGHT_WORLD 2.0f
+#define SHADOW_MAP_MAX_ACNE_LIGHT_WORLD 50.0f
+
+// Constant depth bias, in world units along the light, converted to the cascade's own depth scale in the
+// shader so one number means the same thing in every band.
+#define SHADOW_MAP_DEFAULT_ACNE_DEPTH_BIAS 0
+#define SHADOW_MAP_DEFAULT_ACNE_DEPTH_WORLD 1.0f
+#define SHADOW_MAP_MAX_ACNE_DEPTH_WORLD 50.0f
+
+// Scale the corrections by how edge-on the surface is to the light, as 1 - N.L clamped by the ceiling
+// below. On by default because it is what keeps the corrections from acting where there is no acne.
+//
+// The ceiling matters: 1/(N.L) runs to infinity as a surface turns edge-on, and an unbounded offset there
+// throws the sample point far enough to sample a different part of the scene entirely.
+#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED 1
+#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX 3.0f
+#define SHADOW_MAP_MAX_ACNE_SLOPE_MAX 10.0f
+
+// Apply the corrections in the ORDINARY receiver too, not only in the screen-space mask.
+//
+// Off by default, and that default is a statement about where the problem is: the ordinary receiver reads
+// the exact surface the depth pass rasterised and the rasterizer's own slope bias already covers it. This
+// is here for a scene where that turns out not to hold -- and as the way to see, by turning it on, whether
+// a given patch of acne is the reconstruction's fault or the depth map's.
+#define SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER 0
+
+// Where the mask's resolve gets the surface normal it offsets along.
+//
+// It has no vertex normal -- it has a depth buffer -- so the normal is recovered from the derivatives of
+// the reconstructed world position across the pixel quad. That is a true FACE normal: flat across a
+// triangle, and exact for the flat ground this is mostly correcting. It is also free, which a normal
+// buffer would not be.
+//
+// The cost is at silhouettes, where the quad straddles two surfaces and the derivative is meaningless. A
+// wrong normal there offsets the sample sideways by a texel or two, which is invisible against the edge
+// itself.
+#define SHADOW_MAP_ACNE_NORMAL_FROM_DERIVATIVES 1
+
+typedef struct ShadowMapAcne {
+    int enabled;           // 0/1 -- master switch for every correction below
+    int normalOffset;      // 0/1
+    float normalTexels;    // multiples of the sampled cascade's texel
+    int lightOffset;       // 0/1
+    float lightWorld;      // world units toward the light
+    int depthBias;         // 0/1
+    float depthWorld;      // world units along the light, converted to the cascade's depth scale
+    int slopeScaled;       // 0/1 -- scale the three above by how edge-on the surface is
+    float slopeMax;        // ceiling on that scale
+    int onReceiver;        // 0/1 -- also correct the ordinary receiver, not only the mask
+} ShadowMapAcne;
+
 // --- The struct the application pushes -------------------------------------------------------------
 //
 // One struct rather than twenty arguments, because these travel together through five layers (menu ->
@@ -706,6 +819,10 @@ typedef struct ShadowMapQuality {
     int screenSpace;            // 0/1
     float screenBlur;           // pixels
     float screenDepthTolerance; // world units at unit depth
+
+    // Shadow acne. Travels with the rest rather than in its own setter: it is pushed once per frame from
+    // the same place and adding a second path through five layers would buy nothing.
+    ShadowMapAcne acne;
 } ShadowMapQuality;
 
 // The defaults above, as a value. Written as a function rather than an initialiser macro so both sides of
@@ -728,6 +845,16 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.screenSpace = SHADOW_MAP_DEFAULT_SCREEN_SPACE;
     q.screenBlur = SHADOW_MAP_DEFAULT_SCREEN_BLUR;
     q.screenDepthTolerance = SHADOW_MAP_DEFAULT_SCREEN_DEPTH_TOLERANCE;
+    q.acne.enabled = SHADOW_MAP_DEFAULT_ACNE_ENABLED;
+    q.acne.normalOffset = SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET;
+    q.acne.normalTexels = SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS;
+    q.acne.lightOffset = SHADOW_MAP_DEFAULT_ACNE_LIGHT_OFFSET;
+    q.acne.lightWorld = SHADOW_MAP_DEFAULT_ACNE_LIGHT_WORLD;
+    q.acne.depthBias = SHADOW_MAP_DEFAULT_ACNE_DEPTH_BIAS;
+    q.acne.depthWorld = SHADOW_MAP_DEFAULT_ACNE_DEPTH_WORLD;
+    q.acne.slopeScaled = SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED;
+    q.acne.slopeMax = SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX;
+    q.acne.onReceiver = SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER;
     return q;
 }
 
@@ -754,6 +881,16 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->screenSpace = q->screenSpace ? 1 : 0;
     q->screenBlur = SHADOW_MAP_CLAMP_(q->screenBlur, 0.0f, SHADOW_MAP_MAX_SCREEN_BLUR);
     q->screenDepthTolerance = SHADOW_MAP_CLAMP_(q->screenDepthTolerance, 0.1f, 100.0f);
+    q->acne.enabled = q->acne.enabled ? 1 : 0;
+    q->acne.normalOffset = q->acne.normalOffset ? 1 : 0;
+    q->acne.normalTexels = SHADOW_MAP_CLAMP_(q->acne.normalTexels, 0.0f, SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS);
+    q->acne.lightOffset = q->acne.lightOffset ? 1 : 0;
+    q->acne.lightWorld = SHADOW_MAP_CLAMP_(q->acne.lightWorld, 0.0f, SHADOW_MAP_MAX_ACNE_LIGHT_WORLD);
+    q->acne.depthBias = q->acne.depthBias ? 1 : 0;
+    q->acne.depthWorld = SHADOW_MAP_CLAMP_(q->acne.depthWorld, 0.0f, SHADOW_MAP_MAX_ACNE_DEPTH_WORLD);
+    q->acne.slopeScaled = q->acne.slopeScaled ? 1 : 0;
+    q->acne.slopeMax = SHADOW_MAP_CLAMP_(q->acne.slopeMax, 1.0f, SHADOW_MAP_MAX_ACNE_SLOPE_MAX);
+    q->acne.onReceiver = q->acne.onReceiver ? 1 : 0;
 #undef SHADOW_MAP_CLAMP_
 }
 
