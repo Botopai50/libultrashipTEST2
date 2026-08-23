@@ -604,10 +604,29 @@
 // the receiver to a single texture fetch, which is the largest possible win against the in-frame FXC
 // compile cost.
 //
-// What it costs is that it stops being a forward-shaded effect. The mask is resolved from the depth buffer
-// before the materials draw, so anything the depth buffer does not hold -- alpha-blended surfaces, the
-// water, particles -- is not in the mask and must fall back to sampling the cascades directly. The
-// fallback is why this is a switch and not a replacement.
+// NOT IMPLEMENTED, and the reason is structural rather than a matter of effort.
+//
+// The mask has to be resolved from a COMPLETE scene depth buffer, and this renderer never has one before
+// its receivers shade. The frame order is: the actor loop draws, gSPShadowMapFlush runs the depth pass,
+// and then the room draws and samples the cascades. So at the only point the mask could be built, the
+// depth buffer holds the characters and not the room -- and the room is where the staircase this technique
+// would fix actually lives.
+//
+// The three ways out, and why none of them is this change:
+//
+//   A depth prepass. The correct fix, and a change to the shape of the frame rather than to shadows: every
+//   opaque draw runs twice, which touches the interpreter's whole draw path and costs geometry throughput
+//   in exchange for an effect that is one of five ways to soften an edge.
+//
+//   Last frame's depth. Cheap, and wrong under any camera motion: a screen-space mask reprojected by a
+//   camera that has moved smears along the motion, which trades a stepped edge for a smeared one.
+//
+//   Applying the mask as a post-process multiply. Wrong per se: the shadow term must modulate the diffuse
+//   contribution only, and a multiply over the finished frame darkens emissive surfaces, the interface and
+//   every additive effect along with it.
+//
+// The tuning below and the constant-buffer register it travels in are kept so the contract does not have to
+// change when the prepass exists. The backend ignores them and the application's switch does nothing.
 #define SHADOW_MAP_DEFAULT_SCREEN_SPACE 0
 
 // Blur radius of the mask, in screen pixels at 1080p, scaled with resolution so the look holds.
