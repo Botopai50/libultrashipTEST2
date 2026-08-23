@@ -2980,6 +2980,12 @@ void GfxRenderingAPIDX11::ShadowMomentResolveAndBlur() {
     ID3D11ShaderResourceView* const nullSrv[2] = { nullptr, nullptr };
     ID3D11RenderTargetView* const nullRtv[1] = { nullptr };
 
+    // The receiver still holds the moment array and the mask in its slots from last frame, and both are
+    // about to become render targets. Unbound rather than left to the runtime, which would null them and
+    // log a hazard for every pass.
+    ID3D11ShaderResourceView* const nullShadowSlots[2] = { nullptr, nullptr };
+    mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 2, 2, nullShadowSlots);
+
     auto writeConstants = [&](float slice, float mode, float exponent, float stepX, float stepY, float radius) {
         D3D11_MAPPED_SUBRESOURCE ms;
         if (FAILED(mContext->Map(mShadowMomentCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
@@ -3208,6 +3214,585 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     mShadowResolution = resolution;
     mShadowActorResolution = mShadowActorSplit ? actorResolution : resolution;
     return true;
+}
+
+// SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h).
+//
+// Three shaders: a depth-only prepass that draws the world caster geometry with the CAMERA's matrix, a
+// resolve that turns that depth into a shadow term, and a depth-aware blur whose radius is in screen
+// pixels -- which is the unit the staircase is actually complained in.
+//
+// THE CBUFFER AT b3 IS THE THIRD COPY of a layout that also lives in PerShadowCB (gfx_direct3d_common.h)
+// and in default.shader.hlsl. It has to be declared in full, ignored fields and all, because what matters
+// is the byte offsets of the ones that are read. Change one, change all three.
+static const char* kShadowMaskShaderSource = R"(
+cbuffer ShadowMaskCB : register(b0) {
+    row_major float4x4 cameraViewProj;
+    row_major float4x4 invCameraViewProj;
+    // x = one screen pixel in u, y = in v, z = blur radius in pixels, w = depth tolerance at unit depth
+    float4 maskParams;
+    // xy = the blur's direction this pass, in pixels; zw unused
+    float4 maskBlur;
+};
+
+cbuffer PerShadowCB : register(b3) {
+    row_major float4x4 shadow_view_proj[)" SHADOW_MAP_STR(SHADOW_MAP_MAX_CASCADES) R"(];
+    float4 shadow_splits;
+    float4 shadow_texel_world;
+    float4 shadow_texel_uv;
+    float4 shadow_params;
+    float4 shadow_range;
+    float4 shadow_actor_min;
+    float4 shadow_actor_max;
+    float4 shadow_actor_texel_uv;
+    float4 shadow_edge;
+    float4 shadow_jitter;
+    float4 shadow_filter;
+    float4 shadow_mask;
+};
+
+Texture2DArray<float> g_shadowMap : register(t6);
+SamplerState g_shadowSampler : register(s6);
+Texture2DArray<float4> g_shadowMoments : register(t8);
+SamplerState g_shadowMomentSampler : register(s8);
+Texture2D<float> g_sceneDepth : register(t0);
+Texture2D<float4> g_maskSource : register(t1);
+SamplerState g_maskSampler : register(s0);
+
+struct VSOutput {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+// The prepass. World-space triangles through the camera's matrix, depth only -- there is no pixel shader.
+float4 VSPrepass(float3 pos : POSITION) : SV_POSITION {
+    return mul(float4(pos, 1.0), cameraViewProj);
+}
+
+// Covering triangle for the resolve and the blur, same as the moment passes use.
+VSOutput VSFullscreen(uint id : SV_VertexID) {
+    VSOutput o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.position = float4((o.uv * float2(2.0, -2.0)) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+
+// A compact copy of the receiver's cascade lookup: no actor-box slab test, no debug views, no jitter. The
+// mask is resolved for world geometry, which receives both caster layers, so both are sampled -- world
+// from the moment array when a filterable mode is on, the actor layer always from depth.
+float MaskSampleLayer(float3 world, float viewDepth, uint cascade, float sliceBase, bool isActor) {
+    float4x4 vp = shadow_view_proj[0];
+    float texelUv = shadow_texel_uv.x;
+    if (cascade == 1) {
+        vp = shadow_view_proj[1];
+        texelUv = shadow_texel_uv.y;
+    } else if (cascade == 2) {
+        vp = shadow_view_proj[2];
+        texelUv = shadow_texel_uv.z;
+    }
+    float4 lightClip = mul(float4(world, 1.0), vp);
+    float2 uv = (lightClip.xy * float2(0.5, -0.5)) + 0.5;
+    float z = lightClip.z;
+    if (any(uv < 0.0) || any(uv > 1.0) || z < 0.0 || z > 1.0) {
+        return 1.0; // outside this cascade's footprint nothing is known to occlude
+    }
+    float slice = sliceBase + (float)cascade;
+
+    int filterMode = (int)shadow_jitter.z;
+    if (filterMode > 0 && !isActor) {
+        float4 m = g_shadowMoments.SampleLevel(g_shadowMomentSampler, float3(uv, slice), 0);
+        if (filterMode == 1) {
+            return saturate(exp(-shadow_jitter.w * z) * m.x);
+        }
+        float mean = m.x;
+        float variance = max(m.y - (mean * mean), 1.0e-6);
+        float diff = z - mean;
+        float bound = variance / (variance + (diff * diff));
+        float lit = (z <= mean) ? 1.0 : bound;
+        return saturate((lit - shadow_filter.x) / max(1.0 - shadow_filter.x, 1.0e-4));
+    }
+
+    // Bilinear PCF over the quad, and the analytic reconstruction when it is switched on -- the same two
+    // paths the receiver takes, so turning the mask on does not change which technique is in effect.
+    float2 texelPos = (uv / texelUv) - 0.5;
+    float2 baseTexel = floor(texelPos);
+    float2 subTexel = texelPos - baseTexel;
+    float2 uv00 = (baseTexel + 0.5) * texelUv;
+    float4 stored;
+    stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, slice), 0);
+    stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), slice), 0);
+    stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), slice), 0);
+    stored.y = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), slice), 0);
+
+    if (shadow_edge.x > 0.5) {
+        float4 g = stored - z;
+        float row0 = lerp(g.w, g.z, subTexel.x);
+        float row1 = lerp(g.x, g.y, subTexel.x);
+        float value = lerp(row0, row1, subTexel.y);
+        float du = lerp(g.z - g.w, g.y - g.x, subTexel.y);
+        float dv = row1 - row0;
+        float gradient = length(float2(du, dv));
+        if (gradient < 1.0e-7) {
+            return step(0.0, value);
+        }
+        return saturate(0.5 + ((value / gradient) / max(shadow_edge.y, 1.0e-4)));
+    }
+
+    float4 lit4 = step(z, stored);
+    float2 inv = 1.0 - subTexel;
+    float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
+    return dot(lit4, weights);
+}
+
+// R holds the shadow term, G the view depth it was resolved at. The receiver compares its own depth
+// against G and uses R only where they agree -- which is what covers the surfaces the prepass never had.
+float4 PSResolve(VSOutput input) : SV_TARGET {
+    float deviceDepth = g_sceneDepth.SampleLevel(g_maskSampler, input.uv, 0);
+    // Nothing was drawn here. A far-plane depth unprojects to a point on the horizon and would resolve a
+    // meaningless term, so it is marked as "no depth" and every receiver disagrees with it.
+    if (deviceDepth >= 1.0) {
+        return float4(1.0, -1.0, 0.0, 0.0);
+    }
+    float2 ndc = float2((input.uv.x * 2.0) - 1.0, 1.0 - (input.uv.y * 2.0));
+    float4 world4 = mul(float4(ndc, deviceDepth, 1.0), invCameraViewProj);
+    if (abs(world4.w) < 1.0e-9) {
+        return float4(1.0, -1.0, 0.0, 0.0);
+    }
+    float3 world = world4.xyz / world4.w;
+    float viewDepth = mul(float4(world, 1.0), cameraViewProj).w;
+
+    uint count = (uint)shadow_params.x;
+    if (count == 0 || viewDepth > shadow_range.x) {
+        return float4(1.0, viewDepth, 0.0, 0.0);
+    }
+    uint cascade = count - 1;
+    if (viewDepth <= shadow_splits.x) {
+        cascade = 0;
+    } else if (count > 1 && viewDepth <= shadow_splits.y) {
+        cascade = 1;
+    } else if (count > 2 && viewDepth <= shadow_splits.z) {
+        cascade = 2;
+    }
+    cascade = min(cascade, count - 1);
+
+    float worldLit = MaskSampleLayer(world, viewDepth, cascade, 0.0, false);
+    // The actor layer is shorter than the world layer, so a cascade past its end has no slice to read.
+    float actorLit = 1.0;
+    if (cascade < (uint))" SHADOW_MAP_STR(SHADOW_MAP_ACTOR_CASCADES) R"() {
+        actorLit = MaskSampleLayer(world, viewDepth, cascade, shadow_params.x, true);
+    }
+    return float4(min(worldLit, actorLit), viewDepth, 0.0, 0.0);
+}
+
+// One axis of a depth-aware blur. Radius is in PIXELS, which is the whole point of this technique: two
+// pixels wide is two pixels wide at every distance and in every cascade, however coarse its texels are.
+//
+// The depth test is what keeps the mask from bleeding across silhouettes -- without it a shadowed wall
+// smears its term onto the lit floor behind it and the result reads as a halo. Scaled by the centre
+// pixel's own depth, so the tolerance is a proportion rather than an absolute at every distance.
+float4 PSBlur(VSOutput input) : SV_TARGET {
+    float4 centre = g_maskSource.SampleLevel(g_maskSampler, input.uv, 0);
+    float radius = max(maskParams.z, 0.0);
+    if (radius <= 0.0 || centre.y < 0.0) {
+        return centre;
+    }
+    int taps = (int)ceil(radius);
+    float sigma = max(radius * 0.5, 1.0e-4);
+    float denom = 2.0 * sigma * sigma;
+    float tolerance = maskParams.w * max(centre.y, 1.0) * 0.01;
+    float sum = centre.x;
+    float weightSum = 1.0;
+    [loop]
+    for (int i = 1; i <= taps; i++) {
+        float w = exp(-((float)(i * i)) / denom);
+        float2 offset = maskBlur.xy * (float)i;
+        float4 a = g_maskSource.SampleLevel(g_maskSampler, input.uv + offset, 0);
+        float4 b = g_maskSource.SampleLevel(g_maskSampler, input.uv - offset, 0);
+        if (a.y >= 0.0 && abs(a.y - centre.y) <= tolerance) {
+            sum += w * a.x;
+            weightSum += w;
+        }
+        if (b.y >= 0.0 && abs(b.y - centre.y) <= tolerance) {
+            sum += w * b.x;
+            weightSum += w;
+        }
+    }
+    return float4(sum / weightSum, centre.y, 0.0, 0.0);
+}
+)";
+
+void GfxRenderingAPIDX11::ShadowMaskRelease() {
+    mShadowMaskDepthSrv.Reset();
+    mShadowMaskDsv.Reset();
+    mShadowMaskDepthTex.Reset();
+    mShadowMaskSrv.Reset();
+    mShadowMaskRtv.Reset();
+    mShadowMaskTex.Reset();
+    mShadowMaskBlurSrv.Reset();
+    mShadowMaskBlurRtv.Reset();
+    mShadowMaskBlurTex.Reset();
+    mShadowMaskWidth = 0;
+    mShadowMaskHeight = 0;
+    mShadowMaskActive = false;
+    mShadowMaskValid = false;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMaskPipeline() {
+    if (mShadowMaskPipelineReady) {
+        return true;
+    }
+    if (mShadowMaskPipelineFailed) {
+        return false;
+    }
+    mShadowMaskPipelineFailed = true;
+
+    // The mask borrows the moment pipeline's linear sampler and its cull-none rasterizer state, both of
+    // which are the same objects this would otherwise create a second time. Built here explicitly rather
+    // than assumed, because that pipeline is only built when a filterable mode is on and the mask has to
+    // work in plain depth mode too.
+    if (!CreateShadowMomentPipeline()) {
+        SPDLOG_ERROR("Shadow mask: the shared fullscreen pipeline is unavailable, so the mask cannot run.");
+        return false;
+    }
+
+#if DEBUG_D3D
+    UINT compile_flags = D3DCOMPILE_DEBUG;
+#else
+    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> prepassVs, fullscreenVs, resolvePs, blurPs, err;
+    const size_t len = strlen(kShadowMaskShaderSource);
+    auto compile = [&](const char* entry, const char* profile, ComPtr<ID3DBlob>& out) {
+        if (FAILED(mD3dCompile(kShadowMaskShaderSource, len, nullptr, nullptr, nullptr, entry, profile,
+                               compile_flags, 0, out.ReleaseAndGetAddressOf(), err.ReleaseAndGetAddressOf()))) {
+            SPDLOG_ERROR("Shadow mask: {} failed to compile: {}", entry,
+                         err ? (const char*)err->GetBufferPointer() : "no error blob");
+            return false;
+        }
+        return true;
+    };
+    if (!compile("VSPrepass", "vs_4_0", prepassVs) || !compile("VSFullscreen", "vs_4_0", fullscreenVs) ||
+        !compile("PSResolve", "ps_4_0", resolvePs) || !compile("PSBlur", "ps_4_0", blurPs)) {
+        return false;
+    }
+
+    if (FAILED(mDevice->CreateVertexShader(fullscreenVs->GetBufferPointer(), fullscreenVs->GetBufferSize(), nullptr,
+                                           mShadowMaskFullscreenVs.GetAddressOf())) ||
+        FAILED(mDevice->CreateVertexShader(prepassVs->GetBufferPointer(), prepassVs->GetBufferSize(), nullptr,
+                                           mShadowMaskPrepassVs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(resolvePs->GetBufferPointer(), resolvePs->GetBufferSize(), nullptr,
+                                          mShadowMaskResolvePs.GetAddressOf())) ||
+        FAILED(mDevice->CreatePixelShader(blurPs->GetBufferPointer(), blurPs->GetBufferSize(), nullptr,
+                                          mShadowMaskBlurPs.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the pipeline's shader objects.");
+        return false;
+    }
+
+    const D3D11_INPUT_ELEMENT_DESC ied[1] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    if (FAILED(mDevice->CreateInputLayout(ied, 1, prepassVs->GetBufferPointer(), prepassVs->GetBufferSize(),
+                                          mShadowMaskPrepassLayout.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the prepass input layout.");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cb_desc;
+    ZeroMemory(&cb_desc, sizeof(cb_desc));
+    static_assert(sizeof(ShadowMaskCB) % 16 == 0, "constant buffers must be a multiple of 16 bytes");
+    cb_desc.ByteWidth = sizeof(ShadowMaskCB);
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(mDevice->CreateBuffer(&cb_desc, nullptr, mShadowMaskCb.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the constant buffer.");
+        return false;
+    }
+
+    // Ordinary depth: write and test less-than. The prepass is building a real depth buffer of the scene,
+    // not a shadow map, so nothing here is reversed or biased.
+    D3D11_DEPTH_STENCIL_DESC ds_desc;
+    ZeroMemory(&ds_desc, sizeof(ds_desc));
+    ds_desc.DepthEnable = TRUE;
+    ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    ds_desc.DepthFunc = D3D11_COMPARISON_LESS;
+    ds_desc.StencilEnable = FALSE;
+    if (FAILED(mDevice->CreateDepthStencilState(&ds_desc, mShadowMaskDepthState.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the prepass depth-stencil state.");
+        return false;
+    }
+
+    mShadowMaskPipelineFailed = false;
+    mShadowMaskPipelineReady = true;
+    return true;
+}
+
+bool GfxRenderingAPIDX11::CreateShadowMaskTargets(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+    if (mShadowMaskTex != nullptr && width == mShadowMaskWidth && height == mShadowMaskHeight) {
+        return true;
+    }
+    ShadowMaskRelease();
+
+    // TYPELESS so the same surface is a depth target while the prepass writes it and a texture while the
+    // resolve reads it -- the same trick the cascade array uses. 32-bit because this depth spans the whole
+    // camera frustum and is unprojected back to a world position: 16 bits of it would put the reconstructed
+    // point tens of units from where the pixel actually is, and the shadow lookup would follow it there.
+    D3D11_TEXTURE2D_DESC depth_desc;
+    ZeroMemory(&depth_desc, sizeof(depth_desc));
+    depth_desc.Width = (UINT)width;
+    depth_desc.Height = (UINT)height;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(mDevice->CreateTexture2D(&depth_desc, nullptr, mShadowMaskDepthTex.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the {}x{} prepass depth buffer.", width, height);
+        ShadowMaskRelease();
+        return false;
+    }
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+    ZeroMemory(&dsv_desc, sizeof(dsv_desc));
+    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC depth_srv;
+    ZeroMemory(&depth_srv, sizeof(depth_srv));
+    depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    depth_srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Texture2D.MipLevels = 1;
+    if (FAILED(mDevice->CreateDepthStencilView(mShadowMaskDepthTex.Get(), &dsv_desc, mShadowMaskDsv.GetAddressOf())) ||
+        FAILED(mDevice->CreateShaderResourceView(mShadowMaskDepthTex.Get(), &depth_srv,
+                                                 mShadowMaskDepthSrv.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the prepass depth views.");
+        ShadowMaskRelease();
+        return false;
+    }
+
+    // R holds the shadow term, G the view depth it was resolved at. Float rather than unorm because G is a
+    // world-unit distance running to thousands, and -1 in it is the "no depth here" marker.
+    D3D11_TEXTURE2D_DESC mask_desc = depth_desc;
+    mask_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    mask_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+    ZeroMemory(&rtv_desc, sizeof(rtv_desc));
+    rtv_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC mask_srv;
+    ZeroMemory(&mask_srv, sizeof(mask_srv));
+    mask_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+    mask_srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    mask_srv.Texture2D.MipLevels = 1;
+    if (FAILED(mDevice->CreateTexture2D(&mask_desc, nullptr, mShadowMaskTex.GetAddressOf())) ||
+        FAILED(mDevice->CreateRenderTargetView(mShadowMaskTex.Get(), &rtv_desc, mShadowMaskRtv.GetAddressOf())) ||
+        FAILED(mDevice->CreateShaderResourceView(mShadowMaskTex.Get(), &mask_srv, mShadowMaskSrv.GetAddressOf())) ||
+        FAILED(mDevice->CreateTexture2D(&mask_desc, nullptr, mShadowMaskBlurTex.GetAddressOf())) ||
+        FAILED(mDevice->CreateRenderTargetView(mShadowMaskBlurTex.Get(), &rtv_desc,
+                                               mShadowMaskBlurRtv.GetAddressOf())) ||
+        FAILED(mDevice->CreateShaderResourceView(mShadowMaskBlurTex.Get(), &mask_srv,
+                                                 mShadowMaskBlurSrv.GetAddressOf()))) {
+        SPDLOG_ERROR("Shadow mask: could not create the {}x{} mask targets.", width, height);
+        ShadowMaskRelease();
+        return false;
+    }
+
+    mShadowMaskWidth = width;
+    mShadowMaskHeight = height;
+    SPDLOG_INFO("Shadow mask: ready at {}x{}.", width, height);
+    return true;
+}
+
+bool GfxRenderingAPIDX11::ShadowMaskBegin(const float cameraViewProj[16], const float invCameraViewProj[16]) {
+    mShadowMaskValid = false;
+    mShadowMaskActive = false;
+    if (!mShadowQuality.screenSpace || cameraViewProj == nullptr || invCameraViewProj == nullptr) {
+        return false;
+    }
+    // No cascades this frame means there is nothing to resolve, and a mask of "everything lit" would be
+    // indistinguishable from a mask that failed -- so there is deliberately no mask at all and the receiver
+    // stays on its own path.
+    if (mShadowCascadesActive <= 0 || mShadowMapSrv == nullptr) {
+        return false;
+    }
+    if (mCurrentFramebuffer < 0 || (size_t)mCurrentFramebuffer >= mFrameBuffers.size()) {
+        return false;
+    }
+    const FramebufferDX11& fb = mFrameBuffers[mCurrentFramebuffer];
+    if (fb.texture_id >= mTextures.size()) {
+        return false;
+    }
+    const int width = (int)mTextures[fb.texture_id].width;
+    const int height = (int)mTextures[fb.texture_id].height;
+    if (!CreateShadowMaskPipeline() || !CreateShadowMaskTargets(width, height)) {
+        return false;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(mContext->Map(mShadowMaskCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        return false;
+    }
+    ShadowMaskCB& data = mShadowMaskCbData;
+    memcpy(data.cameraViewProj, cameraViewProj, 16 * sizeof(float));
+    memcpy(data.invCameraViewProj, invCameraViewProj, 16 * sizeof(float));
+    data.maskParams[0] = 1.0f / (float)width;
+    data.maskParams[1] = 1.0f / (float)height;
+    // The radius is quoted at 1080p and scaled with the frame, so the look holds across monitors instead of
+    // getting sharper the larger the window is.
+    data.maskParams[2] = mShadowQuality.screenBlur * ((float)height / 1080.0f);
+    data.maskParams[3] = mShadowQuality.screenDepthTolerance;
+    data.maskBlur[0] = 0.0f;
+    data.maskBlur[1] = 0.0f;
+    data.maskBlur[2] = 0.0f;
+    data.maskBlur[3] = 0.0f;
+    memcpy(ms.pData, &data, sizeof(data));
+    mContext->Unmap(mShadowMaskCb.Get(), 0);
+
+    // Saved here and put back in End: the prepass replaces the target, the viewport and most of the
+    // pipeline, and this runs in the middle of a frame that is about to carry on drawing.
+    mShadowMaskSavedViewportCount = 1;
+    mContext->RSGetViewports(&mShadowMaskSavedViewportCount, &mShadowMaskSavedViewport);
+    mContext->OMGetRenderTargets(1, mShadowMaskSavedRtv.ReleaseAndGetAddressOf(),
+                                 mShadowMaskSavedDsv.ReleaseAndGetAddressOf());
+
+    // The mask's own textures must not still be bound for reading from last frame while they become targets.
+    ID3D11ShaderResourceView* const nullSrv[2] = { nullptr, nullptr };
+    mContext->PSSetShaderResources(0, 2, nullSrv);
+    ID3D11ShaderResourceView* const nullMask[1] = { nullptr };
+    mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 3, 1, nullMask);
+
+    mContext->OMSetRenderTargets(0, nullptr, mShadowMaskDsv.Get());
+    mContext->ClearDepthStencilView(mShadowMaskDsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+    D3D11_VIEWPORT viewport;
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width = (float)width;
+    viewport.Height = (float)height;
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &viewport);
+
+    mContext->IASetInputLayout(mShadowMaskPrepassLayout.Get());
+    mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mContext->VSSetShader(mShadowMaskPrepassVs.Get(), nullptr, 0);
+    mContext->PSSetShader(nullptr, nullptr, 0); // depth only
+    mContext->VSSetConstantBuffers(0, 1, mShadowMaskCb.GetAddressOf());
+    mContext->OMSetDepthStencilState(mShadowMaskDepthState.Get(), 0);
+    mContext->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    // Cull none: this geometry was captured for a light's point of view, where facing was never sorted out,
+    // and a wall modelled from one side has no back to keep.
+    mContext->RSSetState(mShadowMomentRasterState.Get());
+
+    mShadowMaskActive = true;
+    return true;
+}
+
+void GfxRenderingAPIDX11::ShadowMaskDrawCasters(const float* worldXyz, size_t vertexCount, int slot) {
+    if (!mShadowMaskActive || worldXyz == nullptr || vertexCount < 3) {
+        return;
+    }
+    vertexCount -= vertexCount % 3;
+    const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
+    // The world layer's buffers, which the light's passes filled moments ago with these very pointers.
+    const int layer = SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + slotIndex;
+
+    // Only the cache-hit path, deliberately: this pass never uploads. If the buffer does not already hold
+    // this list -- a frame where the light's passes were all reused and never bound it, say -- the prepass
+    // simply lacks that geometry, and every pixel it would have covered disagrees with the mask's stored
+    // depth and falls back to sampling the cascades. A hole in the mask is a slower pixel, not a wrong one.
+    if (mShadowLastCasterPtr[layer] != worldXyz || mShadowLastCasterCount[layer] != vertexCount ||
+        mShadowCasterVb[layer] == nullptr) {
+        return;
+    }
+    const UINT stride = 3 * sizeof(float);
+    const UINT offset = 0;
+    mContext->IASetVertexBuffers(0, 1, mShadowCasterVb[layer].GetAddressOf(), &stride, &offset);
+    mContext->Draw((UINT)vertexCount, 0);
+}
+
+void GfxRenderingAPIDX11::ShadowMaskEnd() {
+    if (!mShadowMaskActive) {
+        return;
+    }
+    mShadowMaskActive = false;
+
+    ID3D11ShaderResourceView* const nullSrv[1] = { nullptr };
+    ID3D11RenderTargetView* const nullRtv[1] = { nullptr };
+
+    // The depth buffer is finished, so it may be read. Resolve it into the mask.
+    mContext->OMSetRenderTargets(0, nullptr, nullptr);
+    mContext->IASetInputLayout(nullptr);
+    mContext->VSSetShader(mShadowMaskFullscreenVs.Get(), nullptr, 0); // the covering triangle
+    mContext->OMSetDepthStencilState(nullptr, 0);
+    mContext->PSSetConstantBuffers(0, 1, mShadowMaskCb.GetAddressOf());
+    mContext->PSSetSamplers(0, 1, mShadowMomentSampler.GetAddressOf());
+    // The cascades this reads live in the slots the receiver uses, and BindForReading has already put them
+    // there -- this runs after the depth pass closed.
+    mContext->OMSetRenderTargets(1, mShadowMaskRtv.GetAddressOf(), nullptr);
+    mContext->PSSetShader(mShadowMaskResolvePs.Get(), nullptr, 0);
+    mContext->PSSetShaderResources(0, 1, mShadowMaskDepthSrv.GetAddressOf());
+    mContext->Draw(3, 0);
+    mContext->PSSetShaderResources(0, 1, nullSrv);
+
+    // Two blur axes, through the scratch and back. Skipped entirely at radius zero, which leaves the mask
+    // exactly as resolved -- still useful, since it collapses the receiver to one fetch.
+    if (mShadowQuality.screenBlur > 0.0f) {
+        auto blurAxis = [&](float dx, float dy, ID3D11RenderTargetView* target, ID3D11ShaderResourceView* source) {
+            D3D11_MAPPED_SUBRESOURCE ms;
+            if (FAILED(mContext->Map(mShadowMaskCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                return;
+            }
+            // Only the direction changes between the two axes, but the whole buffer is rewritten: it is
+            // DYNAMIC and discard-mapped, so a partial update is not on offer.
+            ShadowMaskCB data;
+            memcpy(&data, &mShadowMaskCbData, sizeof(data));
+            data.maskBlur[0] = dx;
+            data.maskBlur[1] = dy;
+            memcpy(ms.pData, &data, sizeof(data));
+            mContext->Unmap(mShadowMaskCb.Get(), 0);
+
+            mContext->OMSetRenderTargets(1, nullRtv, nullptr);
+            mContext->PSSetShaderResources(1, 1, &source);
+            mContext->OMSetRenderTargets(1, &target, nullptr);
+            mContext->PSSetShader(mShadowMaskBlurPs.Get(), nullptr, 0);
+            mContext->Draw(3, 0);
+            mContext->PSSetShaderResources(1, 1, nullSrv);
+        };
+        blurAxis(1.0f / (float)mShadowMaskWidth, 0.0f, mShadowMaskBlurRtv.Get(), mShadowMaskSrv.Get());
+        blurAxis(0.0f, 1.0f / (float)mShadowMaskHeight, mShadowMaskRtv.Get(), mShadowMaskBlurSrv.Get());
+    }
+
+    // Put the frame back exactly as it was found, and hand the mask to the receiver.
+    mContext->OMSetRenderTargets(1, mShadowMaskSavedRtv.GetAddressOf(), mShadowMaskSavedDsv.Get());
+    if (mShadowMaskSavedViewportCount > 0) {
+        mContext->RSSetViewports(1, &mShadowMaskSavedViewport);
+    }
+    mContext->RSSetState(mRasterizerState.Get());
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+    mLastBlendState = nullptr;
+    mLastStencilMode = -1;
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    mContext->PSSetShaderResources(SHADER_MAX_TEXTURES + 3, 1, mShadowMaskSrv.GetAddressOf());
+    mContext->PSSetSamplers(SHADER_MAX_TEXTURES + 3, 1, mShadowMomentSampler.GetAddressOf());
+    mShadowMaskValid = true;
+
+    // Tell the receiver the mask is there. Written HERE and not in SetShadowMapParams, because that runs
+    // first -- it has to, since this pass reads the cascade constants it writes -- so a flag set there
+    // would describe the previous frame's mask. The buffer is uploaded lazily on the next draw, and every
+    // receiver draws after this.
+    mPerShadowCbData.shadow_mask[0] = 1.0f;
+    mPerShadowCbData.shadow_mask[1] = mShadowMaskCbData.maskParams[0];
+    mPerShadowCbData.shadow_mask[2] = mShadowMaskCbData.maskParams[1];
+    mPerShadowCbData.shadow_mask[3] = mShadowQuality.screenDepthTolerance;
+    mShadowCbDirty = true;
 }
 
 bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {

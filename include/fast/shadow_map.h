@@ -604,29 +604,27 @@
 // the receiver to a single texture fetch, which is the largest possible win against the in-frame FXC
 // compile cost.
 //
-// NOT IMPLEMENTED, and the reason is structural rather than a matter of effort.
+// The obstacle, and how it is got around, because it is the whole design.
 //
-// The mask has to be resolved from a COMPLETE scene depth buffer, and this renderer never has one before
-// its receivers shade. The frame order is: the actor loop draws, gSPShadowMapFlush runs the depth pass,
-// and then the room draws and samples the cascades. So at the only point the mask could be built, the
-// depth buffer holds the characters and not the room -- and the room is where the staircase this technique
-// would fix actually lives.
+// The mask has to be resolved from a scene depth buffer, and this renderer never has a complete one before
+// its receivers shade: the actor loop draws, gSPShadowMapFlush runs the depth pass, and only then does the
+// room draw and sample the cascades. At the point a mask could be built, the depth buffer holds the
+// characters and not the room -- and the room is where the staircase this fixes actually lives.
 //
-// The three ways out, and why none of them is this change:
+// A general depth prepass would fix it and is far too big: every opaque draw twice, through the whole of
+// the interpreter's draw path, to soften an edge.
 //
-//   A depth prepass. The correct fix, and a change to the shape of the frame rather than to shadows: every
-//   opaque draw runs twice, which touches the interpreter's whole draw path and costs geometry throughput
-//   in exchange for an effect that is one of five ways to soften an edge.
+// But the room's geometry is ALREADY captured, in world space, and already uploaded to a vertex buffer --
+// it is the world caster layer, cached and rebuilt only when the scene changes. So the prepass is that
+// same buffer drawn once more with the CAMERA's matrix instead of the light's. No display list re-runs, no
+// second pass over the interpreter, no new capture: one extra draw of geometry the GPU is already holding.
 //
-//   Last frame's depth. Cheap, and wrong under any camera motion: a screen-space mask reprojected by a
-//   camera that has moved smears along the motion, which trades a stepped edge for a smeared one.
-//
-//   Applying the mask as a post-process multiply. Wrong per se: the shadow term must modulate the diffuse
-//   contribution only, and a multiply over the finished frame darkens emissive surfaces, the interface and
-//   every additive effect along with it.
-//
-// The tuning below and the constant-buffer register it travels in are kept so the contract does not have to
-// change when the prepass exists. The backend ignores them and the application's switch does nothing.
+// What that buys is a depth buffer of everything that casts, which is not quite everything that receives.
+// The difference is covered rather than ignored: the mask stores the depth it was resolved at alongside the
+// shadow term, and a receiver compares its own depth against it. Agreement means the mask describes this
+// surface and is used; disagreement means this pixel was not in the prepass, and it falls back to sampling
+// the cascades directly. That test also handles the alpha-blended surfaces, the water and the particles,
+// which are not in the prepass by construction.
 #define SHADOW_MAP_DEFAULT_SCREEN_SPACE 0
 
 // Blur radius of the mask, in screen pixels at 1080p, scaled with resolution so the look holds.

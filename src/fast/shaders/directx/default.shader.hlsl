@@ -133,6 +133,16 @@ SamplerState g_shadowActorSampler : register(s7);
 Texture2DArray<float4> g_shadowMoments : register(t8);
 SamplerState g_shadowMomentSampler : register(s8);
 
+// SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h). R holds the shadow
+// term resolved for the whole frame, G the view depth it was resolved at.
+//
+// G is what makes the mask safe to use. It is resolved from a prepass of the world CASTER geometry, which
+// is not quite everything that receives -- and nothing at all of the alpha-blended surfaces, the water or
+// the particles, which are not in it by construction. A receiver compares its own depth against G and uses
+// the mask only where they agree; everywhere else it samples the cascades exactly as it did before.
+Texture2D<float4> g_shadowMask : register(t9);
+SamplerState g_shadowMaskSampler : register(s9);
+
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
 // subtly wrong. Layout matches the PerShadowCB C++ struct exactly.
@@ -184,6 +194,10 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_edge;
     float4 shadow_jitter;
     float4 shadow_filter;
+    // SOH [Enhancement] Screen-space mask (technique 5). x = a mask was built this frame, yz = one screen
+    // pixel in UV, w = how far the mask's stored depth may differ from this receiver's before the mask is
+    // judged to describe a different surface.
+    float4 shadow_mask;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -1071,10 +1085,32 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers =
-            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
-                            input.worldPos.w > 0.5, screenSpace.xy);
-        float shadowLit = min(shadowLayers.x, shadowLayers.y);
+        // SOH [Enhancement] The screen-space mask, where it applies (technique 5). One fetch instead of
+        // the whole cascade lookup, and a penumbra measured in screen pixels rather than in texels.
+        //
+        // Scenery only. The mask folds both caster layers together, and a character must never be
+        // shadowed by the actor layer -- itself included -- so reading it would paint a character with its
+        // own shadow. Characters keep the layered path, which already skips that layer for them.
+        float shadowLit = 1.0;
+        bool haveShadow = false;
+        if (shadow_mask.x > 0.5 && input.worldPos.w > 0.5) {
+            float2 maskSample =
+                g_shadowMask.SampleLevel(g_shadowMaskSampler, screenSpace.xy * shadow_mask.yz, 0).xy;
+            // Same tolerance the mask's own blur used, so a pixel the blur was willing to mix is a pixel
+            // the receiver is willing to read. Negative G is the resolve's "nothing was drawn here" marker
+            // and fails this by construction.
+            float tolerance = shadow_mask.w * max(input.position.w, 1.0) * 0.01;
+            if (maskSample.y >= 0.0 && abs(maskSample.y - input.position.w) <= tolerance) {
+                shadowLit = maskSample.x;
+                haveShadow = true;
+            }
+        }
+        if (!haveShadow) {
+            float2 shadowLayers =
+                ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                                input.worldPos.w > 0.5, screenSpace.xy);
+            shadowLit = min(shadowLayers.x, shadowLayers.y);
+        }
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
         //

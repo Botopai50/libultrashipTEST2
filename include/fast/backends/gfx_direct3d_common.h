@@ -74,6 +74,22 @@ struct PerShadowCB {
     float shadow_edge[4];
     float shadow_jitter[4];
     float shadow_filter[4];
+    // SOH [Enhancement] Screen-space mask (technique 5). x = mask active, yz = one screen pixel in UV,
+    // w = how far the mask's stored depth may differ from the receiver's before the mask is judged to
+    // describe a different surface and the receiver falls back to sampling the cascades.
+    float shadow_mask[4];
+};
+
+// SOH [Enhancement] Screen-space shadow mask (technique 5). Layout must match the ShadowMaskCB cbuffer in
+// kShadowMaskShaderSource field for field. Held as a CPU copy on the backend as well, because the blur
+// rewrites only its direction and the buffer is discard-mapped -- a partial update is not on offer.
+struct ShadowMaskCB {
+    float cameraViewProj[16];
+    float invCameraViewProj[16];
+    // x = one screen pixel in u, y = in v, z = blur radius in pixels, w = depth tolerance at unit depth
+    float maskParams[4];
+    // xy = the blur's direction this pass, in pixels; zw unused
+    float maskBlur[4];
 };
 
 struct PerDrawCB {
@@ -205,6 +221,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
+    bool ShadowMaskBegin(const float cameraViewProj[16], const float invCameraViewProj[16]) override;
+    void ShadowMaskDrawCasters(const float* worldXyz, size_t vertexCount, int slot) override;
+    void ShadowMaskEnd() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float strength, float debugMode) override;
 
@@ -245,6 +264,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool CreateShadowMomentTargets(int mode, int resolution, int sliceCount);
     void ShadowMomentResolveAndBlur();
     void ShadowMomentRelease();
+    // SOH [Enhancement] Screen-space shadow mask (technique 5).
+    bool CreateShadowMaskPipeline();
+    bool CreateShadowMaskTargets(int width, int height);
+    void ShadowMaskRelease();
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -390,6 +413,51 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Slices the depth pass redrew this frame and which therefore need resolving and blurring again. A
     // parked slice keeps the moments it already holds, exactly as it keeps the depths.
     bool mShadowSliceMomentDirty[SHADOW_MAP_MAX_SLICES] = {};
+
+    // SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h).
+    //
+    // A camera-space depth prepass of the world caster geometry, then a mask resolved from it. The mask
+    // holds the shadow term in R and the depth it was resolved at in G: the receiver compares its own depth
+    // against that second channel and falls back to the cascades where they disagree, which is what covers
+    // everything the prepass does not contain.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskDepthTex;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMaskDsv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskDepthSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskTex;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskRtv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskBlurTex;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskBlurRtv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskBlurSrv;
+    // The prepass writes depth only and needs its own vertex shader (the camera's matrix, not the light's)
+    // and a depth-stencil state that writes and tests normally.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowMaskPrepassVs;
+    // Its own covering-triangle vertex shader. The moment pipeline has an identical one, but that
+    // pipeline is only built when a filterable mode is on -- and the mask must work in plain depth
+    // mode too, so it cannot borrow an object that may never have been created.
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowMaskFullscreenVs;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowMaskPrepassLayout;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMaskResolvePs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMaskBlurPs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowMaskCb;
+    ShadowMaskCB mShadowMaskCbData = {};
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowMaskDepthState;
+    bool mShadowMaskPipelineReady = false;
+    bool mShadowMaskPipelineFailed = false;
+    // Size the mask was built at, so a resolution change rebuilds it.
+    int mShadowMaskWidth = 0;
+    int mShadowMaskHeight = 0;
+    // Whether a Begin succeeded and the prepass is open. Guards the draws and the End the same way
+    // mShadowPassActive guards the light's.
+    bool mShadowMaskActive = false;
+    // Whether the mask holds a usable frame. Read where the shader constants are written, so a frame that
+    // never built one tells the receiver to sample the cascades instead of a stale mask.
+    bool mShadowMaskValid = false;
+    // Saved across the prepass and the resolve, since both replace them.
+    D3D11_VIEWPORT mShadowMaskSavedViewport = {};
+    UINT mShadowMaskSavedViewportCount = 0;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskSavedRtv;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMaskSavedDsv;
     bool mShadowPipelineReady = false;
     bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
     bool mShadowPassActive = false;     // between BeginCascade and EndPass

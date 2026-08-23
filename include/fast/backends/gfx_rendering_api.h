@@ -355,6 +355,28 @@ class GfxRenderingAPI {
         mShadowMaxViewDepth = maxViewDepth;
     }
 
+    // SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h). Resolves the
+    // frame's shadow term into one full-screen mask so its penumbra is measured in PIXELS rather than in
+    // shadow-map texels, and so the receiver collapses to a single fetch.
+    //
+    // Three calls, in order, from the end of the shadow pass: Begin opens a camera-space depth prepass,
+    // DrawCasters feeds it the world caster geometry already uploaded for the light's passes, and End
+    // resolves the mask from that depth and blurs it.
+    //
+    // Begin answers false whenever the mask is unavailable -- switched off, resources refused, no cascades
+    // this frame -- and the caller must then skip the draws and the End. Both matrices are row-major, the
+    // same convention as lightViewProj.
+    virtual bool ShadowMaskBegin(const float cameraViewProj[16], const float invCameraViewProj[16]) {
+        return false;
+    }
+    // World-space triangles for the prepass, in the same layout and the same slots the light's passes used.
+    // Passing the SAME pointers means the vertex buffer already holds this list and the call is a rebind
+    // and a draw -- which is the entire reason this is affordable.
+    virtual void ShadowMaskDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0) {
+    }
+    virtual void ShadowMaskEnd() {
+    }
+
     // SOH [Enhancement] Edge-quality policy for the shadow map (see fast/shadow_map.h). One struct rather
     // than a setter per knob, because these travel together and adding one should not mean touching every
     // layer's signature.
