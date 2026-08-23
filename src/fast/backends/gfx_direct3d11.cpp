@@ -3213,6 +3213,35 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
                 1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
     }
+
+    // SOH [Enhancement] Edge quality (see fast/shadow_map.h). Written after the loop because ZeroMemory
+    // above cleared it, and these are frame-global rather than per cascade.
+    {
+        const ShadowMapQuality& q = mShadowQuality;
+        mPerShadowCbData.shadow_edge[0] = q.analyticEdge ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_edge[1] = q.analyticEdgeWidth;
+        // Jitter with a zero radius would fetch the same quad N times and average it to itself -- N times
+        // the bandwidth for the picture it already had. Reported as off rather than honoured literally.
+        const bool jitterOn = q.jitter != 0 && q.jitterRadius > 0.0f && q.jitterTaps > 1;
+        mPerShadowCbData.shadow_edge[2] = jitterOn ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_edge[3] = (float)q.jitterTaps;
+        mPerShadowCbData.shadow_jitter[0] = q.jitterRadius;
+        // Per-frame rotation of the tap pattern. The golden ratio rather than a fixed step: successive
+        // frames land as far from each other as the sequence allows, so a short run of frames covers the
+        // circle evenly instead of beating against a period.
+        mPerShadowCbData.shadow_jitter[1] =
+            q.jitterTemporal ? (float)((double)mShadowQualityFrame * 0.6180339887498949 -
+                                       (long long)((double)mShadowQualityFrame * 0.6180339887498949))
+                             : 0.0f;
+        mPerShadowCbData.shadow_jitter[2] = (float)q.filterMode;
+        mPerShadowCbData.shadow_jitter[3] = q.esmExponent;
+        mPerShadowCbData.shadow_filter[0] = q.bleedReduction;
+        mPerShadowCbData.shadow_filter[1] = q.screenSpace ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_filter[2] = q.blurRadius;
+        mPerShadowCbData.shadow_filter[3] = 0.0f;
+        mShadowQualityFrame++;
+    }
+
     mShadowCbDirty = true;
 }
 

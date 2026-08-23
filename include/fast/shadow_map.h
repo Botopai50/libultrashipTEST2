@@ -1,6 +1,8 @@
 #ifndef FAST_SHADOW_MAP_H
 #define FAST_SHADOW_MAP_H
 
+#include <math.h> // powf, for the split ladder below
+
 // Shared limits and default parameters for the cascaded shadow-map effect.
 //
 // The effect renders the frame's shadow casters depth-only from the key light's point of view into a
@@ -410,5 +412,309 @@
 // unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
 #define SHADOW_MAP_MAX_DEBUG_VIEW 7
+
+
+// ===================================================================================================
+// SOH [Enhancement] Edge quality: the five techniques that attack a stair-stepped shadow edge.
+//
+// Everything above this line describes WHERE a shadow is. Everything below describes what its EDGE looks
+// like once it is in the right place, which is a separate question and was the one left unanswered: the
+// receiver samples a single bilinear quad, so the penumbra is exactly one texel wide and the boundary can
+// only move in whole-texel steps. At the default ladder that step is 0.09, 0.74 and 3.6 world units in the
+// three bands -- one to two screen pixels through most of the useful range, which is read as a staircase.
+//
+// Five independent techniques, each switchable on its own and each with its own tuning, because they attack
+// the same artefact at different points in the pipeline and stack rather than compete:
+//
+//   Analytic edge  -- receiver.  Recovers the sub-texel position of the boundary inside the quad already
+//                                fetched. No extra taps.
+//   Jitter         -- receiver.  Rotates tap offsets per pixel, trading the step for dither.
+//   Filterable map -- map.       Stores a filterable quantity (ESM/VSM/MSM) and blurs the map itself, so
+//                                the receiver stays one fetch and softness stops costing taps.
+//   Ladder         -- fit.       Redistributes cascade range so the texel size is uniform instead of
+//                                350/2500/6000's 40x spread.
+//   Screen space   -- composite. Resolves the shadow term to a full-screen mask and blurs it in PIXELS,
+//                                which is the unit the artefact is actually measured in.
+//
+// The policy split is the same as everything above: the framework owns the technique, the application owns
+// the tuning and pushes it in as one struct. No app-specific CVar keys live here, only the defaults and the
+// bounds the framework will honour.
+// ===================================================================================================
+
+// --- Technique 1: filterable shadow maps -----------------------------------------------------------
+//
+// Which quantity the depth pass stores, and therefore whether the MAP can be blurred at all. Raw depth
+// cannot: averaging two depths gives a surface at neither, so a blurred depth map compares wrong
+// everywhere. The others store something whose average is meaningful, which moves the filtering off the
+// receiver and onto the map -- one blur pass instead of N taps in every material shader.
+//
+// That trade is worth more here than it is in most engines, because of a constraint this renderer has and
+// most do not: the receiver is compiled by FXC SYNCHRONOUSLY INSIDE THE FRAME the first time each material
+// draws (see the note on ShadowProjectAt in the shader). Taps added to the receiver are paid twice -- once
+// per pixel, and once as a compile hitch when new geometry rotates into view. A blur on the map is paid
+// once, off to the side, and can be parked with the slice it belongs to.
+#define SHADOW_MAP_FILTER_DEPTH 0 // raw depth + PCF. The baseline; the map is not filterable.
+#define SHADOW_MAP_FILTER_ESM 1   // exp(k*d). One channel, cheapest, leaks where an occluder is far in front.
+#define SHADOW_MAP_FILTER_VSM 2   // depth + depth^2. Two channels, hardware-filterable, light-bleeds.
+#define SHADOW_MAP_FILTER_MSM 3   // four power moments. Heaviest and the only one that holds up under
+                                  // overlapping occluders, which this game has a great deal of.
+#define SHADOW_MAP_FILTER_MAX 3
+#define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_DEPTH
+
+// ESM's exponent. The stored value is exp(k*d) and the test is exp(-k*z) * stored, so k sets how sharply
+// the reconstructed step falls off: too low and the shadow washes out into a gradient, too high and the
+// exponential overflows the storage format and the shadow returns to a hard edge with acne on top.
+//
+// 80 is about the practical ceiling for a 32-bit float over a cascade's normalised depth range. It is a
+// starting point, not a tuned value -- the right k depends on the cascade's near/far spread, which the
+// ladder controls.
+#define SHADOW_MAP_DEFAULT_ESM_EXPONENT 80.0f
+#define SHADOW_MAP_MIN_ESM_EXPONENT 5.0f
+#define SHADOW_MAP_MAX_ESM_EXPONENT 200.0f
+
+// How much of the low end of the VSM/MSM distribution is cut away before the result is used.
+//
+// Chebyshev's inequality gives an UPPER BOUND on the lit fraction, not the fraction itself, and where two
+// occluders at different depths share a texel that bound is loose -- which is seen as a shadow going
+// translucent in its middle ("light bleeding"). Rescaling the low tail away trades a little penumbra
+// accuracy for that, and is the standard remedy.
+//
+// 0 disables the correction. Above about 0.5 the penumbra starts visibly hardening back up, which is the
+// artefact the whole mode exists to remove.
+#define SHADOW_MAP_DEFAULT_BLEED_REDUCTION 0.20f
+
+// Radius of the separable Gaussian run over the map, in texels of the slice being blurred. This is the
+// knob that actually sets penumbra width in the filterable modes, and it is expressed in texels rather
+// than world units so a cascade's blur scales with its own resolution.
+//
+// 0 turns the blur off, which leaves the filterable format doing nothing useful -- the format is what makes
+// the blur legal, the blur is what makes the edge soft.
+#define SHADOW_MAP_DEFAULT_BLUR_RADIUS 2.0f
+#define SHADOW_MAP_MAX_BLUR_RADIUS 8.0f
+
+// --- Technique 2: analytic edge reconstruction -----------------------------------------------------
+//
+// The receiver already fetches the 2x2 quad of stored depths around the sample point and compares each.
+// Bilinear-weighting those four binary results gives a boundary that is continuous but only one texel
+// wide, and whose iso-contour follows the texel grid's own diagonals -- which is the staircase.
+//
+// Reconstructing instead: the four comparisons say which corners of the quad are occluded, and the four
+// depths say by how much each corner misses. Together they locate where inside the quad the occluding
+// surface crosses the receiver, and coverage can be computed from that crossing directly. No extra fetch,
+// and the contour stops being a function of the grid.
+//
+// Exact for a single straight boundary through the quad, which covers walls, steps, roofs and platform
+// edges -- the geometry the staircase is complained about on. It degrades to the bilinear answer where the
+// quad holds more than one boundary (foliage), which is the correct place to give up.
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE 0
+
+// How far the reconstructed coverage ramp is spread, in texels. 1.0 is the geometric answer -- the ramp
+// occupies exactly the texel the boundary crosses. Above that it is deliberately widened, which is the
+// cheapest softening available anywhere in the system since it costs arithmetic and no fetches.
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH 1.0f
+#define SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH 4.0f
+
+// --- Technique 3: stochastic jitter ----------------------------------------------------------------
+//
+// Rotate the tap pattern by a per-pixel angle instead of holding it on the grid. The step does not get
+// smaller, but it stops being the SAME step for neighbouring pixels, so the eye reads dither rather than a
+// staircase. Costs one hash and a rotation; the tap count is what it is.
+//
+// The honest caveat, stated here because it decides whether this is worth switching on: this renderer has
+// FXAA and no temporal accumulation. Dither with nothing to average it over is grain, and grain in motion
+// is its own artefact. It is offered because on a still image at a moderate tap count it is clearly better
+// than the staircase, and because whether the trade is acceptable is a matter of taste that a constant
+// cannot settle.
+#define SHADOW_MAP_DEFAULT_JITTER 0
+
+// Taps in the rotated pattern. Each is a full bilinear quad fetch, so this is the one knob here that costs
+// real bandwidth, and it is also what decides whether the dither reads as softness or as noise.
+#define SHADOW_MAP_DEFAULT_JITTER_TAPS 8
+#define SHADOW_MAP_MAX_JITTER_TAPS 16
+
+// Radius of the rotated pattern, in texels of the cascade being sampled.
+#define SHADOW_MAP_DEFAULT_JITTER_RADIUS 2.0f
+#define SHADOW_MAP_MAX_JITTER_RADIUS 8.0f
+
+// Advance the per-pixel rotation each frame, so the grain moves instead of standing still.
+//
+// Off by default and deliberately so: a static pattern is a texture the eye stops seeing, while a moving
+// one is a shimmer it cannot stop seeing. With no temporal filter to resolve it, animating the noise
+// usually makes things worse, not better. It is here because with a high tap count it can help, and
+// because the opposite choice is equally defensible on a still camera.
+#define SHADOW_MAP_DEFAULT_JITTER_TEMPORAL 0
+
+// --- Technique 4: cascade split ladder -------------------------------------------------------------
+//
+// Where the cascade boundaries fall, which decides the texel size in each band and therefore how big the
+// staircase step is before any filtering touches it.
+//
+// The hand-drawn ladder (350 / 2500 / 6000) spends the near cascade on a band so short that its texel is
+// 0.09 world units -- finer than anything can be seen at that distance -- and then hands the middle band a
+// texel eight times coarser and the far band forty times coarser. Uniforming that spread is free: it is
+// three numbers, no shader and no new memory, and it shrinks the step exactly where the step is visible.
+#define SHADOW_MAP_LADDER_MANUAL 0    // whatever the application's split sliders say. The existing behaviour.
+#define SHADOW_MAP_LADDER_PRACTICAL 1 // blend of uniform and logarithmic, by lambda below.
+#define SHADOW_MAP_LADDER_MAX 1
+#define SHADOW_MAP_DEFAULT_LADDER_MODE SHADOW_MAP_LADDER_MANUAL
+
+// Blend between a uniform ladder (0) and a logarithmic one (1), the standard "practical split scheme".
+//
+// Logarithmic is what makes the texel size uniform across bands, which is the point; pure logarithmic
+// however puts the first split extremely close to the camera, and a cascade that covers almost nothing
+// wastes a whole slice. The blend is the usual compromise and 0.75 is where it is normally landed.
+#define SHADOW_MAP_DEFAULT_LADDER_LAMBDA 0.75f
+
+// The near distance the ladder is generated from. Not the camera's actual near plane, which is small
+// enough to drag the first split down to nothing; this is the distance at which shadows start being worth
+// resolving finely.
+#define SHADOW_MAP_DEFAULT_LADDER_NEAR 40.0f
+
+// --- Technique 5: screen-space shadow mask ---------------------------------------------------------
+//
+// Resolve the shadow term for the whole frame into one full-screen mask, blur that mask with a depth-aware
+// kernel, then have each material read the mask instead of sampling cascades.
+//
+// This is the only one of the five whose penumbra is measured in SCREEN PIXELS rather than in shadow-map
+// texels, which is the unit the artefact is actually complained in: a two-pixel blur is two pixels wide at
+// every distance, in every cascade, regardless of how coarse that cascade's texels are. It also collapses
+// the receiver to a single texture fetch, which is the largest possible win against the in-frame FXC
+// compile cost.
+//
+// What it costs is that it stops being a forward-shaded effect. The mask is resolved from the depth buffer
+// before the materials draw, so anything the depth buffer does not hold -- alpha-blended surfaces, the
+// water, particles -- is not in the mask and must fall back to sampling the cascades directly. The
+// fallback is why this is a switch and not a replacement.
+#define SHADOW_MAP_DEFAULT_SCREEN_SPACE 0
+
+// Blur radius of the mask, in screen pixels at 1080p, scaled with resolution so the look holds.
+#define SHADOW_MAP_DEFAULT_SCREEN_BLUR 2.0f
+#define SHADOW_MAP_MAX_SCREEN_BLUR 16.0f
+
+// How far apart two pixels' view depths may be before the blur refuses to mix them, in world units.
+//
+// Without this the mask bleeds across silhouettes: a shadowed wall smears its term onto the unshadowed
+// floor behind it, which reads as a halo. With it too tight the blur stops working on any sloped surface,
+// since a slope changes depth across the kernel by construction. Scaled by the pixel's own depth inside
+// the shader, so this is a fraction-like quantity in world units at unit distance rather than an absolute.
+#define SHADOW_MAP_DEFAULT_SCREEN_DEPTH_TOLERANCE 6.0f
+
+// Generate the split ladder for `count` cascades out to `farDistance`, into splits[0..count-1].
+//
+// The practical split scheme: split i is a blend of the uniform ladder (near + (far-near) * i/N, which
+// keeps each band the same DEPTH) and the logarithmic one (near * (far/near)^(i/N), which keeps each band
+// the same RATIO and therefore each texel the same size). Lambda picks between them.
+//
+// Lives in the header rather than in the interpreter because the menu wants to show the numbers it is about
+// to produce, and a preview that reimplements the formula is a preview that can disagree with it.
+//
+// A no-op when mode is MANUAL: the caller's splits are left exactly as they arrived.
+static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDistance, float farDistance, int count,
+                                         float* splits) {
+    int i;
+    if (splits == 0 || count < 1 || mode != SHADOW_MAP_LADDER_PRACTICAL) {
+        return;
+    }
+    if (nearDistance < 1.0f) {
+        nearDistance = 1.0f;
+    }
+    if (farDistance <= nearDistance) {
+        farDistance = nearDistance + 1.0f;
+    }
+    for (i = 0; i < count; i++) {
+        const float fraction = (float)(i + 1) / (float)count;
+        const float uniform = nearDistance + ((farDistance - nearDistance) * fraction);
+        const float logarithmic = nearDistance * powf(farDistance / nearDistance, fraction);
+        splits[i] = (lambda * logarithmic) + ((1.0f - lambda) * uniform);
+    }
+    // The last split IS the range (see SHADOW_MAP_DEFAULT_SPLIT_2), so it must land exactly on it rather
+    // than on whatever the blend rounds to -- the caster capture reads this number.
+    splits[count - 1] = farDistance;
+}
+
+// --- The struct the application pushes -------------------------------------------------------------
+//
+// One struct rather than twenty arguments, because these travel together through five layers (menu ->
+// per-frame snapshot -> interpreter -> rendering API -> constant buffer) and adding a knob should not mean
+// editing five signatures. Plain C layout: this header is included from both sides of the C boundary.
+//
+// Zero-initialising this gives every technique OFF and every tuning at zero, which is not the same as the
+// defaults -- call ShadowMapQualityDefaults() rather than relying on {}.
+typedef struct ShadowMapQuality {
+    // Technique 1 -- filterable maps
+    int filterMode;        // SHADOW_MAP_FILTER_*
+    float esmExponent;     // ESM only
+    float blurRadius;      // texels; 0 = no blur
+    float bleedReduction;  // VSM/MSM only, 0..1
+
+    // Technique 2 -- analytic edge
+    int analyticEdge;         // 0/1
+    float analyticEdgeWidth;  // texels
+
+    // Technique 3 -- stochastic jitter
+    int jitter;          // 0/1
+    int jitterTaps;      // 1..SHADOW_MAP_MAX_JITTER_TAPS
+    float jitterRadius;  // texels
+    int jitterTemporal;  // 0/1
+
+    // Technique 4 -- split ladder
+    int ladderMode;      // SHADOW_MAP_LADDER_*
+    float ladderLambda;  // 0 = uniform, 1 = logarithmic
+    float ladderNear;    // world units
+
+    // Technique 5 -- screen-space mask
+    int screenSpace;            // 0/1
+    float screenBlur;           // pixels
+    float screenDepthTolerance; // world units at unit depth
+} ShadowMapQuality;
+
+// The defaults above, as a value. Written as a function rather than an initialiser macro so both sides of
+// the C boundary get the same one and it cannot drift.
+static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
+    ShadowMapQuality q;
+    q.filterMode = SHADOW_MAP_DEFAULT_FILTER_MODE;
+    q.esmExponent = SHADOW_MAP_DEFAULT_ESM_EXPONENT;
+    q.blurRadius = SHADOW_MAP_DEFAULT_BLUR_RADIUS;
+    q.bleedReduction = SHADOW_MAP_DEFAULT_BLEED_REDUCTION;
+    q.analyticEdge = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE;
+    q.analyticEdgeWidth = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH;
+    q.jitter = SHADOW_MAP_DEFAULT_JITTER;
+    q.jitterTaps = SHADOW_MAP_DEFAULT_JITTER_TAPS;
+    q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
+    q.jitterTemporal = SHADOW_MAP_DEFAULT_JITTER_TEMPORAL;
+    q.ladderMode = SHADOW_MAP_DEFAULT_LADDER_MODE;
+    q.ladderLambda = SHADOW_MAP_DEFAULT_LADDER_LAMBDA;
+    q.ladderNear = SHADOW_MAP_DEFAULT_LADDER_NEAR;
+    q.screenSpace = SHADOW_MAP_DEFAULT_SCREEN_SPACE;
+    q.screenBlur = SHADOW_MAP_DEFAULT_SCREEN_BLUR;
+    q.screenDepthTolerance = SHADOW_MAP_DEFAULT_SCREEN_DEPTH_TOLERANCE;
+    return q;
+}
+
+// Clamp every field into the range the framework will honour. Called by the framework on arrival rather
+// than trusted from the application, and safe to call on the application side too.
+static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
+    if (q == 0) {
+        return;
+    }
+#define SHADOW_MAP_CLAMP_(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+    q->filterMode = SHADOW_MAP_CLAMP_(q->filterMode, 0, SHADOW_MAP_FILTER_MAX);
+    q->esmExponent = SHADOW_MAP_CLAMP_(q->esmExponent, SHADOW_MAP_MIN_ESM_EXPONENT, SHADOW_MAP_MAX_ESM_EXPONENT);
+    q->blurRadius = SHADOW_MAP_CLAMP_(q->blurRadius, 0.0f, SHADOW_MAP_MAX_BLUR_RADIUS);
+    q->bleedReduction = SHADOW_MAP_CLAMP_(q->bleedReduction, 0.0f, 0.99f);
+    q->analyticEdge = q->analyticEdge ? 1 : 0;
+    q->analyticEdgeWidth = SHADOW_MAP_CLAMP_(q->analyticEdgeWidth, 0.25f, SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH);
+    q->jitter = q->jitter ? 1 : 0;
+    q->jitterTaps = SHADOW_MAP_CLAMP_(q->jitterTaps, 1, SHADOW_MAP_MAX_JITTER_TAPS);
+    q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
+    q->jitterTemporal = q->jitterTemporal ? 1 : 0;
+    q->ladderMode = SHADOW_MAP_CLAMP_(q->ladderMode, 0, SHADOW_MAP_LADDER_MAX);
+    q->ladderLambda = SHADOW_MAP_CLAMP_(q->ladderLambda, 0.0f, 1.0f);
+    q->ladderNear = SHADOW_MAP_CLAMP_(q->ladderNear, 1.0f, 1000.0f);
+    q->screenSpace = q->screenSpace ? 1 : 0;
+    q->screenBlur = SHADOW_MAP_CLAMP_(q->screenBlur, 0.0f, SHADOW_MAP_MAX_SCREEN_BLUR);
+    q->screenDepthTolerance = SHADOW_MAP_CLAMP_(q->screenDepthTolerance, 0.1f, 100.0f);
+#undef SHADOW_MAP_CLAMP_
+}
 
 #endif // FAST_SHADOW_MAP_H

@@ -542,9 +542,12 @@ class Interpreter {
         mShadowMapActorResolution = actorResolution > resolution ? resolution : actorResolution;
         if (splits != nullptr) {
             for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
-                mShadowMapSplits[i] = splits[i];
+                mShadowMapSplitsRequested[i] = splits[i];
             }
         }
+        // The ladder may replace what was just stored (see ApplyShadowLadder). Run from both setters, so
+        // the application may push quality and params in either order and get the same ladder either way.
+        ApplyShadowLadder();
         if (lightDir != nullptr) {
             for (int i = 0; i < 3; i++) {
                 mShadowMapLightDir[i] = lightDir[i];
@@ -594,6 +597,40 @@ class Interpreter {
             mShadowWorldCapture = true;
         }
     }
+
+    // SOH [Enhancement] Edge-quality policy (see fast/shadow_map.h). Pushed once per frame alongside
+    // SetShadowMapParams, in either order.
+    //
+    // Most of this is the shader's business and travels straight through to the backend. Two parts are
+    // not: the split ladder is fitted here on the CPU, and a change to it moves every cascade -- so a held
+    // matrix from before the change would project the wrong band and has to be dropped, exactly as a
+    // cascade-count change drops them.
+    void SetShadowMapQuality(const ShadowMapQuality& quality) {
+        const int previousLadder = mShadowMapQuality.ladderMode;
+        const float previousLambda = mShadowMapQuality.ladderLambda;
+        const float previousNear = mShadowMapQuality.ladderNear;
+
+        mShadowMapQuality = quality;
+        ShadowMapQualityClamp(&mShadowMapQuality);
+
+        if (mShadowMapQuality.ladderMode != previousLadder || mShadowMapQuality.ladderLambda != previousLambda ||
+            mShadowMapQuality.ladderNear != previousNear) {
+            for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
+                mShadowMapHeldValid[c] = false;
+                // The park centre is fitted to the old band too, so it is as stale as the matrix is.
+                mShadowMapCascadeCenterValid[c] = false;
+            }
+        }
+        ApplyShadowLadder();
+        if (mRapi != nullptr) {
+            mRapi->SetShadowMapQuality(mShadowMapQuality);
+        }
+    }
+
+    const ShadowMapQuality& ShadowQuality() const {
+        return mShadowMapQuality;
+    }
+
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
@@ -1085,6 +1122,28 @@ class Interpreter {
     uint32_t mShadowMapFrameCounter = 0;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
+    // SOH [Enhancement] What the application asked for, before the ladder. Kept apart from the effective
+    // splits below so switching the ladder off restores the sliders rather than whatever the ladder last
+    // computed -- the manual values must survive a round trip through an automatic mode.
+    float mShadowMapSplitsRequested[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0,
+                                                                 SHADOW_MAP_DEFAULT_SPLIT_1,
+                                                                 SHADOW_MAP_DEFAULT_SPLIT_2 };
+    ShadowMapQuality mShadowMapQuality = ShadowMapQualityDefaults();
+
+    // SOH [Enhancement] Fill the effective splits from the requested ones and the ladder policy. In manual
+    // mode this is a copy; in practical mode the requested LAST split still sets the range and the ones
+    // before it are regenerated, so the reach of the system is the player's and only the distribution
+    // inside it is computed.
+    void ApplyShadowLadder() {
+        for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+            mShadowMapSplits[i] = mShadowMapSplitsRequested[i];
+        }
+        const int count = mShadowMapCascadeCount < 1 ? 1 : mShadowMapCascadeCount;
+        ShadowMapLadderSplits(mShadowMapQuality.ladderMode, mShadowMapQuality.ladderLambda,
+                              mShadowMapQuality.ladderNear, mShadowMapSplitsRequested[count - 1], count,
+                              mShadowMapSplits);
+    }
+
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
                                                         SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels

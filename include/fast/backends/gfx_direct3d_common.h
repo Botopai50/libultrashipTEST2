@@ -67,6 +67,13 @@ struct PerShadowCB {
     // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
     // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
     float shadow_actor_texel_uv[4];
+    // SOH [Enhancement] Edge quality (see shadow_map.h). Packing matches the shader's comment exactly:
+    //   shadow_edge:   x analytic on/off, y ramp width (texels), z jitter on/off, w jitter taps
+    //   shadow_jitter: x jitter radius (texels), y per-frame rotation, z filter mode, w ESM exponent
+    //   shadow_filter: x bleed reduction, y screen-space active, z map blur radius (texels), w unused
+    float shadow_edge[4];
+    float shadow_jitter[4];
+    float shadow_filter[4];
 };
 
 struct PerDrawCB {
@@ -441,6 +448,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerToonCB mPerToonCbData{};
     bool mPerToonCbValid = false; // false until something has actually been uploaded to compare against
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
+    // SOH [Enhancement] Frames since the backend started, used only to advance the jitter pattern's
+    // rotation when temporal jitter is on. Incremented where the shadow constants are written, which
+    // happens exactly once per frame.
+    uint32_t mShadowQualityFrame = 0;
     bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;

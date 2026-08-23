@@ -157,6 +157,18 @@ cbuffer PerShadowCB : register(b3) {
     // One texel of the ACTOR layer in UV terms, per cascade. Equal to shadow_texel_uv while the two layers
     // share a resolution; separate once that layer is sized on its own (see fast/shadow_map.h).
     float4 shadow_actor_texel_uv;
+    // SOH [Enhancement] Edge quality (see fast/shadow_map.h). Three registers holding the switches and
+    // tuning for the techniques that shape the shadow's EDGE, as opposed to deciding where it falls.
+    // Packed rather than named one per register because a cbuffer gives every scalar its own 16 bytes.
+    //   edge:   x = analytic edge on/off, y = its ramp width in texels,
+    //           z = jitter on/off,        w = jitter tap count
+    //   jitter: x = jitter radius in texels, y = per-frame rotation offset (0 when not temporal),
+    //           z = filter mode (SHADOW_MAP_FILTER_*), w = ESM exponent
+    //   filter: x = bleed reduction, y = screen-space mask active, z = map blur radius in texels,
+    //           w = unused
+    float4 shadow_edge;
+    float4 shadow_jitter;
+    float4 shadow_filter;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -188,6 +200,52 @@ cbuffer PerShadowCB : register(b3) {
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
+// SOH [Enhancement] Analytic edge reconstruction (technique 2 -- see fast/shadow_map.h).
+//
+// Coverage from where the boundary actually CROSSES the quad, rather than from bilinearly blending four
+// binary comparisons. Same four depths, no extra fetch.
+//
+// Let g = stored - z, the signed slack at each corner: positive where that corner does not occlude. The
+// lit region is g >= 0, so the boundary is the zero contour of g, and bilinear g is a good model of it
+// inside one quad. Interpolating g and taking its gradient gives the signed distance from the sample point
+// to that contour, in texels -- and a ramp on the distance is an edge whose position varies continuously
+// with the receiver instead of snapping to the grid. That snapping is the staircase.
+//
+// Exact for one straight boundary through the quad, which is walls, steps, roofs and platform edges. Where
+// the quad holds more than one boundary the gradient is meaningless, but so is the bilinear blend, and the
+// magnitude guard below returns the hard answer rather than an invented soft one.
+//
+// `width` widens the ramp past its geometric one-texel extent, which is the cheapest softening in the
+// system: arithmetic, no fetches, no bandwidth.
+float ShadowAnalyticCoverage(float4 stored, float z, float2 subTexel, float width) {
+    // Gather's component order: w is (0,0), z is (1,0), x is (0,1), y is (1,1).
+    float4 g = stored - z;
+    float row0 = lerp(g.w, g.z, subTexel.x); // v = 0
+    float row1 = lerp(g.x, g.y, subTexel.x); // v = 1
+    float value = lerp(row0, row1, subTexel.y);
+    // Gradient in TEXEL units, which is what makes the distance below a texel count.
+    float du = lerp(g.z - g.w, g.y - g.x, subTexel.y);
+    float dv = row1 - row0;
+    float gradient = length(float2(du, dv));
+    // A flat quad has no boundary in it and no gradient to divide by. Falling back to the hard comparison
+    // is right: there is genuinely nothing to antialias, and every neighbouring quad that DOES hold the
+    // boundary is producing the ramp.
+    if (gradient < 1e-7) {
+        return step(0.0, value);
+    }
+    // Signed distance to the contour, in texels, then a linear ramp of `width` texels centred on it.
+    return saturate(0.5 + ((value / gradient) / max(width, 1e-4)));
+}
+
+// SOH [Enhancement] Interleaved gradient noise (technique 3 -- see fast/shadow_map.h).
+//
+// One hash of the pixel coordinate, returning 0..1. Chosen over a texture lookup because it costs no
+// bandwidth and no bind, and over a plain hash because its output is spatially well distributed at the
+// scale of a few pixels -- which is exactly the scale a rotated tap pattern is trying to decorrelate over.
+float ShadowJitterNoise(float2 pixel) {
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
 float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
@@ -228,6 +286,13 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     }
 @end
 
+    // SOH [Enhancement] Technique 2 (see fast/shadow_map.h) consumes the SAME four depths and reconstructs
+    // where the boundary crosses the quad, rather than blending the four comparisons. Branching on a
+    // uniform, so a draw takes one path or the other and neither pays for the one it skipped.
+    if (shadow_edge.x > 0.5) {
+        return ShadowAnalyticCoverage(stored, z, subTexel, shadow_edge.y);
+    }
+
     // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
     // texel does not occlude -- for all four at once. One reference depth for the whole quad: the offset
     // that keeps a surface from shadowing itself is applied by the rasterizer during the depth pass, not
@@ -241,6 +306,46 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     float2 inv = 1.0 - subTexel;
     float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
     return dot(lit, weights);
+}
+
+// SOH [Enhancement] Stochastic jitter (technique 3 -- see fast/shadow_map.h).
+//
+// Spread the taps over a disk and rotate that disk by a per-pixel angle. The step between texels does not
+// shrink, but neighbouring pixels no longer step at the same place, so the boundary reads as dither rather
+// than as a staircase.
+//
+// A Vogel (golden-angle) spiral rather than a grid: it has no preferred axis, so there is no direction
+// along which the pattern itself can print -- which is the failure mode of a rotated square kernel, and is
+// what turned an earlier widened filter into visible wedges.
+//
+// Disabled is a uniform branch straight to the single quad, so a draw with jitter off is byte for byte the
+// cost it was. [loop] and not [unroll] for the reason documented on the layer loop below: this file is
+// compiled by FXC inside the frame a material first draws, and an unrolled sixteen-tap body is that hitch.
+float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool isActor, float2 pixel) {
+    if (shadow_edge.z < 0.5) {
+        return SampleShadowPCF4(uv, z, slice, texelUv, isActor);
+    }
+
+    uint taps = (uint)max(shadow_edge.w, 1.0);
+    // The frame term is zero unless temporal jitter is on, in which case the pattern advances and the grain
+    // moves instead of standing still as a fixed texture over the scene.
+    float angle = (ShadowJitterNoise(pixel) + shadow_jitter.y) * 6.28318530718;
+    float2 rot = float2(cos(angle), sin(angle));
+    float radius = shadow_jitter.x * texelUv;
+
+    float sum = 0.0;
+    [loop]
+    for (uint i = 0; i < taps; i++) {
+        // sqrt of the index fraction distributes the taps by AREA, so the disk is evenly covered rather
+        // than crowded at the centre. 2.3999632 is the golden angle in radians.
+        float r = sqrt(((float)i + 0.5) / (float)taps);
+        float theta = (float)i * 2.3999632;
+        float2 unit = float2(cos(theta), sin(theta));
+        // Complex multiply: rotate the spiral's own direction by this pixel's angle.
+        float2 dir = float2((unit.x * rot.x) - (unit.y * rot.y), (unit.x * rot.y) + (unit.y * rot.x));
+        sum += SampleShadowPCF4(uv + (dir * (r * radius)), z, slice, texelUv, isActor);
+    }
+    return sum / (float)taps;
 }
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
@@ -325,10 +430,10 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 // upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
-float ShadowSample(ShadowProjection p, bool isActor) {
+float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
+        lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
     }
     return lit;
 }
@@ -423,7 +528,8 @@ uint ShadowCascadeIndex(float viewDepth) {
 // `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
-float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors) {
+float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors,
+                       float2 pixel) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     float2 lit = float2(1.0, 1.0);
@@ -562,7 +668,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                     // may have its own. Equal to the world layer's whenever the two are the same size.
                     p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
-                float s = ShadowSample(p, isActor);
+                float s = ShadowSample(p, isActor, pixel);
                 if (isActor) {
                     lit.y = isPartner ? lerp(lit.y, s, t) : s;
                 } else {
@@ -877,7 +983,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
         float2 shadowLayers =
-            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
+            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                            input.worldPos.w > 0.5, screenSpace.xy);
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.

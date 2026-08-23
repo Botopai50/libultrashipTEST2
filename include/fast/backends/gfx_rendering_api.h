@@ -355,6 +355,27 @@ class GfxRenderingAPI {
         mShadowMaxViewDepth = maxViewDepth;
     }
 
+    // SOH [Enhancement] Edge-quality policy for the shadow map (see fast/shadow_map.h). One struct rather
+    // than a setter per knob, because these travel together and adding one should not mean touching every
+    // layer's signature.
+    //
+    // Clamped on arrival rather than trusted: the application owns the tuning, but the framework owns what
+    // it will actually honour, and a value out of range must not be able to reach a shader.
+    //
+    // Virtual and defaulted to storing only, like everything else here: a backend that implements none of
+    // these techniques still answers the setter and simply never reads the result.
+    virtual void SetShadowMapQuality(const ShadowMapQuality& quality) {
+        mShadowQuality = quality;
+        ShadowMapQualityClamp(&mShadowQuality);
+    }
+
+    // Readable so the interpreter can act on the parts of this policy that are decided OUTSIDE the shader
+    // -- the split ladder is fitted on the CPU, and the filterable-map mode changes what the depth pass
+    // has to store.
+    const ShadowMapQuality& ShadowMapQualityPolicy() const {
+        return mShadowQuality;
+    }
+
     virtual void SetShadowMapActorBounds(const float boundsMin[3], const float boundsMax[3]) {
         for (int i = 0; i < 3; i++) {
             mShadowActorBoundsMin[i] = boundsMin[i];
@@ -395,6 +416,9 @@ class GfxRenderingAPI {
     float mShadowActorBoundsMin[3] = { 1e30f, 1e30f, 1e30f };
     float mShadowActorBoundsMax[3] = { -1e30f, -1e30f, -1e30f };
     int mShadowViewSlice = 0;
+    // SOH [Enhancement] Edge-quality policy, defaulted to every technique off so a backend or an
+    // application that never calls the setter behaves exactly as it did before any of this existed.
+    ShadowMapQuality mShadowQuality = ShadowMapQualityDefaults();
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;
