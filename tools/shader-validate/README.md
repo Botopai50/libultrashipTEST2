@@ -33,6 +33,27 @@ It needs an HLSL compiler and picks the best one present:
 | `fxc` on PATH | the compiler the game runs. Authoritative. Ships with the Windows SDK. |
 | `wine` + `mingw-w64` | Wine's `d3dcompiler_47`, a different implementation. See the limits below. |
 
+## The self-test, and why it is not optional
+
+The script compiles two throwaway shaders before it compiles anything real: one trivially valid, one with
+an undeclared identifier. It refuses to continue unless the first passes and the second fails.
+
+That is there because this check was silently green for its whole life. The pass condition used to be "the
+compiler's output does not mention an error", which reads a compiler that printed nothing as a compiler
+that was happy — so a crashed, aborted, or missing compiler turned every variant into `ok`. Under Wine that
+is not hypothetical: `hlslc.exe` can abort out of Wine's own allocator (`free(): invalid pointer`, exit 134)
+with nothing on stdout, and when it does, a full run reports every variant compiling while compiling none
+of them.
+
+Checking only one direction does not help, which is why there are two: a compiler that always fails passes
+the broken-shader half, and a harness that reads silence as success passes the valid-shader half. The
+verdict now comes from the compiler's **exit status**, with the message only confirming it.
+
+If the self-test reports that a trivially valid shader was rejected, the environment is at fault, not the
+shaders — the abort above is the usual cause, and it comes and goes with the Wine prefix's state. Re-run it;
+if it persists, compile the variants by hand or use `fxc`. What must not happen is a green run that proves
+nothing.
+
 ## What it does and does not prove
 
 It compiles the real template, expanded by the renderer's real combiner helpers — those are sliced out of
@@ -62,6 +83,11 @@ Two limits are worth stating plainly, because a check that is trusted past its r
 
 ## Files
 
-- `validate.sh` — slices the helpers, builds the preprocessor, compiles each variant.
+- `validate.sh` — slices the helpers, builds the preprocessor, self-tests, compiles each variant.
+- `internal_shaders.py` — extracts the shadow system's four run-time shaders from `gfx_direct3d11.cpp`
+  (the depth pass, the cutout caster pass, the moment resolve/blur, and the screen-space mask) so they can
+  be compiled too. Nothing used to compile those at all, and a mistake in one reaches a player as the same
+  crash a mistake in the template would. Constants spliced into those strings are read out of
+  `fast/shadow_map.h`, so this cannot validate a shader built from different numbers than the game builds.
 - `prism_driver.cpp` — expands the template through the project's own prism context.
 - `hlslc.c` — calls `D3DCompile`; built with mingw and run under Wine when `fxc` is absent.
