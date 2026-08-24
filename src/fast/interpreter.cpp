@@ -1714,7 +1714,7 @@ void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<Sha
 // caster positions AND their uvs, and each cutout range's RESOLVED texture id -- the id is what the pass
 // binds, and a texture evicted and re-imported between frames changes the picture without moving a single
 // vertex. The matrix is compared separately by the backend, which is also what covers the camera moving.
-uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m) const {
+uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m, int half) const {
     uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t)layer;
     // Whether anything at all reaches this cascade. Tracked separately from the hash because "no casters
     // here" is not just another value: an empty slice reads identically however it is projected, so it is
@@ -1778,12 +1778,19 @@ uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m) cons
     };
 
     if (layer == SHADOW_MAP_LAYER_WORLD) {
-        mixChunks(mShadowWorldChunks);
-        mixAlphaRanges(mShadowAlphaWorldCache);
+        // SOH [Enhancement] Static caster cache: `half` picks which of the two the key describes. The cached
+        // room mesh is the static half; the scenery actors, which move, are the dynamic one. Asking for the
+        // whole slice (SHADOW_KEY_ALL) mixes both and is what every caller wanted before the split.
+        if (half != SHADOW_KEY_DYNAMIC) {
+            mixChunks(mShadowWorldChunks);
+            mixAlphaRanges(mShadowAlphaWorldCache);
+        }
         // Scenery actors are rebuilt every frame because they can move, and they are the reason this key had
         // to become per cascade at all: one of them swaying used to change the key for the whole layer.
-        mixChunks(mShadowSceneryChunks);
-        mixAlphaRanges(mShadowAlphaSceneryReady);
+        if (half != SHADOW_KEY_STATIC) {
+            mixChunks(mShadowSceneryChunks);
+            mixAlphaRanges(mShadowAlphaSceneryReady);
+        }
         // Only as a safety net, and only once something is known to be here. The world spans hash their own
         // geometry, so a rebuilt cache is already visible in them; this covers a path that replaces the
         // cache without rebuilding the spans, which would otherwise go unnoticed.
@@ -4795,14 +4802,23 @@ void Interpreter::RenderShadowMap() {
             // geometry moving somewhere else in the map no longer changes this cascade's key: measurement
             // put nearly every redrawn slice in the "contents changed while the cascade stood still" bucket,
             // and a layer-wide key is what put them there.
-            const uint64_t contentKey = ShadowMapCascadeContentKey(l, &matrices[c * 16]);
-            // False means this slice already holds exactly what the calls below would draw into it. Nothing
+            //
+            // SOH [Enhancement] Static caster cache: asked for as two halves, because the backend may be
+            // able to blit the static one in rather than have it drawn again. The two together identify the
+            // slice exactly as the single key did, so the reuse test is unchanged.
+            const uint64_t staticKey = ShadowMapCascadeContentKey(l, &matrices[c * 16], SHADOW_KEY_STATIC);
+            const uint64_t dynamicKey = ShadowMapCascadeContentKey(l, &matrices[c * 16], SHADOW_KEY_DYNAMIC);
+            // REUSED means this slice already holds exactly what the calls below would draw into it. Nothing
             // may be submitted then -- the backend has not cleared it, has not set the depth pipeline up,
-            // and is not the render target.
-            if (!mRapi->ShadowMapBeginCascade(l, c, &matrices[c * 16], contentKey)) {
+            // and is not the render target. DYNAMIC means the static half arrived by copy and only the
+            // movers are left to draw.
+            const int sliceWork =
+                mRapi->ShadowMapBeginCascadeSplit(l, c, &matrices[c * 16], staticKey, dynamicKey);
+            if (sliceWork == SHADOW_MAP_SLICE_REUSED) {
                 continue;
             }
-            if (casters.size() >= 9) {
+            const bool drawStatic = sliceWork != SHADOW_MAP_SLICE_DYNAMIC;
+            if (drawStatic && casters.size() >= 9) {
                 const size_t casterVerts = casters.size() / 3;
                 const std::vector<ShadowCasterChunk>& chunks =
                     (l == SHADOW_MAP_LAYER_WORLD) ? mShadowWorldChunks : mShadowActorChunks;
@@ -4814,17 +4830,30 @@ void Interpreter::RenderShadowMap() {
                     mRapi->ShadowMapDrawCasters(casters.data(), casterVerts, SHADOW_MAP_CASTER_SLOT_MAIN);
                 }
             }
+            // The cached half's cutout casters, and they have to land BEFORE the static snapshot is taken --
+            // they are part of what it is a snapshot of. Which is why this moved above the scenery: drawn
+            // after, they would go into the live slice only, and vanish on the next frame that arrives by
+            // copy.
+            //
+            // It costs two extra pipeline switches on a frame that rebuilds the static half, and none at
+            // all on the frames that do not, which are the ones this exists to make cheap.
+            if (drawStatic && alpha.VertexCount() >= 3) {
+                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
+                drawAlphaRanges(alpha, &matrices[c * 16]);
+            }
+
+            // SOH [Enhancement] Static caster cache: everything above was the static half. Saying so is what
+            // lets the backend snapshot it and switch the target to the live slice, so the movers below
+            // never reach the copy that is meant to outlast them.
+            if (drawStatic) {
+                mRapi->ShadowMapEndStaticCasters();
+            }
+
             // Scenery actors are per-frame and uncached. Cut into spans now rather than tested as one box:
             // scenery is scattered across a field, so its union covered the field and was never rejected.
             if (sceneryHere && mShadowSceneryReady.size() >= 9 && !mShadowSceneryChunks.empty()) {
                 drawChunkedCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3, mShadowSceneryChunks,
                                    &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_SCENERY);
-            }
-            // Alpha-cutout casters second, so the one big opaque batch keeps the fast path to itself and the
-            // pipeline switch happens once per cascade rather than being interleaved.
-            if (alpha.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
-                drawAlphaRanges(alpha, &matrices[c * 16]);
             }
             if (sceneryHere && mShadowAlphaSceneryReady.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),

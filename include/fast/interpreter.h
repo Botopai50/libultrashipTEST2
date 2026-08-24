@@ -967,7 +967,11 @@ class Interpreter {
     // narrower key answers. Now built from only the spans and cutout ranges whose boxes reach into THIS
     // cascade, so a tree swaying next to the player stops rebuilding the two distant cascades it is nowhere
     // near. Returns SHADOW_MAP_EMPTY_CONTENT_KEY when nothing reaches the cascade at all.
-    uint64_t ShadowMapCascadeContentKey(int layer, const float* lightViewProj) const;
+    // SOH [Enhancement] Static caster cache: which half of a world slice's casters the key describes. The
+    // cached room mesh is static; the scenery actors, which move, are dynamic. Only the world layer has a
+    // meaningful split -- the actor layer is characters, and all of them move.
+    enum { SHADOW_KEY_ALL = 0, SHADOW_KEY_STATIC = 1, SHADOW_KEY_DYNAMIC = 2 };
+    uint64_t ShadowMapCascadeContentKey(int layer, const float* lightViewProj, int half = SHADOW_KEY_ALL) const;
     // Tile geometry and texture coordinates for the caster capture, which runs before the combiner setup
     // that normally derives them (see the definitions for why they are duplicated rather than shared).
     void ShadowCasterTexSize(int tile, float* outWidth, float* outHeight);

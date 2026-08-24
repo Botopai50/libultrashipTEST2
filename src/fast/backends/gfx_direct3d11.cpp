@@ -3216,6 +3216,156 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     return true;
 }
 
+void GfxRenderingAPIDX11::ShadowStaticRelease() {
+    for (int i = 0; i < SHADOW_MAP_MAX_SLICES; i++) {
+        mShadowStaticDsv[i].Reset();
+        mShadowStaticValid[i] = false;
+        mShadowStaticKey[i] = 0;
+    }
+    mShadowStaticTexture.Reset();
+    mShadowStaticReady = false;
+    mShadowStaticResolution = 0;
+    mShadowStaticSlices = 0;
+    mShadowStaticOpenSlice = -1;
+}
+
+// SOH [Enhancement] Static caster cache (see fast/shadow_map.h). A second array holding the WORLD layer's
+// slices with only the casters that do not move in them.
+//
+// World layer only, and the array is only as long as that layer: the actor layer is characters, whose
+// content changes every frame by definition, so there is no static half of it to keep.
+bool GfxRenderingAPIDX11::CreateShadowStaticTargets(int cascadeCount, int resolution) {
+    if (mShadowStaticTexture != nullptr && cascadeCount == mShadowStaticSlices &&
+        resolution == mShadowStaticResolution) {
+        return true;
+    }
+    ShadowStaticRelease();
+    if (cascadeCount <= 0 || resolution <= 0 || mShadowMapTexture == nullptr) {
+        return false;
+    }
+
+    // Deliberately the same desc as the live array, because the copy below requires it: D3D11 will only
+    // copy between resources of identical type, format and dimensions.
+    D3D11_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = (UINT)resolution;
+    desc.Height = (UINT)resolution;
+    desc.MipLevels = 1;
+    desc.ArraySize = (UINT)cascadeCount;
+    desc.Format = DXGI_FORMAT_R16_TYPELESS;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    // A depth target because the static half is rasterised straight into it; never read as a texture, only
+    // copied out of, so it needs no shader resource view.
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, mShadowStaticTexture.GetAddressOf()))) {
+        SPDLOG_WARN("Shadow map: could not create the {}x{} x{} static caster cache; the split is off.",
+                    resolution, resolution, cascadeCount);
+        ShadowStaticRelease();
+        return false;
+    }
+    for (int i = 0; i < cascadeCount; i++) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv;
+        ZeroMemory(&dsv, sizeof(dsv));
+        dsv.Format = DXGI_FORMAT_D16_UNORM;
+        dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv.Texture2DArray.MipSlice = 0;
+        dsv.Texture2DArray.FirstArraySlice = (UINT)i;
+        dsv.Texture2DArray.ArraySize = 1;
+        if (FAILED(mDevice->CreateDepthStencilView(mShadowStaticTexture.Get(), &dsv,
+                                                   mShadowStaticDsv[i].GetAddressOf()))) {
+            SPDLOG_WARN("Shadow map: could not create the static cache's view for slice {}.", i);
+            ShadowStaticRelease();
+            return false;
+        }
+    }
+    mShadowStaticResolution = resolution;
+    mShadowStaticSlices = cascadeCount;
+    mShadowStaticReady = true;
+    SPDLOG_INFO("Shadow map: static caster cache ready at {}x{} across {} slices.", resolution, resolution,
+                cascadeCount);
+    return true;
+}
+
+// Copy the static half of `slice` into the live slice. Neither may be bound as a target while it happens,
+// which is why the target is dropped and put back around it.
+//
+// No source box: D3D11 will not copy a sub-region of a depth-stencil resource, and a whole slice is what is
+// wanted anyway.
+void GfxRenderingAPIDX11::ShadowStaticBlit(int slice) {
+    mContext->OMSetRenderTargets(0, nullptr, nullptr);
+    mContext->CopySubresourceRegion(mShadowMapTexture.Get(), (UINT)slice, 0, 0, 0, mShadowStaticTexture.Get(),
+                                    (UINT)slice, nullptr);
+    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
+}
+
+int GfxRenderingAPIDX11::ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16],
+                                                   uint64_t staticKey, uint64_t dynamicKey) {
+    // The two keys identify the slice together, and the live reuse test is unchanged by the split: a slice
+    // still holds what its whole caster set drew. Mixed rather than xored so a static change cannot be
+    // cancelled out by a dynamic one landing on the same bits.
+    const uint64_t combined = (staticKey * 0x100000001B3ull) ^ dynamicKey;
+
+    // The actor layer has no static half, and a cache that failed to build is simply not there.
+    if (layer != SHADOW_MAP_LAYER_WORLD || !mShadowStaticReady || mShadowStaticTexture == nullptr ||
+        !mShadowQuality.staticCache) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined) ? SHADOW_MAP_SLICE_FULL
+                                                                                  : SHADOW_MAP_SLICE_REUSED;
+    }
+    if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
+        return SHADOW_MAP_SLICE_REUSED;
+    }
+    const int slice = layer * mShadowCascadeCount + cascadeIndex;
+    if (slice >= mShadowStaticSlices || mShadowStaticDsv[slice] == nullptr) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined) ? SHADOW_MAP_SLICE_FULL
+                                                                                  : SHADOW_MAP_SLICE_REUSED;
+    }
+
+    // Is the cached half still the right image? The same casters through a different matrix is a different
+    // image, so both have to match.
+    const bool staticUsable = mShadowStaticValid[slice] && mShadowStaticKey[slice] == staticKey &&
+                              memcmp(mShadowStaticMatrix[slice], lightViewProj, 16 * sizeof(float)) == 0;
+
+    if (staticUsable) {
+        // The clear is what the blit replaces, so it is suppressed and the copy lands on a slice nobody
+        // has written to yet this frame.
+        mShadowSkipSliceClear = true;
+        const bool opened = ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined);
+        mShadowSkipSliceClear = false;
+        if (!opened) {
+            return SHADOW_MAP_SLICE_REUSED; // the live slice already held this exact image
+        }
+        ShadowStaticBlit(slice);
+        return SHADOW_MAP_SLICE_DYNAMIC;
+    }
+
+    // The cached half has to be rebuilt, so the same opening body is aimed at the static copy instead. The
+    // caller draws the static casters, then says so, and ShadowMapEndStaticCasters blits and switches over.
+    mShadowStaticTargetSlice = slice;
+    const bool opened = ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined);
+    mShadowStaticTargetSlice = -1;
+    if (!opened) {
+        return SHADOW_MAP_SLICE_REUSED;
+    }
+    mShadowStaticOpenSlice = slice;
+    mShadowStaticKey[slice] = staticKey;
+    memcpy(mShadowStaticMatrix[slice], lightViewProj, 16 * sizeof(float));
+    // Claimed only once the draws have gone in; see ShadowMapEndStaticCasters.
+    mShadowStaticValid[slice] = false;
+    return SHADOW_MAP_SLICE_FULL;
+}
+
+void GfxRenderingAPIDX11::ShadowMapEndStaticCasters() {
+    if (mShadowStaticOpenSlice < 0) {
+        return;
+    }
+    const int slice = mShadowStaticOpenSlice;
+    mShadowStaticOpenSlice = -1;
+    // The static half is complete and may now be trusted for later frames.
+    mShadowStaticValid[slice] = true;
+    ShadowStaticBlit(slice);
+}
+
 bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {
     if (cascadeCount < 1) {
         cascadeCount = 1;
@@ -3246,6 +3396,15 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, i
     // leaves mShadowMomentTexture null, which the shader reads as depth-and-PCF -- the arrangement that
     // exists when the mode was never asked for. So none of it may fail the configure.
     //
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). Optional in every sense: a failure
+    // here leaves the cache unavailable and the split path falls back to redrawing whole slices, which is
+    // what happens today.
+    if (mShadowQuality.staticCache) {
+        CreateShadowStaticTargets(cascadeCount, resolution);
+    } else {
+        ShadowStaticRelease();
+    }
+
     // The WORLD layer only -- cascadeCount slices, not SHADOW_MAP_SLICES_FOR(cascadeCount). Two reasons,
     // and either alone would be enough:
     //
@@ -3481,8 +3640,16 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     // gone by the time this returns.
     mShadowAlphaBound = false;
 
-    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
-    mContext->ClearDepthStencilView(mShadowMapDsv[slice].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    // SOH [Enhancement] Static caster cache: the split path aims this same body at the static copy while
+    // its half is drawn, and suppresses the clear on the frame where that copy is about to be blitted in.
+    // Both flags are off for every other caller, so the ordinary path is unchanged.
+    ID3D11DepthStencilView* sliceTarget = (mShadowStaticTargetSlice == slice && mShadowStaticDsv[slice] != nullptr)
+                                              ? mShadowStaticDsv[slice].Get()
+                                              : mShadowMapDsv[slice].Get();
+    mContext->OMSetRenderTargets(0, nullptr, sliceTarget);
+    if (!mShadowSkipSliceClear) {
+        mContext->ClearDepthStencilView(sliceTarget, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    }
 
     D3D11_VIEWPORT viewport;
     viewport.TopLeftX = 0.0f;

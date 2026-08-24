@@ -591,6 +591,42 @@
 // because the opposite choice is equally defensible on a still camera.
 #define SHADOW_MAP_DEFAULT_JITTER_TEMPORAL 0
 
+// --- Static caster cache ------------------------------------------------------------------------
+//
+// A slice's casters divide into two kinds that behave nothing alike. The room mesh is a cache: uploaded
+// once and rebuilt only when the scene itself changes. The scenery ACTORS are per frame -- a gate slides,
+// a tree sways -- and cannot be cached on geometry, because the geometry is the same and the matrix is not.
+//
+// Today a slice holds both and is redrawn as a unit. So one swaying tree costs the whole room mesh again,
+// in every slice the tree reaches, every frame it moves. That is the case this exists for. It is not a
+// corner case: chunking the scenery list was already added to stop a single tree invalidating all three
+// world cascades, which says how often it happens.
+//
+// THE SPLIT. Keep a second copy of each world slice holding the STATIC casters alone. Each frame, copy that
+// into the live slice and draw only what moved on top. The copy replaces both the clear and the room mesh's
+// rasterisation.
+//
+//   4096  a slice costs about 420 us to redraw; the copy is about 62 us
+//   1024  the copy is about 4 us, which is nothing
+//
+// WHAT IT COSTS is a second array the size of the world layer's:
+//
+//   cascades at 4096   +96 MB      cascades at 2048   +24 MB
+//   clipmap at 1024    +12 MB      clipmap at 2048    +48 MB
+//
+// Which is why it is off by default and why it belongs beside the clipmap: the layout that wants many
+// small levels is exactly the one where a second copy is cheap. At 4096 cascades this is a real 96 MB, and
+// worth it only in a scene with scenery that actually moves.
+//
+// WHAT IT DOES NOT HELP. A settled scene already redraws nothing -- the parking and the content keys see to
+// that -- so this changes nothing there. It buys back the cost of movement, not the cost of standing still.
+#define SHADOW_MAP_DEFAULT_STATIC_CACHE 0
+
+// What ShadowMapBeginCascadeSplit answers, and therefore what the caller must draw.
+#define SHADOW_MAP_SLICE_REUSED 0  // nothing at all: the live slice already holds this image
+#define SHADOW_MAP_SLICE_FULL 1    // draw the static casters, then the dynamic ones
+#define SHADOW_MAP_SLICE_DYNAMIC 2 // the static half was copied in; draw only what moved
+
 // --- Shadow clipmap ------------------------------------------------------------------------------
 //
 // A second way of laying the map out, chosen instead of the cascade ladder. The idea is the directional
@@ -854,6 +890,9 @@ typedef struct ShadowMapQuality {
 
     // Layout -- the cascade ladder, or the clipmap
     int layout;           // SHADOW_MAP_LAYOUT_*
+    int staticCache;      // 0/1 -- keep a static-only copy of each world slice and blit it
+
+
     int clipmapLevels;    // clipmap only
     float clipmapBase;    // half-extent of level 0, world units
 
@@ -888,6 +927,7 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
     q.jitterTemporal = SHADOW_MAP_DEFAULT_JITTER_TEMPORAL;
     q.layout = SHADOW_MAP_DEFAULT_LAYOUT;
+    q.staticCache = SHADOW_MAP_DEFAULT_STATIC_CACHE;
     q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
     q.clipmapBase = SHADOW_MAP_DEFAULT_CLIPMAP_BASE;
     q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
@@ -926,6 +966,7 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
     q->jitterTemporal = q->jitterTemporal ? 1 : 0;
     q->layout = SHADOW_MAP_CLAMP_(q->layout, 0, SHADOW_MAP_LAYOUT_MAX);
+    q->staticCache = q->staticCache ? 1 : 0;
     q->clipmapLevels = SHADOW_MAP_CLAMP_(q->clipmapLevels, 1, SHADOW_MAP_MAX_CLIPMAP_LEVELS);
     q->clipmapBase =
         SHADOW_MAP_CLAMP_(q->clipmapBase, SHADOW_MAP_MIN_CLIPMAP_BASE, SHADOW_MAP_MAX_CLIPMAP_BASE);

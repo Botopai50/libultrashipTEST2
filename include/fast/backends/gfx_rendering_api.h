@@ -355,6 +355,27 @@ class GfxRenderingAPI {
         mShadowMaxViewDepth = maxViewDepth;
     }
 
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). Opens a WORLD-layer slice knowing that
+    // its casters split in two: a static half that is cached and a dynamic half that is not.
+    //
+    // Answers what the caller must now draw -- SHADOW_MAP_SLICE_REUSED, _FULL or _DYNAMIC. A _DYNAMIC
+    // answer means the static half was copied in from the cache and only the movers are left to draw, which
+    // is the whole point: one swaying tree stops costing the room mesh again.
+    //
+    // Falls back to the ordinary path when the cache is off or unavailable, in which case it answers
+    // _REUSED or _FULL and behaves exactly as ShadowMapBeginCascade does.
+    virtual int ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16],
+                                           uint64_t staticKey, uint64_t dynamicKey) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, staticKey ^ dynamicKey)
+                   ? SHADOW_MAP_SLICE_FULL
+                   : SHADOW_MAP_SLICE_REUSED;
+    }
+
+    // SOH [Enhancement] Between the two halves of a split slice: everything drawn from here on is dynamic
+    // and must not reach the static copy. A no-op where the cache is not in use.
+    virtual void ShadowMapEndStaticCasters() {
+    }
+
     // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). Everything the receiver needs to place a
     // pixel in the clipmap WITHOUT a per-level matrix: the light's three axes, the camera's coordinate
     // along each of them, and the ladder's shape.

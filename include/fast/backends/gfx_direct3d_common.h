@@ -224,6 +224,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
+    int ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16], uint64_t staticKey,
+                                   uint64_t dynamicKey) override;
+    void ShadowMapEndStaticCasters() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float strength, float debugMode) override;
 
@@ -264,6 +267,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool CreateShadowMomentTargets(int mode, int resolution, int sliceCount);
     void ShadowMomentResolveAndBlur();
     void ShadowMomentRelease();
+    // SOH [Enhancement] Static caster cache (technique from the Unity-style cached shadow maps).
+    bool CreateShadowStaticTargets(int cascadeCount, int resolution);
+    void ShadowStaticRelease();
+    void ShadowStaticBlit(int slice);
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -409,6 +416,31 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Slices the depth pass redrew this frame and which therefore need resolving and blurring again. A
     // parked slice keeps the moments it already holds, exactly as it keeps the depths.
     bool mShadowSliceMomentDirty[SHADOW_MAP_MAX_SLICES] = {};
+
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). A second copy of the WORLD layer's
+    // slices holding only the casters that do not move, so a frame where scenery moved can blit that in and
+    // redraw the movers alone instead of the room mesh as well.
+    //
+    // World layer only. The actor layer is characters, whose content changes every frame by definition --
+    // there is no static half of it to cache.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowStaticTexture;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowStaticDsv[SHADOW_MAP_MAX_SLICES];
+    // What each static slice was drawn from, and with. Both have to match for the copy to be legitimate:
+    // the same casters projected through a different matrix is a different image.
+    uint64_t mShadowStaticKey[SHADOW_MAP_MAX_SLICES] = {};
+    float mShadowStaticMatrix[SHADOW_MAP_MAX_SLICES][16] = {};
+    bool mShadowStaticValid[SHADOW_MAP_MAX_SLICES] = {};
+    // The slice a split pass is filling, while its static half is being drawn. -1 once the caller has said
+    // the static casters are done, after which the writes are dynamic and must not reach the cache.
+    int mShadowStaticOpenSlice = -1;
+    // Set around the shared slice-opening body so it targets the STATIC copy, and so it leaves the live
+    // slice's contents alone when the static half is about to be blitted over it. Both are cleared again
+    // immediately; nothing outside the split path ever sees them set.
+    int mShadowStaticTargetSlice = -1;
+    bool mShadowSkipSliceClear = false;
+    bool mShadowStaticReady = false;
+    int mShadowStaticResolution = 0;
+    int mShadowStaticSlices = 0;
 
     bool mShadowPipelineReady = false;
     bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
