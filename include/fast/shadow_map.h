@@ -185,7 +185,7 @@
 // maps across this band and blends with smoothstep, which is what keeps the resolution change from
 // showing up as a hard line sweeping across the ground as the camera moves ("cascade popping").
 // Expressed as a fraction so the band scales with each cascade's size.
-#define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.1f
+#define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.2f
 
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
 // texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
@@ -457,7 +457,11 @@
 #define SHADOW_MAP_FILTER_MSM 3   // four power moments. Heaviest and the only one that holds up under
                                   // overlapping occluders, which this game has a great deal of.
 #define SHADOW_MAP_FILTER_MAX 3
-#define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_DEPTH
+// ESM by default. NOTE THE CEILING: at the default 4096 the moment array wants 256 MB against a 192 MB
+// budget (see SHADOW_MAP_MOMENT_BUDGET_MB), so the backend refuses it, logs why, and falls back to depth
+// and PCF. Which means this default only takes effect once the shadow resolution is 2048 or below -- until
+// then it is a stated preference rather than a mode that is running.
+#define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_ESM
 
 // Ceiling on what the filterable modes may allocate for their moment array, in megabytes.
 //
@@ -527,12 +531,12 @@
 // Exact for a single straight boundary through the quad, which covers walls, steps, roofs and platform
 // edges -- the geometry the staircase is complained about on. It degrades to the bilinear answer where the
 // quad holds more than one boundary (foliage), which is the correct place to give up.
-#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE 0
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE 1
 
 // How far the reconstructed coverage ramp is spread, in texels. 1.0 is the geometric answer -- the ramp
 // occupies exactly the texel the boundary crosses. Above that it is deliberately widened, which is the
 // cheapest softening available anywhere in the system since it costs arithmetic and no fetches.
-#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH 1.0f
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH 2.0f
 #define SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH 4.0f
 
 // --- Technique 3: stochastic jitter ----------------------------------------------------------------
@@ -546,7 +550,7 @@
 // is its own artefact. It is offered because on a still image at a moderate tap count it is clearly better
 // than the staircase, and because whether the trade is acceptable is a matter of taste that a constant
 // cannot settle.
-#define SHADOW_MAP_DEFAULT_JITTER 0
+#define SHADOW_MAP_DEFAULT_JITTER 1
 
 // Taps in the rotated pattern. Each is a full bilinear quad fetch, so this is the one knob here that costs
 // real bandwidth, and it is also what decides whether the dither reads as softness or as noise.
@@ -584,7 +588,7 @@
 // Logarithmic is what makes the texel size uniform across bands, which is the point; pure logarithmic
 // however puts the first split extremely close to the camera, and a cascade that covers almost nothing
 // wastes a whole slice. The blend is the usual compromise and 0.75 is where it is normally landed.
-#define SHADOW_MAP_DEFAULT_LADDER_LAMBDA 0.75f
+#define SHADOW_MAP_DEFAULT_LADDER_LAMBDA 0.85f
 
 // The near distance the ladder is generated from. Not the camera's actual near plane, which is small
 // enough to drag the first split down to nothing; this is the distance at which shadows start being worth
@@ -659,20 +663,18 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 //                    Acne is a grazing-angle problem, so scaling by the angle spends the correction where
 //                    it is needed and nearly nothing where it is not.
 
-// Whether the corrections run at all. Off means the behaviour that shipped before they existed.
+// Whether the corrections run at all.
 //
-// Off is right again now that the screen-space mask is gone. That mask reconstructed its receiver from a
-// depth buffer and was unusable without these; the ordinary receiver reads the interpolated vertex
-// position -- the exact surface the depth pass rasterised -- and the rasterizer's own slope-scaled bias
-// already covers it. So these are a tool for a scene where that turns out not to hold, rather than
-// something the system needs to look right.
-#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 0
+// ON, and these values are a player's, taken from a tuned config rather than reasoned to. The rasterizer's
+// own slope bias is the standing defence and is usually enough; where it was not, the combination below --
+// a small normal offset, slope-scaled, and nothing else -- was what cleared it in practice.
+#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 1
 
 // Normal offset, in multiples of the sampled cascade's texel. Expressed in texels rather than world units
 // because the error it corrects is itself a texel-sized quantity -- a fixed world offset would be far too
 // large in the near cascade and far too small in the far one.
 #define SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET 1
-#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS 1.5f
+#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS 0.6f
 #define SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS 8.0f
 
 // Offset toward the light, in world units. Off by default: it is the one that costs peter panning, and the
@@ -693,7 +695,7 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 // The ceiling matters: 1/(N.L) runs to infinity as a surface turns edge-on, and an unbounded offset there
 // throws the sample point far enough to sample a different part of the scene entirely.
 #define SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED 1
-#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX 3.0f
+#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX 3.5f
 #define SHADOW_MAP_MAX_ACNE_SLOPE_MAX 10.0f
 
 typedef struct ShadowMapAcne {
