@@ -717,12 +717,23 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             // SOH [Enhancement] Acne corrections (see fast/shadow_map.h). Gated on their own switch here:
             // the ordinary receiver reads the exact surface the depth pass rasterised, so it does not
             // normally need them -- unlike the screen-space mask, which reconstructs its position.
+            //
+            // PER CASCADE, which is the whole of this block's shape. The offset is sized in TEXELS, and the
+            // cross-fade partner is a coarser cascade whose texel is several times larger -- so a single
+            // offset computed for the primary and reused for the partner leaves the partner corrected for a
+            // cascade it is not. It then self-shadows, and since the band blends towards it, the seam
+            // darkens across the fade and snaps clean the moment the cascade index flips. That was visible
+            // as the cascade boundary going dark, and only ever with the cross-fade on, because without it
+            // the partner is never sampled.
+            //
+            // The slope is a property of the SURFACE, not of the cascade, so it is computed once.
+            bool acneOn = shadow_acne1.z > 0.5;
+            float acneSlope = acneOn ? ShadowAcneSlope(normal) : 0.0;
             float3 samplePos = worldPos;
             float acneDepthBias = 0.0;
-            if (shadow_acne1.z > 0.5) {
-                float slope = ShadowAcneSlope(normal);
-                samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), slope);
-                acneDepthBias = ShadowAcneDepthBias(cascade, slope);
+            if (acneOn) {
+                samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), acneSlope);
+                acneDepthBias = ShadowAcneDepthBias(cascade, acneSlope);
             }
             ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0);
             primary.z -= acneDepthBias;
@@ -748,8 +759,16 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                partner = ShadowProjectAt(samplePos, pc, 0.0);
-                partner.z -= acneDepthBias;
+                // Its own offset and its own bias, from the PARTNER's texel and depth scale. See the note
+                // above: sharing the primary's is what darkened the seam.
+                float3 partnerPos = worldPos;
+                float partnerBias = 0.0;
+                if (acneOn) {
+                    partnerPos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(pc), acneSlope);
+                    partnerBias = ShadowAcneDepthBias(pc, acneSlope);
+                }
+                partner = ShadowProjectAt(partnerPos, pc, 0.0);
+                partner.z -= partnerBias;
             }
 
             // Can the actor layer possibly shadow this point at all?
