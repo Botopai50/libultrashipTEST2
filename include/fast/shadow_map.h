@@ -66,6 +66,12 @@
 // the slice arithmetic below needs it; the reasoning is with SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS.
 #define SHADOW_MAP_MAX_CLIPMAP_LEVELS 6
 
+// Levels either layout may ask for, and therefore the size of everything held per level: the fitted
+// matrices, the parking state, the update divisors. The clipmap is the one that wants more.
+#define SHADOW_MAP_MAX_LEVELS \
+    (SHADOW_MAP_MAX_CASCADES > SHADOW_MAP_MAX_CLIPMAP_LEVELS ? SHADOW_MAP_MAX_CASCADES \
+                                                             : SHADOW_MAP_MAX_CLIPMAP_LEVELS)
+
 // Slices are laid out world-layer-first: world cascade C is slice C, actor cascade C is slice
 // cascadeCount + C. The actor half is the shorter one, so the total is not a simple product.
 #define SHADOW_MAP_ACTOR_CASCADES_FOR(count) ((count) < SHADOW_MAP_ACTOR_CASCADES ? (count) : SHADOW_MAP_ACTOR_CASCADES)

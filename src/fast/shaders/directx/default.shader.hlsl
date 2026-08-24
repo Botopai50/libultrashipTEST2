@@ -195,6 +195,15 @@ cbuffer PerShadowCB : register(b3) {
     // SOH [Enhancement] Edge hardening (see fast/shadow_map.h). x = on, y = hardness (0 unchanged, 1 a hard
     // threshold), z = where the boundary sits in the coverage range, w unused.
     float4 shadow_harden;
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). The light's three axes, each carrying the
+    // camera's coordinate along it in w, then the ladder's shape. No per-level matrix: levels differ by a
+    // power of two and a snapped centre, and both are arithmetic. That is also what keeps this legal at
+    // ps_4_0, where a dynamically indexed constant-buffer array is not.
+    //   clip_p: x base half-extent, y level count (0 = take the cascade path), z resolution, w unused
+    float4 shadow_clip_x;
+    float4 shadow_clip_y;
+    float4 shadow_clip_z;
+    float4 shadow_clip_p;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -683,6 +692,60 @@ float ShadowHardenEdge(float coverage) {
     float width = max((1.0 - shadow_harden.y) * 0.5, 1.0e-5);
     float threshold = shadow_harden.z;
     return smoothstep(threshold - width, threshold + width, coverage);
+}
+
+// SOH [Enhancement] Clipmap lookup (see fast/shadow_map.h).
+//
+// Nested squares centred on the camera, each twice the extent of the one inside it. The level is a function
+// of how far the point is from the centre, so there is no split ladder, no comparison chain and no matrix
+// array -- every quantity below is computed from the level index.
+//
+// Returns both caster layers, the same pair ShadowLitLayers returns, so the two layouts are
+// interchangeable at the call site.
+float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors) {
+    float2 lit = float2(1.0, 1.0);
+    float levels = shadow_clip_p.y;
+    if (levels < 0.5) {
+        return lit;
+    }
+
+    // The point in the light's frame. The axes carry the camera's coordinate in w, so the offset from the
+    // clipmap's centre falls out of the same dot products.
+    float3 lp = float3(dot(worldPos, shadow_clip_x.xyz), dot(worldPos, shadow_clip_y.xyz),
+                       dot(worldPos, shadow_clip_z.xyz));
+    float2 offset = lp.xy - float2(shadow_clip_x.w, shadow_clip_y.w);
+
+    // Which level contains it: the smallest whose half-extent covers the larger of the two offsets. The
+    // Chebyshev distance rather than the Euclidean one, because the levels are squares.
+    float base = max(shadow_clip_p.x, 1e-4);
+    float reach = max(max(abs(offset.x), abs(offset.y)), base);
+    float level = clamp(ceil(log2(reach / base)), 0.0, levels - 1.0);
+
+    float extent = base * exp2(level);
+    float resolution = max(shadow_clip_p.z, 1.0);
+    float texel = (extent * 2.0) / resolution;
+    // The centre is snapped to THIS level's texel, which is what stops the edges shimmering as the camera
+    // moves -- and, because a camera that has not crossed a texel produces the same centre, is also what
+    // lets the slice be reused with no parking code at all.
+    float2 centre = floor(float2(shadow_clip_x.w, shadow_clip_y.w) / texel) * texel;
+    float2 uv = ((lp.xy - centre) / (extent * 2.0)) + 0.5;
+    if (any(uv < 0.0) || any(uv > 1.0)) {
+        return lit; // outside this level's square nothing is known to occlude
+    }
+
+    // The depth arrangement the fit builds: the eye pulled back three radii, the range running five.
+    float depth = ((lp.z - shadow_clip_z.w) + (extent * 3.0)) / (extent * 5.0);
+    if (depth < 0.0 || depth > 1.0) {
+        return lit;
+    }
+
+    float texelUv = 1.0 / resolution;
+    lit.x = SampleShadowPCF4(uv, depth, level, texelUv, false);
+    // The actor layer is shorter than the world layer here too, and lives at the same stride.
+    if (wantActors && level < (float)@{o_shadow_actor_cascades}) {
+        lit.y = SampleShadowPCF4(uv, depth, level + layerStride, ShadowActorTexelUvAt(0), true);
+    }
+    return lit;
 }
 
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
@@ -1195,8 +1258,15 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
-                                              input.worldPos.w > 0.5, screenSpace.xy, shadowN);
+        // SOH [Enhancement] Two layouts, one call site. The clipmap reports its level count as zero when it
+        // is not the active one, so this is a uniform branch and a draw pays for only the path it takes.
+        float2 shadowLayers;
+        if (shadow_clip_p.y > 0.5) {
+            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_params.x, input.worldPos.w > 0.5);
+        } else {
+            shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                                           input.worldPos.w > 0.5, screenSpace.xy, shadowN);
+        }
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.

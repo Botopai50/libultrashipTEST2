@@ -355,6 +355,29 @@ class GfxRenderingAPI {
         mShadowMaxViewDepth = maxViewDepth;
     }
 
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). Everything the receiver needs to place a
+    // pixel in the clipmap WITHOUT a per-level matrix: the light's three axes, the camera's coordinate
+    // along each of them, and the ladder's shape.
+    //
+    // Sent as axes rather than as matrices because the levels differ only by a power of two and a snapped
+    // centre, both of which the shader can compute. That is what keeps this legal at ps_4_0, where a
+    // dynamically indexed constant-buffer array is not.
+    //
+    // levels == 0 means "not this frame", and the receiver takes the cascade path.
+    virtual void SetShadowMapClipmap(const float lightX[3], const float lightY[3], const float lightZ[3],
+                                     const float cameraInLight[3], float baseHalfExtent, int levels,
+                                     int resolution) {
+        for (int i = 0; i < 3; i++) {
+            mShadowClipmapX[i] = lightX != nullptr ? lightX[i] : 0.0f;
+            mShadowClipmapY[i] = lightY != nullptr ? lightY[i] : 0.0f;
+            mShadowClipmapZ[i] = lightZ != nullptr ? lightZ[i] : 0.0f;
+            mShadowClipmapCamera[i] = cameraInLight != nullptr ? cameraInLight[i] : 0.0f;
+        }
+        mShadowClipmapBase = baseHalfExtent;
+        mShadowClipmapLevels = levels;
+        mShadowClipmapResolution = resolution;
+    }
+
     // SOH [Enhancement] Edge-quality policy for the shadow map (see fast/shadow_map.h). One struct rather
     // than a setter per knob, because these travel together and adding one should not mean touching every
     // layer's signature.
@@ -439,6 +462,14 @@ class GfxRenderingAPI {
     float mShadowTexelWorld[SHADOW_MAP_MAX_CASCADES] = {};
     // The filterable mode the backend could actually honour; see ShadowMapEffectiveFilterMode.
     int mShadowEffectiveFilterMode = SHADOW_MAP_FILTER_DEPTH;
+    // SOH [Enhancement] Clipmap frame; see SetShadowMapClipmap. Zero levels is the cascade path.
+    float mShadowClipmapX[3] = {};
+    float mShadowClipmapY[3] = {};
+    float mShadowClipmapZ[3] = {};
+    float mShadowClipmapCamera[3] = {};
+    float mShadowClipmapBase = 0.0f;
+    int mShadowClipmapLevels = 0;
+    int mShadowClipmapResolution = 0;
     int mShadowCascadesActive = 0;
     float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;

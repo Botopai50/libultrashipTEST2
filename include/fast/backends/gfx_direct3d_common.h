@@ -82,6 +82,17 @@ struct PerShadowCB {
     float shadow_acne1[4];
     // SOH [Enhancement] Edge hardening (see shadow_map.h). x on, y hardness, z threshold, w unused.
     float shadow_harden[4];
+    // SOH [Enhancement] Clipmap layout (see shadow_map.h). The light's axes with the camera's coordinate
+    // along each in w, then the ladder: base half-extent, level count, resolution. No per-level matrix --
+    // levels differ by a power of two and a snapped centre, both computed in the shader.
+    //   clip_x: light X axis, w = camera along it
+    //   clip_y: light Y axis, w = camera along it
+    //   clip_z: light Z axis, w = camera along it
+    //   clip_p: x base half-extent, y level count (0 = cascade path), z resolution, w unused
+    float shadow_clip_x[4];
+    float shadow_clip_y[4];
+    float shadow_clip_z[4];
+    float shadow_clip_p[4];
 };
 
 struct PerDrawCB {

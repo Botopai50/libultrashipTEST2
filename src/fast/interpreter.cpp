@@ -4307,11 +4307,93 @@ void Interpreter::RenderShadowMap() {
     // drawn -- so a half-rate cascade would sometimes go a whole cycle without a rebuild.
     mShadowMapFrameCounter++;
 
-    float matrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
-    float splits[SHADOW_MAP_MAX_CASCADES] = {};
+    // Sized for the larger layout: the clipmap asks for more levels than the ladder has cascades.
+    float matrices[SHADOW_MAP_MAX_LEVELS * 16] = {};
+    float splits[SHADOW_MAP_MAX_LEVELS] = {};
     float nearDist = 0.0f;
     float shadowReach = 0.0f; // furthest view depth any cascade's footprint reaches; grown per cascade below
 
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). Its own block rather than a branch inside the
+    // cascade fit, because it shares almost nothing with it: there is no frustum slice to bound, no sphere
+    // to fit, and no drift margin to spend. Keeping the two apart also means the ladder that works today is
+    // not touched at all by a layout that is still unproven.
+    //
+    // A level is a square of fixed extent centred on the CAMERA, snapped to its own texel grid. Level c has
+    // half-extent base * 2^c, so the texel doubles per level and the density is uniform -- which is the
+    // whole reason for the layout.
+    //
+    // There is no parking code here and none is needed. Snapping the centre to the level's own texel means a
+    // camera that has not moved a texel produces a bit-identical matrix, and the reuse test in
+    // ShadowMapBeginCascade already skips a slice whose matrix and caster list are unchanged. The outer
+    // levels have texels many units wide, so they hold still through most ordinary movement for free.
+    if (mShadowMapQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP) {
+        // The camera, as the clipmap's centre. nearC is the near plane's middle, which is the closest thing
+        // to an eye position this function has and is within a near plane of it.
+        const float camera[3] = { nearC[0], nearC[1], nearC[2] };
+        const float resolution = (float)(mShadowMapResolution > 0 ? mShadowMapResolution : 1);
+
+        for (int c = 0; c < mShadowMapCascadeCount; c++) {
+            const float radius = mShadowMapQuality.clipmapBase * (float)(1 << c);
+            // Reported as this level's reach so everything downstream that reads splits -- the caster
+            // capture's range, the menu's report -- keeps meaning what it meant.
+            splits[c] = radius;
+
+            // Snap along the LIGHT's own axes, not the world's. The grid the texels live on is the light's,
+            // so that is the grid the centre has to land on, or the snapping does not stop the shimmer.
+            const float texel = (radius * 2.0f) / resolution;
+            const float projX = (camera[0] * lx[0]) + (camera[1] * lx[1]) + (camera[2] * lx[2]);
+            const float projY = (camera[0] * ly[0]) + (camera[1] * ly[1]) + (camera[2] * ly[2]);
+            const float projZ = (camera[0] * lz[0]) + (camera[1] * lz[1]) + (camera[2] * lz[2]);
+            const float snapX = std::floor(projX / texel) * texel;
+            const float snapY = std::floor(projY / texel) * texel;
+            const float center[3] = { (lx[0] * snapX) + (ly[0] * snapY) + (lz[0] * projZ),
+                                      (lx[1] * snapX) + (ly[1] * snapY) + (lz[1] * projZ),
+                                      (lx[2] * snapX) + (ly[2] * snapY) + (lz[2] * projZ) };
+
+            // Same depth arrangement the cascades use: the eye pulled back proportionally so casters above
+            // the level still fall inside the range, and the range scaled with the level so precision is
+            // comparable across them.
+            const float back = radius * 3.0f;
+            const float eye[3] = { center[0] - lz[0] * back, center[1] - lz[1] * back,
+                                   center[2] - lz[2] * back };
+            const float zNear = 0.0f;
+            const float zFar = back + radius * 2.0f;
+
+            {
+                const float boxCentre[3] = { center[0] - lz[0] * radius * 0.5f, center[1] - lz[1] * radius * 0.5f,
+                                             center[2] - lz[2] * radius * 0.5f };
+                const float along = ((boxCentre[0] - nearC[0]) * viewDir[0]) +
+                                    ((boxCentre[1] - nearC[1]) * viewDir[1]) +
+                                    ((boxCentre[2] - nearC[2]) * viewDir[2]);
+                const float spread =
+                    radius * std::fabs((lx[0] * viewDir[0]) + (lx[1] * viewDir[1]) + (lx[2] * viewDir[2])) +
+                    radius * std::fabs((ly[0] * viewDir[0]) + (ly[1] * viewDir[1]) + (ly[2] * viewDir[2])) +
+                    radius * 2.5f * std::fabs((lz[0] * viewDir[0]) + (lz[1] * viewDir[1]) + (lz[2] * viewDir[2]));
+                shadowReach = std::max(shadowReach, along + spread);
+            }
+
+            float* m = &matrices[c * 16];
+            const float sx = 1.0f / radius;
+            const float sy = 1.0f / radius;
+            const float sz = 1.0f / (zFar - zNear);
+            m[0] = lx[0] * sx;
+            m[1] = ly[0] * sy;
+            m[2] = lz[0] * sz;
+            m[3] = 0.0f;
+            m[4] = lx[1] * sx;
+            m[5] = ly[1] * sy;
+            m[6] = lz[1] * sz;
+            m[7] = 0.0f;
+            m[8] = lx[2] * sx;
+            m[9] = ly[2] * sy;
+            m[10] = lz[2] * sz;
+            m[11] = 0.0f;
+            m[12] = -(eye[0] * lx[0] + eye[1] * lx[1] + eye[2] * lx[2]) * sx;
+            m[13] = -(eye[0] * ly[0] + eye[1] * ly[1] + eye[2] * ly[2]) * sy;
+            m[14] = (-(eye[0] * lz[0] + eye[1] * lz[1] + eye[2] * lz[2]) - zNear) * sz;
+            m[15] = 1.0f;
+        }
+    } else
     for (int c = 0; c < mShadowMapCascadeCount; c++) {
         const float farDist = mShadowMapSplits[c] > nearDist ? mShadowMapSplits[c] : nearDist + 1.0f;
         splits[c] = farDist;
@@ -4802,6 +4884,21 @@ void Interpreter::RenderShadowMap() {
     // Nudged out by a thousandth. The bound above is TIGHT -- one corner of the box sits exactly on it --
     // and a comparison made in single precision against a number that large can round the wrong way. A
     // thousandth of the reach is far below anything a shadow occupies and removes the question.
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h): hand the receiver the light's axes and the
+    // camera's coordinate along each, which with the ladder's shape is everything it needs to place a pixel
+    // without a per-level matrix. Zero levels tells it to take the cascade path instead.
+    if (mShadowMapQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP) {
+        const float cameraInLight[3] = {
+            (nearC[0] * lx[0]) + (nearC[1] * lx[1]) + (nearC[2] * lx[2]),
+            (nearC[0] * ly[0]) + (nearC[1] * ly[1]) + (nearC[2] * ly[2]),
+            (nearC[0] * lz[0]) + (nearC[1] * lz[1]) + (nearC[2] * lz[2]),
+        };
+        mRapi->SetShadowMapClipmap(lx, ly, lz, cameraInLight, mShadowMapQuality.clipmapBase,
+                                   mShadowMapCascadeCount, mShadowMapResolution);
+    } else {
+        mRapi->SetShadowMapClipmap(nullptr, nullptr, nullptr, nullptr, 0.0f, 0, 0);
+    }
+
     mRapi->SetShadowMapReach(shadowReach * 1.001f);
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
                               mShadowMapStrength, mShadowMapDebug);

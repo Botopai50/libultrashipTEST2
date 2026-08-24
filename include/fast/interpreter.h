@@ -523,15 +523,21 @@ class Interpreter {
         // moment after the switch, which is a wait the player can watch rather than one that stops the
         // picture. Nothing downstream needs to know: this is the same state as the mode being off.
         mShadowMapEnabled = enabled && (mRapi == nullptr || !mRapi->ShaderPrewarmInProgress());
-        const int clampedCascades = cascadeCount < 1                         ? 1
-                                    : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
-                                                                             : cascadeCount;
+        // The clipmap counts LEVELS here, not cascades, and it may have more of them. Its count comes from
+        // its own setting rather than the cascade slider, so the two layouts keep separate numbers and
+        // switching between them does not carry one's choice into the other.
+        const bool clipmapLayout = mShadowMapQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP;
+        const int requestedLevels = clipmapLayout ? mShadowMapQuality.clipmapLevels : cascadeCount;
+        const int levelBound = clipmapLayout ? SHADOW_MAP_MAX_CLIPMAP_LEVELS : SHADOW_MAP_MAX_CASCADES;
+        const int clampedCascades = requestedLevels < 1            ? 1
+                                    : requestedLevels > levelBound ? levelBound
+                                                                   : requestedLevels;
         // Drop every held matrix when the cascade layout changes: cascade N is now fitted to a different
         // span than the matrix saved under it, so freezing to that matrix would project the wrong band.
         // Clearing makes the next frame refit and redraw regardless of whose turn it was -- one frame of
         // full cost, paid on a transition. (The disable path unparks below, for the same reason.)
         if (clampedCascades != mShadowMapCascadeCount) {
-            for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+            for (int i = 0; i < SHADOW_MAP_MAX_LEVELS; i++) {
                 mShadowMapHeldValid[i] = false;
             }
         }
@@ -576,7 +582,7 @@ class Interpreter {
             mShadowWorldCacheGeneration++; // the cache changed, so the slices built from it are stale
             // Unpark the cascades. Holding one across a disable would park it wherever the camera stood at
             // the moment the mode went off, and the next enable could be a different scene entirely.
-            for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
+            for (int c = 0; c < SHADOW_MAP_MAX_LEVELS; c++) {
                 mShadowMapCascadeCenterValid[c] = false;
                 // The update-rate freeze parks the same cascade a second way, by matrix, and it has to be
                 // let go here too -- a held matrix outliving a disable would freeze the next enable to
@@ -615,7 +621,7 @@ class Interpreter {
 
         if (mShadowMapQuality.ladderMode != previousLadder || mShadowMapQuality.ladderLambda != previousLambda ||
             mShadowMapQuality.ladderNear != previousNear) {
-            for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
+            for (int c = 0; c < SHADOW_MAP_MAX_LEVELS; c++) {
                 mShadowMapHeldValid[c] = false;
                 // The park centre is fitted to the old band too, so it is as stale as the matrix is.
                 mShadowMapCascadeCenterValid[c] = false;
@@ -1114,11 +1120,17 @@ class Interpreter {
     // from where the light used to be, which is worse than a stale shadow: it is a wrong one. So a skipped
     // cascade is frozen whole -- the previous frame's matrix is written back over the fitted one, and the
     // reuse machinery then sees an unchanged matrix and skips the draw on its own.
-    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0,
-                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
-                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2 };
-    float mShadowMapHeldMatrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
-    bool mShadowMapHeldValid[SHADOW_MAP_MAX_CASCADES] = {};
+    // Per level, not per cascade: the clipmap has more of them. Entries past the cascade ladder's three
+    // default to 1 rather than 0 -- the rate is used as a modulus, so a zero here would divide by zero on
+    // the first clipmap frame.
+    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_LEVELS] = { SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0,
+                                                            SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
+                                                            SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2,
+                                                            1,
+                                                            1,
+                                                            1 };
+    float mShadowMapHeldMatrices[SHADOW_MAP_MAX_LEVELS * 16] = {};
+    bool mShadowMapHeldValid[SHADOW_MAP_MAX_LEVELS] = {};
     uint32_t mShadowMapFrameCounter = 0;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
@@ -1159,12 +1171,12 @@ class Interpreter {
     // the radius -- so letting it follow the wobble resizes the grid and the texel snapping stops working,
     // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
     // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
-    float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
+    float mShadowMapCascadeRadius[SHADOW_MAP_MAX_LEVELS] = {};
     // Where each cascade is currently parked, and whether anything is parked there yet. Held across frames
     // for as long as the cascade still contains the sphere the frame fits, which is what allows a slice to
     // be reused while the camera moves -- see the containment test in RenderShadowMap.
-    float mShadowMapCascadeCenter[SHADOW_MAP_MAX_CASCADES][3] = {};
-    bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_CASCADES] = {};
+    float mShadowMapCascadeCenter[SHADOW_MAP_MAX_LEVELS][3] = {};
+    bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_LEVELS] = {};
     // Light direction the cascades are currently built around, held across frames for the same reason the
     // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
     // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.

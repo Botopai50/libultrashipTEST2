@@ -3792,6 +3792,22 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_harden[2] = q.edgeThreshold;
         mPerShadowCbData.shadow_harden[3] = 0.0f;
 
+        // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h).
+        for (int i = 0; i < 3; i++) {
+            mPerShadowCbData.shadow_clip_x[i] = mShadowClipmapX[i];
+            mPerShadowCbData.shadow_clip_y[i] = mShadowClipmapY[i];
+            mPerShadowCbData.shadow_clip_z[i] = mShadowClipmapZ[i];
+        }
+        // The camera's coordinate along each axis rides in that axis's w, which is where the shader wants
+        // it: every use of an axis is immediately followed by subtracting the camera along it.
+        mPerShadowCbData.shadow_clip_x[3] = mShadowClipmapCamera[0];
+        mPerShadowCbData.shadow_clip_y[3] = mShadowClipmapCamera[1];
+        mPerShadowCbData.shadow_clip_z[3] = mShadowClipmapCamera[2];
+        mPerShadowCbData.shadow_clip_p[0] = mShadowClipmapBase;
+        mPerShadowCbData.shadow_clip_p[1] = (float)mShadowClipmapLevels;
+        mPerShadowCbData.shadow_clip_p[2] = (float)mShadowClipmapResolution;
+        mPerShadowCbData.shadow_clip_p[3] = 0.0f;
+
         mShadowQualityFrame++;
     }
 
