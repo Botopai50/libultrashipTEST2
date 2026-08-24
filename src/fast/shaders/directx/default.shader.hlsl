@@ -1170,9 +1170,14 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float2 shadowLayers = float2(1.0, 1.0);
         float shadowLit = 1.0;
         bool haveShadow = false;
+        // Read whenever a mask exists, not only when it is going to be used: views 8 and 9 print it, and
+        // they have to be able to print it on the very frames where the receiver rejected it -- that
+        // rejection is the thing being diagnosed.
+        float2 maskSample = float2(1.0, -1.0);
+        if (shadow_mask.x > 0.5) {
+            maskSample = g_shadowMask.SampleLevel(g_shadowMaskSampler, screenSpace.xy * shadow_mask.yz, 0).xy;
+        }
         if (shadow_mask.x > 0.5 && input.worldPos.w > 0.5 && shadow_range.y < 0.5) {
-            float2 maskSample =
-                g_shadowMask.SampleLevel(g_shadowMaskSampler, screenSpace.xy * shadow_mask.yz, 0).xy;
             // Same tolerance the mask's own blur used, so a pixel the blur was willing to mix is a pixel
             // the receiver is willing to read. Negative G is the resolve's "nothing was drawn here" marker
             // and fails this by construction.
@@ -1264,6 +1269,39 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             uint shadowDebugCascade = ShadowCascadeIndex(input.position.w);
             texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
                                shadowDebugCascade == 2 ? 1.0 : 0.0);
+        } else if (shadowDebugMode == 8) {
+            // What the SCREEN-SPACE MASK holds here, and whether this pixel took it.
+            //
+            // Greyscale is the mask's own shadow term, so a mask that is wrong is wrong in this picture and
+            // nothing else has been multiplied into it. MAGENTA is the case that matters most: a pixel the
+            // mask covers but the receiver REJECTED, because the depth it stored disagrees with this
+            // surface's. Large magenta areas mean the prepass and the frame do not line up -- which is a
+            // different fault from a mask whose shadows are simply in the wrong place, and the two are
+            // indistinguishable in the shaded picture. BLUE is no mask at all this frame.
+            if (shadow_mask.x < 0.5) {
+                texel.rgb = float3(0.0, 0.0, 1.0);
+            } else if (maskSample.y < 0.0) {
+                texel.rgb = float3(0.15, 0.15, 0.15); // the resolve found no depth here
+            } else if (!haveShadow) {
+                texel.rgb = float3(1.0, 0.0, 1.0);
+            } else {
+                texel.rgb = float3(maskSample.x, maskSample.x, maskSample.x);
+            }
+        } else if (shadowDebugMode == 9) {
+            // How far the mask's stored depth is from this surface's, as a fraction of the tolerance the
+            // receiver allows. GREEN is agreement, RED is at or past the limit.
+            //
+            // This is the one that separates "the mask is misaligned" from "the mask is fine and its
+            // shadows are wrong". A frame that is red across a whole surface has a prepass that rasterised
+            // that surface somewhere else -- a viewport, a matrix, or a missing draw -- and no amount of
+            // bias tuning will touch it.
+            if (shadow_mask.x < 0.5 || maskSample.y < 0.0) {
+                texel.rgb = float3(0.0, 0.0, 1.0);
+            } else {
+                float tolerance = shadow_mask.w * max(input.position.w, 1.0) * 0.01;
+                float off = saturate(abs(maskSample.y - input.position.w) / max(tolerance, 1e-4));
+                texel.rgb = float3(off, 1.0 - off, 0.0);
+            }
         } else {
             texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }

@@ -3736,14 +3736,27 @@ bool GfxRenderingAPIDX11::ShadowMaskBegin(const float cameraViewProj[16], const 
     mContext->OMSetRenderTargets(0, nullptr, mShadowMaskDsv.Get());
     mContext->ClearDepthStencilView(mShadowMaskDsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
-    D3D11_VIEWPORT viewport;
-    viewport.TopLeftX = 0.0f;
-    viewport.TopLeftY = 0.0f;
-    viewport.Width = (float)width;
-    viewport.Height = (float)height;
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    mContext->RSSetViewports(1, &viewport);
+    // The FRAME's viewport, not the whole surface. The two are not always the same -- the game can draw
+    // into a sub-rect of its render target -- and if the prepass rasterises through a different viewport
+    // than the main pass, its depth lands at different pixels than the geometry the receiver is shading.
+    // The mask is then spatially misaligned with the frame it describes, which is not subtle: every pixel
+    // reads a shadow computed for somewhere else.
+    //
+    // The resolve and the blur below run through this same viewport, so the covering triangle spans exactly
+    // the rect that was drawn and its uv maps to that rect's own NDC. Kept in a member because all three
+    // passes need it.
+    if (mShadowMaskSavedViewportCount > 0 && mShadowMaskSavedViewport.Width > 0.0f &&
+        mShadowMaskSavedViewport.Height > 0.0f) {
+        mShadowMaskViewport = mShadowMaskSavedViewport;
+    } else {
+        mShadowMaskViewport.TopLeftX = 0.0f;
+        mShadowMaskViewport.TopLeftY = 0.0f;
+        mShadowMaskViewport.Width = (float)width;
+        mShadowMaskViewport.Height = (float)height;
+    }
+    mShadowMaskViewport.MinDepth = 0.0f;
+    mShadowMaskViewport.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &mShadowMaskViewport);
 
     mContext->IASetInputLayout(mShadowMaskPrepassLayout.Get());
     mContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3831,6 +3844,8 @@ void GfxRenderingAPIDX11::ShadowMaskEnd() {
     // The depth buffer is finished, so it may be read. Resolve it into the mask.
     mContext->OMSetRenderTargets(0, nullptr, nullptr);
     mContext->IASetInputLayout(nullptr);
+    // Same viewport the prepass used, so the covering triangle spans exactly the rect that holds depth.
+    mContext->RSSetViewports(1, &mShadowMaskViewport);
     mContext->VSSetShader(mShadowMaskFullscreenVs.Get(), nullptr, 0); // the covering triangle
     mContext->OMSetDepthStencilState(nullptr, 0);
     mContext->PSSetConstantBuffers(0, 1, mShadowMaskCb.GetAddressOf());
@@ -4418,6 +4433,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         if (sx > 1e-9f && mShadowResolution > 0) {
             const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
             mPerShadowCbData.shadow_texel_world[c] = texelWorld;
+            // Kept where the application can read it too (see ShadowMapCascadeReport): once the automatic
+            // ladder is choosing the splits, this is the only place the real texel size exists.
+            mShadowTexelWorld[c] = texelWorld;
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
             mPerShadowCbData.shadow_actor_texel_uv[c] =
                 1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);

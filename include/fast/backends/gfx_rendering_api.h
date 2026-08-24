@@ -391,6 +391,26 @@ class GfxRenderingAPI {
         ShadowMapQualityClamp(&mShadowQuality);
     }
 
+    // SOH [Enhancement] What the cascades actually came out as this frame: the far distance of each band
+    // and the world size of one of its texels. Both are computed deep in the fit -- the texel from the
+    // projection matrix itself -- and neither is knowable from the settings alone once the automatic
+    // ladder is choosing the splits.
+    //
+    // Readable so the application can SHOW them. A ladder the player cannot inspect is a ladder they have
+    // to guess at, and the numbers here are the only honest answer to "what did automatic decide".
+    int ShadowMapCascadeReport(float* splitsOut, float* texelWorldOut, int maxCascades) const {
+        const int n = mShadowCascadesActive < maxCascades ? mShadowCascadesActive : maxCascades;
+        for (int i = 0; i < n; i++) {
+            if (splitsOut != nullptr) {
+                splitsOut[i] = mShadowSplits[i];
+            }
+            if (texelWorldOut != nullptr) {
+                texelWorldOut[i] = mShadowTexelWorld[i];
+            }
+        }
+        return n;
+    }
+
     // Readable so the interpreter can act on the parts of this policy that are decided OUTSIDE the shader
     // -- the split ladder is fitted on the CPU, and the filterable-map mode changes what the depth pass
     // has to store.
@@ -426,6 +446,9 @@ class GfxRenderingAPI {
     // state every backend that does not implement the depth pass stays in forever.
     float mShadowViewProj[SHADOW_MAP_MAX_CASCADES * 16] = {};
     float mShadowSplits[SHADOW_MAP_MAX_CASCADES] = {};
+    // World size of one texel in each cascade, recovered from its own projection. Filled by the
+    // backend beside the shader constants; see ShadowMapCascadeReport.
+    float mShadowTexelWorld[SHADOW_MAP_MAX_CASCADES] = {};
     int mShadowCascadesActive = 0;
     float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;

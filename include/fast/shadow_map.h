@@ -408,10 +408,18 @@
 //   4  where that normal came from, vertex or recovered face        (input)
 //   5  the filter's raw coverage, before the hardening remap        (input)
 //   7  the cascade each pixel sampled                               (input)
-// 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
-// unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
+//   8  what the screen-space mask holds, and whether the pixel took it (input)
+//   9  how far the mask's stored depth is from this surface's          (input)
+// 6 was retired with the machinery it measured; the numbering of the rest is deliberately unchanged, so 5
+// still means what it meant. 8 and 9 were retired once and are reused here for the mask, which did not
+// exist when they were.
+//
+// 8 and 9 are the pair for the mask, and they separate the two faults that look identical once shaded: a
+// mask whose shadows are wrong, and a mask that is not aligned with the frame it describes. Read 9 first --
+// red across a whole surface means the prepass drew that surface somewhere else, and nothing in the bias
+// controls will touch it. The shader's PSMain carries the reading order -- which view to
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
-#define SHADOW_MAP_MAX_DEBUG_VIEW 7
+#define SHADOW_MAP_MAX_DEBUG_VIEW 9
 
 
 // ===================================================================================================

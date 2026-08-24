@@ -461,6 +461,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool mShadowMaskValid = false;
     // Saved across the prepass and the resolve, since both replace them.
     D3D11_VIEWPORT mShadowMaskSavedViewport = {};
+    // The viewport all three mask passes rasterise through -- the frame's own, not the whole
+    // surface. See ShadowMaskBegin for why that distinction is not cosmetic.
+    D3D11_VIEWPORT mShadowMaskViewport = {};
     UINT mShadowMaskSavedViewportCount = 0;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskSavedRtv;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMaskSavedDsv;
