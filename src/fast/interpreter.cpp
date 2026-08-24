@@ -4806,32 +4806,6 @@ void Interpreter::RenderShadowMap() {
     mRapi->SetShadowMapParams(matrices, splits, mShadowMapCascadeCount, mShadowMapBlendFraction,
                               mShadowMapStrength, mShadowMapDebug);
 
-    // SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h).
-    //
-    // Here, and only here. It has to run AFTER SetShadowMapParams, because the resolve reads the cascade
-    // constants that call writes; and it has to run BEFORE the room draws, because the room is what reads
-    // the mask -- which is exactly where this hook sits in the frame (see gSPShadowMapFlush in z_actor.c).
-    //
-    // The prepass draws the same world caster lists the cascades were just built from, with the camera's
-    // matrix instead of the light's. Same pointers, so the vertex buffers already hold them and each call
-    // is a rebind and a draw rather than an upload -- which is what makes a depth prepass affordable here
-    // at all.
-    if (mShadowMapQuality.screenSpace != 0) {
-        float invCameraVp[4][4];
-        if (ShadowInvertMatrix(mRsp->P_matrix, invCameraVp)) {
-            if (mRapi->ShadowMaskBegin(&mRsp->P_matrix[0][0], &invCameraVp[0][0])) {
-                if (!mShadowMapWorldCache.empty()) {
-                    mRapi->ShadowMaskDrawCasters(mShadowMapWorldCache.data(), mShadowMapWorldCache.size() / 3,
-                                                 SHADOW_MAP_CASTER_SLOT_MAIN);
-                }
-                if (!mShadowSceneryReady.empty()) {
-                    mRapi->ShadowMaskDrawCasters(mShadowSceneryReady.data(), mShadowSceneryReady.size() / 3,
-                                                 SHADOW_MAP_CASTER_SLOT_SCENERY);
-                }
-                mRapi->ShadowMaskEnd();
-            }
-        }
-    }
 }
 
 void Interpreter::RenderShadowVolumes() {

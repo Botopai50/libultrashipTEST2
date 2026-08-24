@@ -133,16 +133,6 @@ SamplerState g_shadowActorSampler : register(s7);
 Texture2DArray<float4> g_shadowMoments : register(t8);
 SamplerState g_shadowMomentSampler : register(s8);
 
-// SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h). R holds the shadow
-// term resolved for the whole frame, G the view depth it was resolved at.
-//
-// G is what makes the mask safe to use. It is resolved from a prepass of the world CASTER geometry, which
-// is not quite everything that receives -- and nothing at all of the alpha-blended surfaces, the water or
-// the particles, which are not in it by construction. A receiver compares its own depth against G and uses
-// the mask only where they agree; everywhere else it samples the cascades exactly as it did before.
-Texture2D<float4> g_shadowMask : register(t9);
-SamplerState g_shadowMaskSampler : register(s9);
-
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
 // subtly wrong. Layout matches the PerShadowCB C++ struct exactly.
@@ -194,10 +184,6 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_edge;
     float4 shadow_jitter;
     float4 shadow_filter;
-    // SOH [Enhancement] Screen-space mask (technique 5). x = a mask was built this frame, yz = one screen
-    // pixel in UV, w = how far the mask's stored depth may differ from this receiver's before the mask is
-    // judged to describe a different surface.
-    float4 shadow_mask;
     // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). The magnitudes arrive already zeroed when
     // their switch is off, so the shader multiplies rather than branches.
     //   acne0: x = corrections enabled, y = normal offset in texels, z = light offset in world units,
@@ -822,6 +808,17 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                 // Asked of the cascade index rather than of the projection, so the skip lands before the struct
                 // copy below rather than after it.
                 if (isActor && (isPartner ? min(cascade + 1, count - 1) : cascade) >= @{o_shadow_actor_cascades}) {
+                    // Past the actor layer's last cascade there is no slice to read, and the answer is the
+                    // one an empty slice gives: lit.
+                    //
+                    // FADED to it rather than skipped, which is the whole of this change. Skipping left
+                    // lit.y holding the primary cascade's answer right up to the split and then dropping it
+                    // in one step -- so a character's shadow on the ground did not soften across the
+                    // boundary, it stopped dead at a line. Blending towards "lit" over the same band the
+                    // world layer uses makes the layer run out the way every other transition here does.
+                    if (isPartner && blend) {
+                        lit.y = lerp(lit.y, 1.0, t);
+                    }
                     continue;
                 }
                 if (isPartner && !blend) {
@@ -1156,42 +1153,9 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        // SOH [Enhancement] The screen-space mask, where it applies (technique 5). One fetch instead of
-        // the whole cascade lookup, and a penumbra measured in screen pixels rather than in texels.
-        //
-        // Scenery only. The mask folds both caster layers together, and a character must never be
-        // shadowed by the actor layer -- itself included -- so reading it would paint a character with its
-        // own shadow. Characters keep the layered path, which already skips that layer for them.
-        //
-        // Declared out here because the diagnostic views read the two layers apart (view 2 colours which
-        // one occludes), and the mask folds them into a single number. So a view being on also DISABLES
-        // the mask below: an instrument that shows something other than what the frame computed is worse
-        // than no instrument. shadow_range.y carries the view number; 0 is "shade normally".
-        float2 shadowLayers = float2(1.0, 1.0);
-        float shadowLit = 1.0;
-        bool haveShadow = false;
-        // Read whenever a mask exists, not only when it is going to be used: views 8 and 9 print it, and
-        // they have to be able to print it on the very frames where the receiver rejected it -- that
-        // rejection is the thing being diagnosed.
-        float2 maskSample = float2(1.0, -1.0);
-        if (shadow_mask.x > 0.5) {
-            maskSample = g_shadowMask.SampleLevel(g_shadowMaskSampler, screenSpace.xy * shadow_mask.yz, 0).xy;
-        }
-        if (shadow_mask.x > 0.5 && input.worldPos.w > 0.5 && shadow_range.y < 0.5) {
-            // Same tolerance the mask's own blur used, so a pixel the blur was willing to mix is a pixel
-            // the receiver is willing to read. Negative G is the resolve's "nothing was drawn here" marker
-            // and fails this by construction.
-            float tolerance = shadow_mask.w * max(input.position.w, 1.0) * 0.01;
-            if (maskSample.y >= 0.0 && abs(maskSample.y - input.position.w) <= tolerance) {
-                shadowLit = maskSample.x;
-                haveShadow = true;
-            }
-        }
-        if (!haveShadow) {
-            shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
-                                           input.worldPos.w > 0.5, screenSpace.xy, shadowN);
-            shadowLit = min(shadowLayers.x, shadowLayers.y);
-        }
+        float2 shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                                              input.worldPos.w > 0.5, screenSpace.xy, shadowN);
+        float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
         //
@@ -1264,44 +1228,33 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // view and the shaded picture carry the same number -- see the reading order above.
             texel.rgb = float3(shadowCoverage, shadowCoverage, shadowCoverage);
         } else if (shadowDebugMode == 7) {
-            // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands
-            // read as the primary cascade's colour, since that is the one the picture is keyed to.
+            // Which cascade this pixel sampled: red, green, blue from nearest to furthest -- and, across a
+            // cross-fade band, the two colours MIXED by the same factor the shadow term is mixed by.
+            //
+            // It used to paint the band in the primary cascade's flat colour, which made a seam impossible
+            // to diagnose from here: a band that is fading and a band that is not look identical, so a hard
+            // cascade edge on screen could be the blend failing or something else entirely. Now the
+            // gradient IS the blend. A sharp colour boundary means no fade is happening; a smooth ramp
+            // means the fade runs and a seam has some other cause.
             uint shadowDebugCascade = ShadowCascadeIndex(input.position.w);
-            texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
-                               shadowDebugCascade == 2 ? 1.0 : 0.0);
-        } else if (shadowDebugMode == 8) {
-            // What the SCREEN-SPACE MASK holds here, and whether this pixel took it.
-            //
-            // Greyscale is the mask's own shadow term, so a mask that is wrong is wrong in this picture and
-            // nothing else has been multiplied into it. MAGENTA is the case that matters most: a pixel the
-            // mask covers but the receiver REJECTED, because the depth it stored disagrees with this
-            // surface's. Large magenta areas mean the prepass and the frame do not line up -- which is a
-            // different fault from a mask whose shadows are simply in the wrong place, and the two are
-            // indistinguishable in the shaded picture. BLUE is no mask at all this frame.
-            if (shadow_mask.x < 0.5) {
-                texel.rgb = float3(0.0, 0.0, 1.0);
-            } else if (maskSample.y < 0.0) {
-                texel.rgb = float3(0.15, 0.15, 0.15); // the resolve found no depth here
-            } else if (!haveShadow) {
-                texel.rgb = float3(1.0, 0.0, 1.0);
-            } else {
-                texel.rgb = float3(maskSample.x, maskSample.x, maskSample.x);
+            float3 shadowDebugColour = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
+                                              shadowDebugCascade == 2 ? 1.0 : 0.0);
+            uint shadowDebugCount = (uint)shadow_params.x;
+            if (shadowDebugCascade + 1 < shadowDebugCount) {
+                float shadowDebugFar = ShadowSplitAt(shadowDebugCascade);
+                float shadowDebugNear = (shadowDebugCascade == 0) ? 0.0 : ShadowSplitAt(shadowDebugCascade - 1);
+                float shadowDebugStart =
+                    shadowDebugFar - ((shadowDebugFar - shadowDebugNear) * shadow_params.y);
+                if (input.position.w > shadowDebugStart) {
+                    uint shadowDebugNext = min(shadowDebugCascade + 1, shadowDebugCount - 1);
+                    float3 shadowDebugNextColour =
+                        float3(shadowDebugNext == 0 ? 1.0 : 0.0, shadowDebugNext == 1 ? 1.0 : 0.0,
+                               shadowDebugNext == 2 ? 1.0 : 0.0);
+                    shadowDebugColour = lerp(shadowDebugColour, shadowDebugNextColour,
+                                             smoothstep(shadowDebugStart, shadowDebugFar, input.position.w));
+                }
             }
-        } else if (shadowDebugMode == 9) {
-            // How far the mask's stored depth is from this surface's, as a fraction of the tolerance the
-            // receiver allows. GREEN is agreement, RED is at or past the limit.
-            //
-            // This is the one that separates "the mask is misaligned" from "the mask is fine and its
-            // shadows are wrong". A frame that is red across a whole surface has a prepass that rasterised
-            // that surface somewhere else -- a viewport, a matrix, or a missing draw -- and no amount of
-            // bias tuning will touch it.
-            if (shadow_mask.x < 0.5 || maskSample.y < 0.0) {
-                texel.rgb = float3(0.0, 0.0, 1.0);
-            } else {
-                float tolerance = shadow_mask.w * max(input.position.w, 1.0) * 0.01;
-                float off = saturate(abs(maskSample.y - input.position.w) / max(tolerance, 1e-4));
-                texel.rgb = float3(off, 1.0 - off, 0.0);
-            }
+            texel.rgb = shadowDebugColour;
         } else {
             texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
         }

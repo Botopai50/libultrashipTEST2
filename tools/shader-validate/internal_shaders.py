@@ -3,7 +3,7 @@
 
 default.shader.hlsl is not the only shader compiled at run time. The shadow system carries four more, as
 C++ raw strings in gfx_direct3d11.cpp: the depth pass, the alpha-cutout caster pass, the moment
-resolve/blur, and the screen-space mask. Nothing ever compiled them -- not the build, not CI, not
+resolve/blur. Nothing ever compiled them -- not the build, not CI, not
 validate.sh, which only ever looked at the template. A mistake in one of them reaches a player as the same
 CreateAndLoadNewShader crash, and that is exactly how one did.
 
@@ -25,12 +25,6 @@ SHADERS = {
     "kShadowDepthShaderSource": [("VSMain", "vs_4_0")],
     "kShadowAlphaDepthShaderSource": [("VSMain", "vs_4_0"), ("PSMain", "ps_4_0")],
     "kShadowMomentShaderSource": [("VSMain", "vs_4_0"), ("PSResolve", "ps_4_0"), ("PSBlur", "ps_4_0")],
-    "kShadowMaskShaderSource": [
-        ("VSPrepass", "vs_4_0"),
-        ("VSFullscreen", "vs_4_0"),
-        ("PSResolve", "ps_4_0"),
-        ("PSBlur", "ps_4_0"),
-    ],
 }
 
 

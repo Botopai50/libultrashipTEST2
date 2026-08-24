@@ -408,18 +408,10 @@
 //   4  where that normal came from, vertex or recovered face        (input)
 //   5  the filter's raw coverage, before the hardening remap        (input)
 //   7  the cascade each pixel sampled                               (input)
-//   8  what the screen-space mask holds, and whether the pixel took it (input)
-//   9  how far the mask's stored depth is from this surface's          (input)
-// 6 was retired with the machinery it measured; the numbering of the rest is deliberately unchanged, so 5
-// still means what it meant. 8 and 9 were retired once and are reused here for the mask, which did not
-// exist when they were.
-//
-// 8 and 9 are the pair for the mask, and they separate the two faults that look identical once shaded: a
-// mask whose shadows are wrong, and a mask that is not aligned with the frame it describes. Read 9 first --
-// red across a whole surface means the prepass drew that surface somewhere else, and nothing in the bias
-// controls will touch it. The shader's PSMain carries the reading order -- which view to
+// 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
+// unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
-#define SHADOW_MAP_MAX_DEBUG_VIEW 9
+#define SHADOW_MAP_MAX_DEBUG_VIEW 7
 
 
 // ===================================================================================================
@@ -431,7 +423,7 @@
 // only move in whole-texel steps. At the default ladder that step is 0.09, 0.74 and 3.6 world units in the
 // three bands -- one to two screen pixels through most of the useful range, which is read as a staircase.
 //
-// Five independent techniques, each switchable on its own and each with its own tuning, because they attack
+// Four independent techniques, each switchable on its own and each with its own tuning, because they attack
 // the same artefact at different points in the pipeline and stack rather than compete:
 //
 //   Analytic edge  -- receiver.  Recovers the sub-texel position of the boundary inside the quad already
@@ -441,8 +433,6 @@
 //                                the receiver stays one fetch and softness stops costing taps.
 //   Ladder         -- fit.       Redistributes cascade range so the texel size is uniform instead of
 //                                350/2500/6000's 40x spread.
-//   Screen space   -- composite. Resolves the shadow term to a full-screen mask and blurs it in PIXELS,
-//                                which is the unit the artefact is actually measured in.
 //
 // The policy split is the same as everything above: the framework owns the technique, the application owns
 // the tuning and pushes it in as one struct. No app-specific CVar keys live here, only the defaults and the
@@ -601,52 +591,6 @@
 // resolving finely.
 #define SHADOW_MAP_DEFAULT_LADDER_NEAR 40.0f
 
-// --- Technique 5: screen-space shadow mask ---------------------------------------------------------
-//
-// Resolve the shadow term for the whole frame into one full-screen mask, blur that mask with a depth-aware
-// kernel, then have each material read the mask instead of sampling cascades.
-//
-// This is the only one of the five whose penumbra is measured in SCREEN PIXELS rather than in shadow-map
-// texels, which is the unit the artefact is actually complained in: a two-pixel blur is two pixels wide at
-// every distance, in every cascade, regardless of how coarse that cascade's texels are. It also collapses
-// the receiver to a single texture fetch, which is the largest possible win against the in-frame FXC
-// compile cost.
-//
-// The obstacle, and how it is got around, because it is the whole design.
-//
-// The mask has to be resolved from a scene depth buffer, and this renderer never has a complete one before
-// its receivers shade: the actor loop draws, gSPShadowMapFlush runs the depth pass, and only then does the
-// room draw and sample the cascades. At the point a mask could be built, the depth buffer holds the
-// characters and not the room -- and the room is where the staircase this fixes actually lives.
-//
-// A general depth prepass would fix it and is far too big: every opaque draw twice, through the whole of
-// the interpreter's draw path, to soften an edge.
-//
-// But the room's geometry is ALREADY captured, in world space, and already uploaded to a vertex buffer --
-// it is the world caster layer, cached and rebuilt only when the scene changes. So the prepass is that
-// same buffer drawn once more with the CAMERA's matrix instead of the light's. No display list re-runs, no
-// second pass over the interpreter, no new capture: one extra draw of geometry the GPU is already holding.
-//
-// What that buys is a depth buffer of everything that casts, which is not quite everything that receives.
-// The difference is covered rather than ignored: the mask stores the depth it was resolved at alongside the
-// shadow term, and a receiver compares its own depth against it. Agreement means the mask describes this
-// surface and is used; disagreement means this pixel was not in the prepass, and it falls back to sampling
-// the cascades directly. That test also handles the alpha-blended surfaces, the water and the particles,
-// which are not in the prepass by construction.
-#define SHADOW_MAP_DEFAULT_SCREEN_SPACE 0
-
-// Blur radius of the mask, in screen pixels at 1080p, scaled with resolution so the look holds.
-#define SHADOW_MAP_DEFAULT_SCREEN_BLUR 2.0f
-#define SHADOW_MAP_MAX_SCREEN_BLUR 16.0f
-
-// How far apart two pixels' view depths may be before the blur refuses to mix them, in world units.
-//
-// Without this the mask bleeds across silhouettes: a shadowed wall smears its term onto the unshadowed
-// floor behind it, which reads as a halo. With it too tight the blur stops working on any sloped surface,
-// since a slope changes depth across the kernel by construction. Scaled by the pixel's own depth inside
-// the shader, so this is a fraction-like quantity in world units at unit distance rather than an absolute.
-#define SHADOW_MAP_DEFAULT_SCREEN_DEPTH_TOLERANCE 6.0f
-
 // Generate the split ladder for `count` cascades out to `farDistance`, into splits[0..count-1].
 //
 // The practical split scheme: split i is a blend of the uniform ladder (near + (far-near) * i/N, which
@@ -687,18 +631,13 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 // view angle the striping projects into long rays converging at the horizon, which is why it reads as a
 // starburst on the ground rather than as stripes.
 //
-// The system's ONLY defence until now was the rasterizer's slope-scaled bias (SHADOW_MAP_SLOPE_BIAS),
-// applied while the depth map is written. That is enough for the ordinary receiver, whose world position
-// is the interpolated vertex position -- the exact surface the depth pass rasterised.
+// The system's standing defence is the rasterizer's slope-scaled bias (SHADOW_MAP_SLOPE_BIAS), applied
+// while the depth map is written, and for the ordinary receiver it is enough: that receiver's world
+// position is the interpolated vertex position, which is the exact surface the depth pass rasterised.
 //
-// It is NOT enough for the screen-space mask, and that is a difference in kind rather than in degree. The
-// mask reconstructs its position by unprojecting a screen-resolution depth buffer, so the point it asks
-// about is off the real surface by the depth buffer's own quantisation -- and that error is measured along
-// the VIEW ray. On ground seen at a grazing angle, a fraction of a depth step is many world units of
-// sliding along the surface, which dwarfs a bias sized for the light's own rasterisation.
-//
-// So the corrections below exist, they are per-technique, and they are off by default: the ordinary
-// receiver does not need them and paying for them there would be spending on a problem it does not have.
+// These exist for where it is not enough -- a cascade whose texel has grown very large, a surface almost
+// edge-on to the light, a scene the ladder is stretched across. They are off by default because the system
+// does not normally need them.
 //
 // Each is a different place to intervene, and they compose:
 //
@@ -720,17 +659,14 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 //                    Acne is a grazing-angle problem, so scaling by the angle spends the correction where
 //                    it is needed and nearly nothing where it is not.
 
-// Whether the corrections run at all.
+// Whether the corrections run at all. Off means the behaviour that shipped before they existed.
 //
-// ON by default, which is a deliberate reversal of how everything else here defaults. The screen-space
-// mask is not merely improved by these -- it is unusable without them: reconstructing a receiver from a
-// screen-resolution depth buffer stripes the entire ground with the shadow map's own texel grid, which at
-// a grazing view angle reads as rays converging on the horizon. Shipping the mask with its correction off
-// would be shipping it broken.
-//
-// It costs nothing when the mask is off, because the ordinary receiver only applies these when asked
-// separately (see SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER, which stays off).
-#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 1
+// Off is right again now that the screen-space mask is gone. That mask reconstructed its receiver from a
+// depth buffer and was unusable without these; the ordinary receiver reads the interpolated vertex
+// position -- the exact surface the depth pass rasterised -- and the rasterizer's own slope-scaled bias
+// already covers it. So these are a tool for a scene where that turns out not to hold, rather than
+// something the system needs to look right.
+#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 0
 
 // Normal offset, in multiples of the sampled cascade's texel. Expressed in texels rather than world units
 // because the error it corrects is itself a texel-sized quantity -- a fixed world offset would be far too
@@ -760,26 +696,6 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 #define SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX 3.0f
 #define SHADOW_MAP_MAX_ACNE_SLOPE_MAX 10.0f
 
-// Apply the corrections in the ORDINARY receiver too, not only in the screen-space mask.
-//
-// Off by default, and that default is a statement about where the problem is: the ordinary receiver reads
-// the exact surface the depth pass rasterised and the rasterizer's own slope bias already covers it. This
-// is here for a scene where that turns out not to hold -- and as the way to see, by turning it on, whether
-// a given patch of acne is the reconstruction's fault or the depth map's.
-#define SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER 0
-
-// Where the mask's resolve gets the surface normal it offsets along.
-//
-// It has no vertex normal -- it has a depth buffer -- so the normal is recovered from the derivatives of
-// the reconstructed world position across the pixel quad. That is a true FACE normal: flat across a
-// triangle, and exact for the flat ground this is mostly correcting. It is also free, which a normal
-// buffer would not be.
-//
-// The cost is at silhouettes, where the quad straddles two surfaces and the derivative is meaningless. A
-// wrong normal there offsets the sample sideways by a texel or two, which is invisible against the edge
-// itself.
-#define SHADOW_MAP_ACNE_NORMAL_FROM_DERIVATIVES 1
-
 typedef struct ShadowMapAcne {
     int enabled;           // 0/1 -- master switch for every correction below
     int normalOffset;      // 0/1
@@ -790,7 +706,6 @@ typedef struct ShadowMapAcne {
     float depthWorld;      // world units along the light, converted to the cascade's depth scale
     int slopeScaled;       // 0/1 -- scale the three above by how edge-on the surface is
     float slopeMax;        // ceiling on that scale
-    int onReceiver;        // 0/1 -- also correct the ordinary receiver, not only the mask
 } ShadowMapAcne;
 
 // --- The struct the application pushes -------------------------------------------------------------
@@ -823,10 +738,6 @@ typedef struct ShadowMapQuality {
     float ladderLambda;  // 0 = uniform, 1 = logarithmic
     float ladderNear;    // world units
 
-    // Technique 5 -- screen-space mask
-    int screenSpace;            // 0/1
-    float screenBlur;           // pixels
-    float screenDepthTolerance; // world units at unit depth
 
     // Shadow acne. Travels with the rest rather than in its own setter: it is pushed once per frame from
     // the same place and adding a second path through five layers would buy nothing.
@@ -850,9 +761,6 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.ladderMode = SHADOW_MAP_DEFAULT_LADDER_MODE;
     q.ladderLambda = SHADOW_MAP_DEFAULT_LADDER_LAMBDA;
     q.ladderNear = SHADOW_MAP_DEFAULT_LADDER_NEAR;
-    q.screenSpace = SHADOW_MAP_DEFAULT_SCREEN_SPACE;
-    q.screenBlur = SHADOW_MAP_DEFAULT_SCREEN_BLUR;
-    q.screenDepthTolerance = SHADOW_MAP_DEFAULT_SCREEN_DEPTH_TOLERANCE;
     q.acne.enabled = SHADOW_MAP_DEFAULT_ACNE_ENABLED;
     q.acne.normalOffset = SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET;
     q.acne.normalTexels = SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS;
@@ -862,7 +770,6 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.acne.depthWorld = SHADOW_MAP_DEFAULT_ACNE_DEPTH_WORLD;
     q.acne.slopeScaled = SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED;
     q.acne.slopeMax = SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX;
-    q.acne.onReceiver = SHADOW_MAP_DEFAULT_ACNE_ON_RECEIVER;
     return q;
 }
 
@@ -886,9 +793,6 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->ladderMode = SHADOW_MAP_CLAMP_(q->ladderMode, 0, SHADOW_MAP_LADDER_MAX);
     q->ladderLambda = SHADOW_MAP_CLAMP_(q->ladderLambda, 0.0f, 1.0f);
     q->ladderNear = SHADOW_MAP_CLAMP_(q->ladderNear, 1.0f, 1000.0f);
-    q->screenSpace = q->screenSpace ? 1 : 0;
-    q->screenBlur = SHADOW_MAP_CLAMP_(q->screenBlur, 0.0f, SHADOW_MAP_MAX_SCREEN_BLUR);
-    q->screenDepthTolerance = SHADOW_MAP_CLAMP_(q->screenDepthTolerance, 0.1f, 100.0f);
     q->acne.enabled = q->acne.enabled ? 1 : 0;
     q->acne.normalOffset = q->acne.normalOffset ? 1 : 0;
     q->acne.normalTexels = SHADOW_MAP_CLAMP_(q->acne.normalTexels, 0.0f, SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS);
@@ -898,7 +802,6 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->acne.depthWorld = SHADOW_MAP_CLAMP_(q->acne.depthWorld, 0.0f, SHADOW_MAP_MAX_ACNE_DEPTH_WORLD);
     q->acne.slopeScaled = q->acne.slopeScaled ? 1 : 0;
     q->acne.slopeMax = SHADOW_MAP_CLAMP_(q->acne.slopeMax, 1.0f, SHADOW_MAP_MAX_ACNE_SLOPE_MAX);
-    q->acne.onReceiver = q->acne.onReceiver ? 1 : 0;
 #undef SHADOW_MAP_CLAMP_
 }
 

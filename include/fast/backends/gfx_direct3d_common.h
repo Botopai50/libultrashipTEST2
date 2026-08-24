@@ -74,28 +74,12 @@ struct PerShadowCB {
     float shadow_edge[4];
     float shadow_jitter[4];
     float shadow_filter[4];
-    // SOH [Enhancement] Screen-space mask (technique 5). x = mask active, yz = one screen pixel in UV,
-    // w = how far the mask's stored depth may differ from the receiver's before the mask is judged to
-    // describe a different surface and the receiver falls back to sampling the cascades.
-    float shadow_mask[4];
     // SOH [Enhancement] Shadow acne (see shadow_map.h). Magnitudes arrive already zeroed when their switch
     // is off, so the shaders multiply rather than branch.
     //   acne0: x enabled, y normal offset (texels), z light offset (world), w depth bias (world)
     //   acne1: x slope-scaled, y slope ceiling, z apply in the ordinary receiver, w unused
     float shadow_acne0[4];
     float shadow_acne1[4];
-};
-
-// SOH [Enhancement] Screen-space shadow mask (technique 5). Layout must match the ShadowMaskCB cbuffer in
-// kShadowMaskShaderSource field for field. Held as a CPU copy on the backend as well, because the blur
-// rewrites only its direction and the buffer is discard-mapped -- a partial update is not on offer.
-struct ShadowMaskCB {
-    float cameraViewProj[16];
-    float invCameraViewProj[16];
-    // x = one screen pixel in u, y = in v, z = blur radius in pixels, w = depth tolerance at unit depth
-    float maskParams[4];
-    // xy = the blur's direction this pass, in pixels; zw unused
-    float maskBlur[4];
 };
 
 struct PerDrawCB {
@@ -227,9 +211,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
     void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
     void ShadowMapEndPass() override;
-    bool ShadowMaskBegin(const float cameraViewProj[16], const float invCameraViewProj[16]) override;
-    void ShadowMaskDrawCasters(const float* worldXyz, size_t vertexCount, int slot) override;
-    void ShadowMaskEnd() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float strength, float debugMode) override;
 
@@ -270,10 +251,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool CreateShadowMomentTargets(int mode, int resolution, int sliceCount);
     void ShadowMomentResolveAndBlur();
     void ShadowMomentRelease();
-    // SOH [Enhancement] Screen-space shadow mask (technique 5).
-    bool CreateShadowMaskPipeline();
-    bool CreateShadowMaskTargets(int width, int height);
-    void ShadowMaskRelease();
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -420,162 +397,6 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // parked slice keeps the moments it already holds, exactly as it keeps the depths.
     bool mShadowSliceMomentDirty[SHADOW_MAP_MAX_SLICES] = {};
 
-    // SOH [Enhancement] Screen-space shadow mask (technique 5 -- see fast/shadow_map.h).
-    //
-    // A camera-space depth prepass of the world caster geometry, then a mask resolved from it. The mask
-    // holds the shadow term in R and the depth it was resolved at in G: the receiver compares its own depth
-    // against that second channel and falls back to the cascades where they disagree, which is what covers
-    // everything the prepass does not contain.
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskDepthTex;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMaskDsv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskDepthSrv;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskTex;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskRtv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskSrv;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowMaskBlurTex;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskBlurRtv;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mShadowMaskBlurSrv;
-    // The prepass writes depth only and needs its own vertex shader (the camera's matrix, not the light's)
-    // and a depth-stencil state that writes and tests normally.
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowMaskPrepassVs;
-    // Its own covering-triangle vertex shader. The moment pipeline has an identical one, but that
-    // pipeline is only built when a filterable mode is on -- and the mask must work in plain depth
-    // mode too, so it cannot borrow an object that may never have been created.
-    Microsoft::WRL::ComPtr<ID3D11VertexShader> mShadowMaskFullscreenVs;
-    Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowMaskPrepassLayout;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMaskResolvePs;
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowMaskBlurPs;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowMaskCb;
-    ShadowMaskCB mShadowMaskCbData = {};
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowMaskDepthState;
-    bool mShadowMaskPipelineReady = false;
-    bool mShadowMaskPipelineFailed = false;
-    // Size the mask was built at, so a resolution change rebuilds it.
-    int mShadowMaskWidth = 0;
-    int mShadowMaskHeight = 0;
-    // Whether a Begin succeeded and the prepass is open. Guards the draws and the End the same way
-    // mShadowPassActive guards the light's.
-    bool mShadowMaskActive = false;
-    // Whether the mask holds a usable frame. Read where the shader constants are written, so a frame that
-    // never built one tells the receiver to sample the cascades instead of a stale mask.
-    bool mShadowMaskValid = false;
-    // Saved across the prepass and the resolve, since both replace them.
-    D3D11_VIEWPORT mShadowMaskSavedViewport = {};
-    // The viewport all three mask passes rasterise through -- the frame's own, not the whole
-    // surface. See ShadowMaskBegin for why that distinction is not cosmetic.
-    D3D11_VIEWPORT mShadowMaskViewport = {};
-    UINT mShadowMaskSavedViewportCount = 0;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mShadowMaskSavedRtv;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowMaskSavedDsv;
-    bool mShadowPipelineReady = false;
-    bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
-    bool mShadowPassActive = false;     // between BeginCascade and EndPass
-    // Viewport to put back when the depth pass ends: the pass overwrites it with the cascade's square
-    // one, and the interpreter does not necessarily re-issue SetViewport before the next draw.
-    D3D11_VIEWPORT mShadowSavedViewport = {};
-    UINT mShadowSavedViewportCount = 0;
-
-    // SOH [Enhancement] How long the depth pass actually takes on the GPU, in milliseconds.
-    //
-    // Everything the shadow map costs divides into two halves that are invisible from a frame rate: filling
-    // the cascades (this) and sampling them (the receiver shaders). They respond to completely different
-    // work, so tuning without knowing which one dominates is guesswork. This measures the first directly,
-    // which by subtraction bounds the second.
-    //
-    // Timestamps rather than a CPU clock, because the CPU only records that it submitted the pass, not that
-    // the GPU ran it. Results are collected KFrames later so the query is complete by the time it is read --
-    // reading it in the frame that issued it would block the CPU on the GPU and change the thing being
-    // measured. Built and issued only while a shadow debug mode is on; off, none of it exists.
-    static constexpr int kShadowTimerFrames = 4;
-    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerDisjoint[kShadowTimerFrames];
-    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerFrameStart[kShadowTimerFrames];
-    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerFrameEnd[kShadowTimerFrames];
-    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerStart[kShadowTimerFrames];
-    Microsoft::WRL::ComPtr<ID3D11Query> mShadowTimerEnd[kShadowTimerFrames];
-    bool mShadowTimerPending[kShadowTimerFrames] = {};
-    // Whether that slot's frame opened a depth pass at all. A frame that reused every slice submits no
-    // pass, so its pass timestamps were never issued and must not be read.
-    bool mShadowTimerPassIssued[kShadowTimerFrames] = {};
-    int mShadowTimerSlot = 0;
-    bool mShadowTimerFrameOpen = false; // this frame is being timed
-    bool mShadowTimerOpen = false;      // and its depth pass issued a start timestamp
-    bool mShadowTimerFailed = false;    // query creation failed once; do not retry every frame
-    double mShadowTimerSumMs = 0.0;
-    int mShadowTimerSamples = 0;
-    double mShadowTimerFrameSumMs = 0.0;
-    int mShadowTimerFrameSamples = 0;
-    // Slices cleared and redrawn since the last log line. The one number that says whether the cascades are
-    // staying parked: eight means every slice is rebuilt every frame, which is what this all exists to stop.
-    uint32_t mShadowSlicesDrawn = 0;
-    uint32_t mShadowSlicesFrames = 0; // timed frames those slices were spread over
-    // SOH [Enhancement] WHY each of those slices had to be redrawn, which the count alone cannot say and
-    // which decides what is worth fixing. Two mutually exclusive causes, split on the question that
-    // actually separates the available remedies:
-    //
-    //   mShadowRedrawContent - the cascade had not moved at all; only what goes IN it changed. These are
-    //                          the redraws a narrower reuse key could avoid, since the key is currently
-    //                          computed per layer and mixes in per-frame scenery from anywhere in the map.
-    //   mShadowRedrawMatrix  - the cascade itself moved, because the camera walked out of it or the sun
-    //                          swung past the light-direction hysteresis. No reuse key can help these; the
-    //                          remedy would be parking margins.
-    //
-    // Plus the ones that were simply never filled. The three sum to mShadowSlicesDrawn.
-    uint32_t mShadowRedrawContent = 0;
-    // SOH [Enhancement] ...and split by layer, because the two have very different floors. The ACTOR layer
-    // holds animating characters, so its slices genuinely change every frame and nothing can reuse them --
-    // it is the irreducible part. Only the WORLD figure is the one with room left in it, and without the
-    // split the two are added together and the floor is invisible.
-    uint32_t mShadowRedrawContentWorld = 0;
-    uint32_t mShadowRedrawContentActors = 0;
-    uint32_t mShadowRedrawMatrix = 0;
-    uint32_t mShadowRedrawFirst = 0;
-    int mShadowTimerReported = 0; // frames since the last log line
-    void ShadowTimerFrameBegin();
-    bool ShadowTimerBegin();
-    void ShadowTimerEnd();
-    void ShadowTimerFrameEnd();
-    void ShadowTimerCollect();
-
-    HMODULE mDX11Module;
-
-    HMODULE mCompilerModule;
-    pD3DCompile mD3dCompile;
-
-    uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
-
-    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
-    // SOH [Enhancement] Depth-stencil states, created lazily and cached for the device's lifetime (the
-    // stencil features flip the mode many times per frame, and each flip used to re-run
-    // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
-    // scheme as the Metal backend's cache.
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilStates[64];
-    int mLastStencilMode = -1; // SOH [Enhancement] world light casting: cache tracker for mStencilMode
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerToonCb;   // SOH [Enhancement] toon lighting (register b2)
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerShadowCb; // SOH [Enhancement] shadow cascades (register b3)
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBufferCopy;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mDepthValueOutputUav;
-    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShader;
-    Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
-    Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
-    size_t mCoordBufferSize;
-
-#if DEBUG_D3D
-    Microsoft::WRL::ComPtr<ID3D11Debug> debug;
-#endif
-
-    PerFrameCB mPerFrameCbData;
-    PerDrawCB mPerDrawCbData;
-    // SOH [Enhancement] toon lighting. What the buffer currently HOLDS, not a scratch area: the draw path
-    // compares against it to decide whether the upload is worth doing at all. Value-initialised, including
-    // the named padding, so that comparison never reads an indeterminate byte.
-    PerToonCB mPerToonCbData{};
-    bool mPerToonCbValid = false; // false until something has actually been uploaded to compare against
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
     // SOH [Enhancement] Frames since the backend started, used only to advance the jitter pattern's
     // rotation when temporal jitter is on. Incremented where the shadow constants are written, which
