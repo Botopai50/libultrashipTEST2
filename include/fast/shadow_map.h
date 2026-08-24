@@ -62,11 +62,27 @@
 // RECEIVE the world layer's shadows at every distance -- this shortens the casting, not the shading.
 #define SHADOW_MAP_ACTOR_CASCADES 2
 
+// Levels a clipmap may have. Declared here rather than beside the rest of its contract because
+// the slice arithmetic below needs it; the reasoning is with SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS.
+#define SHADOW_MAP_MAX_CLIPMAP_LEVELS 6
+
 // Slices are laid out world-layer-first: world cascade C is slice C, actor cascade C is slice
 // cascadeCount + C. The actor half is the shorter one, so the total is not a simple product.
 #define SHADOW_MAP_ACTOR_CASCADES_FOR(count) ((count) < SHADOW_MAP_ACTOR_CASCADES ? (count) : SHADOW_MAP_ACTOR_CASCADES)
 #define SHADOW_MAP_SLICES_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count))
-#define SHADOW_MAP_MAX_SLICES SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)
+
+// The TEXTURE array has to hold whichever layout asks for more slices, and the clipmap asks for more: six
+// levels against three cascades (see SHADOW_MAP_MAX_CLIPMAP_LEVELS, further down).
+//
+// Only the texture grows. The constant buffer's matrix array stays at SHADOW_MAP_MAX_CASCADES, because the
+// clipmap has no per-level matrix to put in it -- every level shares one basis and differs by a power of
+// two, so its projection is arithmetic in the shader. That is the difference between this being a change to
+// an allocation and a change to every shader that samples a shadow.
+#define SHADOW_MAP_MAX_SLICES                                                    \
+    (SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES) >                            \
+             SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CLIPMAP_LEVELS)                \
+         ? SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)                        \
+         : SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CLIPMAP_LEVELS))
 
 // SOH [Enhancement] Content key meaning "nothing will be drawn into this slice at all".
 //
@@ -569,6 +585,68 @@
 // because the opposite choice is equally defensible on a still camera.
 #define SHADOW_MAP_DEFAULT_JITTER_TEMPORAL 0
 
+// --- Shadow clipmap ------------------------------------------------------------------------------
+//
+// A second way of laying the map out, chosen instead of the cascade ladder. The idea is the directional
+// half of Unreal's Virtual Shadow Maps, minus the part that does not port.
+//
+// WHAT A CLIPMAP IS. Rather than N slabs fitted to N slices of the view frustum, it is N nested squares
+// CENTRED ON THE CAMERA, each exactly twice the world extent of the one inside it. Level 0 is small and
+// fine; each level out doubles its extent and therefore doubles its texel. Which level a pixel reads is a
+// function of how far it is from the centre, not of which band of view depth it fell in.
+//
+// WHY IT IS BETTER HERE, and it is not a small difference:
+//
+//   The texel ratio between neighbours is exactly 2. The hand-fitted ladder's is 3 to 8 -- measured at
+//   0.09, 0.74 and 3.6 world units -- and that jump is what a cross-fade has to hide. A factor of two is
+//   most of the way to invisible before any blending is applied.
+//
+//   The boundaries are circles around the camera, so they travel WITH the player instead of sweeping
+//   across the world as the camera moves. A seam that moves with you is one you stop noticing.
+//
+//   Levels can be far smaller. Density is uniform, so a level does not need 4096 to be sharp where it
+//   matters: six levels at 1024 is 6.3 megatexels against three at 4096's 50. Eight times less memory and
+//   eight times less fill, better distributed.
+//
+// WHAT IS NOT PORTED, and why. Unreal's version is virtual in the memory sense: a page table, a physical
+// page pool, and per-page allocation driven by which pages the visible pixels actually touch. That needs
+// compute shaders, indirect draw, atomics and a depth prepass, and it is practical there because Nanite
+// can re-rasterise geometry cheaply. This renderer has none of those -- the receiver is compiled by FXC
+// inside the frame, and the geometry is N64 display lists resubmitted per level. The LAYOUT is the part
+// that ports, and the layout is where the image quality lives.
+//
+// THE SHADER HAS NO ARRAY, which is what makes this affordable at ps_4_0 rather than merely desirable.
+// Every level shares one light basis and differs only by a power of two, so the level, its extent, its
+// texel and its snapped centre are all ARITHMETIC -- there is no per-level matrix to index, no comparison
+// chain over splits, and no dynamically indexed constant-buffer array (which ps_4_0 does not allow, and
+// which tools/shader-validate cannot warn about because Wine's compiler accepts it). The clipmap receiver
+// is smaller than the cascade one despite covering twice as many levels.
+#define SHADOW_MAP_LAYOUT_CASCADE 0 // the fitted ladder. What everything above describes.
+#define SHADOW_MAP_LAYOUT_CLIPMAP 1
+#define SHADOW_MAP_LAYOUT_MAX 1
+#define SHADOW_MAP_DEFAULT_LAYOUT SHADOW_MAP_LAYOUT_CASCADE
+
+// Levels in the clipmap. Six covers 32x the base extent, which reaches the cascade ladder's range from a
+// base small enough to be sharp underfoot.
+//
+// A hard bound because the depth pass costs per slice and the array is sized from it. Unlike the cascade
+// count this can afford to be generous: a clipmap level is cheap precisely because it does not have to be
+// large to be sharp.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS 6
+
+// Half the world extent of level 0, in world units. The whole ladder follows: level i is this times 2^i,
+// and the outermost reaches base * 2^(levels-1).
+//
+// 190 with six levels reaches about 6000, matching the cascade ladder's range, while level 0 is 380 units
+// across -- at 1024 that is 0.37 world units per texel underfoot.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_BASE 190.0f
+#define SHADOW_MAP_MIN_CLIPMAP_BASE 20.0f
+#define SHADOW_MAP_MAX_CLIPMAP_BASE 2000.0f
+
+// Per-level square resolution for the clipmap. Lower than the cascade default on purpose: uniform density
+// is what buys the sharpness, so the resolution does not have to.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 1024
+
 // --- Edge hardening ------------------------------------------------------------------------------
 //
 // Everything above widens or smooths the boundary. This is the control in the other direction: find the
@@ -768,6 +846,11 @@ typedef struct ShadowMapQuality {
     float jitterRadius;  // texels
     int jitterTemporal;  // 0/1
 
+    // Layout -- the cascade ladder, or the clipmap
+    int layout;           // SHADOW_MAP_LAYOUT_*
+    int clipmapLevels;    // clipmap only
+    float clipmapBase;    // half-extent of level 0, world units
+
     // Edge hardening
     int edgeHarden;       // 0/1
     float edgeHardness;   // 0 = unchanged, 1 = a hard threshold
@@ -798,6 +881,9 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.jitterTaps = SHADOW_MAP_DEFAULT_JITTER_TAPS;
     q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
     q.jitterTemporal = SHADOW_MAP_DEFAULT_JITTER_TEMPORAL;
+    q.layout = SHADOW_MAP_DEFAULT_LAYOUT;
+    q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
+    q.clipmapBase = SHADOW_MAP_DEFAULT_CLIPMAP_BASE;
     q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
     q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
@@ -833,6 +919,10 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->jitterTaps = SHADOW_MAP_CLAMP_(q->jitterTaps, 1, SHADOW_MAP_MAX_JITTER_TAPS);
     q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
     q->jitterTemporal = q->jitterTemporal ? 1 : 0;
+    q->layout = SHADOW_MAP_CLAMP_(q->layout, 0, SHADOW_MAP_LAYOUT_MAX);
+    q->clipmapLevels = SHADOW_MAP_CLAMP_(q->clipmapLevels, 1, SHADOW_MAP_MAX_CLIPMAP_LEVELS);
+    q->clipmapBase =
+        SHADOW_MAP_CLAMP_(q->clipmapBase, SHADOW_MAP_MIN_CLIPMAP_BASE, SHADOW_MAP_MAX_CLIPMAP_BASE);
     q->edgeHarden = q->edgeHarden ? 1 : 0;
     q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
     q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);
