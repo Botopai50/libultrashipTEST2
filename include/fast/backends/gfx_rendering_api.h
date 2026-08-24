@@ -369,6 +369,16 @@ class GfxRenderingAPI {
         ShadowMapQualityClamp(&mShadowQuality);
     }
 
+    // SOH [Enhancement] Which filterable mode is ACTUALLY running, which is not always the one that was
+    // asked for: the moment array can be refused for memory (see SHADOW_MAP_MOMENT_BUDGET_MB) or fail to
+    // build, and the receiver then falls back to depth and PCF.
+    //
+    // Readable so the application can say so. The refusal is logged, and a log is not where a player finds
+    // out why a setting they ticked changed nothing on screen.
+    int ShadowMapEffectiveFilterMode() const {
+        return mShadowEffectiveFilterMode;
+    }
+
     // SOH [Enhancement] What the cascades actually came out as this frame: the far distance of each band
     // and the world size of one of its texels. Both are computed deep in the fit -- the texel from the
     // projection matrix itself -- and neither is knowable from the settings alone once the automatic
@@ -427,6 +437,8 @@ class GfxRenderingAPI {
     // World size of one texel in each cascade, recovered from its own projection. Filled by the
     // backend beside the shader constants; see ShadowMapCascadeReport.
     float mShadowTexelWorld[SHADOW_MAP_MAX_CASCADES] = {};
+    // The filterable mode the backend could actually honour; see ShadowMapEffectiveFilterMode.
+    int mShadowEffectiveFilterMode = SHADOW_MAP_FILTER_DEPTH;
     int mShadowCascadesActive = 0;
     float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;

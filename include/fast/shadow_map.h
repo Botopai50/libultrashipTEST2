@@ -569,6 +569,39 @@
 // because the opposite choice is equally defensible on a still camera.
 #define SHADOW_MAP_DEFAULT_JITTER_TEMPORAL 0
 
+// --- Edge hardening ------------------------------------------------------------------------------
+//
+// Everything above widens or smooths the boundary. This is the control in the other direction: find the
+// boundary and compress it, for a harder, more defined outline.
+//
+// The "finding" is free and needs no extra fetches, because coverage already carries it. A value at 0 or 1
+// is interior -- fully shadowed or fully lit -- and only the boundary produces anything in between. So the
+// remap below acts ONLY on the edge by construction: interiors map to themselves whatever the setting, and
+// the width of the ramp is the whole of what changes.
+//
+// Applied AFTER the raw coverage is taken for diagnostics, which is what debug view 5 has always promised
+// -- it shows "the filter's raw coverage, before the hardening remap". There was one before the rollback
+// and the view outlived it; this puts the value the view describes back under it. So a boundary that is
+// faceted in view 5 and faceted on screen is faceted in the comparison, and one that is smooth in view 5
+// and hard on screen is this.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDEN 0
+
+// How far the ramp is compressed towards a step. 0 leaves coverage exactly as it arrived; 1 is a hard
+// threshold with no transition at all.
+//
+// A hard threshold is not automatically what is wanted: the penumbra carries the cascade's texel size, so
+// removing it removes the only cue that distance is being sampled more coarsely, and the boundary starts
+// showing the texel grid it was hiding. Somewhere short of 1 is usually where this lands.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.5f
+
+// Where in the coverage range the boundary is taken to be. 0.5 is the geometric answer -- half the kernel
+// occluded is the edge.
+//
+// Moving it GROWS or SHRINKS the shadow: below 0.5 a lightly-occluded pixel counts as shadowed and the
+// shadow spreads; above it the shadow pulls in. Worth having next to the hardness, because compressing a
+// ramp around a shifted centre is how an outline is thickened or thinned rather than merely sharpened.
+#define SHADOW_MAP_DEFAULT_EDGE_THRESHOLD 0.5f
+
 // --- Technique 4: cascade split ladder -------------------------------------------------------------
 //
 // Where the cascade boundaries fall, which decides the texel size in each band and therefore how big the
@@ -735,6 +768,11 @@ typedef struct ShadowMapQuality {
     float jitterRadius;  // texels
     int jitterTemporal;  // 0/1
 
+    // Edge hardening
+    int edgeHarden;       // 0/1
+    float edgeHardness;   // 0 = unchanged, 1 = a hard threshold
+    float edgeThreshold;  // where the boundary sits in the coverage range
+
     // Technique 4 -- split ladder
     int ladderMode;      // SHADOW_MAP_LADDER_*
     float ladderLambda;  // 0 = uniform, 1 = logarithmic
@@ -760,6 +798,9 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.jitterTaps = SHADOW_MAP_DEFAULT_JITTER_TAPS;
     q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
     q.jitterTemporal = SHADOW_MAP_DEFAULT_JITTER_TEMPORAL;
+    q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
+    q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
+    q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
     q.ladderMode = SHADOW_MAP_DEFAULT_LADDER_MODE;
     q.ladderLambda = SHADOW_MAP_DEFAULT_LADDER_LAMBDA;
     q.ladderNear = SHADOW_MAP_DEFAULT_LADDER_NEAR;
@@ -792,6 +833,9 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->jitterTaps = SHADOW_MAP_CLAMP_(q->jitterTaps, 1, SHADOW_MAP_MAX_JITTER_TAPS);
     q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
     q->jitterTemporal = q->jitterTemporal ? 1 : 0;
+    q->edgeHarden = q->edgeHarden ? 1 : 0;
+    q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
+    q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);
     q->ladderMode = SHADOW_MAP_CLAMP_(q->ladderMode, 0, SHADOW_MAP_LADDER_MAX);
     q->ladderLambda = SHADOW_MAP_CLAMP_(q->ladderLambda, 0.0f, 1.0f);
     q->ladderNear = SHADOW_MAP_CLAMP_(q->ladderNear, 1.0f, 1000.0f);

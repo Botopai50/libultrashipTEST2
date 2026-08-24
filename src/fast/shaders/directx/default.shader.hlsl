@@ -192,6 +192,9 @@ cbuffer PerShadowCB : register(b3) {
     //          z = apply in the ordinary receiver too, w = unused
     float4 shadow_acne0;
     float4 shadow_acne1;
+    // SOH [Enhancement] Edge hardening (see fast/shadow_map.h). x = on, y = hardness (0 unchanged, 1 a hard
+    // threshold), z = where the boundary sits in the coverage range, w unused.
+    float4 shadow_harden;
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -660,6 +663,26 @@ float ShadowAcneDepthBias(uint cascade, float slope) {
         return 0.0;
     }
     return shadow_acne0.w * slope * ShadowDepthScaleAt(cascade);
+}
+
+// SOH [Enhancement] Compress the boundary for a harder outline (see fast/shadow_map.h).
+//
+// The edge identifies itself: coverage is 0 or 1 across every interior, and only the boundary lands in
+// between. So remapping the range acts on the boundary alone -- interiors map to themselves whatever the
+// setting -- and no search, no derivative and no extra fetch is needed to find it.
+//
+// smoothstep rather than a linear ramp so the compressed edge keeps a continuous derivative; a linear one
+// leaves a visible corner where it meets the interiors, which on a shadow reads as a second, fainter edge
+// just inside the first.
+float ShadowHardenEdge(float coverage) {
+    if (shadow_harden.x < 0.5) {
+        return coverage;
+    }
+    // Hardness 1 leaves no width at all, which smoothstep cannot express -- its two edges would be equal.
+    // Held just apart, so full hardness is a step one float wide rather than a divide by zero.
+    float width = max((1.0 - shadow_harden.y) * 0.5, 1.0e-5);
+    float threshold = shadow_harden.z;
+    return smoothstep(threshold - width, threshold + width, coverage);
 }
 
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
@@ -1169,6 +1192,10 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // literally the same number, which is worth stating: if the two disagree in SHAPE, something below
         // this line is lying.
         float shadowCoverage = shadowLit;
+        // SOH [Enhancement] Hardened AFTER the raw value is taken above, which is what debug view 5 has
+        // always claimed to show -- the coverage before the hardening remap. The two are the same number
+        // again only when this is off.
+        shadowLit = ShadowHardenEdge(shadowLit);
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two

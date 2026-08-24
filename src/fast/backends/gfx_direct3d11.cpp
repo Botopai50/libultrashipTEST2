@@ -3765,8 +3765,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         // The EFFECTIVE mode, not the requested one: the moment array may have been refused for
         // memory (see SHADOW_MAP_MOMENT_BUDGET_MB) or failed to compile, and the shader must then be
         // told to read depth. Configure runs before this every frame, so the pointer is current.
-        mPerShadowCbData.shadow_jitter[2] =
-            mShadowMomentTexture != nullptr ? (float)mShadowMomentMode : (float)SHADOW_MAP_FILTER_DEPTH;
+        mShadowEffectiveFilterMode =
+            mShadowMomentTexture != nullptr ? mShadowMomentMode : SHADOW_MAP_FILTER_DEPTH;
+        mPerShadowCbData.shadow_jitter[2] = (float)mShadowEffectiveFilterMode;
         mPerShadowCbData.shadow_jitter[3] = q.esmExponent;
         mPerShadowCbData.shadow_filter[0] = q.bleedReduction;
         mPerShadowCbData.shadow_filter[1] = 0.0f;
@@ -3784,6 +3785,12 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_acne1[1] = acne.slopeMax;
         mPerShadowCbData.shadow_acne1[2] = acne.enabled ? 1.0f : 0.0f;
         mPerShadowCbData.shadow_acne1[3] = 0.0f;
+
+        // SOH [Enhancement] Edge hardening (see fast/shadow_map.h).
+        mPerShadowCbData.shadow_harden[0] = q.edgeHarden ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_harden[1] = q.edgeHardness;
+        mPerShadowCbData.shadow_harden[2] = q.edgeThreshold;
+        mPerShadowCbData.shadow_harden[3] = 0.0f;
 
         mShadowQualityFrame++;
     }

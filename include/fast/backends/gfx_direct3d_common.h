@@ -80,6 +80,8 @@ struct PerShadowCB {
     //   acne1: x slope-scaled, y slope ceiling, z apply in the ordinary receiver, w unused
     float shadow_acne0[4];
     float shadow_acne1[4];
+    // SOH [Enhancement] Edge hardening (see shadow_map.h). x on, y hardness, z threshold, w unused.
+    float shadow_harden[4];
 };
 
 struct PerDrawCB {
