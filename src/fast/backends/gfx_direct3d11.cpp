@@ -3713,6 +3713,25 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
         return;
     }
 
+    // The cutout path binds its own pipeline and leaves it bound, on the reasoning that the next
+    // ShadowMapBeginCascade puts the opaque one back. That held only while no opaque draw ever followed a
+    // cutout draw INSIDE one slice -- an ordering rule that lived in a comment and nowhere else, and that
+    // the static caster cache broke the moment it moved the cached half's cutouts above the scenery.
+    //
+    // What that cost: scenery rasterised through the cutout pipeline, a vertex shader expecting five floats
+    // per vertex fed three, and a pixel shader clipping against whatever texture was still bound. The depth
+    // written was noise, and the shadow came out stippled.
+    //
+    // So the opaque path restores what it needs instead of trusting the order. One branch per draw, taken
+    // only when a cutout batch actually preceded this one.
+    if (mShadowAlphaBound) {
+        mContext->IASetInputLayout(mShadowDepthLayout.Get());
+        mContext->VSSetShader(mShadowDepthVs.Get(), nullptr, 0);
+        mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
+        mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
+        mShadowAlphaBound = false;
+    }
+
     const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
     const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
     // One buffer per (layer, slot). The slot is what lets the world layer draw its cached room mesh and a
