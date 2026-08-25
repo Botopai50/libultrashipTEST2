@@ -702,9 +702,29 @@
 // levels at the cascade default of 4096 is 192 MB, which is most of why raising the level count looked
 // unaffordable when it is in fact the cheapest knob here.
 //
-// 2048 with eight to ten levels is the shape this layout wants: 64 to 80 MB, a level-0 texel finer than the
-// cascade ladder's near band, and two to eight times its range.
-#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 2048
+// 4096, and 2048 was measured to be a regression rather than a saving. Against the cascade ladder at its
+// own 4096, in world units per texel at a given distance from the camera:
+//
+//     dist   ladder   clip@2048   clip@4096
+//      150    0.090       0.234       0.117
+//      400    0.740       0.469       0.234
+//      900    0.740       0.938       0.469
+//     2000    0.740       3.750       1.875
+//     4000    3.600       7.500       3.750
+//
+// At 2048 the clipmap loses at nearly every distance -- five times worse at 2000 units. At 4096 it wins or
+// ties almost everywhere. A layout meant to replace the ladder must not be coarser than it.
+//
+// The reason it needs the higher number is structural and worth stating, because no setting fixes it: a
+// clipmap level is a SQUARE CENTRED ON THE CAMERA and a cascade is a slab FITTED TO THE VIEW FRUSTUM. The
+// camera looks one way, so the square spends most of its area on ground nobody is looking at. That is the
+// price of boundaries that travel with the player and of a texel ratio of exactly two; the density has to
+// be bought back with resolution.
+//
+// Eight levels at 4096 is 256 MB for the world layer. The actor layer's two levels cover only the innermost
+// squares -- a few hundred units -- so 4096 there is extravagant, and Resolução (Personagens) is a separate
+// setting for exactly this reason: dropping it to 1024 takes 60 MB off the total.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 4096
 
 // --- Edge hardening ------------------------------------------------------------------------------
 //
