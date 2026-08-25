@@ -745,7 +745,13 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, flo
     // moves -- and, because a camera that has not crossed a texel produces the same centre, is also what
     // lets the slice be reused with no parking code at all.
     float2 centre = floor(float2(shadow_clip_x.w, shadow_clip_y.w) / texel) * texel;
-    float2 uv = ((lp.xy - centre) / (extent * 2.0)) + 0.5;
+
+    // Normalised device coordinates for this level, then texture space -- and the Y FLIP is not optional.
+    // NDC is +up and a texture is +down, which is why ShadowProject writes -ndc.y * 0.5 + 0.5 on the cascade
+    // path. Leaving it out here mirrored the map vertically: the shadows then slid the wrong way in Y as
+    // the camera moved, which reads as the whole scene's shadows travelling with the camera.
+    float2 ndc = (lp.xy - centre) / extent;
+    float2 uv = float2((ndc.x * 0.5) + 0.5, (-ndc.y * 0.5) + 0.5);
     if (any(uv < 0.0) || any(uv > 1.0)) {
         return lit; // outside this level's square nothing is known to occlude
     }
