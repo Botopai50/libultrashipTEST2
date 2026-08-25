@@ -702,7 +702,7 @@ float ShadowHardenEdge(float coverage) {
 //
 // Returns both caster layers, the same pair ShadowLitLayers returns, so the two layouts are
 // interchangeable at the call site.
-float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors) {
+float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, float2 pixel, float3 normal) {
     float2 lit = float2(1.0, 1.0);
     float levels = shadow_clip_p.y;
     if (levels < 0.5) {
@@ -724,11 +724,34 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors) {
     float extent = base * exp2(level);
     float resolution = max(shadow_clip_p.z, 1.0);
     float texel = (extent * 2.0) / resolution;
+
+    // SOH [Enhancement] Acne corrections, the same four the cascade path applies (see fast/shadow_map.h).
+    // Chosen from THIS level's texel, which is why they come after the level and not before it: the offset
+    // is sized in texels, and a clipmap's texel doubles per level.
+    //
+    // The level is picked from the UNOFFSET position deliberately. Offsetting first would let a point near a
+    // boundary be nudged into the neighbouring level, and the level it is nudged into would have a different
+    // texel -- which is the same circularity the cascade path avoids by fitting before it biases.
+    float acneBias = 0.0;
+    if (shadow_acne1.z > 0.5) {
+        float acneSlope = ShadowAcneSlope(normal);
+        float3 moved = ShadowAcneMovePoint(worldPos, normal, texel, acneSlope);
+        lp = float3(dot(moved, shadow_clip_x.xyz), dot(moved, shadow_clip_y.xyz), dot(moved, shadow_clip_z.xyz));
+        // The depth range is five extents (see the fit), so that is what turns a world-unit bias into this
+        // level's normalised depth.
+        acneBias = shadow_acne0.w * acneSlope / (extent * 5.0);
+    }
     // The centre is snapped to THIS level's texel, which is what stops the edges shimmering as the camera
     // moves -- and, because a camera that has not crossed a texel produces the same centre, is also what
     // lets the slice be reused with no parking code at all.
     float2 centre = floor(float2(shadow_clip_x.w, shadow_clip_y.w) / texel) * texel;
-    float2 uv = ((lp.xy - centre) / (extent * 2.0)) + 0.5;
+
+    // Normalised device coordinates for this level, then texture space -- and the Y FLIP is not optional.
+    // NDC is +up and a texture is +down, which is why ShadowProject writes -ndc.y * 0.5 + 0.5 on the cascade
+    // path. Leaving it out here mirrored the map vertically: the shadows then slid the wrong way in Y as
+    // the camera moved, which reads as the whole scene's shadows travelling with the camera.
+    float2 ndc = (lp.xy - centre) / extent;
+    float2 uv = float2((ndc.x * 0.5) + 0.5, (-ndc.y * 0.5) + 0.5);
     if (any(uv < 0.0) || any(uv > 1.0)) {
         return lit; // outside this level's square nothing is known to occlude
     }
@@ -740,10 +763,25 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors) {
     }
 
     float texelUv = 1.0 / resolution;
-    lit.x = SampleShadowPCF4(uv, depth, level, texelUv, false);
+
+    // Everything downstream of the projection is shared with the cascade layout, and shared by going
+    // through the same call rather than by repeating it: ShadowSample is what carries the jitter kernel and
+    // the filterable-map modes. Reaching past it to SampleShadowPCF4 -- which this did at first -- silently
+    // dropped both, and dropped the acne corrections with them. A layout is a way of PLACING the map; it
+    // has no business changing which techniques exist.
+    ShadowProjection p;
+    p.uv = uv;
+    p.z = depth - acneBias;
+    p.texelUv = texelUv;
+    p.slice = level;
+    p.inside = 1.0; // the footprint test is the uv/depth bounds above, already applied
+
+    lit.x = ShadowSample(p, false, pixel);
     // The actor layer is shorter than the world layer here too, and lives at the same stride.
     if (wantActors && level < (float)@{o_shadow_actor_cascades}) {
-        lit.y = SampleShadowPCF4(uv, depth, level + layerStride, ShadowActorTexelUvAt(0), true);
+        p.slice = level + layerStride;
+        p.texelUv = ShadowActorTexelUvAt(0);
+        lit.y = ShadowSample(p, true, pixel);
     }
     return lit;
 }
@@ -1262,7 +1300,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // is not the active one, so this is a uniform branch and a draw pays for only the path it takes.
         float2 shadowLayers;
         if (shadow_clip_p.y > 0.5) {
-            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_params.x, input.worldPos.w > 0.5);
+            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_params.x, input.worldPos.w > 0.5,
+                                            screenSpace.xy, shadowN);
         } else {
             shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
                                            input.worldPos.w > 0.5, screenSpace.xy, shadowN);
