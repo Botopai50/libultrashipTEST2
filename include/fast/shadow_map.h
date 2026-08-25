@@ -64,7 +64,7 @@
 
 // Levels a clipmap may have. Declared here rather than beside the rest of its contract because
 // the slice arithmetic below needs it; the reasoning is with SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS.
-#define SHADOW_MAP_MAX_CLIPMAP_LEVELS 6
+#define SHADOW_MAP_MAX_CLIPMAP_LEVELS 10
 
 // Levels either layout may ask for, and therefore the size of everything held per level: the fitted
 // matrices, the parking state, the update divisors. The clipmap is the one that wants more.
@@ -668,26 +668,43 @@
 #define SHADOW_MAP_LAYOUT_MAX 1
 #define SHADOW_MAP_DEFAULT_LAYOUT SHADOW_MAP_LAYOUT_CASCADE
 
-// Levels in the clipmap. Six covers 32x the base extent, which reaches the cascade ladder's range from a
-// base small enough to be sharp underfoot.
+// Levels in the clipmap, and the knob to reach for when the range is short.
 //
-// A hard bound because the depth pass costs per slice and the array is sized from it. Unlike the cascade
-// count this can afford to be generous: a clipmap level is cheap precisely because it does not have to be
-// large to be sharp.
-#define SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS 6
+// Levels cost LINEARLY and buy range EXPONENTIALLY, which is the whole shape of this ladder and is the
+// opposite of how the cascade count behaves. One more level doubles the reach for the price of one more
+// slice -- and a clipmap slice is small, because uniform density means no level has to be large to be
+// sharp. Measured across the plausible settings:
+//
+//   levels  base   res    reach    texel L0   memory
+//        6   190  4096     6080       0.093    192 MB
+//        8   120  2048    15360       0.117     64 MB
+//       10   100  2048    51200       0.098     80 MB
+//
+// So more levels at a lower per-level resolution beats fewer at a high one on every axis that matters.
+// Ten is the bound because the depth pass still costs per slice and every level past the horizon is a
+// slice drawn for nothing.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS 8
 
 // Half the world extent of level 0, in world units. The whole ladder follows: level i is this times 2^i,
 // and the outermost reaches base * 2^(levels-1).
 //
-// 190 with six levels reaches about 6000, matching the cascade ladder's range, while level 0 is 380 units
-// across -- at 1024 that is 0.37 world units per texel underfoot.
-#define SHADOW_MAP_DEFAULT_CLIPMAP_BASE 190.0f
+// 120 with eight levels reaches about 15000 -- two and a half times the cascade ladder -- while level 0 is
+// 240 units across, which at 2048 is 0.117 world units per texel underfoot.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_BASE 120.0f
 #define SHADOW_MAP_MIN_CLIPMAP_BASE 20.0f
 #define SHADOW_MAP_MAX_CLIPMAP_BASE 2000.0f
 
-// Per-level square resolution for the clipmap. Lower than the cascade default on purpose: uniform density
-// is what buys the sharpness, so the resolution does not have to.
-#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 1024
+// Per-level square resolution for the clipmap, and its OWN setting rather than the cascade ladder's.
+//
+// It was a dead constant at first -- declared, and the clipmap left sharing Graphics.ShadowMap.Resolution
+// with the cascades. That coupling is wrong in both directions: a clipmap wants many small levels and a
+// cascade ladder wants few large ones, so a resolution that suits one starves or bankrupts the other. Six
+// levels at the cascade default of 4096 is 192 MB, which is most of why raising the level count looked
+// unaffordable when it is in fact the cheapest knob here.
+//
+// 2048 with eight to ten levels is the shape this layout wants: 64 to 80 MB, a level-0 texel finer than the
+// cascade ladder's near band, and two to eight times its range.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 2048
 
 // --- Edge hardening ------------------------------------------------------------------------------
 //
@@ -893,8 +910,9 @@ typedef struct ShadowMapQuality {
     int staticCache;      // 0/1 -- keep a static-only copy of each world slice and blit it
 
 
-    int clipmapLevels;    // clipmap only
-    float clipmapBase;    // half-extent of level 0, world units
+    int clipmapLevels;      // clipmap only
+    float clipmapBase;      // half-extent of level 0, world units
+    int clipmapResolution;  // per-level square resolution, independent of the cascade ladder's
 
     // Edge hardening
     int edgeHarden;       // 0/1
@@ -930,6 +948,7 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.staticCache = SHADOW_MAP_DEFAULT_STATIC_CACHE;
     q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
     q.clipmapBase = SHADOW_MAP_DEFAULT_CLIPMAP_BASE;
+    q.clipmapResolution = SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION;
     q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
     q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
@@ -970,6 +989,8 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->clipmapLevels = SHADOW_MAP_CLAMP_(q->clipmapLevels, 1, SHADOW_MAP_MAX_CLIPMAP_LEVELS);
     q->clipmapBase =
         SHADOW_MAP_CLAMP_(q->clipmapBase, SHADOW_MAP_MIN_CLIPMAP_BASE, SHADOW_MAP_MAX_CLIPMAP_BASE);
+    q->clipmapResolution =
+        SHADOW_MAP_CLAMP_(q->clipmapResolution, SHADOW_MAP_MIN_RESOLUTION, SHADOW_MAP_MAX_RESOLUTION);
     q->edgeHarden = q->edgeHarden ? 1 : 0;
     q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
     q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);

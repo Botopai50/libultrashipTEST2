@@ -542,7 +542,10 @@ class Interpreter {
             }
         }
         mShadowMapCascadeCount = clampedCascades;
-        mShadowMapResolution = resolution;
+        // The clipmap sizes its levels itself. Sharing the ladder's resolution starves one layout or
+        // bankrupts the other -- a clipmap wants many small levels, a ladder few large ones -- and every
+        // texel figure downstream reads this, so overriding here is enough for the whole system.
+        mShadowMapResolution = clipmapLayout ? mShadowMapQuality.clipmapResolution : resolution;
         // Never finer than the world layer (see shadow_map.h); the backend clamps it again, but keeping the
         // two in order here means the value the interpreter reasons with is the one that will be used.
         mShadowMapActorResolution = actorResolution > resolution ? resolution : actorResolution;
@@ -1127,12 +1130,10 @@ class Interpreter {
     // Per level, not per cascade: the clipmap has more of them. Entries past the cascade ladder's three
     // default to 1 rather than 0 -- the rate is used as a modulus, so a zero here would divide by zero on
     // the first clipmap frame.
-    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_LEVELS] = { SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0,
-                                                            SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
-                                                            SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2,
-                                                            1,
-                                                            1,
-                                                            1 };
+    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_LEVELS] = {
+        SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0, SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
+        SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2, 1, 1, 1, 1, 1, 1, 1
+    };
     float mShadowMapHeldMatrices[SHADOW_MAP_MAX_LEVELS * 16] = {};
     bool mShadowMapHeldValid[SHADOW_MAP_MAX_LEVELS] = {};
     uint32_t mShadowMapFrameCounter = 0;
