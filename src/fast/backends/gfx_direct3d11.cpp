@@ -3955,10 +3955,6 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             mShadowMomentTexture != nullptr ? mShadowMomentMode : SHADOW_MAP_FILTER_DEPTH;
         mPerShadowCbData.shadow_jitter[2] = (float)mShadowEffectiveFilterMode;
         mPerShadowCbData.shadow_jitter[3] = q.esmExponent;
-        mPerShadowCbData.shadow_filter[0] = q.bleedReduction;
-        mPerShadowCbData.shadow_filter[1] = 0.0f;
-        mPerShadowCbData.shadow_filter[2] = q.blurRadius;
-        mPerShadowCbData.shadow_filter[3] = 0.0f;
 
         // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). Each magnitude is zeroed when its own
         // switch is off, so the shader multiplies by it rather than branching on a second flag.
@@ -3976,7 +3972,10 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_harden[0] = q.edgeHarden ? 1.0f : 0.0f;
         mPerShadowCbData.shadow_harden[1] = q.edgeHardness;
         mPerShadowCbData.shadow_harden[2] = q.edgeThreshold;
-        mPerShadowCbData.shadow_harden[3] = 0.0f;
+        // Bleed reduction rides in harden.w; see the cbuffer comment. blurRadius is deliberately NOT sent:
+        // the blur is a resolve-pass filter that reads mShadowQuality directly, so the receiver never had a
+        // use for it. It used to be packed here anyway, which read like a knob the shader honoured.
+        mPerShadowCbData.shadow_harden[3] = q.bleedReduction;
 
         // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h).
         for (int i = 0; i < 3; i++) {

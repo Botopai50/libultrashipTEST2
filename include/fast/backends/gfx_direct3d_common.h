@@ -70,10 +70,8 @@ struct PerShadowCB {
     // SOH [Enhancement] Edge quality (see shadow_map.h). Packing matches the shader's comment exactly:
     //   shadow_edge:   x analytic on/off, y ramp width (texels), z jitter on/off, w jitter taps
     //   shadow_jitter: x jitter radius (texels), y per-frame rotation, z filter mode, w ESM exponent
-    //   shadow_filter: x bleed reduction, y screen-space active, z map blur radius (texels), w unused
     float shadow_edge[4];
     float shadow_jitter[4];
-    float shadow_filter[4];
     // SOH [Enhancement] Shadow acne (see shadow_map.h). Magnitudes arrive already zeroed when their switch
     // is off, so the shaders multiply rather than branch.
     //   acne0: x enabled, y normal offset (texels), z light offset (world), w depth bias (world)

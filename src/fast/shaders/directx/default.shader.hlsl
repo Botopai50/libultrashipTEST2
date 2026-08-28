@@ -179,11 +179,8 @@ cbuffer PerShadowCB : register(b3) {
     //           z = jitter on/off,        w = jitter tap count
     //   jitter: x = jitter radius in texels, y = per-frame rotation offset (0 when not temporal),
     //           z = filter mode (SHADOW_MAP_FILTER_*), w = ESM exponent
-    //   filter: x = bleed reduction, y = screen-space mask active, z = map blur radius in texels,
-    //           w = unused
     float4 shadow_edge;
     float4 shadow_jitter;
-    float4 shadow_filter;
     // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). The magnitudes arrive already zeroed when
     // their switch is off, so the shader multiplies rather than branches.
     //   acne0: x = corrections enabled, y = normal offset in texels, z = light offset in world units,
@@ -193,7 +190,11 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_acne0;
     float4 shadow_acne1;
     // SOH [Enhancement] Edge hardening (see fast/shadow_map.h). x = on, y = hardness (0 unchanged, 1 a hard
-    // threshold), z = where the boundary sits in the coverage range, w unused.
+    // threshold), z = where the boundary sits in the coverage range.
+    // w = light-bleed reduction for the filterable modes. It lodges here rather than in a float4 of its own
+    // because it is the ONE survivor of the four slots that group once had, and a float4 carrying a single
+    // scalar is 12 wasted bytes and three more chances to get the C++ layout wrong. Written in the same
+    // block as x/y/z, so there is no second writer to order against.
     float4 shadow_harden;
     // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). The light's three axes, each carrying the
     // camera's coordinate along it in w, then the ladder's shape. No per-level matrix: levels differ by a
@@ -539,7 +540,7 @@ float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
         int filterMode = (int)shadow_jitter.z;
         if (filterMode > 0 && !isActor) {
             float4 stored = g_shadowMoments.SampleLevel(g_shadowMomentSampler, float3(p.uv, p.slice), 0);
-            lit = ShadowMomentLit(stored, p.z, filterMode, shadow_jitter.w, shadow_filter.x);
+            lit = ShadowMomentLit(stored, p.z, filterMode, shadow_jitter.w, shadow_harden.w);
         } else {
             lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
         }
