@@ -166,22 +166,16 @@
 // Per-cascade square resolution bounds. Anything under 256 produces texels so large that the bias needed
 // to hide the acne swallows the shadow itself.
 //
-// 8192 is the ceiling, and it is a real one rather than a round number: Direct3D feature level 10.0
-// guarantees textures to 8192 on a side, and this backend already refuses to start below 10.0. So every
-// device that reaches the shadow map at all can hold a slice this size -- whether it should is another
-// question, and the numbers are stark. One D16 slice:
+// 4096 is the ceiling, and it is a measured one rather than a hardware limit -- feature level 10.0
+// guarantees 8192, and 8192 was offered briefly and taken back out for being unusable in practice. A D16
+// slice quadruples with each step: 8 MB at 2048, 32 at 4096, 128 at 8192. Three cascades at 8192 is 640 MB
+// with the actor layer, and eight clipmap levels at 8192 is over a gigabyte.
 //
-//     2048     8 MB        4096    32 MB        8192   128 MB
-//
-// A slice quadruples with each step, so 8192 is only worth reaching for on a layout with FEW slices. Three
-// cascades at 8192 is 640 MB with the actor layer; eight clipmap levels at 8192 is over a gigabyte, which
-// is not a setting so much as a way to fail an allocation. The clipmap's answer to wanting sharper shadows
-// is more levels at a moderate resolution, not fewer at an extreme one.
-//
-// The actor layer has its own resolution for exactly this reason: it covers only the innermost squares, so
-// dropping it to 1024 takes a quarter of a gigabyte off an 8192 configuration and costs nothing visible.
+// The clipmap's answer to wanting sharper shadows is MORE LEVELS at a moderate resolution, not fewer at an
+// extreme one: levels cost linearly and a level does not have to be large to be sharp. That is the knob
+// this ceiling is pointing at.
 #define SHADOW_MAP_MIN_RESOLUTION 256
-#define SHADOW_MAP_MAX_RESOLUTION 8192
+#define SHADOW_MAP_MAX_RESOLUTION 4096
 #define SHADOW_MAP_DEFAULT_RESOLUTION 4096
 
 // The actor layer's own resolution, chosen separately from the world layer's.
