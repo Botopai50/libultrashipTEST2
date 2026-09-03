@@ -118,20 +118,6 @@ SamplerState g_shadowSampler : register(s6);
 Texture2DArray<float> g_shadowMapActors : register(t7);
 SamplerState g_shadowActorSampler : register(s7);
 
-// SOH [Enhancement] Filterable shadow maps (technique 1 -- see fast/shadow_map.h). Holds a quantity whose
-// AVERAGE is meaningful -- exp(k*d) for ESM, the first two or four power moments for VSM and MSM -- so the
-// MAP can be blurred and the receiver stays one bilinear fetch.
-//
-// Its own slot rather than reinterpreting the depth one: the formats differ and so does the filtering that
-// is correct for each. Point is the only correct setting for a hand-rolled comparison; linear is the whole
-// point of a filterable quantity.
-//
-// WORLD LAYER ONLY. The actor layer keeps depth and PCF -- it lives in a different texture when the two
-// resolutions are split, and it is redrawn every frame, so it would pay the resolve and both blur axes
-// every frame for the shadows this technique helps least. The backend allocates only the world cascades,
-// so this array's slice index IS the cascade index.
-Texture2DArray<float4> g_shadowMoments : register(t8);
-SamplerState g_shadowMomentSampler : register(s8);
 
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
@@ -177,24 +163,22 @@ cbuffer PerShadowCB : register(b3) {
     // Packed rather than named one per register because a cbuffer gives every scalar its own 16 bytes.
     //   edge:   x = analytic edge on/off, y = its ramp width in texels,
     //           z = jitter on/off,        w = jitter tap count
-    //   jitter: x = jitter radius in texels, y = per-frame rotation offset (0 when not temporal),
-    //           z = filter mode (SHADOW_MAP_FILTER_*), w = ESM exponent
+    //   jitter: x = jitter radius in texels. y, z and w are dead slots -- they carried the per-frame tap
+    //           rotation and the filterable modes, all removed. Kept zeroed rather than repacked so the
+    //           removal did not also shift this layout; folding them out is its own change.
     float4 shadow_edge;
     float4 shadow_jitter;
     // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). The magnitudes arrive already zeroed when
     // their switch is off, so the shader multiplies rather than branches.
-    //   acne0: x = corrections enabled, y = normal offset in texels, z = light offset in world units,
-    //          w = depth bias in world units along the light
+    //   acne0: x = corrections enabled, y = normal offset in texels. z and w are dead slots -- they
+    //          carried the light-offset and depth-bias methods, both removed.
     //   acne1: x = scale by how edge-on the surface is, y = the ceiling on that scale,
     //          z = apply in the ordinary receiver too, w = unused
     float4 shadow_acne0;
     float4 shadow_acne1;
     // SOH [Enhancement] Edge hardening (see fast/shadow_map.h). x = on, y = hardness (0 unchanged, 1 a hard
-    // threshold), z = where the boundary sits in the coverage range.
-    // w = light-bleed reduction for the filterable modes. It lodges here rather than in a float4 of its own
-    // because it is the ONE survivor of the four slots that group once had, and a float4 carrying a single
-    // scalar is 12 wasted bytes and three more chances to get the C++ layout wrong. Written in the same
-    // block as x/y/z, so there is no second writer to order against.
+    // threshold), z = where the boundary sits in the coverage range, w = dead slot (light-bleed reduction,
+    // removed with the filterable modes).
     float4 shadow_harden;
     // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). The light's three axes, each carrying the
     // camera's coordinate along it in w, then the ladder's shape. No per-level matrix: levels differ by a
@@ -363,9 +347,7 @@ float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool 
     }
 
     uint taps = (uint)max(shadow_edge.w, 1.0);
-    // The frame term is zero unless temporal jitter is on, in which case the pattern advances and the grain
-    // moves instead of standing still as a fixed texture over the scene.
-    float angle = (ShadowJitterNoise(pixel) + shadow_jitter.y) * 6.28318530718;
+    float angle = ShadowJitterNoise(pixel) * 6.28318530718;
     float2 rot = float2(cos(angle), sin(angle));
     float radius = shadow_jitter.x * texelUv;
 
@@ -384,70 +366,6 @@ float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool 
     return sum / (float)taps;
 }
 
-// SOH [Enhancement] Recover the lit fraction from stored moments (technique 1 -- see fast/shadow_map.h).
-//
-// One bilinear fetch, already averaged by the blur and by the hardware, turned back into coverage. This is
-// where a filterable map pays off: the softness came from a blur over the map, so nothing here loops.
-float ShadowMomentLit(float4 m, float z, int mode, float exponent, float bleed) {
-    if (mode == 1) {
-        // ESM. The stored average of exp(k*d) against exp(k*z) for this receiver. Saturated because the
-        // estimate runs above one wherever the blur averaged in something nearer than this receiver -- an
-        // overshoot, not an occlusion.
-        return saturate(exp(-exponent * z) * m.x);
-    }
-
-    if (mode == 2) {
-        // VSM. Chebyshev's inequality on the first two moments bounds the lit fraction from above.
-        float mean = m.x;
-        float variance = max(m.y - (mean * mean), 1.0e-6);
-        float diff = z - mean;
-        float bound = variance / (variance + (diff * diff));
-        // In front of the mean nothing can occlude, and the bound is not the answer there.
-        float lit = (z <= mean) ? 1.0 : bound;
-        // The bound is loose where two occluders at different depths share a texel, which is seen as a
-        // shadow going translucent in its middle. Rescaling the low tail away is the standard remedy.
-        return saturate((lit - bleed) / max(1.0 - bleed, 1.0e-4));
-    }
-
-    // MSM, four power moments (Peters & Klein). Solves for the tightest bound consistent with all four,
-    // which is what holds up under the overlapping occluders VSM bleeds through.
-    //
-    // Biased a hair towards the moments of a flat fully lit surface first: a texel whose casters are all at
-    // one depth -- most of an empty map -- makes the system below exactly degenerate.
-    float4 b = lerp(m, float4(0.0, 0.375, 0.0, 0.375), 6.0e-5);
-
-    // Cholesky of the Hankel matrix the moments form, solved in place.
-    float d22 = b.y - (b.x * b.x);
-    float l32d22 = b.z - (b.x * b.y);
-    float d33d22 = ((b.w - (b.y * b.y)) * d22) - (l32d22 * l32d22);
-    float invD22 = 1.0 / max(d22, 1.0e-9);
-    float l32 = l32d22 * invD22;
-
-    float3 c;
-    c.x = 1.0;
-    c.y = z - b.x;
-    c.z = (z * z) - b.y - (l32 * c.y);
-    c.y *= invD22;
-    c.z *= d22 / max(d33d22, 1.0e-9);
-    c.y -= l32 * c.z;
-    c.x -= dot(c.yz, b.xy);
-
-    // Roots of c.z t^2 + c.y t + c.x, ordered.
-    float safeC2 = (c.z < 0.0) ? min(c.z, -1.0e-9) : max(c.z, 1.0e-9);
-    float p = c.y / safeC2;
-    float q = c.x / safeC2;
-    // Clamped at zero rather than trusted: a moment set the blur has pushed slightly out of validity gives
-    // a negative discriminant, and a NaN here would spread through the whole shaded pixel.
-    float root = sqrt(max((p * p * 0.25) - q, 0.0));
-    float z1 = (-p * 0.5) - root;
-    float z2 = (-p * 0.5) + root;
-
-    float4 sw = (z2 < z) ? float4(z1, z, 1.0, 1.0) : ((z1 < z) ? float4(z, z1, 0.0, 1.0) : float4(0.0, 0.0, 0.0, 0.0));
-    float denom = (z2 - sw.y) * (z - z1);
-    float quotient = ((sw.x * z2) - (b.x * (sw.x + z2)) + b.y) / ((abs(denom) < 1.0e-9) ? 1.0e-9 : denom);
-    float occluded = saturate(sw.z + (sw.w * quotient));
-    return saturate(((1.0 - occluded) - bleed) / max(1.0 - bleed, 1.0e-4));
-}
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
@@ -534,16 +452,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        // SOH [Enhancement] Filterable modes replace the whole kernel with one fetch (technique 1). World
-        // layer only -- see the note on g_shadowMoments. The mode arrives already reduced to what the
-        // backend could actually allocate, so a refused mode reads as 0 here and takes the depth path.
-        int filterMode = (int)shadow_jitter.z;
-        if (filterMode > 0 && !isActor) {
-            float4 stored = g_shadowMoments.SampleLevel(g_shadowMomentSampler, float3(p.uv, p.slice), 0);
-            lit = ShadowMomentLit(stored, p.z, filterMode, shadow_jitter.w, shadow_harden.w);
-        } else {
-            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
-        }
+        lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
     }
     return lit;
 }
@@ -653,27 +562,16 @@ float ShadowAcneSlope(float3 normal) {
 
 // Move the sample point off the surface before it is projected.
 //
-// The normal offset is the one that is correct in principle: the error being corrected is a displacement in
-// world space, so the correction is one too -- and being ALONG THE SURFACE rather than along the light, it
-// does not detach a shadow from the foot of its caster. The light offset does detach it, which is why it is
-// off by default and why it is a separate switch.
+// The offset is ALONG THE SURFACE rather than along the light, which is what keeps a shadow attached to the
+// foot of its caster. Moving along the light instead was offered as a separate method and removed: it fixes
+// the same acne and detaches the shadow doing it.
 float3 ShadowAcneMovePoint(float3 world, float3 normal, float texelWorld, float slope) {
     if (shadow_acne0.x < 0.5) {
         return world;
     }
-    float3 moved = world + (normal * (texelWorld * shadow_acne0.y * slope));
-    return moved + (-ShadowLightAxis() * (shadow_acne0.z * slope));
+    return world + (normal * (texelWorld * shadow_acne0.y * slope));
 }
 
-// Depth bias, in the cascade's normalised depth, from a distance in world units along the light. Subtracted
-// from the receiver's depth, so it moves the receiver TOWARDS the light -- the direction that stops a
-// surface comparing as occluded by itself.
-float ShadowAcneDepthBias(uint cascade, float slope) {
-    if (shadow_acne0.x < 0.5) {
-        return 0.0;
-    }
-    return shadow_acne0.w * slope * ShadowDepthScaleAt(cascade);
-}
 
 // SOH [Enhancement] Compress the boundary for a harder outline (see fast/shadow_map.h).
 //
@@ -733,14 +631,10 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, flo
     // The level is picked from the UNOFFSET position deliberately. Offsetting first would let a point near a
     // boundary be nudged into the neighbouring level, and the level it is nudged into would have a different
     // texel -- which is the same circularity the cascade path avoids by fitting before it biases.
-    float acneBias = 0.0;
     if (shadow_acne1.z > 0.5) {
         float acneSlope = ShadowAcneSlope(normal);
         float3 moved = ShadowAcneMovePoint(worldPos, normal, texel, acneSlope);
         lp = float3(dot(moved, shadow_clip_x.xyz), dot(moved, shadow_clip_y.xyz), dot(moved, shadow_clip_z.xyz));
-        // The depth range is five extents (see the fit), so that is what turns a world-unit bias into this
-        // level's normalised depth.
-        acneBias = shadow_acne0.w * acneSlope / (extent * 5.0);
     }
     // The centre is snapped to THIS level's texel, which is what stops the edges shimmering as the camera
     // moves -- and, because a camera that has not crossed a texel produces the same centre, is also what
@@ -766,13 +660,13 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, flo
     float texelUv = 1.0 / resolution;
 
     // Everything downstream of the projection is shared with the cascade layout, and shared by going
-    // through the same call rather than by repeating it: ShadowSample is what carries the jitter kernel and
-    // the filterable-map modes. Reaching past it to SampleShadowPCF4 -- which this did at first -- silently
-    // dropped both, and dropped the acne corrections with them. A layout is a way of PLACING the map; it
-    // has no business changing which techniques exist.
+    // through the same call rather than by repeating it: ShadowSample is what carries the jitter kernel.
+    // Reaching past it to SampleShadowPCF4 -- which this did at first -- silently dropped it, and dropped
+    // the acne corrections with it. A layout is a way of PLACING the map; it has no business changing
+    // which techniques exist.
     ShadowProjection p;
     p.uv = uv;
-    p.z = depth - acneBias;
+    p.z = depth;
     p.texelUv = texelUv;
     p.slice = level;
     p.inside = 1.0; // the footprint test is the uv/depth bounds above, already applied
@@ -832,13 +726,10 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             bool acneOn = shadow_acne1.z > 0.5;
             float acneSlope = acneOn ? ShadowAcneSlope(normal) : 0.0;
             float3 samplePos = worldPos;
-            float acneDepthBias = 0.0;
             if (acneOn) {
                 samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), acneSlope);
-                acneDepthBias = ShadowAcneDepthBias(cascade, acneSlope);
             }
             ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0);
-            primary.z -= acneDepthBias;
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
@@ -861,16 +752,13 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                // Its own offset and its own bias, from the PARTNER's texel and depth scale. See the note
-                // above: sharing the primary's is what darkened the seam.
+                // Its own offset, from the PARTNER's texel. See the note above: sharing the primary's is
+                // what darkened the seam.
                 float3 partnerPos = worldPos;
-                float partnerBias = 0.0;
                 if (acneOn) {
                     partnerPos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(pc), acneSlope);
-                    partnerBias = ShadowAcneDepthBias(pc, acneSlope);
                 }
                 partner = ShadowProjectAt(partnerPos, pc, 0.0);
-                partner.z -= partnerBias;
             }
 
             // Can the actor layer possibly shadow this point at all?

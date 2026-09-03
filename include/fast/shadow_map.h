@@ -469,88 +469,6 @@
 // bounds the framework will honour.
 // ===================================================================================================
 
-// --- Technique 1: filterable shadow maps -----------------------------------------------------------
-//
-// Which quantity the depth pass stores, and therefore whether the MAP can be blurred at all. Raw depth
-// cannot: averaging two depths gives a surface at neither, so a blurred depth map compares wrong
-// everywhere. The others store something whose average is meaningful, which moves the filtering off the
-// receiver and onto the map -- one blur pass instead of N taps in every material shader.
-//
-// That trade is worth more here than it is in most engines, because of a constraint this renderer has and
-// most do not: the receiver is compiled by FXC SYNCHRONOUSLY INSIDE THE FRAME the first time each material
-// draws (see the note on ShadowProjectAt in the shader). Taps added to the receiver are paid twice -- once
-// per pixel, and once as a compile hitch when new geometry rotates into view. A blur on the map is paid
-// once, off to the side, and can be parked with the slice it belongs to.
-#define SHADOW_MAP_FILTER_DEPTH 0 // raw depth + PCF. The baseline; the map is not filterable.
-#define SHADOW_MAP_FILTER_ESM 1   // exp(k*d). One channel, cheapest, leaks where an occluder is far in front.
-#define SHADOW_MAP_FILTER_VSM 2   // depth + depth^2. Two channels, hardware-filterable, light-bleeds.
-#define SHADOW_MAP_FILTER_MSM 3   // four power moments. Heaviest and the only one that holds up under
-                                  // overlapping occluders, which this game has a great deal of.
-#define SHADOW_MAP_FILTER_MAX 3
-// ESM by default. NOTE THE CEILING: at the default 4096 the moment array wants 256 MB against a 192 MB
-// budget (see SHADOW_MAP_MOMENT_BUDGET_MB), so the backend refuses it, logs why, and falls back to depth
-// and PCF. Which means this default only takes effect once the shadow resolution is 2048 or below -- until
-// then it is a stated preference rather than a mode that is running.
-#define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_ESM
-
-// FLOOR on what the filterable modes may allocate for their moment array, in megabytes -- the figure used
-// when nothing better is known about the machine. This was the whole limit once; it is now the minimum, and
-// the real number comes from the adapter (see GfxRenderingAPI::SetShadowMapMomentBudgetFromVideoMemory).
-//
-// A limit has to exist, and NOT because the allocation would otherwise fail -- it mostly would not. D3D11
-// manages residency itself, so the driver accepts an array larger than physical VRAM and pages the excess
-// over PCIe. That does not fail; it runs, at a few frames a second, with the shadow map crossing the bus
-// every frame. Allocation success is not proof that something fits, so the size has to be judged before the
-// driver is asked.
-//
-// The cost is severe enough to be worth judging. The depth array stores one 16-bit value per texel; the
-// moment array stores one to four 32- or 16-bit ones, so it is two to four times larger than a map that is
-// already 160 MB across five slices at 4096. Measured:
-//
-//               4096      2048      1024
-//   depth D16   160 MB     40 MB     10 MB
-//   ESM  R32F   320 MB     80 MB     20 MB
-//   VSM  RG32F  640 MB    160 MB     40 MB
-//   MSM  RGBA16 640 MB    160 MB     40 MB
-//
-// What this number must not be is the answer for every machine, which is exactly what it was: a 2 GB card
-// and a 24 GB card were told the same 192, generous on one and absurdly tight on the other. On its own it
-// admits every mode at 2048 and below and none at 4096 -- so on any card with real memory the adapter's
-// share is what decides, and 4096 is reachable. This value only still applies where the adapter reports no
-// dedicated memory of its own.
-#define SHADOW_MAP_MOMENT_BUDGET_MB 192
-
-// ESM's exponent. The stored value is exp(k*d) and the test is exp(-k*z) * stored, so k sets how sharply
-// the reconstructed step falls off: too low and the shadow washes out into a gradient, too high and the
-// exponential overflows the storage format and the shadow returns to a hard edge with acne on top.
-//
-// 80 is about the practical ceiling for a 32-bit float over a cascade's normalised depth range. It is a
-// starting point, not a tuned value -- the right k depends on the cascade's near/far spread, which the
-// ladder controls.
-#define SHADOW_MAP_DEFAULT_ESM_EXPONENT 80.0f
-#define SHADOW_MAP_MIN_ESM_EXPONENT 5.0f
-#define SHADOW_MAP_MAX_ESM_EXPONENT 200.0f
-
-// How much of the low end of the VSM/MSM distribution is cut away before the result is used.
-//
-// Chebyshev's inequality gives an UPPER BOUND on the lit fraction, not the fraction itself, and where two
-// occluders at different depths share a texel that bound is loose -- which is seen as a shadow going
-// translucent in its middle ("light bleeding"). Rescaling the low tail away trades a little penumbra
-// accuracy for that, and is the standard remedy.
-//
-// 0 disables the correction. Above about 0.5 the penumbra starts visibly hardening back up, which is the
-// artefact the whole mode exists to remove.
-#define SHADOW_MAP_DEFAULT_BLEED_REDUCTION 0.20f
-
-// Radius of the separable Gaussian run over the map, in texels of the slice being blurred. This is the
-// knob that actually sets penumbra width in the filterable modes, and it is expressed in texels rather
-// than world units so a cascade's blur scales with its own resolution.
-//
-// 0 turns the blur off, which leaves the filterable format doing nothing useful -- the format is what makes
-// the blur legal, the blur is what makes the edge soft.
-#define SHADOW_MAP_DEFAULT_BLUR_RADIUS 2.0f
-#define SHADOW_MAP_MAX_BLUR_RADIUS 8.0f
-
 // --- Technique 2: analytic edge reconstruction -----------------------------------------------------
 //
 // The receiver already fetches the 2x2 quad of stored depths around the sample point and compares each.
@@ -594,14 +512,6 @@
 // Radius of the rotated pattern, in texels of the cascade being sampled.
 #define SHADOW_MAP_DEFAULT_JITTER_RADIUS 2.0f
 #define SHADOW_MAP_MAX_JITTER_RADIUS 8.0f
-
-// Advance the per-pixel rotation each frame, so the grain moves instead of standing still.
-//
-// Off by default and deliberately so: a static pattern is a texture the eye stops seeing, while a moving
-// one is a shimmer it cannot stop seeing. With no temporal filter to resolve it, animating the noise
-// usually makes things worse, not better. It is here because with a high tap count it can help, and
-// because the opposite choice is equally defensible on a still camera.
-#define SHADOW_MAP_DEFAULT_JITTER_TEMPORAL 0
 
 // --- Static caster cache ------------------------------------------------------------------------
 //
@@ -879,18 +789,6 @@ static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDista
 #define SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS 0.6f
 #define SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS 8.0f
 
-// Offset toward the light, in world units. Off by default: it is the one that costs peter panning, and the
-// normal offset above reaches the same place without that cost.
-#define SHADOW_MAP_DEFAULT_ACNE_LIGHT_OFFSET 0
-#define SHADOW_MAP_DEFAULT_ACNE_LIGHT_WORLD 2.0f
-#define SHADOW_MAP_MAX_ACNE_LIGHT_WORLD 50.0f
-
-// Constant depth bias, in world units along the light, converted to the cascade's own depth scale in the
-// shader so one number means the same thing in every band.
-#define SHADOW_MAP_DEFAULT_ACNE_DEPTH_BIAS 0
-#define SHADOW_MAP_DEFAULT_ACNE_DEPTH_WORLD 1.0f
-#define SHADOW_MAP_MAX_ACNE_DEPTH_WORLD 50.0f
-
 // Scale the corrections by how edge-on the surface is to the light, as 1 - N.L clamped by the ceiling
 // below. On by default because it is what keeps the corrections from acting where there is no acne.
 //
@@ -904,11 +802,7 @@ typedef struct ShadowMapAcne {
     int enabled;           // 0/1 -- master switch for every correction below
     int normalOffset;      // 0/1
     float normalTexels;    // multiples of the sampled cascade's texel
-    int lightOffset;       // 0/1
-    float lightWorld;      // world units toward the light
-    int depthBias;         // 0/1
-    float depthWorld;      // world units along the light, converted to the cascade's depth scale
-    int slopeScaled;       // 0/1 -- scale the three above by how edge-on the surface is
+    int slopeScaled;       // 0/1 -- scale the offset above by how edge-on the surface is
     float slopeMax;        // ceiling on that scale
 } ShadowMapAcne;
 
@@ -922,10 +816,6 @@ typedef struct ShadowMapAcne {
 // defaults -- call ShadowMapQualityDefaults() rather than relying on {}.
 typedef struct ShadowMapQuality {
     // Technique 1 -- filterable maps
-    int filterMode;        // SHADOW_MAP_FILTER_*
-    float esmExponent;     // ESM only
-    float blurRadius;      // texels; 0 = no blur
-    float bleedReduction;  // VSM/MSM only, 0..1
 
     // Technique 2 -- analytic edge
     int analyticEdge;         // 0/1
@@ -935,7 +825,6 @@ typedef struct ShadowMapQuality {
     int jitter;          // 0/1
     int jitterTaps;      // 1..SHADOW_MAP_MAX_JITTER_TAPS
     float jitterRadius;  // texels
-    int jitterTemporal;  // 0/1
 
     // Layout -- the cascade ladder, or the clipmap
     int layout;           // SHADOW_MAP_LAYOUT_*
@@ -966,16 +855,11 @@ typedef struct ShadowMapQuality {
 // the C boundary get the same one and it cannot drift.
 static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     ShadowMapQuality q;
-    q.filterMode = SHADOW_MAP_DEFAULT_FILTER_MODE;
-    q.esmExponent = SHADOW_MAP_DEFAULT_ESM_EXPONENT;
-    q.blurRadius = SHADOW_MAP_DEFAULT_BLUR_RADIUS;
-    q.bleedReduction = SHADOW_MAP_DEFAULT_BLEED_REDUCTION;
     q.analyticEdge = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE;
     q.analyticEdgeWidth = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH;
     q.jitter = SHADOW_MAP_DEFAULT_JITTER;
     q.jitterTaps = SHADOW_MAP_DEFAULT_JITTER_TAPS;
     q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
-    q.jitterTemporal = SHADOW_MAP_DEFAULT_JITTER_TEMPORAL;
     q.layout = SHADOW_MAP_DEFAULT_LAYOUT;
     q.staticCache = SHADOW_MAP_DEFAULT_STATIC_CACHE;
     q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
@@ -990,10 +874,6 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.acne.enabled = SHADOW_MAP_DEFAULT_ACNE_ENABLED;
     q.acne.normalOffset = SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET;
     q.acne.normalTexels = SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS;
-    q.acne.lightOffset = SHADOW_MAP_DEFAULT_ACNE_LIGHT_OFFSET;
-    q.acne.lightWorld = SHADOW_MAP_DEFAULT_ACNE_LIGHT_WORLD;
-    q.acne.depthBias = SHADOW_MAP_DEFAULT_ACNE_DEPTH_BIAS;
-    q.acne.depthWorld = SHADOW_MAP_DEFAULT_ACNE_DEPTH_WORLD;
     q.acne.slopeScaled = SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED;
     q.acne.slopeMax = SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX;
     return q;
@@ -1006,16 +886,11 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
         return;
     }
 #define SHADOW_MAP_CLAMP_(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
-    q->filterMode = SHADOW_MAP_CLAMP_(q->filterMode, 0, SHADOW_MAP_FILTER_MAX);
-    q->esmExponent = SHADOW_MAP_CLAMP_(q->esmExponent, SHADOW_MAP_MIN_ESM_EXPONENT, SHADOW_MAP_MAX_ESM_EXPONENT);
-    q->blurRadius = SHADOW_MAP_CLAMP_(q->blurRadius, 0.0f, SHADOW_MAP_MAX_BLUR_RADIUS);
-    q->bleedReduction = SHADOW_MAP_CLAMP_(q->bleedReduction, 0.0f, 0.99f);
     q->analyticEdge = q->analyticEdge ? 1 : 0;
     q->analyticEdgeWidth = SHADOW_MAP_CLAMP_(q->analyticEdgeWidth, 0.25f, SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH);
     q->jitter = q->jitter ? 1 : 0;
     q->jitterTaps = SHADOW_MAP_CLAMP_(q->jitterTaps, 1, SHADOW_MAP_MAX_JITTER_TAPS);
     q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
-    q->jitterTemporal = q->jitterTemporal ? 1 : 0;
     q->layout = SHADOW_MAP_CLAMP_(q->layout, 0, SHADOW_MAP_LAYOUT_MAX);
     q->staticCache = q->staticCache ? 1 : 0;
     q->clipmapLevels = SHADOW_MAP_CLAMP_(q->clipmapLevels, 1, SHADOW_MAP_MAX_CLIPMAP_LEVELS);
@@ -1032,10 +907,6 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->acne.enabled = q->acne.enabled ? 1 : 0;
     q->acne.normalOffset = q->acne.normalOffset ? 1 : 0;
     q->acne.normalTexels = SHADOW_MAP_CLAMP_(q->acne.normalTexels, 0.0f, SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS);
-    q->acne.lightOffset = q->acne.lightOffset ? 1 : 0;
-    q->acne.lightWorld = SHADOW_MAP_CLAMP_(q->acne.lightWorld, 0.0f, SHADOW_MAP_MAX_ACNE_LIGHT_WORLD);
-    q->acne.depthBias = q->acne.depthBias ? 1 : 0;
-    q->acne.depthWorld = SHADOW_MAP_CLAMP_(q->acne.depthWorld, 0.0f, SHADOW_MAP_MAX_ACNE_DEPTH_WORLD);
     q->acne.slopeScaled = q->acne.slopeScaled ? 1 : 0;
     q->acne.slopeMax = SHADOW_MAP_CLAMP_(q->acne.slopeMax, 1.0f, SHADOW_MAP_MAX_ACNE_SLOPE_MAX);
 #undef SHADOW_MAP_CLAMP_

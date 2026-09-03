@@ -413,51 +413,6 @@ class GfxRenderingAPI {
         ShadowMapQualityClamp(&mShadowQuality);
     }
 
-    // SOH [Enhancement] Which filterable mode is ACTUALLY running, which is not always the one that was
-    // asked for: the moment array can be refused for memory (see SHADOW_MAP_MOMENT_BUDGET_MB) or fail to
-    // build, and the receiver then falls back to depth and PCF.
-    //
-    // Readable so the application can say so. The refusal is logged, and a log is not where a player finds
-    // out why a setting they ticked changed nothing on screen.
-    int ShadowMapEffectiveFilterMode() const {
-        return mShadowEffectiveFilterMode;
-    }
-
-    // SOH [Enhancement] How much memory the filterable modes are allowed, in MB, on THIS machine.
-    //
-    // A limit has to exist, and not because the allocation would fail -- it mostly would not. D3D11 manages
-    // residency itself, so the driver will accept an array larger than physical VRAM and page the excess
-    // over PCIe. That does not fail; it runs, at a few frames a second, with the shadow map crossing the bus
-    // every frame. Allocation success is not proof that something fits, so the check has to happen before
-    // the driver is asked, not by reading its answer.
-    //
-    // What the limit must NOT be is a constant. It used to be one, which meant a 2 GB card and a 24 GB card
-    // were told the same number -- generous on one, absurdly tight on the other. Backends that know the
-    // adapter's memory replace this with a share of it; the rest keep the compiled-in floor.
-    int ShadowMapMomentBudgetMb() const {
-        return mShadowMomentBudgetMb;
-    }
-
-    // Hand this the adapter's dedicated video memory in bytes and it applies the policy above: a quarter of
-    // it, and never below the compiled-in floor, so this can only ever widen the old fixed limit.
-    //
-    // A quarter because the moment array is ONE optional effect stacked on top of the depth array, the
-    // framebuffers and every game texture -- it does not get to plan for more. Integrated parts with no
-    // memory of their own report 0, and there is no share of zero to take, so they keep the floor.
-    //
-    // The policy lives here, beside the accessor and the reasoning, rather than in whichever backend
-    // happens to have an adapter handle -- so a second backend learning to read its VRAM inherits the rule
-    // instead of writing a second copy that drifts.
-    void SetShadowMapMomentBudgetFromVideoMemory(uint64_t dedicatedBytes) {
-        if (dedicatedBytes == 0) {
-            return;
-        }
-        const uint64_t quarterMb = (dedicatedBytes / (1024ull * 1024ull)) / 4ull;
-        if (quarterMb > (uint64_t)mShadowMomentBudgetMb) {
-            mShadowMomentBudgetMb = (int)quarterMb;
-        }
-    }
-
     // SOH [Enhancement] What the cascades actually came out as this frame: the far distance of each band
     // and the world size of one of its texels. Both are computed deep in the fit -- the texel from the
     // projection matrix itself -- and neither is knowable from the settings alone once the automatic
@@ -516,11 +471,6 @@ class GfxRenderingAPI {
     // World size of one texel in each cascade, recovered from its own projection. Filled by the
     // backend beside the shader constants; see ShadowMapCascadeReport.
     float mShadowTexelWorld[SHADOW_MAP_MAX_CASCADES] = {};
-    // The filterable mode the backend could actually honour; see ShadowMapEffectiveFilterMode.
-    int mShadowEffectiveFilterMode = SHADOW_MAP_FILTER_DEPTH;
-    // See ShadowMapMomentBudgetMb. Starts at the compiled-in floor; a backend that can read the adapter's
-    // memory raises it at device creation.
-    int mShadowMomentBudgetMb = SHADOW_MAP_MOMENT_BUDGET_MB;
     // SOH [Enhancement] Clipmap frame; see SetShadowMapClipmap. Zero levels is the cascade path.
     float mShadowClipmapX[3] = {};
     float mShadowClipmapY[3] = {};
