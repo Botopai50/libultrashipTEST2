@@ -328,6 +328,13 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
             if (SUCCEEDED(res2)) {
                 adapterName = adapterDesc.Description;
                 wcstombs(adapterNameCStr, adapterName.c_str(), 128);
+
+                // SOH [Enhancement] Size the filterable shadow modes against THIS card, not a constant.
+                // The desc was already being fetched here to log the adapter's name; the memory figure sat
+                // in the same struct and was thrown away. The policy is in the base class.
+                self->SetShadowMapMomentBudgetFromVideoMemory((uint64_t)adapterDesc.DedicatedVideoMemory);
+                SPDLOG_INFO("Shadow map: filterable modes may use up to {} MB on this adapter.",
+                            self->ShadowMapMomentBudgetMb());
             }
             Adapter->Release();
         }
@@ -2830,10 +2837,11 @@ bool GfxRenderingAPIDX11::CreateShadowMomentTargets(int mode, int resolution, in
     // back to depth and PCF -- worse looking than asked for, but not "no shadows".
     const double megabytes = ((double)resolution * (double)resolution * (double)bytesPerTexel *
                              (double)(sliceCount + 1)) / (1024.0 * 1024.0);
-    if (megabytes > (double)SHADOW_MAP_MOMENT_BUDGET_MB) {
-        SPDLOG_WARN("Shadow map: the filterable mode wants {:.0f} MB at {}x{} across {} slices, over the "
-                    "{} MB ceiling. Falling back to depth and PCF -- lower the shadow resolution to use it.",
-                    megabytes, resolution, resolution, sliceCount, SHADOW_MAP_MOMENT_BUDGET_MB);
+    if (megabytes > (double)mShadowMomentBudgetMb) {
+        SPDLOG_WARN("Shadow map: the filterable mode wants {:.0f} MB at {}x{} across {} slices, over this "
+                    "adapter's {} MB share. Falling back to depth and PCF -- lower the shadow resolution to "
+                    "use it.",
+                    megabytes, resolution, resolution, sliceCount, mShadowMomentBudgetMb);
         return false;
     }
 

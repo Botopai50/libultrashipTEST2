@@ -493,11 +493,19 @@
 // then it is a stated preference rather than a mode that is running.
 #define SHADOW_MAP_DEFAULT_FILTER_MODE SHADOW_MAP_FILTER_ESM
 
-// Ceiling on what the filterable modes may allocate for their moment array, in megabytes.
+// FLOOR on what the filterable modes may allocate for their moment array, in megabytes -- the figure used
+// when nothing better is known about the machine. This was the whole limit once; it is now the minimum, and
+// the real number comes from the adapter (see GfxRenderingAPI::SetShadowMapMomentBudgetFromVideoMemory).
 //
-// This is the constraint that decides whether a filterable mode is usable at all, and it is severe. The
-// depth array stores one 16-bit value per texel; the moment array stores one to four 32- or 16-bit ones, so
-// it is two to four times larger than a map that is already 160 MB across five slices at 4096. Measured:
+// A limit has to exist, and NOT because the allocation would otherwise fail -- it mostly would not. D3D11
+// manages residency itself, so the driver accepts an array larger than physical VRAM and pages the excess
+// over PCIe. That does not fail; it runs, at a few frames a second, with the shadow map crossing the bus
+// every frame. Allocation success is not proof that something fits, so the size has to be judged before the
+// driver is asked.
+//
+// The cost is severe enough to be worth judging. The depth array stores one 16-bit value per texel; the
+// moment array stores one to four 32- or 16-bit ones, so it is two to four times larger than a map that is
+// already 160 MB across five slices at 4096. Measured:
 //
 //               4096      2048      1024
 //   depth D16   160 MB     40 MB     10 MB
@@ -505,15 +513,11 @@
 //   VSM  RG32F  640 MB    160 MB     40 MB
 //   MSM  RGBA16 640 MB    160 MB     40 MB
 //
-// So a filterable mode at the default resolution asks for between a third and two thirds of a gigabyte on
-// top of what the shadow map already costs, which is not a thing to allocate because a checkbox was ticked.
-// The backend refuses above this ceiling, says so in the log, and leaves the mode reporting as unavailable
-// -- which falls back to depth and PCF rather than to no shadows.
-//
-// 192 admits every mode at 2048 and below, and admits none at 4096. That is the honest shape of the trade:
-// these modes buy a soft edge with memory, and the resolution has to come down to pay for it. Halving the
-// resolution costs a factor of two in texel size, which the blur then more than gives back -- which is the
-// whole argument for the technique.
+// What this number must not be is the answer for every machine, which is exactly what it was: a 2 GB card
+// and a 24 GB card were told the same 192, generous on one and absurdly tight on the other. On its own it
+// admits every mode at 2048 and below and none at 4096 -- so on any card with real memory the adapter's
+// share is what decides, and 4096 is reachable. This value only still applies where the adapter reports no
+// dedicated memory of its own.
 #define SHADOW_MAP_MOMENT_BUDGET_MB 192
 
 // ESM's exponent. The stored value is exp(k*d) and the test is exp(-k*z) * stored, so k sets how sharply
