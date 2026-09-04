@@ -2141,6 +2141,28 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     alignas(16) float onx[kVtxBlock], ony[kVtxBlock], onz[kVtxBlock];
     alignas(16) int32_t shadeR[kVtxBlock], shadeG[kVtxBlock], shadeB[kVtxBlock];
 
+    // SOH [Enhancement] Read once what the loop below cannot change, for the same reason the packing loop
+    // in GfxSpTri1 does it: this loop writes vertices through `d`, which points INTO mRsp->loaded_vertices.
+    // Those writes are to a different member than the ones read here, but nothing in the type says so, so
+    // every read below was fetched again on each of n_vertices iterations -- the lookat coefficients six
+    // times over, since texture generation reads all six components per vertex.
+    //
+    // Placed after the lights_changed block above, which is what WRITES current_lookat_coeffs. Types are
+    // kept exactly as declared (uint16_t scales, int16_t fog) so the integer promotions in the expressions
+    // below are the ones they always were.
+    const uint16_t texScaleS = mRsp->texture_scaling_factor.s;
+    const uint16_t texScaleT = mRsp->texture_scaling_factor.t;
+    const bool texGen = (mRsp->geometry_mode & G_TEXTURE_GEN) != 0;
+    const bool texGenLinear = (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) != 0;
+    const bool fogOn = (mRsp->geometry_mode & G_FOG) != 0;
+    const bool toonOn = mRdp->toon;
+    const int16_t fogMul = mRsp->fog_mul;
+    const int16_t fogOffset = mRsp->fog_offset;
+    const float lookatX[3] = { mRsp->current_lookat_coeffs[0][0], mRsp->current_lookat_coeffs[0][1],
+                               mRsp->current_lookat_coeffs[0][2] };
+    const float lookatY[3] = { mRsp->current_lookat_coeffs[1][0], mRsp->current_lookat_coeffs[1][1],
+                               mRsp->current_lookat_coeffs[1][2] };
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const size_t k = i % kVtxBlock;
         if (k == 0) {
@@ -2202,8 +2224,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->wz = mz[k];
         }
 
-        short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
-        short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+        short U = v->tc[0] * texScaleS >> 16;
+        short V = v->tc[1] * texScaleT >> 16;
 
         if (lighting) {
             // Summed for the whole block at the top of it (see ShadeVertexBlock); this lane's share of it.
@@ -2245,20 +2267,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 d->ny = ony[k];
                 d->nz = onz[k];
             }
-            if (mRdp->toon) {
+            if (toonOn) {
                 d->color.r = 255;
                 d->color.g = 255;
                 d->color.b = 255;
             }
 
-            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+            if (texGen) {
                 float dotx = 0, doty = 0;
-                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
-                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
-                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
-                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
-                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
-                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
+                dotx += vn->n[0] * lookatX[0];
+                dotx += vn->n[1] * lookatX[1];
+                dotx += vn->n[2] * lookatX[2];
+                doty += vn->n[0] * lookatY[0];
+                doty += vn->n[1] * lookatY[1];
+                doty += vn->n[2] * lookatY[2];
 
                 dotx /= 127.0f;
                 doty /= 127.0f;
@@ -2266,7 +2288,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
                 doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
 
-                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
+                if (texGenLinear) {
                     // Not sure exactly what formula we should use to get accurate values
                     /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
                     doty = (2.906921f * doty * doty + 1.36114f) * doty;
@@ -2279,8 +2301,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     doty = (doty + 1.0f) / 4.0f;
                 }
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                U = (int32_t)(dotx * texScaleS);
+                V = (int32_t)(doty * texScaleT);
             }
         } else {
             d->color.r = v->cn[0];
@@ -2315,7 +2337,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->z = z;
         d->w = w;
 
-        if (mRsp->geometry_mode & G_FOG) {
+        if (fogOn) {
             if (fabsf(w) < 0.001f) {
                 // To avoid division by zero
                 w = 0.001f;
@@ -2326,7 +2348,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            float fog_z = z * winv * fogMul + fogOffset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
