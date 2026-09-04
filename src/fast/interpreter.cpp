@@ -2907,6 +2907,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    // SOH [Enhancement] Everything the packing loop below reads that cannot change while it runs, read once.
+    //
+    // The loop stores into mBufVbo and calls memcpy, and the compiler cannot prove either is a different
+    // object from mRdp or mRsp -- they are separate allocations, but nothing in the types says so. So every
+    // one of these was RELOADED from memory on each pass: the tile fields up to six times per triangle
+    // (three vertices by two texture units), the rest three times. For the hottest loop in the renderer,
+    // over every triangle in the game.
+    //
+    // Hoisting only moves the reads. The arithmetic below is left exactly where it was and in the same
+    // order, including the divisions -- turning `u /= 1 << shifts` into a multiply by a precomputed
+    // reciprocal would round differently, and a texture coordinate is not a place to accept that.
+    int tileShifts[2] = {}, tileShiftT[2] = {};
+    float tileUls[2] = {}, tileUlt[2] = {};
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t]) {
+            continue;
+        }
+        const auto& tile = mRdp->texture_tile[mRdp->first_tile_index + t];
+        tileShifts[t] = tile.shifts;
+        tileShiftT[t] = tile.shiftt;
+        tileUls[t] = tile.uls / 4.0f;
+        tileUlt[t] = tile.ult / 4.0f;
+    }
+    const bool texcoordLinearFilter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    // Only meaningful when the normal attribute is emitted at all; read here so the loop does not.
+    const bool packHaveNormal = (mRsp->geometry_mode & G_LIGHTING) != 0;
+    const float grayscaleR = mRdp->grayscale_color.r / 255.0f;
+    const float grayscaleG = mRdp->grayscale_color.g / 255.0f;
+    const float grayscaleB = mRdp->grayscale_color.b / 255.0f;
+    const float grayscaleA = mRdp->grayscale_color.a / 255.0f;
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
@@ -2925,8 +2956,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             float u = v_arr[i]->u / 32.0f;
             float v = v_arr[i]->v / 32.0f;
 
-            int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
-            int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
+            int shifts = tileShifts[t];
+            int shiftt = tileShiftT[t];
             if (shifts != 0) {
                 if (shifts <= 10) {
                     u /= 1 << shifts;
@@ -2942,10 +2973,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            u -= mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
-            v -= mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
+            u -= tileUls[t];
+            v -= tileUlt[t];
 
-            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
+            if (texcoordLinearFilter) {
                 // Linear filter adds 0.5f to the coordinates
                 if (!is_rect) {
                     u += 0.5f;
@@ -2976,10 +3007,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
 
         if (use_grayscale) {
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.r / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+            mBufVbo[mBufVboLen++] = grayscaleR;
+            mBufVbo[mBufVboLen++] = grayscaleG;
+            mBufVbo[mBufVboLen++] = grayscaleB;
+            mBufVbo[mBufVboLen++] = grayscaleA; // lerp interpolation factor (not alpha)
         }
 
         // SOH [Enhancement] Toon lighting: world-space normal (aNormal). The dominant light/ambient
@@ -2994,10 +3025,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // point -- nx/ny/nz are only written on lit geometry, so an unlit draw would otherwise ship
         // whatever the last lit object happened to leave in the vertex slot.
         if (use_toon || use_shadow_map) {
-            const bool haveNormal = (mRsp->geometry_mode & G_LIGHTING) != 0;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nx : 0.0f;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->ny : 0.0f;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nz : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->nx : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->ny : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->nz : 0.0f;
         }
 
         // SOH [Enhancement] Cascaded shadow maps: world position (aWorldPos), so the pixel shader can
