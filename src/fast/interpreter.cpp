@@ -2375,8 +2375,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // three: the stencil path needs toon_shadow, and all three shadow-map paths need the shadow map on plus
     // one of its brackets open. Everything the block computes is derived state with no side effects, so
     // skipping it is exactly equivalent to running it and reaching no branch.
+    //
+    // mShadowWorldCapture belongs in the test for exactly that reason, and its absence was costing the most
+    // expensive frames in the game. BOTH world-layer branches below already require it -- it is what makes a
+    // settled room reuse its cached caster list instead of re-walking it -- so on every frame that reuses the
+    // cache a world-caster triangle entered here, built a whole TextureCacheKey to answer the cutout
+    // question, and then reached no branch and threw the answer away. That is per triangle, over the entire
+    // room mesh, on the frames this cache exists to make cheap.
+    //
+    // toon_shadow and shadow_scenery_caster stay ungated: the actor path and the scenery path have no cache
+    // to skip, and run every frame.
     const bool shadowCaptureActive =
-        mRdp->toon_shadow || (mShadowMapEnabled && (mRdp->shadow_world_caster || mRdp->shadow_scenery_caster));
+        mRdp->toon_shadow ||
+        (mShadowMapEnabled &&
+         (mRdp->shadow_scenery_caster || (mRdp->shadow_world_caster && mShadowWorldCapture)));
     if (shadowCaptureActive) {
         TextureCacheKey shadowAlphaKey{};
         bool shadowAlphaCaster = false;
