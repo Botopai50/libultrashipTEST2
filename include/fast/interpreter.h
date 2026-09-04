@@ -963,6 +963,9 @@ class Interpreter {
     float mShadowObjectMax[3] = {};
     bool mShadowObjectHasVerts = false;
     size_t mShadowAlphaObjectMark = 0; // where the current object started in the actor cutout list
+    // The same, for the actor OPAQUE list. It exists so that list can be written into directly and rolled
+    // back, the way the cutout one already is, instead of being staged in mShadowVerts and copied.
+    size_t mShadowOpaqueObjectMark = 0;
     // Whether the backend can actually draw cutout casters. False keeps them on the opaque list, where they
     // cast their quad -- which is what this whole path exists to avoid, but is still a shadow.
     bool mShadowAlphaSupported = false;

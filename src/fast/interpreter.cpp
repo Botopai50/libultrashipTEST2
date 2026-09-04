@@ -2459,11 +2459,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
             } else if (shadowCasterExcluded) {
                 // Nothing: not a caster, and the stencil path is not running (see ShadowCasterExcludedByRenderMode).
-            } else if (mShadowMapEnabled || casterLit) {
-                // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
-                // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
-                // map needs the object's bounding box before it can decide the object is worth casting at all
-                // (see FlushToonShadow).
+            } else if (mShadowMapEnabled) {
+                // Straight into the layer's list, not into a staging buffer that gets copied there at the
+                // object boundary. The cutout half beside this one has always worked that way -- it writes
+                // through and rolls back to a mark when the size gate rejects the object -- and the size
+                // gate is the only reason the opaque half was staged at all. Doing the same here spends one
+                // write per vertex instead of two, every frame, over every character in the scene.
+                //
+                // The bounding box the gate judges is accumulated separately just above, so nothing about
+                // the decision needs the vertices to be held apart from the list.
+                ShadowAppendTriangle(mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS], v_arr);
+            } else if (casterLit) {
+                // Stencil volumes still stage: that path needs the whole silhouette in one place before it
+                // can build a volume from it, which is a different requirement from the gate's.
                 ShadowAppendTriangle(mShadowVerts, v_arr);
             }
         } else if (mShadowMapEnabled && mRdp->shadow_scenery_caster && !is_rect && !shadowCasterExcluded) {
@@ -3643,6 +3651,7 @@ void Interpreter::FlushToonShadow() {
         mShadowVerts.clear();
         mShadowObjectHasVerts = false;
         mShadowAlphaObjectMark = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].verts.size();
+        mShadowOpaqueObjectMark = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size();
     };
 
     if (mShadowMapEnabled) {
@@ -3659,15 +3668,21 @@ void Interpreter::FlushToonShadow() {
                                                mShadowObjectMax[1] - mShadowObjectMin[1],
                                                mShadowObjectMax[2] - mShadowObjectMin[2] })
                                   : 0.0f;
-        if (extent >= mShadowMapMinCasterSize) {
-            if (mShadowVerts.size() >= 9 &&
-                mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
-                std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
-                dst.insert(dst.end(), mShadowVerts.begin(), mShadowVerts.end());
+        // The budget is read at the mark, which is the size BEFORE this object, so an object is still
+        // accepted or rejected whole -- exactly as it was when the test guarded a copy. Checking it per
+        // triangle instead would let one land half-drawn at the boundary, which is a character with part of
+        // a shadow.
+        const bool objectAccepted =
+            extent >= mShadowMapMinCasterSize && mShadowOpaqueObjectMark < kShadowMapCasterBudgetFloats;
+        if (!objectAccepted) {
+            // Rejected, so take back what this object wrote. The opaque half is a plain truncation: the
+            // vertices were appended to the end and nothing has been appended after them.
+            std::vector<float>& opaque = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
+            if (opaque.size() > mShadowOpaqueObjectMark) {
+                opaque.resize(mShadowOpaqueObjectMark);
             }
-        } else {
-            // Too small: roll the cutout half back to where this object started too, or the gate would only
-            // ever drop half a caster and clutter would keep casting whatever part of it was alpha-tested.
+            // And the cutout half back to where this object started too, or the gate would only ever drop
+            // half a caster and clutter would keep casting whatever part of it was alpha-tested.
             ShadowAlphaCasters& alpha = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS];
             if (alpha.verts.size() > mShadowAlphaObjectMark) {
                 const uint32_t markVertex = (uint32_t)(mShadowAlphaObjectMark / 5);
@@ -4164,6 +4179,7 @@ void Interpreter::RenderShadowMap() {
         // with it -- otherwise the first object of the new frame is measured against last frame's offset and
         // the size gate cannot roll it back.
         mShadowAlphaObjectMark = 0;
+        mShadowOpaqueObjectMark = 0;
         mShadowObjectHasVerts = false;
     }
 
