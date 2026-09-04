@@ -1689,17 +1689,34 @@ void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<Sha
         ShadowCasterChunk chunk;
         chunk.firstVertex = (uint32_t)(base / 3);
         chunk.vertexCount = (uint32_t)((end - base) / 3);
-        for (int a = 0; a < 3; a++) {
-            chunk.min[a] = std::numeric_limits<float>::max();
-            chunk.max[a] = -std::numeric_limits<float>::max();
-        }
+        // Accumulated in locals and stored once, not read back out of the struct on every vertex.
+        //
+        // `chunk` is a struct in memory and `v` is a vector's buffer, and nothing in the types says they are
+        // different objects -- so writing chunk.min[a] forced the next iteration to RELOAD it, and the same
+        // for the other five. Six loads and six stores per vertex, over every scenery and actor caster in
+        // the scene, every frame. The same aliasing the packing and vertex loops were carrying.
+        //
+        // Same operations in the same order, so the boxes come out identical; only where the running values
+        // live changes.
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float minZ = std::numeric_limits<float>::max();
+        float maxX = -std::numeric_limits<float>::max();
+        float maxY = -std::numeric_limits<float>::max();
+        float maxZ = -std::numeric_limits<float>::max();
         for (size_t i = base; i < end; i += 3) {
-            for (int a = 0; a < 3; a++) {
-                const float p = v[i + a];
-                chunk.min[a] = std::min(chunk.min[a], p);
-                chunk.max[a] = std::max(chunk.max[a], p);
-            }
+            const float px = v[i + 0];
+            const float py = v[i + 1];
+            const float pz = v[i + 2];
+            minX = std::min(minX, px);
+            maxX = std::max(maxX, px);
+            minY = std::min(minY, py);
+            maxY = std::max(maxY, py);
+            minZ = std::min(minZ, pz);
+            maxZ = std::max(maxZ, pz);
         }
+        chunk.min[0] = minX, chunk.min[1] = minY, chunk.min[2] = minZ;
+        chunk.max[0] = maxX, chunk.max[1] = maxY, chunk.max[2] = maxZ;
         // The span's signature, taken here because this walk already has the data in cache. A cascade's
         // reuse key is then a combine over the spans it touches, so the vertex data is hashed once per
         // frame however many cascades read it.
