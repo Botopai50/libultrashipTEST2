@@ -4857,11 +4857,11 @@ void Interpreter::RenderShadowMap() {
     //
     // A span whose texture could not be resolved is NOT bridgeable: it has no texture to be drawn with, so
     // it always breaks the run.
-    auto drawAlphaRanges = [this, &boxVisible](const ShadowAlphaCasters& set, const float* m) {
+    auto drawAlphaRanges = [this, &boxVisible](const ShadowAlphaCasters& set, const float* m, int slot) {
         uint32_t runTexture = UINT32_MAX, runFirst = 0, runCount = 0, gapCount = 0;
         auto flush = [&] {
             if (runCount >= 3) {
-                mRapi->ShadowMapDrawAlphaRange(runTexture, runFirst, runCount);
+                mRapi->ShadowMapDrawAlphaRange(runTexture, runFirst, runCount, slot);
             }
             runCount = 0;
             gapCount = 0;
@@ -4952,8 +4952,9 @@ void Interpreter::RenderShadowMap() {
             // It costs two extra pipeline switches on a frame that rebuilds the static half, and none at
             // all on the frames that do not, which are the ones this exists to make cheap.
             if (drawStatic && alpha.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
-                drawAlphaRanges(alpha, &matrices[c * 16]);
+                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount(),
+                                                   SHADOW_MAP_CASTER_SLOT_MAIN);
+                drawAlphaRanges(alpha, &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_MAIN);
             }
 
             // SOH [Enhancement] Static caster cache: everything above was the static half. Saying so is what
@@ -4971,8 +4972,9 @@ void Interpreter::RenderShadowMap() {
             }
             if (sceneryHere && mShadowAlphaSceneryReady.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
-                                                  mShadowAlphaSceneryReady.VertexCount());
-                drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16]);
+                                                  mShadowAlphaSceneryReady.VertexCount(),
+                                                  SHADOW_MAP_CASTER_SLOT_SCENERY);
+                drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_SCENERY);
             }
         }
     }

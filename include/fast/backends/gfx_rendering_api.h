@@ -272,13 +272,13 @@ class GfxRenderingAPI {
         return false;
     }
 
-    virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+    virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) {
     }
 
     // Draw one material's slice of the uploaded alpha casters, clipping against that texture's alpha so the
     // depth map records the leaf rather than the quad holding it. `textureId` is a texture the backend
     // already holds from the main pass.
-    virtual void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
+    virtual void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount, int slot) {
     }
 
     // Close the depth pass and restore the render target the frame was drawing to. After this the
