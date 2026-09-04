@@ -189,6 +189,11 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const std::strin
     return LoadResourceProcess({ filePath, mDefaultCacheOwner, mDefaultCacheArchive }, loadExact, initData);
 }
 
+ResourceManager::InFlightGuard::~InFlightGuard() {
+    const std::lock_guard<std::mutex> lock(Manager->mInFlightMutex);
+    Manager->mInFlight.erase(Key);
+}
+
 std::shared_future<std::shared_ptr<IResource>>
 ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool loadExact, BS::priority_t priority,
                                    std::shared_ptr<ResourceInitData> initData) {
@@ -221,22 +226,18 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return existing->second;
     }
 
-    auto future = mThreadPool->submit_task(
+    // .share() explicitly: submit_task hands back a std::future, and the conversion to shared_future only
+    // happens for an rvalue. Returning the call directly used to make that conversion invisible; naming the
+    // result to also store it in mInFlight turns it into an lvalue, which does not convert.
+    const std::shared_future<std::shared_ptr<IResource>> future = mThreadPool->submit_task(
         [this, key, initData]() -> std::shared_ptr<IResource> {
             // Erase on the way out whatever happens, including on an exception: an entry left behind is a
-            // completed future served to every future caller as if it were a live load.
-            struct InFlightGuard {
-                ResourceManager* Manager;
-                const InFlightKey& Key;
-                ~InFlightGuard() {
-                    const std::lock_guard<std::mutex> lock(Manager->mInFlightMutex);
-                    Manager->mInFlight.erase(Key);
-                }
-            } guard{ this, key };
-
+            // completed future served to every later caller as if it were a live load.
+            const InFlightGuard guard{ this, key };
             return LoadResourceProcess(key.Identifier, key.LoadExact, initData);
         },
-        priority);
+        priority)
+                                                                 .share();
 
     mInFlight.emplace(key, future);
     return future;

@@ -155,6 +155,16 @@ class ResourceManager {
             return ResourceIdentifierHash{}(key.Identifier) ^ (key.LoadExact ? 0x9e3779b97f4a7c15ULL : 0ULL);
         }
     };
+    // Removes the entry when the load finishes, however it finishes -- a normal return or an exception.
+    // A nested type of ResourceManager rather than a local struct inside the worker lambda: a local class
+    // declared inside a lambda reaching for the enclosing class's private members is exactly the kind of
+    // access question compilers disagree about, and there is nothing to gain by asking it.
+    struct InFlightGuard {
+        ResourceManager* Manager;
+        InFlightKey Key;
+        ~InFlightGuard();
+    };
+
     std::mutex mInFlightMutex;
     std::unordered_map<InFlightKey, std::shared_future<std::shared_ptr<IResource>>, InFlightKeyHash> mInFlight;
 
