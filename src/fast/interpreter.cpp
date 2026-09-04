@@ -1568,7 +1568,7 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
         dst.ranges.back().vertexCount >= kShadowAlphaChunkTriangles * 3) {
         const float inf = std::numeric_limits<float>::max();
         dst.ranges.push_back(
-            { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf } });
+            { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf }, 0ull });
     }
     // Built into a local and inserted once, for the same reason the opaque path does (see
     // ShadowAppendTriangle): fifteen push_backs per triangle is fifteen capacity checks.
@@ -1584,6 +1584,7 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
         o[4] = w;
     }
     dst.verts.insert(dst.verts.end(), tri, tri + 15);
+    dst.hashesValid = false; // the signatures no longer describe what is in here
     ShadowAlphaRange& range = dst.ranges.back();
     range.vertexCount += 3;
     // Grow the range's box with this triangle. Done here rather than in a second pass because the vertices
@@ -1762,17 +1763,9 @@ uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m, int 
             const uint32_t fields[2] = { r.textureId, r.vertexCount };
             h = ShadowHashBytes(h, fields, sizeof(fields));
             // The cutout vertices themselves move under a range whose fields do not -- a swaying billboard
-            // keeps its count and its texture. Only ranges that reach this cascade are walked.
-            //
-            // FIVE floats per vertex here, not three: this buffer carries world xyz AND uv (see
-            // ShadowAlphaCasters::verts). Indexing it by three would hash a sliding, wrong slice of the
-            // buffer, which fails in the dangerous direction -- two different frames hashing equal and a
-            // stale depth map left on screen.
-            const size_t first = (size_t)r.firstVertex * 5;
-            const size_t count = (size_t)r.vertexCount * 5;
-            if (first + count <= a.verts.size()) {
-                h = ShadowHashBytes(h, a.verts.data() + first, count * sizeof(float));
-            }
+            // keeps its count and its texture. Their signature was taken once this frame, in
+            // ResolveShadowAlphaTextures, rather than re-hashed here for every cascade that reaches them.
+            h = ShadowHashBytes(h, &r.hash, sizeof(r.hash));
         }
         h = ShadowHashBytes(h, &accepted, sizeof(accepted));
     };
@@ -1818,7 +1811,31 @@ void Interpreter::ResolveShadowAlphaTextures(ShadowAlphaCasters& set) {
         // path is to stop foliage casting its bounding quad, so falling back to the opaque draw would
         // reinstate exactly the artefact it exists to remove.
         r.textureId = (it != mTextureCache.map.end()) ? it->second.texture_id : UINT32_MAX;
+
+        // SOH [Enhancement] And the range's signature, when it needs retaking.
+        //
+        // The reuse key used to hash these bytes itself, once for every cascade the range reached. For the
+        // WORLD cutouts that was three times a frame, forever, over vertices that had not moved since the
+        // room loaded. Taking it here costs one pass over data this loop already touches, and the key then
+        // combines eight bytes per range instead of five floats per vertex.
+        //
+        // The texture id above is looked up every frame because it genuinely can change under a still
+        // range -- a texture evicted and re-imported. The vertices cannot, so they are signed only when
+        // something wrote to the set.
+        //
+        // FIVE floats per vertex: this buffer carries world xyz AND uv. Indexing by three would hash a
+        // sliding, wrong slice of the buffer -- which fails in the dangerous direction, two different frames
+        // hashing equal and a stale depth map left on screen. The bounds test is kept for the same reason.
+        if (!set.hashesValid) {
+            r.hash = 0xCBF29CE484222325ull;
+            const size_t first = (size_t)r.firstVertex * 5;
+            const size_t count = (size_t)r.vertexCount * 5;
+            if (first + count <= set.verts.size()) {
+                r.hash = ShadowHashBytes(r.hash, set.verts.data() + first, count * sizeof(float));
+            }
+        }
     }
+    set.hashesValid = true;
 }
 
 // SOH [Enhancement] Four vertices' worth of transform at a time.

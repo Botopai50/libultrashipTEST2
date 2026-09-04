@@ -919,17 +919,35 @@ class Interpreter {
         // near cascade covers almost none of them.
         float min[3];
         float max[3];
+        // SOH [Enhancement] Signature of this range's vertices, taken once per frame in
+        // ResolveShadowAlphaTextures. The cascade reuse key used to hash these bytes itself, which meant
+        // hashing them again for every cascade that reached the range -- and for the WORLD cache, which is
+        // the cached room mesh, hashing bytes that had not changed since the cache was built. The opaque
+        // spans beside this one (ShadowCasterChunk) already worked this way; the cutout ranges did not.
+        uint64_t hash;
     };
     struct ShadowAlphaCasters {
         std::vector<float> verts; // 5 floats per vertex: world xyz + uv
         std::vector<ShadowAlphaRange> ranges;
+        // Whether every range's `hash` describes the vertices currently in `verts`.
+        //
+        // False means the signatures must be retaken before a reuse key is built from them. It matters most
+        // for the WORLD cache, which is swapped in when the room changes and then stands still for thousands
+        // of frames: without this it would be re-signed every frame to produce the same number. The
+        // per-frame lists get no benefit and lose nothing -- their contents are new each frame, so the flag
+        // is false when they arrive either way.
+        bool hashesValid = false;
         void clear() {
             verts.clear();
             ranges.clear();
+            hashesValid = false;
         }
         void swap(ShadowAlphaCasters& o) {
             verts.swap(o.verts);
             ranges.swap(o.ranges);
+            // Swapped, not cleared: a range carries its own signature, so validity travels with the data it
+            // describes rather than with the variable holding it.
+            std::swap(hashesValid, o.hashesValid);
         }
         size_t VertexCount() const {
             return verts.size() / 5;
