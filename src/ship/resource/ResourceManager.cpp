@@ -141,7 +141,13 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
     auto file = LoadFileProcess(identifier.Path);
     if (file == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
-        mResourceCache[identifier] = ResourceLoadError::NotFound;
+        // Under the lock, like every other write to this map. This one was not, and it runs on the worker
+        // pool: a failed load could be rehashing mResourceCache while another worker was reading or writing
+        // it. Every other assignment in this function already takes mMutex -- this was the exception.
+        {
+            const std::lock_guard<std::mutex> lock(mMutex);
+            mResourceCache[identifier] = ResourceLoadError::NotFound;
+        }
         return nullptr;
     }
 
@@ -200,11 +206,40 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return promise->get_future().share();
     }
 
-    return mThreadPool->submit_task(
-        [this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
-            return LoadResourceProcess(identifier, loadExact, initData);
+    // One load per thing in flight; see mInFlight. The lock is held across the submit AND the insert on
+    // purpose: the task erases its own entry when it finishes, and if it were allowed to run and erase
+    // before the insert landed, the entry would be published after the load was already over and would sit
+    // there forever, handing later callers a resource that may since have been unloaded.
+    //
+    // Nothing expensive happens under this lock. submit_task only enqueues -- the read, the decompress and
+    // the parse all happen on the worker, with the lock long since released.
+    const InFlightKey key{ identifier, loadExact };
+    const std::lock_guard<std::mutex> inFlightLock(mInFlightMutex);
+
+    const auto existing = mInFlight.find(key);
+    if (existing != mInFlight.end()) {
+        return existing->second;
+    }
+
+    auto future = mThreadPool->submit_task(
+        [this, key, initData]() -> std::shared_ptr<IResource> {
+            // Erase on the way out whatever happens, including on an exception: an entry left behind is a
+            // completed future served to every future caller as if it were a live load.
+            struct InFlightGuard {
+                ResourceManager* Manager;
+                const InFlightKey& Key;
+                ~InFlightGuard() {
+                    const std::lock_guard<std::mutex> lock(Manager->mInFlightMutex);
+                    Manager->mInFlight.erase(Key);
+                }
+            } guard{ this, key };
+
+            return LoadResourceProcess(key.Identifier, key.LoadExact, initData);
         },
         priority);
+
+    mInFlight.emplace(key, future);
+    return future;
 }
 
 std::shared_future<std::shared_ptr<IResource>>

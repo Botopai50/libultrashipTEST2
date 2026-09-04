@@ -47,13 +47,17 @@ std::shared_ptr<File> ArchiveManager::LoadFile(const std::string& filePath) {
     return LoadFile(CRC64(filePath.c_str()));
 }
 
+// find() rather than operator[], because operator[] INSERTS on a miss. This is a read path, and it is
+// reached from the resource worker pool, so every lookup of a file that is not in any archive was quietly
+// growing the map -- a write, from several threads, through a path that reads as a query. HasFile() a few
+// lines down already did the non-inserting thing; these two were the odd ones out.
 std::shared_ptr<File> ArchiveManager::LoadFile(uint64_t hash) {
-    auto archive = mFileToArchive[hash];
-    if (archive == nullptr) {
+    const auto it = mFileToArchive.find(hash);
+    if (it == mFileToArchive.end() || it->second == nullptr) {
         return nullptr;
     }
 
-    return archive->LoadFile(hash);
+    return it->second->LoadFile(hash);
 }
 
 bool ArchiveManager::HasFile(const std::string& filePath) {
@@ -65,7 +69,8 @@ bool ArchiveManager::HasFile(uint64_t hash) {
 }
 
 std::shared_ptr<Archive> ArchiveManager::GetArchiveFromFile(const std::string& filePath) {
-    return mFileToArchive[CRC64(filePath.c_str())];
+    const auto it = mFileToArchive.find(CRC64(filePath.c_str()));
+    return it == mFileToArchive.end() ? nullptr : it->second;
 }
 
 std::shared_ptr<std::vector<std::string>> ArchiveManager::ListFiles(const std::string& searchMask) {
