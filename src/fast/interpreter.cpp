@@ -4212,7 +4212,12 @@ void Interpreter::RenderShadowMap() {
         // and the room-mesh cache being rebuilt. This counts the first directly, span by span, so the two
         // stop being guesses. A span whose hash is unchanged did not move, however the list around it was
         // rebuilt; spans appearing or disappearing count as changes, since they are.
-        {
+        //
+        // Behind the same test as the cutout census below, and for the same reason: these two counters are
+        // read in one place, the per-second line under the debug view or GPU profiling. Cheaper than that
+        // census -- it compares span signatures that are already computed rather than walking vertices --
+        // but it still resized and refilled a vector every frame to answer a question nobody asked.
+        if (mShadowMapDebug > 0.5f || (mRapi != nullptr && mRapi->ShadowMapProfiling())) {
             const size_t n = mShadowSceneryChunks.size();
             const size_t prev = mShadowSceneryChunkHashPrev.size();
             size_t changed = n > prev ? n - prev : prev - n;
@@ -4227,6 +4232,8 @@ void Interpreter::RenderShadowMap() {
             for (size_t i = 0; i < n; i++) {
                 mShadowSceneryChunkHashPrev[i] = mShadowSceneryChunks[i].hash;
             }
+        } else {
+            mShadowSceneryChunkHashPrev.clear();
         }
 
         // The character layer gets cut into spans in the same walk that measures it.
@@ -4711,20 +4718,30 @@ void Interpreter::RenderShadowMap() {
     // back saying world cascades were still being redrawn with those spans completely still and the room
     // cache not rebuilding -- so the cause had to be in what was not being measured. Grass and foliage are
     // cutout casters, and in an open field they are most of what moves.
-    {
+    //
+    // Only when someone is going to read it. mShadowAlphaRangesSeen/Changed are consumed in exactly one
+    // place -- the per-second census line, printed under `mShadowMapDebug > 0.5f ||
+    // mRapi->ShadowMapProfiling()`. Both are developer-tools toggles and both are off in a normal session,
+    // so this walked every cutout range in the scene, every frame, to feed two counters nobody read.
+    //
+    // The prev-hash list is dropped while it is off rather than kept: it would otherwise be compared
+    // against on the first frame after someone turns profiling on, reporting a scene that has not moved
+    // since as though it had, because the snapshot beside it is minutes old.
+    const bool censusWanted = mShadowMapDebug > 0.5f || (mRapi != nullptr && mRapi->ShadowMapProfiling());
+    if (!censusWanted) {
+        mShadowAlphaRangeHashPrev.clear();
+    } else {
         size_t index = 0;
         size_t changed = 0;
         auto tally = [&](const ShadowAlphaCasters& set) {
             for (const ShadowAlphaRange& r : set.ranges) {
-                // The same things the key mixes for this range, in one value: its identity fields and its
-                // vertices. Five floats per vertex here -- world xyz plus uv.
+                // The same things the key mixes for this range, in one value: its identity fields and the
+                // signature of its vertices -- taken once in ResolveShadowAlphaTextures, not walked again
+                // here. This used to hash the vertex bytes itself, which is the same pass over the same
+                // data the reuse key was already paying for.
                 const uint32_t fields[3] = { r.textureId, r.firstVertex, r.vertexCount };
                 uint64_t h = ShadowHashBytes(0xCBF29CE484222325ull, fields, sizeof(fields));
-                const size_t first = (size_t)r.firstVertex * 5;
-                const size_t count = (size_t)r.vertexCount * 5;
-                if (first + count <= set.verts.size()) {
-                    h = ShadowHashBytes(h, set.verts.data() + first, count * sizeof(float));
-                }
+                h = ShadowHashBytes(h, &r.hash, sizeof(r.hash));
                 if (index >= mShadowAlphaRangeHashPrev.size() || mShadowAlphaRangeHashPrev[index] != h) {
                     changed++;
                 }
