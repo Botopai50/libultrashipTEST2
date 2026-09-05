@@ -1334,40 +1334,63 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
 
-        mRasterizerState.Reset();
-
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
-
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
-
-        switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
+        // SOH [Enhancement] Cached, the same way the depth-stencil states directly above already are, and
+        // for the same reason their comment gives: decal geometry flips this flag many times a frame, and
+        // every flip ran CreateRasterizerState -- a driver object allocated, bound, and dropped, per flip,
+        // for one of two descriptions that never change while the mode and the target hold still.
+        //
+        // Only two states exist, one per value of zmodeDecal, so the cache is an array of two rather than a
+        // keyed table. The bias in them is not constant, though: it is derived from the z-fighting mode and
+        // the render target's height, so both are recorded and the PAIR is dropped whenever either moves.
+        // That is what keeps this exactly equivalent to rebuilding on every flip -- at any flip the state
+        // bound is still one built from the current mode and the current height.
+        const int zFightingMode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        if (zFightingMode != mRasterizerStatesZFightingMode || mRenderTargetHeight != mRasterizerStatesHeight) {
+            mRasterizerStates[0].Reset();
+            mRasterizerStates[1].Reset();
+            mRasterizerStatesZFightingMode = zFightingMode;
+            mRasterizerStatesHeight = mRenderTargetHeight;
         }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
 
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
+        const int rsSlot = mCurrentZmodeDecal ? 1 : 0;
+        if (mRasterizerStates[rsSlot] == nullptr) {
+            D3D11_RASTERIZER_DESC rasterizer_desc;
+            ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+
+            rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+            rasterizer_desc.CullMode = D3D11_CULL_NONE;
+            rasterizer_desc.FrontCounterClockwise = true;
+            rasterizer_desc.DepthBias = 0;
+            // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+            // fighting
+            const int n64modeFactor = 120;
+            const int noVanishFactor = 100;
+            float SSDB = -2;
+
+            switch (zFightingMode) {
+                case 1: // scaled z-fighting (N64 mode like)
+                    SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+                    break;
+                case 2: // no vanishing paths
+                    SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+                    break;
+                case 0: // disabled
+                default:
+                    SSDB = -2;
+            }
+            rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
+            rasterizer_desc.DepthBiasClamp = 0.0f;
+            rasterizer_desc.DepthClipEnable = false;
+            rasterizer_desc.ScissorEnable = true;
+            rasterizer_desc.MultisampleEnable = false;
+            rasterizer_desc.AntialiasedLineEnable = false;
+
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerStates[rsSlot].GetAddressOf()));
+        }
+
+        // Still tracked separately, because the shadow pass rebinds whatever was last bound when it hands
+        // the context back (see ShadowMapEndPass).
+        mRasterizerState = mRasterizerStates[rsSlot];
         mContext->RSSetState(mRasterizerState.Get());
     }
 
