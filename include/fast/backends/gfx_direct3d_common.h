@@ -219,8 +219,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
                               size_t drawCount) override;
     bool SupportsShadowMapAlphaCasters() override;
-    void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
-    void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
+    int ShadowAlphaSlotIndex(int slot) const;
+    void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) override;
+    void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount, int slot) override;
     void ShadowMapEndPass() override;
     int ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16], uint64_t staticKey,
                                    uint64_t dynamicKey) override;
@@ -349,10 +350,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowAlphaPs;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowAlphaLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowAlphaSampler;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowAlphaVb;
-    size_t mShadowAlphaVbVertices = 0;
-    const float* mShadowAlphaLastPtr = nullptr;
-    size_t mShadowAlphaLastCount = 0;
+    // One buffer and one record per (layer, slot), exactly as the opaque casters have. A single shared
+    // buffer is what made the reuse test useless here: the draw loop alternates the cached room mesh's
+    // cutouts and the per-frame scenery cutouts on every cascade, so consecutive calls never matched and
+    // the whole list was re-uploaded on each one. Separate slots is the same fix the opaque path already
+    // carries, and for the same reason.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowAlphaVb[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS];
+    size_t mShadowAlphaVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    const float* mShadowAlphaLastPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    size_t mShadowAlphaLastCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    // Which slot's vertex buffer is on the context, so a run of ranges from one list binds it once.
+    int mShadowAlphaBoundIndex = -1;
     bool mShadowAlphaPipelineReady = false; // every alpha object built successfully
     bool mShadowAlphaBound = false;         // the alpha pipeline is the one currently set on the context
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists

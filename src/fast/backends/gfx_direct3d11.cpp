@@ -3074,11 +3074,15 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mShadowLastCasterPtr[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] =
             nullptr;
         mShadowLastCasterCount[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] = 0;
-        // The alpha list gets no such exemption: it shares one buffer between the two layers, so whatever it
-        // holds is overwritten within the pass anyway, and the actor half is double-buffered exactly like the
-        // opaque one. Forget it wholesale rather than reason about which half is safe.
-        mShadowAlphaLastPtr = nullptr;
-        mShadowAlphaLastCount = 0;
+        // The cutout lists now follow exactly the same rule, because they now have exactly the same shape:
+        // one buffer per slot. The two that are rebuilt every frame forget their records; the cached room
+        // mesh's cutouts keep theirs, so an unchanged room uploads them once and then never again.
+        mShadowAlphaLastPtr[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] =
+            nullptr;
+        mShadowAlphaLastCount[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] = 0;
+        mShadowAlphaLastPtr[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] =
+            nullptr;
+        mShadowAlphaLastCount[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] = 0;
         mShadowPassActive = true;
         ShadowTimerBegin();
     }
@@ -3116,6 +3120,7 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     // Everything below re-establishes the OPAQUE pipeline, so any alpha binding from the previous cascade is
     // gone by the time this returns.
     mShadowAlphaBound = false;
+    mShadowAlphaBoundIndex = -1;
 
     // SOH [Enhancement] Static caster cache: the split path aims this same body at the static copy while
     // its half is drawn, and suppresses the clear on the frame where that copy is about to be blitted in.
@@ -3207,6 +3212,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
         mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
         mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
         mShadowAlphaBound = false;
+        mShadowAlphaBoundIndex = -1;
     }
 
     const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
@@ -3278,19 +3284,30 @@ bool GfxRenderingAPIDX11::SupportsShadowMapAlphaCasters() {
     return mShadowAlphaPipelineReady;
 }
 
-void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+// (layer, slot) -> the index both caster paths key their buffers and reuse records on. The layer is the one
+// the open cascade named, exactly as ShadowMapDrawCasters reads it.
+int GfxRenderingAPIDX11::ShadowAlphaSlotIndex(int slot) const {
+    const int layerIndex =
+        (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
+    return layerIndex * SHADOW_MAP_CASTER_SLOTS + slotIndex;
+}
+
+void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) {
     if (!mShadowPassActive || !mShadowAlphaPipelineReady || xyzUv == nullptr || vertexCount < 3) {
         return;
     }
+    const int index = ShadowAlphaSlotIndex(slot);
     // Same reuse rule as the opaque list: identical pointer and count means the buffer already holds this
     // geometry, whether that is from the previous cascade or (for the cached world layer) the previous
-    // frame. Only the world layer's record survives a pass; see ShadowMapBeginCascade.
-    if (mShadowAlphaLastPtr == xyzUv && mShadowAlphaLastCount == vertexCount && mShadowAlphaVb != nullptr) {
+    // frame. Only the world layer's MAIN record survives a pass; see ShadowMapBeginCascade.
+    if (mShadowAlphaLastPtr[index] == xyzUv && mShadowAlphaLastCount[index] == vertexCount &&
+        mShadowAlphaVb[index] != nullptr) {
         return;
     }
 
-    if (mShadowAlphaVb == nullptr || mShadowAlphaVbVertices < vertexCount) {
-        size_t capacity = mShadowAlphaVbVertices ? mShadowAlphaVbVertices : 32u * 1024u;
+    if (mShadowAlphaVb[index] == nullptr || mShadowAlphaVbVertices[index] < vertexCount) {
+        size_t capacity = mShadowAlphaVbVertices[index] ? mShadowAlphaVbVertices[index] : 32u * 1024u;
         while (capacity < vertexCount) {
             capacity *= 2;
         }
@@ -3306,29 +3323,34 @@ void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t
             ShadowMapInvalidateOpenSlice();
             return;
         }
-        mShadowAlphaVb = grown;
-        mShadowAlphaVbVertices = capacity;
-        mShadowAlphaLastPtr = nullptr;
-        mShadowAlphaLastCount = 0;
+        mShadowAlphaVb[index] = grown;
+        mShadowAlphaVbVertices[index] = capacity;
+        mShadowAlphaLastPtr[index] = nullptr;
+        mShadowAlphaLastCount[index] = 0;
+        if (mShadowAlphaBoundIndex == index) {
+            mShadowAlphaBoundIndex = -1; // the buffer on the context is the old one
+        }
     }
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
-    if (FAILED(mContext->Map(mShadowAlphaVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+    if (FAILED(mContext->Map(mShadowAlphaVb[index].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         ShadowMapInvalidateOpenSlice();
         return;
     }
     memcpy(ms.pData, xyzUv, vertexCount * 5 * sizeof(float));
-    mContext->Unmap(mShadowAlphaVb.Get(), 0);
-    mShadowAlphaLastPtr = xyzUv;
-    mShadowAlphaLastCount = vertexCount;
+    mContext->Unmap(mShadowAlphaVb[index].Get(), 0);
+    mShadowAlphaLastPtr[index] = xyzUv;
+    mShadowAlphaLastCount[index] = vertexCount;
 }
 
-void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
-    if (!mShadowPassActive || !mShadowAlphaPipelineReady || mShadowAlphaVb == nullptr || vertexCount < 3) {
+void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount,
+                                                 int slot) {
+    const int index = ShadowAlphaSlotIndex(slot);
+    if (!mShadowPassActive || !mShadowAlphaPipelineReady || mShadowAlphaVb[index] == nullptr || vertexCount < 3) {
         return;
     }
-    if (firstVertex + vertexCount > mShadowAlphaLastCount) {
+    if (firstVertex + vertexCount > mShadowAlphaLastCount[index]) {
         ShadowMapInvalidateOpenSlice();
         return; // range does not lie inside what was uploaded
     }
@@ -3344,10 +3366,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
     // Switch the pipeline once and leave it: consecutive ranges differ only by texture and draw offset.
     // ShadowMapBeginCascade puts the opaque pipeline back for the next cascade.
     if (!mShadowAlphaBound) {
-        UINT stride = 5 * sizeof(float);
-        UINT offset = 0;
         mContext->IASetInputLayout(mShadowAlphaLayout.Get());
-        mContext->IASetVertexBuffers(0, 1, mShadowAlphaVb.GetAddressOf(), &stride, &offset);
         mContext->VSSetShader(mShadowAlphaVs.Get(), nullptr, 0);
         mContext->PSSetShader(mShadowAlphaPs.Get(), nullptr, 0);
         mContext->PSSetSamplers(0, 1, mShadowAlphaSampler.GetAddressOf());
@@ -3359,6 +3378,15 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
         // while the main pass re-bound every sampler on every draw and so could not be misled by a stale
         // record; it is needed now that the pass skips the ones it believes are already bound.
         mLastSamplerStates[0] = nullptr;
+        mShadowAlphaBoundIndex = -1; // the pipeline was just (re)established; no vertex buffer with it yet
+    }
+    // The vertex buffer is bound per slot rather than with the pipeline, so a run of ranges out of one list
+    // costs one bind however many draws it takes, and switching lists costs a bind and not an upload.
+    if (mShadowAlphaBoundIndex != index) {
+        const UINT stride = 5 * sizeof(float);
+        const UINT offset = 0;
+        mContext->IASetVertexBuffers(0, 1, mShadowAlphaVb[index].GetAddressOf(), &stride, &offset);
+        mShadowAlphaBoundIndex = index;
     }
     mContext->PSSetShaderResources(0, 1, mTextures[textureId].resource_view.GetAddressOf());
     mContext->Draw((UINT)vertexCount, (UINT)firstVertex);
@@ -3629,6 +3657,7 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mShadowPassActive = false;
     ShadowTimerEnd();
     mShadowAlphaBound = false;
+    mShadowAlphaBoundIndex = -1;
     mShadowCurrentSlice = -1;
 
     // Put back the frame's render target and viewport.

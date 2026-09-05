@@ -1173,7 +1173,27 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // Both computed unconditionally and then selected. ddx/ddy are gradient instructions and may not
         // sit inside varying control flow, so they cannot be moved inside the diagnostic branch that reads
         // them; the cost is two derivatives and a normalize.
-        float3 shadowGeoN = cross(ddx(input.worldPos.xyz), ddy(input.worldPos.xyz));
+        //
+        // The operand order is not arbitrary, and having it backwards is what made the acne correction
+        // CAUSE acne. SV_Position.y increases DOWNWARD in Direct3D, so the screen-space basis (ddx, ddy)
+        // is left-handed with respect to the world and cross(ddx, ddy) points INTO the surface. On a floor
+        // it came out as (0,-1,0) -- debug view 3 draws that purple, while a real vertex normal in the same
+        // scene draws green, which is how it was found.
+        //
+        // Two things followed from the flip, and both were visible. The offset is
+        // `world + normal * texels * slope`, so a downward normal pushed the sample point INTO the floor and
+        // the receiver compared as occluded across a whole plaza. And it inverted the slope control: with
+        // the normal facing away from the light, ndl saturates to zero, the slope pins at its ceiling, and
+        // RAISING that ceiling made the wrong-way offset bigger -- the setting meant to fix acne shaded the
+        // whole room instead.
+        //
+        // Only geometry with no vertex normal of its own reaches this, which here is the room mesh and most
+        // scenery -- so it was the ground and the walls that were wrong while characters were right.
+        //
+        // Swapped rather than negated: one expression to read instead of an expression and a sign. This file
+        // is compiled by the Direct3D 11 backend alone (Metal and OpenGL have their own shader trees, and
+        // the shadow map exists on neither), so no other convention is affected by this order.
+        float3 shadowGeoN = cross(ddy(input.worldPos.xyz), ddx(input.worldPos.xyz));
         float shadowNLen = length(input.normal);
         float3 shadowN = (shadowNLen > 1e-4) ? (input.normal / shadowNLen) : normalize(shadowGeoN);
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective

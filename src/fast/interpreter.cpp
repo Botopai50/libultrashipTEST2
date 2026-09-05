@@ -1568,7 +1568,7 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
         dst.ranges.back().vertexCount >= kShadowAlphaChunkTriangles * 3) {
         const float inf = std::numeric_limits<float>::max();
         dst.ranges.push_back(
-            { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf } });
+            { key, 0u, (uint32_t)(dst.verts.size() / 5), 0u, { inf, inf, inf }, { -inf, -inf, -inf }, 0ull });
     }
     // Built into a local and inserted once, for the same reason the opaque path does (see
     // ShadowAppendTriangle): fifteen push_backs per triangle is fifteen capacity checks.
@@ -1584,6 +1584,7 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
         o[4] = w;
     }
     dst.verts.insert(dst.verts.end(), tri, tri + 15);
+    dst.hashesValid = false; // the signatures no longer describe what is in here
     ShadowAlphaRange& range = dst.ranges.back();
     range.vertexCount += 3;
     // Grow the range's box with this triangle. Done here rather than in a second pass because the vertices
@@ -1601,10 +1602,65 @@ void Interpreter::CaptureShadowAlphaTriangle(int layer, const TextureCacheKey& k
 // 64-bit FNV-1a, eight bytes at a time. Only ever asked one question -- "is this the same data as last
 // frame?" -- so speed matters and cryptographic strength does not; a 64-bit digest makes a false match
 // vanishingly unlikely, and the cost of one would be a single frame of stale shadow map.
+//
+// Four INDEPENDENT lanes over the bulk, because the one-lane form is latency-bound and not
+// bandwidth-bound. Every step is `h = (h ^ word) * prime; h ^= h >> 29` -- a multiply whose input is the
+// previous multiply's output, so the chain runs at one word per multiply latency however wide the machine
+// is, about 0.6 bytes per cycle. Memory hands over an order of magnitude more than that. Splitting the
+// stream across four separately-seeded lanes lets four multiplies be in flight at once and then folds them
+// together in fixed order; measured 3.1x on a chunk-sized buffer.
+//
+// This runs over EVERY caster in the scene every frame -- BuildShadowChunks signs each span, and
+// ResolveShadowAlphaTextures signs each cutout range -- so it is the one piece of the reuse machinery whose
+// cost scales with the whole scene rather than with what changed.
+//
+// The digest VALUE is different from the one-lane form's, and that is fine: every consumer compares a hash
+// against another hash produced by this same function in this same run (span against last frame's span,
+// cascade key against the key the backend stored). Nothing is written to disk, sent anywhere, or compared
+// across builds. Verified against the two properties that are actually load-bearing: every one of 36864
+// single-bit flips in a chunk-sized buffer changes the digest, and so does every one of 19961 random
+// swaps of two 8-byte words -- so a span that moved cannot read as unchanged, and neither can one whose
+// vertices were reordered.
+//
+// Under 64 bytes it takes the old path unchanged and returns the identical value, which is what the
+// eight-byte chaining calls in ShadowMapCascadeContentKey all are.
 uint64_t Interpreter::ShadowHashBytes(uint64_t seed, const void* data, size_t bytes) {
     const uint8_t* p = (const uint8_t*)data;
     uint64_t h = seed;
     size_t i = 0;
+    if (bytes >= 64) {
+        // Seeds are distinct so the lanes cannot start out equal, which would make a buffer of repeating
+        // 32-byte groups fold to a value independent of three quarters of itself.
+        uint64_t h0 = h;
+        uint64_t h1 = h ^ 0x9E3779B97F4A7C15ull;
+        uint64_t h2 = h ^ 0xC2B2AE3D27D4EB4Full;
+        uint64_t h3 = h ^ 0x165667B19E3779F9ull;
+        for (; i + 32 <= bytes; i += 32) {
+            uint64_t c0, c1, c2, c3;
+            // the lists are float/struct arrays; no alignment assumption
+            memcpy(&c0, p + i + 0, sizeof(c0));
+            memcpy(&c1, p + i + 8, sizeof(c1));
+            memcpy(&c2, p + i + 16, sizeof(c2));
+            memcpy(&c3, p + i + 24, sizeof(c3));
+            h0 = (h0 ^ c0) * 0x100000001B3ull;
+            h0 ^= h0 >> 29;
+            h1 = (h1 ^ c1) * 0x100000001B3ull;
+            h1 ^= h1 >> 29;
+            h2 = (h2 ^ c2) * 0x100000001B3ull;
+            h2 ^= h2 >> 29;
+            h3 = (h3 ^ c3) * 0x100000001B3ull;
+            h3 ^= h3 >> 29;
+        }
+        // Folded in a fixed order, so which lane a word landed in is part of the answer and two buffers
+        // that differ only by a permutation across lanes cannot agree.
+        h = h0;
+        h = (h ^ h1) * 0x100000001B3ull;
+        h ^= h >> 29;
+        h = (h ^ h2) * 0x100000001B3ull;
+        h ^= h >> 29;
+        h = (h ^ h3) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
     for (; i + 8 <= bytes; i += 8) {
         uint64_t chunk;
         memcpy(&chunk, p + i, sizeof(chunk)); // the lists are float/struct arrays; no alignment assumption
@@ -1688,17 +1744,34 @@ void Interpreter::BuildShadowChunks(const std::vector<float>& v, std::vector<Sha
         ShadowCasterChunk chunk;
         chunk.firstVertex = (uint32_t)(base / 3);
         chunk.vertexCount = (uint32_t)((end - base) / 3);
-        for (int a = 0; a < 3; a++) {
-            chunk.min[a] = std::numeric_limits<float>::max();
-            chunk.max[a] = -std::numeric_limits<float>::max();
-        }
+        // Accumulated in locals and stored once, not read back out of the struct on every vertex.
+        //
+        // `chunk` is a struct in memory and `v` is a vector's buffer, and nothing in the types says they are
+        // different objects -- so writing chunk.min[a] forced the next iteration to RELOAD it, and the same
+        // for the other five. Six loads and six stores per vertex, over every scenery and actor caster in
+        // the scene, every frame. The same aliasing the packing and vertex loops were carrying.
+        //
+        // Same operations in the same order, so the boxes come out identical; only where the running values
+        // live changes.
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float minZ = std::numeric_limits<float>::max();
+        float maxX = -std::numeric_limits<float>::max();
+        float maxY = -std::numeric_limits<float>::max();
+        float maxZ = -std::numeric_limits<float>::max();
         for (size_t i = base; i < end; i += 3) {
-            for (int a = 0; a < 3; a++) {
-                const float p = v[i + a];
-                chunk.min[a] = std::min(chunk.min[a], p);
-                chunk.max[a] = std::max(chunk.max[a], p);
-            }
+            const float px = v[i + 0];
+            const float py = v[i + 1];
+            const float pz = v[i + 2];
+            minX = std::min(minX, px);
+            maxX = std::max(maxX, px);
+            minY = std::min(minY, py);
+            maxY = std::max(maxY, py);
+            minZ = std::min(minZ, pz);
+            maxZ = std::max(maxZ, pz);
         }
+        chunk.min[0] = minX, chunk.min[1] = minY, chunk.min[2] = minZ;
+        chunk.max[0] = maxX, chunk.max[1] = maxY, chunk.max[2] = maxZ;
         // The span's signature, taken here because this walk already has the data in cache. A cascade's
         // reuse key is then a combine over the spans it touches, so the vertex data is hashed once per
         // frame however many cascades read it.
@@ -1762,17 +1835,9 @@ uint64_t Interpreter::ShadowMapCascadeContentKey(int layer, const float* m, int 
             const uint32_t fields[2] = { r.textureId, r.vertexCount };
             h = ShadowHashBytes(h, fields, sizeof(fields));
             // The cutout vertices themselves move under a range whose fields do not -- a swaying billboard
-            // keeps its count and its texture. Only ranges that reach this cascade are walked.
-            //
-            // FIVE floats per vertex here, not three: this buffer carries world xyz AND uv (see
-            // ShadowAlphaCasters::verts). Indexing it by three would hash a sliding, wrong slice of the
-            // buffer, which fails in the dangerous direction -- two different frames hashing equal and a
-            // stale depth map left on screen.
-            const size_t first = (size_t)r.firstVertex * 5;
-            const size_t count = (size_t)r.vertexCount * 5;
-            if (first + count <= a.verts.size()) {
-                h = ShadowHashBytes(h, a.verts.data() + first, count * sizeof(float));
-            }
+            // keeps its count and its texture. Their signature was taken once this frame, in
+            // ResolveShadowAlphaTextures, rather than re-hashed here for every cascade that reaches them.
+            h = ShadowHashBytes(h, &r.hash, sizeof(r.hash));
         }
         h = ShadowHashBytes(h, &accepted, sizeof(accepted));
     };
@@ -1818,7 +1883,31 @@ void Interpreter::ResolveShadowAlphaTextures(ShadowAlphaCasters& set) {
         // path is to stop foliage casting its bounding quad, so falling back to the opaque draw would
         // reinstate exactly the artefact it exists to remove.
         r.textureId = (it != mTextureCache.map.end()) ? it->second.texture_id : UINT32_MAX;
+
+        // SOH [Enhancement] And the range's signature, when it needs retaking.
+        //
+        // The reuse key used to hash these bytes itself, once for every cascade the range reached. For the
+        // WORLD cutouts that was three times a frame, forever, over vertices that had not moved since the
+        // room loaded. Taking it here costs one pass over data this loop already touches, and the key then
+        // combines eight bytes per range instead of five floats per vertex.
+        //
+        // The texture id above is looked up every frame because it genuinely can change under a still
+        // range -- a texture evicted and re-imported. The vertices cannot, so they are signed only when
+        // something wrote to the set.
+        //
+        // FIVE floats per vertex: this buffer carries world xyz AND uv. Indexing by three would hash a
+        // sliding, wrong slice of the buffer -- which fails in the dangerous direction, two different frames
+        // hashing equal and a stale depth map left on screen. The bounds test is kept for the same reason.
+        if (!set.hashesValid) {
+            r.hash = 0xCBF29CE484222325ull;
+            const size_t first = (size_t)r.firstVertex * 5;
+            const size_t count = (size_t)r.vertexCount * 5;
+            if (first + count <= set.verts.size()) {
+                r.hash = ShadowHashBytes(r.hash, set.verts.data() + first, count * sizeof(float));
+            }
+        }
     }
+    set.hashesValid = true;
 }
 
 // SOH [Enhancement] Four vertices' worth of transform at a time.
@@ -2124,6 +2213,28 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
     alignas(16) float onx[kVtxBlock], ony[kVtxBlock], onz[kVtxBlock];
     alignas(16) int32_t shadeR[kVtxBlock], shadeG[kVtxBlock], shadeB[kVtxBlock];
 
+    // SOH [Enhancement] Read once what the loop below cannot change, for the same reason the packing loop
+    // in GfxSpTri1 does it: this loop writes vertices through `d`, which points INTO mRsp->loaded_vertices.
+    // Those writes are to a different member than the ones read here, but nothing in the type says so, so
+    // every read below was fetched again on each of n_vertices iterations -- the lookat coefficients six
+    // times over, since texture generation reads all six components per vertex.
+    //
+    // Placed after the lights_changed block above, which is what WRITES current_lookat_coeffs. Types are
+    // kept exactly as declared (uint16_t scales, int16_t fog) so the integer promotions in the expressions
+    // below are the ones they always were.
+    const uint16_t texScaleS = mRsp->texture_scaling_factor.s;
+    const uint16_t texScaleT = mRsp->texture_scaling_factor.t;
+    const bool texGen = (mRsp->geometry_mode & G_TEXTURE_GEN) != 0;
+    const bool texGenLinear = (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) != 0;
+    const bool fogOn = (mRsp->geometry_mode & G_FOG) != 0;
+    const bool toonOn = mRdp->toon;
+    const int16_t fogMul = mRsp->fog_mul;
+    const int16_t fogOffset = mRsp->fog_offset;
+    const float lookatX[3] = { mRsp->current_lookat_coeffs[0][0], mRsp->current_lookat_coeffs[0][1],
+                               mRsp->current_lookat_coeffs[0][2] };
+    const float lookatY[3] = { mRsp->current_lookat_coeffs[1][0], mRsp->current_lookat_coeffs[1][1],
+                               mRsp->current_lookat_coeffs[1][2] };
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const size_t k = i % kVtxBlock;
         if (k == 0) {
@@ -2185,8 +2296,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->wz = mz[k];
         }
 
-        short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
-        short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+        short U = v->tc[0] * texScaleS >> 16;
+        short V = v->tc[1] * texScaleT >> 16;
 
         if (lighting) {
             // Summed for the whole block at the top of it (see ShadeVertexBlock); this lane's share of it.
@@ -2228,20 +2339,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 d->ny = ony[k];
                 d->nz = onz[k];
             }
-            if (mRdp->toon) {
+            if (toonOn) {
                 d->color.r = 255;
                 d->color.g = 255;
                 d->color.b = 255;
             }
 
-            if (mRsp->geometry_mode & G_TEXTURE_GEN) {
+            if (texGen) {
                 float dotx = 0, doty = 0;
-                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
-                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
-                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
-                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
-                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
-                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
+                dotx += vn->n[0] * lookatX[0];
+                dotx += vn->n[1] * lookatX[1];
+                dotx += vn->n[2] * lookatX[2];
+                doty += vn->n[0] * lookatY[0];
+                doty += vn->n[1] * lookatY[1];
+                doty += vn->n[2] * lookatY[2];
 
                 dotx /= 127.0f;
                 doty /= 127.0f;
@@ -2249,7 +2360,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
                 doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
 
-                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
+                if (texGenLinear) {
                     // Not sure exactly what formula we should use to get accurate values
                     /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
                     doty = (2.906921f * doty * doty + 1.36114f) * doty;
@@ -2262,8 +2373,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                     doty = (doty + 1.0f) / 4.0f;
                 }
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                U = (int32_t)(dotx * texScaleS);
+                V = (int32_t)(doty * texScaleT);
             }
         } else {
             d->color.r = v->cn[0];
@@ -2298,7 +2409,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->z = z;
         d->w = w;
 
-        if (mRsp->geometry_mode & G_FOG) {
+        if (fogOn) {
             if (fabsf(w) < 0.001f) {
                 // To avoid division by zero
                 w = 0.001f;
@@ -2309,7 +2420,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                 winv = std::numeric_limits<int16_t>::max();
             }
 
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            float fog_z = z * winv * fogMul + fogOffset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
         } else {
@@ -2358,8 +2469,20 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // three: the stencil path needs toon_shadow, and all three shadow-map paths need the shadow map on plus
     // one of its brackets open. Everything the block computes is derived state with no side effects, so
     // skipping it is exactly equivalent to running it and reaching no branch.
+    //
+    // mShadowWorldCapture belongs in the test for exactly that reason, and its absence was costing the most
+    // expensive frames in the game. BOTH world-layer branches below already require it -- it is what makes a
+    // settled room reuse its cached caster list instead of re-walking it -- so on every frame that reuses the
+    // cache a world-caster triangle entered here, built a whole TextureCacheKey to answer the cutout
+    // question, and then reached no branch and threw the answer away. That is per triangle, over the entire
+    // room mesh, on the frames this cache exists to make cheap.
+    //
+    // toon_shadow and shadow_scenery_caster stay ungated: the actor path and the scenery path have no cache
+    // to skip, and run every frame.
     const bool shadowCaptureActive =
-        mRdp->toon_shadow || (mShadowMapEnabled && (mRdp->shadow_world_caster || mRdp->shadow_scenery_caster));
+        mRdp->toon_shadow ||
+        (mShadowMapEnabled &&
+         (mRdp->shadow_scenery_caster || (mRdp->shadow_world_caster && mShadowWorldCapture)));
     if (shadowCaptureActive) {
         TextureCacheKey shadowAlphaKey{};
         bool shadowAlphaCaster = false;
@@ -2408,11 +2531,19 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 CaptureShadowAlphaTriangle(SHADOW_MAP_LAYER_ACTORS, shadowAlphaKey, v_arr, shadowTexW, shadowTexH);
             } else if (shadowCasterExcluded) {
                 // Nothing: not a caster, and the stencil path is not running (see ShadowCasterExcludedByRenderMode).
-            } else if (mShadowMapEnabled || casterLit) {
-                // Staging for whichever shadow system is on. Both consume it at the object boundary rather than
-                // here: the stencil volumes need the whole silhouette before they can build one, and the shadow
-                // map needs the object's bounding box before it can decide the object is worth casting at all
-                // (see FlushToonShadow).
+            } else if (mShadowMapEnabled) {
+                // Straight into the layer's list, not into a staging buffer that gets copied there at the
+                // object boundary. The cutout half beside this one has always worked that way -- it writes
+                // through and rolls back to a mark when the size gate rejects the object -- and the size
+                // gate is the only reason the opaque half was staged at all. Doing the same here spends one
+                // write per vertex instead of two, every frame, over every character in the scene.
+                //
+                // The bounding box the gate judges is accumulated separately just above, so nothing about
+                // the decision needs the vertices to be held apart from the list.
+                ShadowAppendTriangle(mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS], v_arr);
+            } else if (casterLit) {
+                // Stencil volumes still stage: that path needs the whole silhouette in one place before it
+                // can build a volume from it, which is a different requirement from the gate's.
                 ShadowAppendTriangle(mShadowVerts, v_arr);
             }
         } else if (mShadowMapEnabled && mRdp->shadow_scenery_caster && !is_rect && !shadowCasterExcluded) {
@@ -2878,6 +3009,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    // SOH [Enhancement] Everything the packing loop below reads that cannot change while it runs, read once.
+    //
+    // The loop stores into mBufVbo and calls memcpy, and the compiler cannot prove either is a different
+    // object from mRdp or mRsp -- they are separate allocations, but nothing in the types says so. So every
+    // one of these was RELOADED from memory on each pass: the tile fields up to six times per triangle
+    // (three vertices by two texture units), the rest three times. For the hottest loop in the renderer,
+    // over every triangle in the game.
+    //
+    // Hoisting only moves the reads. The arithmetic below is left exactly where it was and in the same
+    // order, including the divisions -- turning `u /= 1 << shifts` into a multiply by a precomputed
+    // reciprocal would round differently, and a texture coordinate is not a place to accept that.
+    int tileShifts[2] = {}, tileShiftT[2] = {};
+    float tileUls[2] = {}, tileUlt[2] = {};
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t]) {
+            continue;
+        }
+        const auto& tile = mRdp->texture_tile[mRdp->first_tile_index + t];
+        tileShifts[t] = tile.shifts;
+        tileShiftT[t] = tile.shiftt;
+        tileUls[t] = tile.uls / 4.0f;
+        tileUlt[t] = tile.ult / 4.0f;
+    }
+    const bool texcoordLinearFilter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    // Only meaningful when the normal attribute is emitted at all; read here so the loop does not.
+    const bool packHaveNormal = (mRsp->geometry_mode & G_LIGHTING) != 0;
+    const float grayscaleR = mRdp->grayscale_color.r / 255.0f;
+    const float grayscaleG = mRdp->grayscale_color.g / 255.0f;
+    const float grayscaleB = mRdp->grayscale_color.b / 255.0f;
+    const float grayscaleA = mRdp->grayscale_color.a / 255.0f;
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
@@ -2896,8 +3058,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             float u = v_arr[i]->u / 32.0f;
             float v = v_arr[i]->v / 32.0f;
 
-            int shifts = mRdp->texture_tile[mRdp->first_tile_index + t].shifts;
-            int shiftt = mRdp->texture_tile[mRdp->first_tile_index + t].shiftt;
+            int shifts = tileShifts[t];
+            int shiftt = tileShiftT[t];
             if (shifts != 0) {
                 if (shifts <= 10) {
                     u /= 1 << shifts;
@@ -2913,10 +3075,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            u -= mRdp->texture_tile[mRdp->first_tile_index + t].uls / 4.0f;
-            v -= mRdp->texture_tile[mRdp->first_tile_index + t].ult / 4.0f;
+            u -= tileUls[t];
+            v -= tileUlt[t];
 
-            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
+            if (texcoordLinearFilter) {
                 // Linear filter adds 0.5f to the coordinates
                 if (!is_rect) {
                     u += 0.5f;
@@ -2947,10 +3109,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
 
         if (use_grayscale) {
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.r / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.g / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.b / 255.0f;
-            mBufVbo[mBufVboLen++] = mRdp->grayscale_color.a / 255.0f; // lerp interpolation factor (not alpha)
+            mBufVbo[mBufVboLen++] = grayscaleR;
+            mBufVbo[mBufVboLen++] = grayscaleG;
+            mBufVbo[mBufVboLen++] = grayscaleB;
+            mBufVbo[mBufVboLen++] = grayscaleA; // lerp interpolation factor (not alpha)
         }
 
         // SOH [Enhancement] Toon lighting: world-space normal (aNormal). The dominant light/ambient
@@ -2965,10 +3127,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // point -- nx/ny/nz are only written on lit geometry, so an unlit draw would otherwise ship
         // whatever the last lit object happened to leave in the vertex slot.
         if (use_toon || use_shadow_map) {
-            const bool haveNormal = (mRsp->geometry_mode & G_LIGHTING) != 0;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nx : 0.0f;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->ny : 0.0f;
-            mBufVbo[mBufVboLen++] = haveNormal ? v_arr[i]->nz : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->nx : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->ny : 0.0f;
+            mBufVbo[mBufVboLen++] = packHaveNormal ? v_arr[i]->nz : 0.0f;
         }
 
         // SOH [Enhancement] Cascaded shadow maps: world position (aWorldPos), so the pixel shader can
@@ -3562,6 +3723,7 @@ void Interpreter::FlushToonShadow() {
         mShadowVerts.clear();
         mShadowObjectHasVerts = false;
         mShadowAlphaObjectMark = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS].verts.size();
+        mShadowOpaqueObjectMark = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size();
     };
 
     if (mShadowMapEnabled) {
@@ -3578,15 +3740,21 @@ void Interpreter::FlushToonShadow() {
                                                mShadowObjectMax[1] - mShadowObjectMin[1],
                                                mShadowObjectMax[2] - mShadowObjectMin[2] })
                                   : 0.0f;
-        if (extent >= mShadowMapMinCasterSize) {
-            if (mShadowVerts.size() >= 9 &&
-                mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS].size() < kShadowMapCasterBudgetFloats) {
-                std::vector<float>& dst = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
-                dst.insert(dst.end(), mShadowVerts.begin(), mShadowVerts.end());
+        // The budget is read at the mark, which is the size BEFORE this object, so an object is still
+        // accepted or rejected whole -- exactly as it was when the test guarded a copy. Checking it per
+        // triangle instead would let one land half-drawn at the boundary, which is a character with part of
+        // a shadow.
+        const bool objectAccepted =
+            extent >= mShadowMapMinCasterSize && mShadowOpaqueObjectMark < kShadowMapCasterBudgetFloats;
+        if (!objectAccepted) {
+            // Rejected, so take back what this object wrote. The opaque half is a plain truncation: the
+            // vertices were appended to the end and nothing has been appended after them.
+            std::vector<float>& opaque = mShadowMapCasters[SHADOW_MAP_LAYER_ACTORS];
+            if (opaque.size() > mShadowOpaqueObjectMark) {
+                opaque.resize(mShadowOpaqueObjectMark);
             }
-        } else {
-            // Too small: roll the cutout half back to where this object started too, or the gate would only
-            // ever drop half a caster and clutter would keep casting whatever part of it was alpha-tested.
+            // And the cutout half back to where this object started too, or the gate would only ever drop
+            // half a caster and clutter would keep casting whatever part of it was alpha-tested.
             ShadowAlphaCasters& alpha = mShadowAlphaCasters[SHADOW_MAP_LAYER_ACTORS];
             if (alpha.verts.size() > mShadowAlphaObjectMark) {
                 const uint32_t markVertex = (uint32_t)(mShadowAlphaObjectMark / 5);
@@ -4083,6 +4251,7 @@ void Interpreter::RenderShadowMap() {
         // with it -- otherwise the first object of the new frame is measured against last frame's offset and
         // the size gate cannot roll it back.
         mShadowAlphaObjectMark = 0;
+        mShadowOpaqueObjectMark = 0;
         mShadowObjectHasVerts = false;
     }
 
@@ -4131,7 +4300,12 @@ void Interpreter::RenderShadowMap() {
         // and the room-mesh cache being rebuilt. This counts the first directly, span by span, so the two
         // stop being guesses. A span whose hash is unchanged did not move, however the list around it was
         // rebuilt; spans appearing or disappearing count as changes, since they are.
-        {
+        //
+        // Behind the same test as the cutout census below, and for the same reason: these two counters are
+        // read in one place, the per-second line under the debug view or GPU profiling. Cheaper than that
+        // census -- it compares span signatures that are already computed rather than walking vertices --
+        // but it still resized and refilled a vector every frame to answer a question nobody asked.
+        if (mShadowMapDebug > 0.5f || (mRapi != nullptr && mRapi->ShadowMapProfiling())) {
             const size_t n = mShadowSceneryChunks.size();
             const size_t prev = mShadowSceneryChunkHashPrev.size();
             size_t changed = n > prev ? n - prev : prev - n;
@@ -4146,6 +4320,8 @@ void Interpreter::RenderShadowMap() {
             for (size_t i = 0; i < n; i++) {
                 mShadowSceneryChunkHashPrev[i] = mShadowSceneryChunks[i].hash;
             }
+        } else {
+            mShadowSceneryChunkHashPrev.clear();
         }
 
         // The character layer gets cut into spans in the same walk that measures it.
@@ -4630,20 +4806,30 @@ void Interpreter::RenderShadowMap() {
     // back saying world cascades were still being redrawn with those spans completely still and the room
     // cache not rebuilding -- so the cause had to be in what was not being measured. Grass and foliage are
     // cutout casters, and in an open field they are most of what moves.
-    {
+    //
+    // Only when someone is going to read it. mShadowAlphaRangesSeen/Changed are consumed in exactly one
+    // place -- the per-second census line, printed under `mShadowMapDebug > 0.5f ||
+    // mRapi->ShadowMapProfiling()`. Both are developer-tools toggles and both are off in a normal session,
+    // so this walked every cutout range in the scene, every frame, to feed two counters nobody read.
+    //
+    // The prev-hash list is dropped while it is off rather than kept: it would otherwise be compared
+    // against on the first frame after someone turns profiling on, reporting a scene that has not moved
+    // since as though it had, because the snapshot beside it is minutes old.
+    const bool censusWanted = mShadowMapDebug > 0.5f || (mRapi != nullptr && mRapi->ShadowMapProfiling());
+    if (!censusWanted) {
+        mShadowAlphaRangeHashPrev.clear();
+    } else {
         size_t index = 0;
         size_t changed = 0;
         auto tally = [&](const ShadowAlphaCasters& set) {
             for (const ShadowAlphaRange& r : set.ranges) {
-                // The same things the key mixes for this range, in one value: its identity fields and its
-                // vertices. Five floats per vertex here -- world xyz plus uv.
+                // The same things the key mixes for this range, in one value: its identity fields and the
+                // signature of its vertices -- taken once in ResolveShadowAlphaTextures, not walked again
+                // here. This used to hash the vertex bytes itself, which is the same pass over the same
+                // data the reuse key was already paying for.
                 const uint32_t fields[3] = { r.textureId, r.firstVertex, r.vertexCount };
                 uint64_t h = ShadowHashBytes(0xCBF29CE484222325ull, fields, sizeof(fields));
-                const size_t first = (size_t)r.firstVertex * 5;
-                const size_t count = (size_t)r.vertexCount * 5;
-                if (first + count <= set.verts.size()) {
-                    h = ShadowHashBytes(h, set.verts.data() + first, count * sizeof(float));
-                }
+                h = ShadowHashBytes(h, &r.hash, sizeof(r.hash));
                 if (index >= mShadowAlphaRangeHashPrev.size() || mShadowAlphaRangeHashPrev[index] != h) {
                     changed++;
                 }
@@ -4743,11 +4929,11 @@ void Interpreter::RenderShadowMap() {
     //
     // A span whose texture could not be resolved is NOT bridgeable: it has no texture to be drawn with, so
     // it always breaks the run.
-    auto drawAlphaRanges = [this, &boxVisible](const ShadowAlphaCasters& set, const float* m) {
+    auto drawAlphaRanges = [this, &boxVisible](const ShadowAlphaCasters& set, const float* m, int slot) {
         uint32_t runTexture = UINT32_MAX, runFirst = 0, runCount = 0, gapCount = 0;
         auto flush = [&] {
             if (runCount >= 3) {
-                mRapi->ShadowMapDrawAlphaRange(runTexture, runFirst, runCount);
+                mRapi->ShadowMapDrawAlphaRange(runTexture, runFirst, runCount, slot);
             }
             runCount = 0;
             gapCount = 0;
@@ -4838,8 +5024,9 @@ void Interpreter::RenderShadowMap() {
             // It costs two extra pipeline switches on a frame that rebuilds the static half, and none at
             // all on the frames that do not, which are the ones this exists to make cheap.
             if (drawStatic && alpha.VertexCount() >= 3) {
-                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount());
-                drawAlphaRanges(alpha, &matrices[c * 16]);
+                mRapi->ShadowMapUploadAlphaCasters(alpha.verts.data(), alpha.VertexCount(),
+                                                   SHADOW_MAP_CASTER_SLOT_MAIN);
+                drawAlphaRanges(alpha, &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_MAIN);
             }
 
             // SOH [Enhancement] Static caster cache: everything above was the static half. Saying so is what
@@ -4857,8 +5044,9 @@ void Interpreter::RenderShadowMap() {
             }
             if (sceneryHere && mShadowAlphaSceneryReady.VertexCount() >= 3) {
                 mRapi->ShadowMapUploadAlphaCasters(mShadowAlphaSceneryReady.verts.data(),
-                                                  mShadowAlphaSceneryReady.VertexCount());
-                drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16]);
+                                                  mShadowAlphaSceneryReady.VertexCount(),
+                                                  SHADOW_MAP_CASTER_SLOT_SCENERY);
+                drawAlphaRanges(mShadowAlphaSceneryReady, &matrices[c * 16], SHADOW_MAP_CASTER_SLOT_SCENERY);
             }
         }
     }
