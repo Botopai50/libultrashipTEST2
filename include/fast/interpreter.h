@@ -549,7 +549,8 @@ class Interpreter {
         mShadowMapResolution = clipmapLayout ? mShadowMapQuality.clipmapResolution : resolution;
         // Never finer than the world layer (see shadow_map.h); the backend clamps it again, but keeping the
         // two in order here means the value the interpreter reasons with is the one that will be used.
-        mShadowMapActorResolution = actorResolution > resolution ? resolution : actorResolution;
+        mShadowMapActorResolution =
+            actorResolution > mShadowMapResolution ? mShadowMapResolution : actorResolution;
         if (splits != nullptr) {
             for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
                 mShadowMapSplitsRequested[i] = splits[i];

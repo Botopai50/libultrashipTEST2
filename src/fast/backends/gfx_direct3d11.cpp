@@ -648,7 +648,7 @@ uint64_t ShaderCacheSeed() {
 }
 
 constexpr uint32_t kShaderCacheMagic = 0x53535546; // 'FUSS'
-constexpr uint32_t kShaderCacheVersion = 1;
+constexpr uint32_t kShaderCacheVersion = 2;
 
 struct ShaderCacheHeader {
     uint32_t magic;
@@ -658,6 +658,7 @@ struct ShaderCacheHeader {
     uint64_t sourceLength;
     uint64_t vsSize;
     uint64_t psSize;
+    uint64_t bytecodeHash;
 };
 
 uint64_t ShaderHash(const char* data, size_t len, uint64_t seed) {
@@ -688,24 +689,36 @@ std::string ShaderCachePath(uint64_t hashA, uint64_t hashB) {
 
 bool ShaderCacheLoad(const std::string& path, uint64_t hashA, uint64_t hashB, size_t sourceLength,
                      std::vector<uint8_t>& vs, std::vector<uint8_t>& ps) {
-    std::ifstream f(path, std::ios::binary);
+    vs.clear();
+    ps.clear();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         return false;
     }
+    const auto fileSize = f.tellg();
+    f.seekg(0);
     ShaderCacheHeader h{};
     f.read((char*)&h, sizeof(h));
     // Every field is checked, including the ones the filename already encodes: a truncated write, a stale
     // format or a name collision must all read as "not cached" and fall through to compiling.
     if (!f || h.magic != kShaderCacheMagic || h.version != kShaderCacheVersion || h.hashA != hashA ||
         h.hashB != hashB || h.sourceLength != sourceLength || h.vsSize == 0 || h.psSize == 0 ||
-        h.vsSize > (1u << 24) || h.psSize > (1u << 24)) {
+        h.vsSize > (1u << 24) || h.psSize > (1u << 24) ||
+        fileSize != static_cast<std::streamoff>(sizeof(h) + h.vsSize + h.psSize)) {
         return false;
     }
     vs.resize((size_t)h.vsSize);
     ps.resize((size_t)h.psSize);
     f.read((char*)vs.data(), vs.size());
     f.read((char*)ps.data(), ps.size());
-    return (bool)f;
+    const uint64_t hash = ShaderHash(reinterpret_cast<const char*>(ps.data()), ps.size(),
+                                    ShaderHash(reinterpret_cast<const char*>(vs.data()), vs.size(), h.hashA));
+    if (!f || hash != h.bytecodeHash) {
+        vs.clear();
+        ps.clear();
+        return false;
+    }
+    return true;
 }
 
 void ShaderCacheStore(const std::string& path, uint64_t hashA, uint64_t hashB, size_t sourceLength,
@@ -713,24 +726,29 @@ void ShaderCacheStore(const std::string& path, uint64_t hashA, uint64_t hashB, s
     // Written to a temporary and renamed, so a crash or a second instance mid-write cannot leave a
     // half-file that later reads as a valid header with a truncated body.
     static std::atomic<uint32_t> counter{ 0 };
-    const std::string tmp = path + "." + std::to_string(counter.fetch_add(1)) + ".tmp";
+    const std::string tmp = path + "." + std::to_string(GetCurrentProcessId()) + "." +
+                            std::to_string(counter.fetch_add(1)) + ".tmp";
+    bool written = false;
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             return;
         }
         ShaderCacheHeader h{ kShaderCacheMagic, kShaderCacheVersion, hashA, hashB,
-                             (uint64_t)sourceLength, (uint64_t)vsSize, (uint64_t)psSize };
+                             (uint64_t)sourceLength, (uint64_t)vsSize, (uint64_t)psSize,
+                             ShaderHash(static_cast<const char*>(ps), psSize,
+                                        ShaderHash(static_cast<const char*>(vs), vsSize, hashA)) };
         f.write((const char*)&h, sizeof(h));
         f.write((const char*)vs, vsSize);
         f.write((const char*)ps, psSize);
-        if (!f) {
-            return;
-        }
+        f.close();
+        written = !f.fail();
     }
     std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
+    if (written) {
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (!written || ec) {
         std::filesystem::remove(tmp, ec);
     }
 }
@@ -2314,15 +2332,14 @@ GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, fl
 
     ID3D11UnorderedAccessView* nullUav = nullptr;
     mContext->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
-    DepthReadbackDX11::Coordinates orderedCoordinates(coordinates.begin(), coordinates.end());
-    std::vector<float> depthValues;
+    mDepthReadbackCoordinates.assign(coordinates.begin(), coordinates.end());
     ThrowIfFailed(mDepthReadback.Read(mDevice.Get(), mContext.Get(), mDepthValueOutputBuffer.Get(),
-                                    orderedCoordinates, mAsyncDepthReadbackEnabled, depthValues));
+                                    mDepthReadbackCoordinates, mAsyncDepthReadbackEnabled, mDepthReadbackValues));
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
     {
         size_t i = 0;
         for (const auto& coord : coordinates) {
-            res.emplace(coord, depthValues[i++] * 65532.0f);
+            res.emplace(coord, mDepthReadbackValues[i++] * 65532.0f);
         }
     }
 

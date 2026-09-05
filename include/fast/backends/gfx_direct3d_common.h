@@ -491,6 +491,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
     DepthReadbackDX11 mDepthReadback;
+    DepthReadbackDX11::Coordinates mDepthReadbackCoordinates;
+    std::vector<float> mDepthReadbackValues;
     int mDepthReadbackFramebuffer = -1;
     bool mAsyncDepthReadbackEnabled = false;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mDepthValueOutputUav;
