@@ -131,6 +131,11 @@ class ResourceManager {
     std::shared_ptr<IResource> GetCachedResource(std::variant<ResourceLoadError, std::shared_ptr<IResource>> cacheLine);
 
   private:
+    // Called after signature normalization and a cache miss by both public loading APIs.
+    std::shared_future<std::shared_ptr<IResource>>
+    QueueResourceLoad(const ResourceIdentifier& identifier, bool loadExact, BS::priority_t priority,
+                      std::shared_ptr<ResourceInitData> initData);
+
     // A load that has been queued but has not finished yet, so a second request for the same thing can wait
     // on the first instead of repeating it.
     //

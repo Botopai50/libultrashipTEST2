@@ -3,11 +3,9 @@
 #include "ship/resource/File.h"
 #include "ship/resource/archive/Archive.h"
 #include <algorithm>
+#include <cstring>
 #include <thread>
-#include "ship/utils/StringHelper.h"
 #include "ship/utils/Utils.h"
-#include "ship/config/ConsoleVariable.h"
-#include "ship/Context.h"
 
 namespace Ship {
 
@@ -200,7 +198,7 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
     // Check for and remove the OTR signature
     if (OtrSignatureCheck(identifier.Path.c_str())) {
         auto newFilePath = identifier.Path.substr(7);
-        return LoadResourceAsync({ newFilePath, identifier.Owner, identifier.Parent }, loadExact, priority);
+        return LoadResourceAsync({ newFilePath, identifier.Owner, identifier.Parent }, loadExact, priority, initData);
     }
 
     // Check the cache before queueing the job.
@@ -211,6 +209,12 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return promise->get_future().share();
     }
 
+    return QueueResourceLoad(identifier, loadExact, priority, initData);
+}
+
+std::shared_future<std::shared_ptr<IResource>>
+ResourceManager::QueueResourceLoad(const ResourceIdentifier& identifier, bool loadExact, BS::priority_t priority,
+                                   std::shared_ptr<ResourceInitData> initData) {
     // One load per thing in flight; see mInFlight. The lock is held across the submit AND the insert on
     // purpose: the task erases its own entry when it finishes, and if it were allowed to run and erase
     // before the insert landed, the entry would be published after the load was already over and would sit
@@ -251,7 +255,19 @@ ResourceManager::LoadResourceAsync(const std::string& filePath, bool loadExact, 
 
 std::shared_ptr<IResource> ResourceManager::LoadResource(const ResourceIdentifier& identifier, bool loadExact,
                                                          std::shared_ptr<ResourceInitData> initData) {
-    auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+    if (OtrSignatureCheck(identifier.Path.c_str())) {
+        return LoadResource({ identifier.Path.substr(7), identifier.Owner, identifier.Parent }, loadExact, initData);
+    }
+
+    // A synchronous cache hit needs no promise or shared-future state. Use the same cache lookup as
+    // the async API so alternate assets and dirty resources keep their existing behavior.
+    if (auto resource = GetCachedResource(identifier, loadExact)) {
+        return resource;
+    }
+
+    // Share the miss path with async callers without repeating the cache lookup. The worker still
+    // rechecks the cache after queueing, and concurrent requests still share one in-flight load.
+    auto resource = QueueResourceLoad(identifier, loadExact, BS::pr::highest, initData).get();
     if (resource == nullptr) {
         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
     }
