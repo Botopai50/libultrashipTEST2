@@ -475,7 +475,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
 
+    // The rasterizer state currently BOUND. Kept as its own handle because the shadow pass rebinds it when
+    // it hands the context back (see ShadowMapEndPass); it now aliases one of the two cached states below.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
+    // SOH [Enhancement] Rasterizer states, created lazily and cached, exactly as the depth-stencil states
+    // right below already were. Indexed by zmodeDecal, which is the only thing that varies per draw; the
+    // slope-scaled depth bias also depends on the z-fighting mode and the render target's height, so both
+    // are recorded and the pair is dropped when either moves. Decal geometry flips this many times a frame
+    // and every flip used to run CreateRasterizerState, allocating a driver object each time.
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerStates[2];
+    int mRasterizerStatesZFightingMode = -1;
+    int32_t mRasterizerStatesHeight = -1;
     // SOH [Enhancement] Depth-stencil states, created lazily and cached for the device's lifetime (the
     // stencil features flip the mode many times per frame, and each flip used to re-run
     // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
