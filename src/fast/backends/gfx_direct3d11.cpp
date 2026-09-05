@@ -1344,7 +1344,8 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         // the render target's height, so both are recorded and the PAIR is dropped whenever either moves.
         // That is what keeps this exactly equivalent to rebuilding on every flip -- at any flip the state
         // bound is still one built from the current mode and the current height.
-        const int zFightingMode = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        const int zFightingMode =
+            Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
         if (zFightingMode != mRasterizerStatesZFightingMode || mRenderTargetHeight != mRasterizerStatesHeight) {
             mRasterizerStates[0].Reset();
             mRasterizerStates[1].Reset();
