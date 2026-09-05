@@ -121,6 +121,10 @@ class GfxRenderingAPI {
     }
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
+    // Opt-in for visual occlusion queries that tolerate one query of latency. Other backends keep
+    // their synchronous implementation; gameplay callers should leave this disabled.
+    virtual void SetAsyncDepthReadbackEnabled(bool enabled) {
+    }
     virtual void* GetFramebufferTextureId(int fbId) = 0;
     virtual void SelectTextureFb(int fbId) = 0;
     virtual void DeleteTexture(uint32_t texId) = 0;

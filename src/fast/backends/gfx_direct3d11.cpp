@@ -1635,11 +1635,15 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 
     if (has_depth_buffer &&
         (diff || !fb.has_depth_buffer || (fb.depth_stencil_srv.Get() != nullptr) != can_extract_depth)) {
+        mDepthReadback.Reset();
         fb.depth_stencil_srv.Reset();
         CreateDepthStencilObjects(width, height, msaa_level, fb.depth_stencil_view.ReleaseAndGetAddressOf(),
                                   can_extract_depth ? fb.depth_stencil_srv.GetAddressOf() : nullptr);
     }
     if (!has_depth_buffer) {
+        if (fb.has_depth_buffer) {
+            mDepthReadback.Reset();
+        }
         fb.depth_stencil_view.Reset();
         fb.depth_stencil_srv.Reset();
     }
@@ -2207,8 +2211,22 @@ FilteringMode GfxRenderingAPIDX11::GetTextureFilter() {
     return mCurrentFilterMode;
 }
 
+void GfxRenderingAPIDX11::SetAsyncDepthReadbackEnabled(bool enabled) {
+    if (mAsyncDepthReadbackEnabled != enabled) {
+        mAsyncDepthReadbackEnabled = enabled;
+        mDepthReadback.Reset();
+    }
+}
+
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
+    if (coordinates.empty()) {
+        return {};
+    }
+    if (mDepthReadbackFramebuffer != fb_id) {
+        mDepthReadback.Reset();
+        mDepthReadbackFramebuffer = fb_id;
+    }
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     TextureData& td = mTextures[fb.texture_id];
 
@@ -2217,7 +2235,7 @@ GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, fl
         mCoordBufferSrv.Reset();
         mDepthValueOutputBuffer.Reset();
         mDepthValueOutputUav.Reset();
-        mDepthValueOutputBufferCopy.Reset();
+        mDepthReadback.Reset();
 
         D3D11_BUFFER_DESC coord_buf_desc;
         coord_buf_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -2255,11 +2273,6 @@ GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, fl
         output_buffer_uav_desc.Buffer.Flags = 0;
         ThrowIfFailed(mDevice->CreateUnorderedAccessView(mDepthValueOutputBuffer.Get(), &output_buffer_uav_desc,
                                                          mDepthValueOutputUav.GetAddressOf()));
-
-        output_buffer_desc.Usage = D3D11_USAGE_STAGING;
-        output_buffer_desc.BindFlags = 0;
-        output_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ThrowIfFailed(mDevice->CreateBuffer(&output_buffer_desc, nullptr, mDepthValueOutputBufferCopy.GetAddressOf()));
 
         mCoordBufferSize = coordinates.size();
     }
@@ -2299,16 +2312,19 @@ GfxRenderingAPIDX11::GetPixelDepth(int fb_id, const std::set<std::pair<float, fl
 
     mContext->Dispatch(coordinates.size(), 1, 1);
 
-    mContext->CopyResource(mDepthValueOutputBufferCopy.Get(), mDepthValueOutputBuffer.Get());
-    ThrowIfFailed(mContext->Map(mDepthValueOutputBufferCopy.Get(), 0, D3D11_MAP_READ, 0, &ms));
+    ID3D11UnorderedAccessView* nullUav = nullptr;
+    mContext->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+    DepthReadbackDX11::Coordinates orderedCoordinates(coordinates.begin(), coordinates.end());
+    std::vector<float> depthValues;
+    ThrowIfFailed(mDepthReadback.Read(mDevice.Get(), mContext.Get(), mDepthValueOutputBuffer.Get(),
+                                    orderedCoordinates, mAsyncDepthReadbackEnabled, depthValues));
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
     {
         size_t i = 0;
         for (const auto& coord : coordinates) {
-            res.emplace(coord, ((float*)ms.pData)[i++] * 65532.0f);
+            res.emplace(coord, depthValues[i++] * 65532.0f);
         }
     }
-    mContext->Unmap(mDepthValueOutputBufferCopy.Get(), 0);
 
     ID3D11ShaderResourceView* null_arr[2] = { nullptr, nullptr };
     mContext->CSSetShaderResources(0, 2, null_arr);

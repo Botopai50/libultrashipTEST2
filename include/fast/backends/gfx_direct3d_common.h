@@ -9,6 +9,7 @@
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
+#include "gfx_direct3d11_depth_readback.h"
 #include <thread>
 #include <atomic>
 #include <vector>
@@ -200,6 +201,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
+    void SetAsyncDepthReadbackEnabled(bool enabled) override;
     void* GetFramebufferTextureId(int fbId) override;
     void SelectTextureFb(int fbId) override;
     void DeleteTexture(uint32_t texId) override;
@@ -488,12 +490,14 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBufferCopy;
+    DepthReadbackDX11 mDepthReadback;
+    int mDepthReadbackFramebuffer = -1;
+    bool mAsyncDepthReadbackEnabled = false;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> mDepthValueOutputUav;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShader;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
     Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
-    size_t mCoordBufferSize;
+    size_t mCoordBufferSize = 0;
 
 #if DEBUG_D3D
     Microsoft::WRL::ComPtr<ID3D11Debug> debug;
