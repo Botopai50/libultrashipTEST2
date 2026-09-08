@@ -594,6 +594,9 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         mDrawUniforms.toonHighlightIntensity = mToonHighlightIntensity;
         mDrawUniforms.toonShadowIntensity = mToonShadowIntensity;
         mDrawUniforms.toonDebug = mToonDebug;
+        mDrawUniforms.toonLocalEnabled = mToonLocalLights.enabled;
+        memcpy(mDrawUniforms.toonLocalDir, mToonLocalLights.direction, sizeof(mDrawUniforms.toonLocalDir));
+        memcpy(mDrawUniforms.toonLocalColor, mToonLocalLights.color, sizeof(mDrawUniforms.toonLocalColor));
     }
 
     if (textures_changed || mShaderProgram->opt_toon) {

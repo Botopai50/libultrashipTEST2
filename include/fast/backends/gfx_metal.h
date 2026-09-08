@@ -141,7 +141,12 @@ struct DrawUniforms {
     simd::float1 toonHighlightIntensity;
     simd::float1 toonShadowIntensity;
     simd::float1 toonDebug;
+    simd::float1 toonLocalEnabled;
+    simd::float1 toonLocalDir[TOON_LOCAL_LIGHT_MAX][4];
+    simd::float1 toonLocalColor[TOON_LOCAL_LIGHT_MAX][4];
 };
+static_assert(sizeof(DrawUniforms) == 212, "DrawUniforms must match the Metal scalar-array layout");
+static_assert(offsetof(DrawUniforms, toonLocalDir) == 84, "Metal local-light array offset mismatch");
 
 struct CoordUniforms {
     simd::uint2 coords[MAX_PIXEL_DEPTH_COORDS];

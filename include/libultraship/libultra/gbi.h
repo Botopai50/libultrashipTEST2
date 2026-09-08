@@ -190,6 +190,7 @@
 #define G_READFB 0x3e
 #define G_SETINTENSITY 0x40
 #define G_SETTOON 0x41 // SOH [Enhancement] toon lighting per-draw marker
+#define G_SETTOONLOCAL 0x4c // Per-object local toon light snapshot
 #define G_SETTOONKEY 0x4a // SOH [Enhancement] toon lighting per-object key light (dir + color)
 #define G_SETTOONSHADOW 0x4b // SOH [Enhancement] actor shadow per-object marker (arm/disarm, feet clamp, size)
 #define G_SETSTENCIL 0x46 // SOH [Enhancement] world light casting: per-draw stencil mode
@@ -2817,6 +2818,24 @@ typedef union Gfx {
 
 #define gsSPToon(state) \
     { (_SHIFTL(G_SETTOON, 24, 8)), (state) }
+
+// Reset before each object's local lights, including objects with no sources.
+#define gSPToonLocalLightsReset(pkt, enabled)                     \
+    {                                                           \
+        Gfx* _g = (Gfx*)(pkt);                                   \
+        _g->words.w0 = _SHIFTL(G_SETTOONLOCAL, 24, 8) | ((enabled) ? 1 : 0); \
+        _g->words.w1 = 0;                                        \
+    }
+
+// slot is zero-based, 0..3. Color already contains distance attenuation.
+#define gSPToonLocalLight(pkt, slot, dx, dy, dz, r, g, b)          \
+    {                                                           \
+        Gfx* _g = (Gfx*)(pkt);                                   \
+        _g->words.w0 = _SHIFTL(G_SETTOONLOCAL, 24, 8) |            \
+            _SHIFTL((dx) & 255, 16, 8) | _SHIFTL((dy) & 255, 8, 8) | _SHIFTL((dz) & 255, 0, 8); \
+        _g->words.w1 = _SHIFTL((slot) + 1, 24, 8) |              \
+            _SHIFTL((r) & 255, 16, 8) | _SHIFTL((g) & 255, 8, 8) | _SHIFTL((b) & 255, 0, 8); \
+    }
 
 // SOH [Enhancement] Toon lighting per-object key light. dx/dy/dz are the signed key direction
 // (world space, * 127) and r/g/b the key light color, packed into the two command words.

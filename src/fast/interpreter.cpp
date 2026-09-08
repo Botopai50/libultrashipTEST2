@@ -174,6 +174,7 @@ void Interpreter::Flush() {
         // SOH [Enhancement] Push the dominant toon light for this batch. The backend only consumes it
         // when the bound shader is a toon variant, so it is a no-op for ordinary draws.
         mRapi->SetToonLighting(mRsp->toon_light_dir, mRsp->toon_light_color, mRsp->toon_ambient);
+        mRapi->SetToonLocalLights(mRsp->toon_local_lights);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -6892,10 +6893,22 @@ bool gfx_set_toon_handler_custom(F3DGfx** cmd0) {
     gfx->FlushToonShadow();
     gfx->mRdp->toon_shadow = false;
 
+    gfx->Flush();
+    gfx->mRsp->toon_local_lights = {};
     gfx->mRdp->toon = cmd->words.w1;
     gfx->mRdpCombinerDirty = true; // one mark for toon and the toon_shadow clear above it
     // A fresh key must be supplied (per object) after each toon-on; clear any stale one.
     gfx->mRsp->toon_key_valid = false;
+    return false;
+}
+
+bool gfx_set_toon_local_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    ToonLocalLights next = gfx->mRsp->toon_local_lights;
+    ToonLocalLightsDecode(&next, (uint32_t)(*cmd0)->words.w0, (uint32_t)(*cmd0)->words.w1);
+    if (memcmp(&next, &gfx->mRsp->toon_local_lights, sizeof(next)) == 0) return false;
+    gfx->Flush(); // pending vertices still belong to the previous light snapshot
+    gfx->mRsp->toon_local_lights = next;
     return false;
 }
 
@@ -7435,6 +7448,7 @@ static constexpr UcodeHandler otrHandlers = {
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
     { OTR_G_SETTOON, { "G_SETTOON", gfx_set_toon_handler_custom } },                // G_SETTOON (0x41)
+    { OTR_G_SETTOONLOCAL, { "G_SETTOONLOCAL", gfx_set_toon_local_handler_custom } },
     { OTR_G_SETTOONKEY, { "G_SETTOONKEY", gfx_set_toon_key_handler_custom } },      // G_SETTOONKEY (0x4a)
     { OTR_G_SETTOONSHADOW,
       { "G_SETTOONSHADOW", gfx_set_toon_shadow_handler_custom } }, // G_SETTOONSHADOW (0x4b) actor shadow

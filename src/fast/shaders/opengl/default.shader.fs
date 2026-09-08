@@ -55,6 +55,9 @@ uniform float toon_ramp_softness;
 uniform float toon_highlight_intensity;
 uniform float toon_shadow_intensity;
 uniform float toon_debug;
+uniform float toon_local_enabled;
+uniform vec4 toon_local_dir[4];
+uniform vec4 toon_local_color[4];
 @end
 
 uniform int texture_width[2];
@@ -194,12 +197,21 @@ void main() {
                                     toon_ramp_center + toon_ramp_softness, toonNL);
         vec3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
         vec3 toonShadow = mix(toonLit, toon_ambient, toon_shadow_intensity);
+        vec3 localContribution = vec3(0.0);
+        if (toon_local_enabled > 0.5) {
+            for (int i = 0; i < 4; ++i) {
+                float localNL = dot(toonN, toon_local_dir[i].xyz) * 0.5 + 0.5;
+                float localRamp = smoothstep(toon_ramp_center - toon_ramp_softness,
+                                             toon_ramp_center + toon_ramp_softness, localNL);
+                localContribution += toon_local_color[i].xyz * toon_highlight_intensity * localRamp;
+            }
+        }
         if (toon_debug > 0.5) {
             // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
             // discarded — makes it obvious which draws are receiving toon lighting.
             texel.rgb = vec3(toonRamp);
         } else {
-            texel.rgb = clamp(texel.rgb * mix(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            texel.rgb = clamp(texel.rgb * (mix(toonShadow, toonLit, toonRamp) + localContribution), 0.0, 1.0);
         }
     @end
 

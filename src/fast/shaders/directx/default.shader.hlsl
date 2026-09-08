@@ -90,7 +90,10 @@ cbuffer PerToonCB : register(b2) {
     float toon_highlight_intensity;
     float toon_shadow_intensity;
     float toon_debug;
-    float2 _toon_pad;
+    float toon_local_enabled;
+    float _toon_pad;
+    float4 toon_local_dir[4];
+    float4 toon_local_color[4];
 }
 @end
 
@@ -1142,17 +1145,31 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.
     @if(o_toon)
+        float3 toonAlbedo = texel.rgb;
+        float3 toonLocalContribution = float3(0.0, 0.0, 0.0);
         float3 toonN = normalize(input.normal);
         float toonNL = dot(toonN, normalize(toon_light_dir)) * 0.5 + 0.5;
         float toonRamp = smoothstep(toon_ramp_center - toon_ramp_softness, toon_ramp_center + toon_ramp_softness, toonNL);
         float3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
         float3 toonShadow = lerp(toonLit, toon_ambient, toon_shadow_intensity);
+        float3 toonDirectContribution = toon_light_color * toon_highlight_intensity *
+            lerp(1.0 - toon_shadow_intensity, 1.0, toonRamp);
+        if (toon_local_enabled > 0.5) {
+            [unroll] for (int i = 0; i < 4; ++i) {
+                float localNL = dot(toonN, toon_local_dir[i].xyz) * 0.5 + 0.5;
+                float localRamp = smoothstep(toon_ramp_center - toon_ramp_softness,
+                                             toon_ramp_center + toon_ramp_softness, localNL);
+                toonLocalContribution += toon_local_color[i].xyz * toon_highlight_intensity * localRamp;
+            }
+        }
         if (toon_debug > 0.5) {
             // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
             // discarded — makes it obvious which draws are receiving toon lighting.
             texel.rgb = float3(toonRamp, toonRamp, toonRamp);
         } else {
-            texel.rgb = clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            texel.rgb = toon_local_enabled > 0.5
+                ? toonAlbedo * (toon_ambient + toonDirectContribution + toonLocalContribution)
+                : clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
         }
     @end
 
@@ -1320,8 +1337,23 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             }
             texel.rgb = shadowDebugColour;
         } else {
-            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            float directionalVisibility = lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            @if(o_toon)
+                if (toon_local_enabled > 0.5 && toon_debug < 0.5) {
+                    // A solar occluder removes only the directional contribution.
+                    texel.rgb = toonAlbedo * (toon_ambient + toonDirectContribution * directionalVisibility +
+                                              toonLocalContribution);
+                } else {
+                    texel.rgb *= directionalVisibility;
+                }
+            @else
+                texel.rgb *= directionalVisibility;
+            @end
         }
+    @end
+
+    @if(o_toon)
+        if (toon_local_enabled > 0.5) texel.rgb = clamp(texel.rgb, 0.0, 1.0);
     @end
 
     @if(o_fog)

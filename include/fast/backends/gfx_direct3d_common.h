@@ -45,8 +45,13 @@ struct PerToonCB {
     float toon_highlight_intensity;
     float toon_shadow_intensity;
     float toon_debug;
-    float _toon_pad[2];
+    float toon_local_enabled;
+    float _toon_pad;
+    float toon_local_dir[TOON_LOCAL_LIGHT_MAX][4];
+    float toon_local_color[TOON_LOCAL_LIGHT_MAX][4];
 };
+static_assert(sizeof(PerToonCB) == 192, "PerToonCB must match the HLSL register layout");
+static_assert(offsetof(PerToonCB, toon_local_dir) == 64, "Local directions start at HLSL register c4");
 
 // SOH [Enhancement] Cascaded shadow maps (register b3). Layout must match the PerShadowCB cbuffer in
 // default.shader.hlsl field for field. Everything is float4-shaped because HLSL gives each element of a

@@ -1466,6 +1466,9 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         toon.toon_highlight_intensity = mToonHighlightIntensity;
         toon.toon_shadow_intensity = mToonShadowIntensity;
         toon.toon_debug = mToonDebug;
+        toon.toon_local_enabled = mToonLocalLights.enabled;
+        memcpy(toon.toon_local_dir, mToonLocalLights.direction, sizeof(toon.toon_local_dir));
+        memcpy(toon.toon_local_color, mToonLocalLights.color, sizeof(toon.toon_local_color));
 
         if (!mPerToonCbValid || memcmp(&toon, &mPerToonCbData, sizeof(PerToonCB)) != 0) {
             D3D11_MAPPED_SUBRESOURCE toon_ms;

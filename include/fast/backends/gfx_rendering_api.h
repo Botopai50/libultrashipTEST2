@@ -9,6 +9,7 @@
 #include "fast/shadow_map.h"
 
 namespace Fast {
+static_assert(TOON_LOCAL_LIGHT_MAX == 4, "Update the HLSL, GLSL and Metal array bounds together");
 struct ShaderProgram;
 
 struct GfxClipParameters {
@@ -156,6 +157,10 @@ class GfxRenderingAPI {
 
     // SOH [Enhancement] Toon lighting: the interpreter pushes the per-object dominant light here
     // before each batch; backends read the mToon* members in their per-draw uniform paths.
+    virtual void SetToonLocalLights(const ToonLocalLights& lights) {
+        mToonLocalLights = lights;
+    }
+
     virtual void SetToonLighting(const float dir[3], const float color[3], const float ambient[3]) {
         for (int i = 0; i < 3; i++) {
             mToonLightDir[i] = dir[i];
@@ -462,6 +467,7 @@ class GfxRenderingAPI {
     float mToonHighlightIntensity = TOON_SHADING_DEFAULT_HIGHLIGHT;
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
+    ToonLocalLights mToonLocalLights{};
     int mStencilMode = 0; // SOH [Enhancement] world light casting / actor shadows (see StencilMode)
     // SOH [Enhancement] Cascaded shadow maps: the frame's cascade transforms and tuning, pushed by
     // SetShadowMapParams. mShadowCascadesActive == 0 means "no shadow map this frame", which is the
