@@ -4555,17 +4555,9 @@ void Interpreter::RenderShadowMap() {
     }
     // Use the application's current rendered-frame light. Holding small angular changes here turns
     // continuous solar motion into pauses and jumps, amplified by tall scenery even with a static camera.
-    float up[3] = { 0.0f, 1.0f, 0.0f };
-    if (std::fabs(lz[1]) > 0.99f) {
-        up[0] = 1.0f;
-        up[1] = 0.0f;
-    }
-    float lx[3] = { up[1] * lz[2] - up[2] * lz[1], up[2] * lz[0] - up[0] * lz[2], up[0] * lz[1] - up[1] * lz[0] };
-    float lxLen = std::sqrt(lx[0] * lx[0] + lx[1] * lx[1] + lx[2] * lx[2]);
-    for (int i = 0; i < 3; i++) {
-        lx[i] /= lxLen;
-    }
-    const float ly[3] = { lz[1] * lx[2] - lz[2] * lx[1], lz[2] * lx[0] - lz[0] * lx[2], lz[0] * lx[1] - lz[1] * lx[0] };
+    ShadowLightFrameUpdate(&mShadowLightFrame, lz);
+    const float* lx = mShadowLightFrame.x;
+    const float* ly = mShadowLightFrame.y;
 
     // Advanced here rather than at the top of the frame: the early exits above leave without rendering a
     // pass at all, and a counter that moved on those would let a cascade's turn come round while nothing was

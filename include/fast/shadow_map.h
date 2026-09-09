@@ -238,6 +238,10 @@
 // this may well need to move. It is a starting point, not a tuned value.
 #define SHADOW_MAP_SLOPE_BIAS 1.0f
 
+// D16 stores quantized depths. The slope term vanishes on light-facing surfaces, so retain two
+// representable depth steps for rasterization/interpolation error even when the slope is zero.
+#define SHADOW_MAP_DEPTH_BIAS_UNITS 2
+
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is
 // never in the map to be compared against itself -- but it requires the caster to HAVE a back. A wall

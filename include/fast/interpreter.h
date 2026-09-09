@@ -13,6 +13,7 @@
 
 #include "fast/lus_gbi.h"
 #include "fast/types.h"
+#include "fast/shadow_light_frame.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
 
@@ -574,6 +575,7 @@ class Interpreter {
         mShadowMapMinCasterSize = minCasterSize;
         mShadowMapDebug = debugMode;
         if (!enabled) {
+            mShadowLightFrame = {};
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
@@ -1215,6 +1217,7 @@ class Interpreter {
     // be reused while the camera moves -- see the containment test in RenderShadowMap.
     float mShadowMapCascadeCenter[SHADOW_MAP_MAX_LEVELS][3] = {};
     bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_LEVELS] = {};
+    ShadowLightFrame mShadowLightFrame = {};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

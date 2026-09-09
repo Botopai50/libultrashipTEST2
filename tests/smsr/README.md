@@ -4,7 +4,7 @@ Standalone Windows tests; no game assets or SoH build required. Run from the app
 
 ```sh
 cmake -S libultraship/tests/smsr -B build-smsr
-cmake --build build-smsr --config Release --target smsr_tests smsr_prism_driver smsr_clipmap_tests smsr_upload_tests
+cmake --build build-smsr --config Release --target smsr_tests smsr_prism_driver smsr_clipmap_tests smsr_upload_tests smsr_light_frame_tests smsr_depth_tests
 ctest --test-dir build-smsr -C Release -R "^smsr_" --output-on-failure
 ```
 
@@ -26,6 +26,15 @@ The separate `prism` dependency test is not part of this suite; use the `^smsr_`
 buffers. It reproduces stale data when a room allocation returns with the same pointer and vertex count
 after skipped uploads, then verifies generation invalidation repairs both buffers while preserving reuse
 for an unchanged generation. It does not reproduce a particular in-game scene.
+
+`smsr_light_frame_stability` checks rotation-minimizing light axes, the solar orbit near noon,
+crossing the old up-axis threshold, antipodal directions, orthonormality and bit-identical reuse
+when the light is stationary.
+
+`smsr_depth_stability` runs the production rasterizer-state function on WARP. It rasterizes a planar
+receiver across 64 D16 quantization phases and reads back the depths: a zero-bias control reproduces
+temporal self-shadowing, while the quantization margin avoids it. It also checks bounded displacement,
+continued occlusion by a separate surface, and a nonzero bias clamp at large cascade/clipmap extents.
 
 For offline configuration, set `FETCHCONTENT_SOURCE_DIR_PRISM` and `FETCHCONTENT_SOURCE_DIR_SPDLOG` to
 existing dependency checkouts. Prism is pinned to the revision used by libultraship. These tests verify

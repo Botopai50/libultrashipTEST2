@@ -2499,11 +2499,9 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // it should do. The far side is safe too: a caster clamped to the far value never wins a comparison it
     // should lose, so nothing gains a shadow it should not have.
     rast_desc.DepthClipEnable = FALSE;
-    // No constant bias here. It is applied in the shader instead, in world units divided by each
-    // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different
-    // physical distance in every cascade. The slope term stays: being relative to the polygon's own
-    // gradient is exactly right, and it is the same relative amount whatever the range.
-    rast_desc.DepthBias = 0;
+    // The receiver compares unquantized depth with D16. Reserve a small quantization margin even
+    // where the slope vanishes, or a stationary surface alternates between lit and self-shadowed.
+    rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
     rast_desc.SlopeScaledDepthBias = SHADOW_MAP_SLOPE_BIAS;
     if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
@@ -2992,13 +2990,16 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD in this cascade's own depth units: the projection scales the
     // light's unit x axis by 1/radius, so sx IS 1/radius, and a cascade's depth range is five radii by
     // construction.
-    float depthBiasClamp = 0.0f;
+    const float depthUnit = 1.0f / 65535.0f;
+    const float minimumClamp = SHADOW_MAP_DEPTH_BIAS_UNITS * depthUnit;
+    float depthBiasClamp = minimumClamp;
     const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
                                (lightViewProj[8] * lightViewProj[8]));
     if (sx > 1e-9f) {
         depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sx / 5.0f;
-        // Quantised for the same reason the slope is: a value drifting by a hair must not rebuild the state.
-        depthBiasClamp = std::floor((depthBiasClamp * 4096.0f) + 0.5f) / 4096.0f;
+        // Quantize to the texture's precision, not 1/4096. The old rounding could reach zero on
+        // large levels, which D3D interprets as UNLIMITED bias and causes abrupt shadow displacement.
+        depthBiasClamp = std::max(minimumClamp, std::floor(depthBiasClamp / depthUnit) * depthUnit);
     }
 
     // Both facings recorded. Front-face culling was tried here and removed: it does remove self-shadowing
@@ -3013,7 +3014,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         rast_desc.FillMode = D3D11_FILL_SOLID;
         rast_desc.CullMode = D3D11_CULL_NONE;
         rast_desc.DepthClipEnable = FALSE;
-        rast_desc.DepthBias = 0;
+        rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
         rast_desc.SlopeScaledDepthBias = slope;
         rast_desc.DepthBiasClamp = depthBiasClamp;
         ComPtr<ID3D11RasterizerState> built;
