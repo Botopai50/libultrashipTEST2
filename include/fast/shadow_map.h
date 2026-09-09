@@ -814,7 +814,16 @@ typedef struct ShadowMapAcne {
 //
 // Zero-initialising this gives every technique OFF and every tuning at zero, which is not the same as the
 // defaults -- call ShadowMapQualityDefaults() rather than relying on {}.
+#define SHADOW_MAP_DEFAULT_SMSR 0
+#define SHADOW_MAP_DEFAULT_SMSR_STEPS 16
+#define SHADOW_MAP_MAX_SMSR_STEPS 64
+#define SHADOW_MAP_DEFAULT_SMSR_EPSILON 0.00002f
+#define SHADOW_MAP_MAX_SMSR_EPSILON 0.001f
+
 typedef struct ShadowMapQuality {
+    int smsr;             // binary silhouette revectorization, bypasses all shadow filtering
+    int smsrMaxSteps;      // maximum texels traversed in each direction
+    float smsrEpsilon;     // near-equality tolerance in normalized shadow depth
     // Technique 1 -- filterable maps
 
     // Technique 2 -- analytic edge
@@ -855,6 +864,9 @@ typedef struct ShadowMapQuality {
 // the C boundary get the same one and it cannot drift.
 static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     ShadowMapQuality q;
+    q.smsr = SHADOW_MAP_DEFAULT_SMSR;
+    q.smsrMaxSteps = SHADOW_MAP_DEFAULT_SMSR_STEPS;
+    q.smsrEpsilon = SHADOW_MAP_DEFAULT_SMSR_EPSILON;
     q.analyticEdge = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE;
     q.analyticEdgeWidth = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH;
     q.jitter = SHADOW_MAP_DEFAULT_JITTER;
@@ -886,6 +898,12 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
         return;
     }
 #define SHADOW_MAP_CLAMP_(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+    q->smsr = q->smsr ? 1 : 0;
+    q->smsrMaxSteps = SHADOW_MAP_CLAMP_(q->smsrMaxSteps, 1, SHADOW_MAP_MAX_SMSR_STEPS);
+    // Reject NaN as well as out-of-range values from configuration files.
+    if (!(q->smsrEpsilon >= 0.0f && q->smsrEpsilon <= SHADOW_MAP_MAX_SMSR_EPSILON)) {
+        q->smsrEpsilon = SHADOW_MAP_DEFAULT_SMSR_EPSILON;
+    }
     q->analyticEdge = q->analyticEdge ? 1 : 0;
     q->analyticEdgeWidth = SHADOW_MAP_CLAMP_(q->analyticEdgeWidth, 0.25f, SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH);
     q->jitter = q->jitter ? 1 : 0;

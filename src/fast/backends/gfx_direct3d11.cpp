@@ -1884,8 +1884,8 @@ void GfxRenderingAPIDX11::DrawShadowMapView() {
     // The array holds the world layer's cascades first and then the actor layer's, and the actor layer is
     // the shorter one -- so the count is not a product. Asking for a slice past the end would sample
     // whatever the clamp lands on and show a picture that is not there.
-    const int worldSlices = mShadowCascadesActive;
-    const int actorSlices = SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowCascadesActive);
+    const int worldSlices = mShadowCascadeCount;
+    const int actorSlices = SHADOW_MAP_ACTOR_CASCADES_FOR(worldSlices);
     const int totalSlices = worldSlices + actorSlices;
     const int index = slice - 1; // the setting is 1-based so that 0 can mean off
     if (index >= totalSlices) {
@@ -1918,7 +1918,8 @@ void GfxRenderingAPIDX11::DrawShadowMapView() {
     float sliceIndex = (float)index;
     if (isActorHalf && mShadowActorSrv != nullptr) {
         srv = mShadowActorSrv.Get();
-        sliceIndex = (float)(index - worldSlices);
+        // Actor SRVs use the same logical slice indices as the world array.
+        sliceIndex = (float)index;
     }
 
     // The stretch. A cascade's depths crowd near its near plane, so the raw range is nearly flat on screen
@@ -2904,10 +2905,12 @@ void GfxRenderingAPIDX11::ShadowMapEndStaticCasters() {
 }
 
 bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {
+    const int levelBound = mShadowQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP
+                               ? SHADOW_MAP_MAX_CLIPMAP_LEVELS : SHADOW_MAP_MAX_CASCADES;
     if (cascadeCount < 1) {
         cascadeCount = 1;
-    } else if (cascadeCount > SHADOW_MAP_MAX_CASCADES) {
-        cascadeCount = SHADOW_MAP_MAX_CASCADES;
+    } else if (cascadeCount > levelBound) {
+        cascadeCount = levelBound;
     }
     if (resolution < SHADOW_MAP_MIN_RESOLUTION) {
         resolution = SHADOW_MAP_MIN_RESOLUTION;
@@ -3465,6 +3468,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
     // above cleared it, and these are frame-global rather than per cascade.
     {
         const ShadowMapQuality& q = mShadowQuality;
+        mPerShadowCbData.shadow_smsr[0] = q.smsr ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_smsr[1] = (float)q.smsrMaxSteps;
+        mPerShadowCbData.shadow_smsr[2] = q.smsrEpsilon;
         mPerShadowCbData.shadow_edge[0] = q.analyticEdge ? 1.0f : 0.0f;
         mPerShadowCbData.shadow_edge[1] = q.analyticEdgeWidth;
         // Jitter with a zero radius would fetch the same quad N times and average it to itself -- N times

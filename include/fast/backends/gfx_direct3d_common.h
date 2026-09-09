@@ -96,6 +96,7 @@ struct PerShadowCB {
     float shadow_clip_y[4];
     float shadow_clip_z[4];
     float shadow_clip_p[4];
+    float shadow_smsr[4]; // x enabled, y max traversal steps, z depth epsilon, w reserved
 };
 
 struct PerDrawCB {

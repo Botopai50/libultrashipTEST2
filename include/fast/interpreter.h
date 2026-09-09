@@ -1178,7 +1178,10 @@ class Interpreter {
         for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
             mShadowMapSplits[i] = mShadowMapSplitsRequested[i];
         }
-        const int count = mShadowMapCascadeCount < 1 ? 1 : mShadowMapCascadeCount;
+        // This ladder owns three entries even while the active clipmap has more levels.
+        const int count = mShadowMapCascadeCount < 1 ? 1
+                          : mShadowMapCascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
+                                                                           : mShadowMapCascadeCount;
         ShadowMapLadderSplits(mShadowMapQuality.ladderMode, mShadowMapQuality.ladderLambda,
                               mShadowMapQuality.ladderNear, mShadowMapSplitsRequested[count - 1], count,
                               mShadowMapSplits);

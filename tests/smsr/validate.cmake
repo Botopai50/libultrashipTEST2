@@ -1,0 +1,18 @@
+foreach(opts s sg ts tsg tsf2a tsf2ang)
+    set(expanded "${OUTPUT}/smsr-${opts}.hlsl")
+    execute_process(COMMAND "${DRIVER}" "${SHADER}" "${SHADER_ROOT}" "${opts}"
+                    OUTPUT_FILE "${expanded}" RESULT_VARIABLE result)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Prism expansion failed for ${opts}")
+    endif()
+    if(opts MATCHES "g")
+        set(profile "4_1")
+    else()
+        set(profile "4_0")
+    endif()
+    execute_process(COMMAND "${TESTER}" --compile "${expanded}" "${profile}"
+                    RESULT_VARIABLE result)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Native shader compilation failed for ${opts}")
+    endif()
+endforeach()

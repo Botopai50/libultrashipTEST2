@@ -192,6 +192,7 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_clip_y;
     float4 shadow_clip_z;
     float4 shadow_clip_p;
+    float4 shadow_smsr; // enabled, max steps, normalized depth epsilon, reserved
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -405,8 +406,188 @@ struct ShadowProjection {
     float z; // ndc depth of the receiver
     float texelUv;
     float slice;  // texture-array slice, this layer's offset included
+    float3 depthPlane; // dz/du, dz/dv, valid receiver plane (SMSR only)
     float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
 };
+
+// SMSR-BEGIN
+// Single-pass SMSR, Macedo & Apolinario (GI 2016), supplementary section 2, cases 1-12.
+// https://marciocerqueira.github.io/docs/publications/2016-GI-Supp.pdf
+// Original implementation of the published equations. Every visibility result is binary.
+
+float3 SmsrDepthPlane(float3 normal, float3 axisX, float3 axisY, float3 axisZ) {
+    // Transform a receiver plane into orthographic light space. Unlike screen derivatives
+    // inside a divergent edge search, this remains valid for every traversed texel.
+    float3 n = float3(dot(normal, axisX) / max(dot(axisX, axisX), 1e-30),
+                      dot(normal, axisY) / max(dot(axisY, axisY), 1e-30),
+                      dot(normal, axisZ) / max(dot(axisZ, axisZ), 1e-30));
+    if (abs(n.z) <= 1e-4 * length(n) || length(n) < 1e-20) {
+        return float3(0.0, 0.0, 0.0); // grazing/degenerate: keep the ordinary hard test
+    }
+    return float3(float2(-2.0 * n.x, 2.0 * n.y) / n.z, 1.0); // UV Y is down
+}
+
+bool SmsrInBounds(int2 coord, int size) {
+    return all(coord >= 0) && all(coord < size);
+}
+
+float SmsrDepth(int2 coord, float slice, bool isActor) {
+    float depth = 1.0;
+    if (isActor) {
+        depth = g_shadowMapActors.Load(int4(coord, (int)slice, 0));
+    } else {
+        depth = g_shadowMap.Load(int4(coord, (int)slice, 0));
+    }
+    return depth;
+}
+
+float SmsrLitAt(ShadowProjection projection, int2 coord, int size, bool isActor) {
+    if (!SmsrInBounds(coord, size)) {
+        return 1.0;
+    }
+    float zl = SmsrDepth(coord, projection.slice, isActor);
+    float2 uv = (float2(coord) + 0.5) * projection.texelUv;
+    float zc = projection.z + dot(projection.depthPlane.xy, uv - projection.uv);
+    // Only a near-equality is corrected. A distinct occluder must not become a receiver.
+    if (abs(zc - zl) <= shadow_smsr.z) {
+        zc = min(zc, zl);
+    }
+    return zc <= zl ? 1.0 : 0.0;
+}
+
+float2 SmsrDiscontinuity(ShadowProjection projection, int2 coord, int size, bool isActor, float s) {
+    float left = abs(SmsrLitAt(projection, coord + int2(-1, 0), size, isActor) - s);
+    float right = abs(SmsrLitAt(projection, coord + int2(1, 0), size, isActor) - s);
+    float top = abs(SmsrLitAt(projection, coord + int2(0, -1), size, isActor) - s);
+    float bottom = abs(SmsrLitAt(projection, coord + int2(0, 1), size, isActor) - s);
+    return float2(2.0 * left + right, top + 2.0 * bottom) * 0.25;
+}
+
+// x = oriented distance, y = endpoint/beginning was actually found.
+// A search limit or map boundary is unknown, never a fabricated edge endpoint.
+float2 SmsrTrace(ShadowProjection projection, int2 origin, int2 direction, int size,
+                 bool isActor, float initialDirection, bool alongX) {
+    int limit = clamp((int)shadow_smsr.y, 1, 64);
+    [loop]
+    for (int distance = 1; distance <= limit; ++distance) {
+        int2 coord = origin + direction * distance;
+        if (!SmsrInBounds(coord, size)) {
+            return float2(-(float)distance, 0.0);
+        }
+        float s = SmsrLitAt(projection, coord, size, isActor);
+        if (s < 0.5) {
+            return float2((float)distance, 1.0); // end: illumination changed
+        }
+        // Only the two neighbours perpendicular to the traversal can change the
+        // relevant discontinuity component. Avoid fetching the other two at each step.
+        int2 across = alongX ? int2(0, 1) : int2(1, 0);
+        float minus = 1.0 - SmsrLitAt(projection, coord - across, size, isActor);
+        float plus = 1.0 - SmsrLitAt(projection, coord + across, size, isActor);
+        float dc = alongX ? (minus + 2.0 * plus) * 0.25 : (2.0 * minus + plus) * 0.25;
+        if (dc != initialDirection) {
+            return float2(-(float)distance, 1.0); // beginning: direction changed
+        }
+    }
+    return float2(-(float)(limit + 1), 0.0);
+}
+
+// x = normalized position, y = -1 dual negative / 0 positive-negative / 1 dual positive.
+float2 SmsrNormalize(float2 negative, float2 positive, float p) {
+    if (negative.y < 0.5 || positive.y < 0.5) {
+        return float2(0.0, -1.0); // truncated edge: conservative hard-shadow fallback
+    }
+    float alpha1 = negative.x;
+    float alpha2 = positive.x;
+    float kind = (alpha1 > 0.0 ? 1.0 : 0.0) + (alpha2 > 0.0 ? 1.0 : 0.0) - 1.0;
+    float L = max(abs(alpha1) + abs(alpha2) - 1.0, 1.0);
+    float po = alpha1 > alpha2 ? 1.0 - p : p;
+    float don = (1.0 - max(alpha1, alpha2) / L) + po / L;
+    return float2(saturate(don), kind);
+}
+
+// dc.rg = compressed discontinuities; dc.ba = dominant horizontal/vertical directions.
+// don.rg = normalized positions along X/Y; don.ba = their respective edge classes.
+float vSMSR(float4 dc, float4 don, float2 p) {
+    if (all(dc.xy == 0.0)) {
+        return 1.0;
+    }
+    if (don.z < 0.0 || don.w < 0.0) {
+        return 1.0; // Case 1: dual negative
+    }
+    if (don.z > 0.0 || don.w > 0.0) {
+        return 0.0; // Case 2: dual positive closes the edge
+    }
+    if (dc.x == 0.75 || dc.y == 0.75) {
+        return 0.0; // Case 3: opposite discontinuities close the gap
+    }
+    // Cases 9/10 (bottom/top) and 11/12 (left/right), with strict comparisons.
+    float vertical = ((dc.y == 0.5 ? 1.0 - p.y : p.y) < don.x) ? 0.0 : 1.0;
+    float horizontal = ((dc.x == 0.5 ? p.x : 1.0 - p.x) < don.y) ? 0.0 : 1.0;
+    if (dc.x == 0.0) {
+        return vertical; // Cases 9, 10
+    }
+    if (dc.y == 0.0) {
+        return horizontal; // Cases 11, 12
+    }
+    if (dc.z > 0.5 && dc.w > 0.5) {
+        return min(horizontal, vertical); // Case 8: intersecting edges
+    }
+    if (dc.z > 0.5) {
+        return horizontal; // Case 4: horizontal discontinuity dominates at a corner
+    }
+    if (dc.w > 0.5) {
+        return vertical; // Case 5: vertical discontinuity dominates at a corner
+    }
+    // Cases 6/7: a one-texel corner, no dominant direction.
+    float py = dc.y == 0.5 ? p.y : 1.0 - p.y;
+    return 1.0 - don.x < py ? 0.0 : 1.0;
+}
+
+float SampleShadowSMSR(ShadowProjection projection, bool isActor) {
+    int size = (int)round(1.0 / projection.texelUv);
+    int2 origin = int2(floor(projection.uv * size));
+    if (!SmsrInBounds(origin, size)) {
+        return 1.0;
+    }
+    float s = SmsrLitAt(projection, origin, size, isActor);
+    if (s < 0.5 || projection.depthPlane.z < 0.5) {
+        return s; // Only entering (lit-side) discontinuities are revectorized.
+    }
+    float2 dc = SmsrDiscontinuity(projection, origin, size, isActor, s);
+    if (all(dc == 0.0)) {
+        return s;
+    }
+    bool corner = dc.x > 0.0 && dc.y > 0.0;
+    float2 dominant = float2(dc.x > 0.0 ? 1.0 : 0.0, dc.y > 0.0 ? 1.0 : 0.0);
+    if (corner) {
+        // Look away from each shadow neighbour: continuing discontinuities on the
+        // lit neighbours distinguish a long edge from a one-texel corner/intersection.
+        int2 awayY = int2(0, dc.y == 0.25 ? 1 : -1);
+        int2 awayX = int2(dc.x == 0.5 ? 1 : -1, 0);
+        float2 nextY = SmsrDiscontinuity(projection, origin + awayY, size, isActor, 1.0);
+        float2 nextX = SmsrDiscontinuity(projection, origin + awayX, size, isActor, 1.0);
+        dominant.x = SmsrInBounds(origin + awayY, size) && nextY.x == dc.x ? 1.0 : 0.0;
+        dominant.y = SmsrInBounds(origin + awayX, size) && nextX.y == dc.y ? 1.0 : 0.0;
+    }
+    float2 p = frac(projection.uv * size);
+    float4 don = float4(0.0, 0.0, 0.0, 0.0);
+    if (dominant.y > 0.5 || (corner && all(dominant == 0.0))) {
+        float2 a = SmsrTrace(projection, origin, int2(-1, 0), size, isActor, dc.y, true);
+        float2 b = SmsrTrace(projection, origin, int2(1, 0), size, isActor, dc.y, true);
+        float2 edge = SmsrNormalize(a, b, p.x);
+        don.x = edge.x;
+        don.z = edge.y;
+    }
+    if (dominant.x > 0.5) {
+        float2 a = SmsrTrace(projection, origin, int2(0, -1), size, isActor, dc.x, false);
+        float2 b = SmsrTrace(projection, origin, int2(0, 1), size, isActor, dc.x, false);
+        float2 edge = SmsrNormalize(a, b, p.y);
+        don.y = edge.x;
+        don.w = edge.y;
+    }
+    return s * vSMSR(float4(dc, dominant), don, p);
+}
+// SMSR-END
 
 // The direction the light travels, which every cascade shares.
 //
@@ -421,7 +602,7 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
+ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase, float3 normal) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -430,6 +611,10 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
     ShadowProjection o;
+    o.depthPlane = float3(0.0, 0.0, 0.0);
+    if (shadow_smsr.x > 0.5) {
+        o.depthPlane = SmsrDepthPlane(normal, viewProj._11_21_31, viewProj._12_22_32, viewProj._13_23_33);
+    }
     o.uv = uv;
     o.z = ndc.z;
     o.texelUv = texelUv;
@@ -455,7 +640,12 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
+        [branch]
+        if (shadow_smsr.x > 0.5) {
+            lit = SampleShadowSMSR(p, isActor);
+        } else {
+            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
+        }
     }
     return lit;
 }
@@ -499,7 +689,7 @@ float ShadowActorTexelUvAt(uint cascade) {
     return v;
 }
 
-ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float3 normal) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
@@ -509,7 +699,7 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
         viewProj = shadow_view_proj[2];
         texelUv = shadow_texel_uv.z;
     }
-    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
+    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase, normal);
 }
 
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
@@ -586,7 +776,7 @@ float3 ShadowAcneMovePoint(float3 world, float3 normal, float texelWorld, float 
 // leaves a visible corner where it meets the interiors, which on a shadow reads as a second, fainter edge
 // just inside the first.
 float ShadowHardenEdge(float coverage) {
-    if (shadow_harden.x < 0.5) {
+    if (shadow_harden.x < 0.5 || shadow_smsr.x > 0.5) {
         return coverage;
     }
     // Hardness 1 leaves no width at all, which smoothstep cannot express -- its two edges would be equal.
@@ -607,7 +797,7 @@ float ShadowHardenEdge(float coverage) {
 float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, float2 pixel, float3 normal) {
     float2 lit = float2(1.0, 1.0);
     float levels = shadow_clip_p.y;
-    if (levels < 0.5) {
+    if (levels < 0.5 || shadow_params.x < 0.5) {
         return lit;
     }
 
@@ -668,6 +858,11 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, flo
     // the acne corrections with it. A layout is a way of PLACING the map; it has no business changing
     // which techniques exist.
     ShadowProjection p;
+    p.depthPlane = float3(0.0, 0.0, 0.0);
+    if (shadow_smsr.x > 0.5) {
+        p.depthPlane = SmsrDepthPlane(normal, shadow_clip_x.xyz / extent,
+                                      shadow_clip_y.xyz / extent, shadow_clip_z.xyz / (5.0 * extent));
+    }
     p.uv = uv;
     p.z = depth;
     p.texelUv = texelUv;
@@ -732,14 +927,14 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             if (acneOn) {
                 samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), acneSlope);
             }
-            ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0);
+            ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0, normal);
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
             // line that sweeps across the ground as the camera moves.
             bool blend = false;
             float t = 0.0;
-            if (cascade + 1 < count) {
+            if (cascade + 1 < count && shadow_smsr.x < 0.5) {
                 // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name
                 // at runtime where a stray definition would be baffling to debug.
                 float farEdge = ShadowSplitAt(cascade);
@@ -761,7 +956,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                 if (acneOn) {
                     partnerPos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(pc), acneSlope);
                 }
-                partner = ShadowProjectAt(partnerPos, pc, 0.0);
+                partner = ShadowProjectAt(partnerPos, pc, 0.0, normal);
             }
 
             // Can the actor layer possibly shadow this point at all?
@@ -1213,6 +1408,12 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float3 shadowGeoN = cross(ddy(input.worldPos.xyz), ddx(input.worldPos.xyz));
         float shadowNLen = length(input.normal);
         float3 shadowN = (shadowNLen > 1e-4) ? (input.normal / shadowNLen) : normalize(shadowGeoN);
+        // The geometric receiver plane is calculated before any divergent level/edge search.
+        // Smooth vertex normals do not describe the depth change across a triangle.
+        if (shadow_smsr.x > 0.5 && dot(shadowGeoN, shadowGeoN) > 1e-20) {
+            float3 planeN = normalize(shadowGeoN);
+            shadowN = dot(planeN, shadowN) < 0.0 ? -planeN : planeN;
+        }
         // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
         // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
@@ -1226,7 +1427,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // is not the active one, so this is a uniform branch and a draw pays for only the path it takes.
         float2 shadowLayers;
         if (shadow_clip_p.y > 0.5) {
-            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_params.x, input.worldPos.w > 0.5,
+            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_clip_p.y, input.worldPos.w > 0.5,
                                             screenSpace.xy, shadowN);
         } else {
             shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
