@@ -269,6 +269,12 @@ float4 ShadowReceiverDepths(float2 uv, float z, float texelUv, float2 gradient) 
     // Gather order: (0,1), (1,1), (1,0), (0,0).
     return base + float4(dz.y, dz.x + dz.y, dz.x, 0.0);
 }
+float4 ShadowReceiverVisibility(float4 stored, float4 receiver) {
+    // A cleared D16 texel (also the sampler border) contains no caster. A grazing
+    // receiver plane can extrapolate beyond depth 1 at a neighbouring tap; that
+    // must not turn the far-plane clear value into an occluding surface.
+    return max(step(receiver - (1.0 / 65535.0), stored), step(1.0, stored));
+}
 // RECEIVER-PLANE-END
 
 float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor, float2 depthGradient) {
@@ -315,16 +321,10 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     // where the boundary crosses the quad, rather than blending the four comparisons. Branching on a
     // uniform, so a draw takes one path or the other and neither pays for the one it skipped.
     float4 receiver = ShadowReceiverDepths(uv, z, texelUv, depthGradient);
-    // One D16 step covers rounding of the stored depth without moving the receiver in world space.
-    float4 separation = stored - receiver + (1.0 / 65535.0);
+    float4 lit = ShadowReceiverVisibility(stored, receiver);
     if (shadow_edge.x > 0.5) {
-        return ShadowAnalyticCoverage(separation, 0.0, subTexel, shadow_edge.y);
+        return ShadowAnalyticCoverage(lit, 0.5, subTexel, shadow_edge.y);
     }
-
-    // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
-    // texel does not occlude -- for all four at once, using each tap's own receiver depth. Rasterizer
-    // bias remains a precision margin; it no longer has to compensate for the filter's footprint.
-    float4 lit = step(0.0, separation);
 
     // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
     // dot it is one instruction instead of three dependent ones. Comparing first and filtering after is the
@@ -451,6 +451,9 @@ float SmsrLitAt(ShadowProjection projection, int2 coord, int size, bool isActor)
         return 1.0;
     }
     float zl = SmsrDepth(coord, projection.slice, isActor);
+    if (zl >= 1.0) {
+        return 1.0; // clear depth is empty, even if the extrapolated receiver exceeds 1
+    }
     float2 uv = (float2(coord) + 0.5) * projection.texelUv;
     float zc = projection.z + dot(projection.depthPlane.xy, uv - projection.uv);
     // Only a near-equality is corrected. A distinct occluder must not become a receiver.

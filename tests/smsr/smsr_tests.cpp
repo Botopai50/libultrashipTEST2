@@ -62,6 +62,10 @@ float4 TestVS(uint id : SV_VertexID) : SV_POSITION {
     return float4((id == 2 ? 3.0 : -1.0) * w, (id == 1 ? 3.0 : -1.0) * w, 0.5 * w, w);
 }
 float4 TestPS(float4 position : SV_POSITION) : SV_TARGET {
+    if (testConfig.x == 10.0) {
+        float4 receiver = ShadowReceiverDepths(testUV.xy, testUV.z, 1.0 / testConfig.y, testPlane.xy);
+        return ShadowReceiverVisibility(testDC, receiver);
+    }
     if (testConfig.x == 9.0) {
         return ShadowAnalyticCoverage(testDC, 0.0, position.xy / testUV.w, 2.0);
     }
@@ -316,6 +320,45 @@ static void ReceiverPlaneComparisons(Fixture& fixture) {
     std::cout << "Receiver-plane quad comparisons: 64 phases without false occlusion; real occluders preserved\n";
 }
 
+static void EmptyMapGrazingReceiver(Fixture& fixture) {
+    constexpr int size = 32;
+    auto empty = fixture.Map(size, 1, std::vector<float>(size*size, 1.0f));
+    fixture.context->PSSetShaderResources(6, 1, empty.GetAddressOf());
+    fixture.context->PSSetShaderResources(7, 1, empty.GetAddressOf());
+    Params params;
+    params.config = {2, size, 0, 0};
+    params.uv = {.5f, .5f, .5f, 0};
+    params.plane = {64, 64, 1, 0};
+    for (int actor = 0; actor < 2; ++actor) {
+        params.config[3] = float(actor);
+        Check(fixture.Draw(params)[0][0] == 1.0f,
+              "empty shadow map must not occlude a grazing receiver plane");
+    }
+    // The filtered mode uses the same empty-texel rule for each of its four taps.
+    params.config[0] = 10;
+    params.dc = {1,1,1,1};
+    for (float slope : {-128.0f, -64.0f, 64.0f, 128.0f}) {
+        params.plane = {slope, slope, 1, 0};
+        const auto visibility = fixture.Draw(params)[0];
+        for (float value : visibility)
+            Check(value == 1.0f, "filtered empty taps stay lit across grazing slopes");
+    }
+    params.plane = {0,0,1,0};
+    params.uv[2] = 1.0f;
+    params.dc = {1, 1-2.0f/65535.0f, .2f, 1};
+    const auto farOccluder = fixture.Draw(params)[0];
+    Check(farOccluder[0] == 1 && farOccluder[1] == 0 && farOccluder[2] == 0 && farOccluder[3] == 1,
+          "only exact clear depth is empty; nearby real depths still occlude");
+    params.config[0] = 2;
+    params.uv[2] = .5f;
+    params.plane = {64,64,1,0};
+    auto occupied = fixture.Map(size, 1, std::vector<float>(size*size, .2f));
+    fixture.context->PSSetShaderResources(6, 1, occupied.GetAddressOf());
+    params.config[3] = 0;
+    Check(fixture.Draw(params)[0][0] == 0.0f, "grazing receiver still sees real occluders");
+    std::cout << "Empty D16 world/actor maps stay lit at grazing angles; real occluders preserved\n";
+}
+
 static void Silhouettes(Fixture& fixture, const char* outputPath) {
     constexpr int mapSize = 32, scale = 8, renderSize = mapSize * scale;
     std::vector<float> depths(mapSize * mapSize * 5, .8f);
@@ -464,6 +507,7 @@ int main(int argc, char** argv) {
         PerspectiveCascadeSelection(fixture);
         ReceiverPlaneComparisons(fixture);
         AnalyticOccluderDepth(fixture);
+        EmptyMapGrazingReceiver(fixture);
         Silhouettes(fixture, argv[2]);
         return 0;
     } catch (const std::exception& error) {
