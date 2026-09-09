@@ -3555,6 +3555,9 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             depth.close();
             if (!depth) throw std::runtime_error("Cannot finish depth file");
             nlohmann::json metadata;
+            const auto gameContext = nlohmann::json::parse(
+                captureCVars->GetString(SHADOW_MAP_CAPTURE_CONTEXT_CVAR, "{}"), nullptr, false);
+            if (gameContext.is_object()) metadata["game_context"] = gameContext;
             metadata["format"] = "SDS1";
             metadata["layer"] = "world";
             metadata["complete"] = true;

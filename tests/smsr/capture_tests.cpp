@@ -18,6 +18,7 @@ namespace Ship {
 struct CaptureVariables {
     int request = 0;
     std::string status;
+    const char* GetString(const char*, const char*) { return "{\"scene_id\":81,\"day_time_u16\":32768}"; }
     int GetInteger(const char*, int) {
         return request;
     }
@@ -121,6 +122,7 @@ int main() {
         info.close();
         Check(metadata["complete"] == true && metadata["slice_matrices"][9][0] == 10.0f,
               "actual slice matrix metadata");
+        Check(metadata["game_context"]["day_time_u16"] == 32768, "game clock context exported");
         Check(metadata["shadow_smsr"].size() == 4, "receiver settings exported");
         const auto saved = vars->status;
         fixture.Capture(slices);

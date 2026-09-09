@@ -425,6 +425,7 @@
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
 // One-shot capture requests are consumed by the DirectX backend; not saved settings.
 #define SHADOW_MAP_CAPTURE_REQUEST_CVAR "gFast.ShadowCapture.Request"
+#define SHADOW_MAP_CAPTURE_CONTEXT_CVAR "gFast.ShadowCapture.Context"
 #define SHADOW_MAP_CAPTURE_STATUS_CVAR "gFast.ShadowCapture.Status"
 
 #define SHADOW_MAP_MAX_DEBUG_VIEW 7
