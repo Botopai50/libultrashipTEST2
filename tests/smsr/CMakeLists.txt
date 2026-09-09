@@ -94,3 +94,12 @@ add_test(NAME smsr_full_shaders COMMAND "${CMAKE_COMMAND}"
          "-DSHADER=${SHADER}" "-DSHADER_ROOT=${LUS}/src/fast/shaders"
          "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/validate.cmake")
 set_tests_properties(smsr_full_shaders PROPERTIES TIMEOUT 180)
+
+find_path(SHADOW_CAPTURE_JSON_INCLUDE nlohmann/json.hpp REQUIRED)
+extract_between("${backend_source}" "// SHADOW-CAPTURE-BEGIN" "// SHADOW-CAPTURE-END" capture)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/shadow_capture.inc" "${capture}")
+add_executable(smsr_capture_tests capture_tests.cpp)
+target_include_directories(smsr_capture_tests PRIVATE "${LUS}/include" "${CMAKE_CURRENT_BINARY_DIR}" "${SHADOW_CAPTURE_JSON_INCLUDE}")
+target_compile_definitions(smsr_capture_tests PRIVATE NOMINMAX)
+target_link_libraries(smsr_capture_tests PRIVATE d3d11)
+add_test(NAME smsr_depth_capture COMMAND smsr_capture_tests)

@@ -423,6 +423,10 @@
 // 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
 // unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
+// One-shot capture requests are consumed by the DirectX backend; not saved settings.
+#define SHADOW_MAP_CAPTURE_REQUEST_CVAR "gFast.ShadowCapture.Request"
+#define SHADOW_MAP_CAPTURE_STATUS_CVAR "gFast.ShadowCapture.Status"
+
 #define SHADOW_MAP_MAX_DEBUG_VIEW 7
 
 

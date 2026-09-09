@@ -1,6 +1,8 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
+#include <chrono>
+#include "fast/backends/shadow_capture.h"
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -3536,6 +3538,64 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mShadowQualityFrame++;
     }
 
+    // SHADOW-CAPTURE-BEGIN
+    auto captureCVars = Ship::Context::GetInstance()->GetConsoleVariables();
+    if (captureCVars->GetInteger(SHADOW_MAP_CAPTURE_REQUEST_CVAR, 0) != 0) {
+        captureCVars->SetInteger(SHADOW_MAP_CAPTURE_REQUEST_CVAR, 0);
+        try {
+            if (count <= 0 || mShadowMapTexture == nullptr)
+                throw std::runtime_error("Shadow map is not active");
+            const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const std::filesystem::path dir = Ship::Context::GetPathRelativeToAppDirectory(
+                "shadow-captures/" + std::to_string(stamp));
+            std::filesystem::create_directories(dir);
+            std::ofstream depth(dir / "world.sds", std::ios::binary);
+            WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowMapTexture.Get(), count, depth);
+            depth.close();
+            if (!depth) throw std::runtime_error("Cannot finish depth file");
+            nlohmann::json metadata;
+            metadata["format"] = "SDS1";
+            metadata["layer"] = "world";
+            metadata["complete"] = true;
+#define CAPTURE_FIELD(field) metadata[#field] = mPerShadowCbData.field
+            CAPTURE_FIELD(shadow_view_proj);
+            CAPTURE_FIELD(shadow_splits);
+            CAPTURE_FIELD(shadow_texel_world);
+            CAPTURE_FIELD(shadow_texel_uv);
+            CAPTURE_FIELD(shadow_params);
+            CAPTURE_FIELD(shadow_range);
+            CAPTURE_FIELD(shadow_edge);
+            CAPTURE_FIELD(shadow_jitter);
+            CAPTURE_FIELD(shadow_acne0);
+            CAPTURE_FIELD(shadow_acne1);
+            CAPTURE_FIELD(shadow_harden);
+            CAPTURE_FIELD(shadow_clip_x);
+            CAPTURE_FIELD(shadow_clip_y);
+            CAPTURE_FIELD(shadow_clip_z);
+            CAPTURE_FIELD(shadow_clip_p);
+            CAPTURE_FIELD(shadow_smsr);
+#undef CAPTURE_FIELD
+            metadata["slice_valid"] = nlohmann::json::array();
+            metadata["slice_matrices"] = nlohmann::json::array();
+            for (int slice = 0; slice < count; ++slice) {
+                metadata["slice_valid"].push_back(mShadowSliceValid[slice]);
+                metadata["slice_matrices"].push_back(mShadowSliceMatrix[slice]);
+            }
+            std::ofstream info(dir / "capture.json");
+            info << metadata.dump(2);
+            info.close();
+            if (!info) throw std::runtime_error("Cannot finish capture metadata");
+            captureCVars->SetString(SHADOW_MAP_CAPTURE_STATUS_CVAR, dir.string().c_str());
+            SPDLOG_INFO("Shadow capture saved: {}", dir.string());
+        } catch (const std::exception& error) {
+            const std::string message = std::string("Capture failed: ") + error.what();
+            captureCVars->SetString(SHADOW_MAP_CAPTURE_STATUS_CVAR, message.c_str());
+            SPDLOG_ERROR("{}", message);
+        }
+    }
+
+    // SHADOW-CAPTURE-END
     mShadowCbDirty = true;
 }
 
