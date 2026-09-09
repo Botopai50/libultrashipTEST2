@@ -226,24 +226,15 @@ cbuffer PerShadowCB : register(b3) {
 // edges stair-step.
 // SOH [Enhancement] Analytic edge reconstruction (technique 2 -- see fast/shadow_map.h).
 //
-// Coverage from where the boundary actually CROSSES the quad, rather than from bilinearly blending four
-// binary comparisons. Same four depths, no extra fetch.
-//
-// Let g = stored - z, the signed slack at each corner: positive where that corner does not occlude. The
-// lit region is g >= 0, so the boundary is the zero contour of g, and bilinear g is a good model of it
-// inside one quad. Interpolating g and taking its gradient gives the signed distance from the sample point
-// to that contour, in texels -- and a ramp on the distance is an edge whose position varies continuously
-// with the receiver instead of snapping to the grid. That snapping is the staircase.
-//
-// Exact for one straight boundary through the quad, which is walls, steps, roofs and platform edges. Where
-// the quad holds more than one boundary the gradient is meaningless, but so is the bilinear blend, and the
-// magnitude guard below returns the hard answer rather than an invented soft one.
-//
-// `width` widens the ramp past its geometric one-texel extent, which is the cheapest softening in the
-// system: arithmetic, no fetches, no bandwidth.
+// Estimate the contour from binary visibility, then widen its coverage ramp.
+// Stored depths at adjacent texels may belong to unrelated surfaces. Interpolating
+// their magnitudes invents a connecting surface and pulls the contour toward the
+// receiver's tiny bias margin. Compare first, as in PCF: equal visibility must
+// produce the same edge even when the occluder/receiver separation changes.
+// This is a coverage approximation, not exact geometric silhouette recovery.
 float ShadowAnalyticCoverage(float4 stored, float z, float2 subTexel, float width) {
     // Gather's component order: w is (0,0), z is (1,0), x is (0,1), y is (1,1).
-    float4 g = stored - z;
+    float4 g = step(z, stored) - 0.5;
     float row0 = lerp(g.w, g.z, subTexel.x); // v = 0
     float row1 = lerp(g.x, g.y, subTexel.x); // v = 1
     float value = lerp(row0, row1, subTexel.y);
@@ -720,6 +711,7 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float3
 // repeating the ladder -- a debug view that reimplements the thing it is inspecting can agree with the
 // picture and disagree with the code, which is the one failure mode an instrument may not have. Literal
 // indices only, same constraint as ShadowSplitAt.
+// SHADOW-VIEW-DEPTH-BEGIN
 uint ShadowCascadeIndex(float viewDepth) {
     uint count = (uint)shadow_params.x;
     uint cascade = 0;
@@ -736,6 +728,8 @@ uint ShadowCascadeIndex(float viewDepth) {
     }
     return cascade;
 }
+
+// SHADOW-VIEW-DEPTH-END
 
 // SOH [Enhancement] The cascade's world-to-depth scale, for turning a bias in world units into one in the
 // cascade's own normalised depth. The projection is orthographic and row-vector, so the light axis column's
@@ -1422,8 +1416,8 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             float3 planeN = normalize(shadowGeoN);
             shadowN = dot(planeN, shadowN) < 0.0 ? -planeN : planeN;
         }
-        // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
-        // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
+        // Direct3D pixel SV_Position.w preserves perspective-interpolated clip W.
+        // See the WARP perspective-cascade regression; do not invert it as gl_FragCoord.w.
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
         // character is shadowed by the world but never by another character (or by itself) -- the
         // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.

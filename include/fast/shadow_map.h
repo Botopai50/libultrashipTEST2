@@ -457,19 +457,14 @@
 // Bilinear-weighting those four binary results gives a boundary that is continuous but only one texel
 // wide, and whose iso-contour follows the texel grid's own diagonals -- which is the staircase.
 //
-// Reconstructing instead: the four comparisons say which corners of the quad are occluded, and the four
-// depths say by how much each corner misses. Together they locate where inside the quad the occluding
-// surface crosses the receiver, and coverage can be computed from that crossing directly. No extra fetch,
-// and the contour stops being a function of the grid.
-//
-// Exact for a single straight boundary through the quad, which covers walls, steps, roofs and platform
-// edges -- the geometry the staircase is complained about on. It degrades to the bilinear answer where the
-// quad holds more than one boundary (foliage), which is the correct place to give up.
+// Estimate the contour from the four binary comparisons and widen its coverage ramp.
+// Do not interpolate raw depth magnitudes: adjacent texels can belong to unrelated
+// surfaces, and that would move the contour with their separation. This approximation
+// does not recover an exact geometric silhouette from four depth samples.
 #define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE 1
 
-// How far the reconstructed coverage ramp is spread, in texels. 1.0 is the geometric answer -- the ramp
-// occupies exactly the texel the boundary crosses. Above that it is deliberately widened, which is the
-// cheapest softening available anywhere in the system since it costs arithmetic and no fetches.
+// Width of the approximate coverage ramp in texels. Larger values soften the edge
+// without adding texture reads.
 #define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH 2.0f
 #define SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH 4.0f
 

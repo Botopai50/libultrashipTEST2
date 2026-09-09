@@ -49,6 +49,8 @@ Texture2DArray<float> g_shadowMapActors : register(t7);
 cbuffer TestCB : register(b0) {
     float4 testDC, testDon, testP, testUV, testPlane, shadow_smsr, testConfig;
 };
+static const float4 shadow_params = float4(3,0.1,0,1);
+static const float4 shadow_splits = float4(100,300,1000,0);
 static const float4 shadow_range = float4(0,0,0,0);
 float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool actor, float2 pixel, float2 gradient) {
     return 0.375; // distinguish the existing filtered path from binary SMSR
@@ -56,9 +58,17 @@ float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool 
 )";
 static const char* kEntry = R"(
 float4 TestVS(uint id : SV_VertexID) : SV_POSITION {
-    return float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.0, 1.0);
+    float w = testConfig.x == 8.0 ? (id == 0 ? testDC.x : (id == 1 ? testDC.y : testDC.z)) : 1.0;
+    return float4((id == 2 ? 3.0 : -1.0) * w, (id == 1 ? 3.0 : -1.0) * w, 0.5 * w, w);
 }
 float4 TestPS(float4 position : SV_POSITION) : SV_TARGET {
+    if (testConfig.x == 9.0) {
+        return ShadowAnalyticCoverage(testDC, 0.0, position.xy / testUV.w, 2.0);
+    }
+    if (testConfig.x == 8.0) {
+        float depth = position.w;
+        return float4(position.w, depth, ShadowCascadeIndex(depth), ShadowCascadeIndex(rcp(position.w)));
+    }
     if (testConfig.x == 7.0) {
         float4 receiver = ShadowReceiverDepths(testUV.xy, testUV.z, 1.0 / testConfig.y, testPlane.xy);
         return step(receiver, testDC);
@@ -112,6 +122,7 @@ class Fixture {
         context->VSSetShader(vs.Get(), nullptr, 0);
         context->PSSetShader(ps.Get(), nullptr, 0);
         context->PSSetConstantBuffers(0, 1, cb.GetAddressOf());
+        context->VSSetConstantBuffers(0, 1, cb.GetAddressOf());
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
     ComPtr<ID3D11ShaderResourceView> Map(int size, int slices, const std::vector<float>& depths) {
@@ -226,6 +237,56 @@ static void VisibilityCases(Fixture& fixture) {
     Check(std::abs(value[0] - .2f) < 1e-5f && std::abs(value[1] + .4f) < 1e-5f && value[2] == 1,
           "receiver-plane slope and Y convention");
     std::cout << "12 visibility cases, equality, ONDS orientation and depth-plane projection passed\n";
+}
+
+static void AnalyticOccluderDepth(Fixture& fixture) {
+    Params params;
+    params.config[0] = 9;
+    params.uv[3] = 32;
+    params.dc = { -0.05f, 0.05f, 0.05f, -0.05f };
+    const auto reference = fixture.Draw(params, 32);
+    // Same vertical visibility edge. Only the occluder/receiver separation changes.
+    for (const auto& depths : { Pixel{-.4f,.0001f,.0001f,-.1f},
+                               Pixel{-.0001f,.1f,.4f,-.0001f} }) {
+        params.dc = depths;
+        const auto changed = fixture.Draw(params, 32);
+        for (size_t i = 0; i < changed.size(); ++i) {
+            Check(std::abs(changed[i][0]-reference[i][0]) < 1e-6f,
+                  "unchanged visibility must not move the reconstructed edge when surface depths vary");
+        }
+    }
+    for (float depth : { -.4f, .0001f }) {
+        params.dc.fill(depth);
+        for (const auto& pixel : fixture.Draw(params, 32))
+            Check(pixel[0] == (depth < 0 ? 0.0f : 1.0f), "uniform lit/shadow interiors preserved");
+    }
+    std::cout << "Analytic coverage: depth discontinuities preserve the visibility contour and uniform interiors\n";
+}
+
+static void PerspectiveCascadeSelection(Fixture& fixture) {
+    Params params;
+    params.config[0] = 8;
+    for (const auto& depths : { Pixel{50,50,50,0}, Pixel{150,150,150,0},
+                               Pixel{500,500,500,0}, Pixel{50,500,900,0} }) {
+        params.dc = depths;
+        const auto image = fixture.Draw(params, 16);
+        for (int y = 0; y < 16; ++y) {
+            for (int x = 0; x < 16; ++x) {
+                const float b1 = .5f - (y + .5f) / 32.0f; // viewport Y points down
+                const float b2 = (x + .5f) / 32.0f;
+                const float expected = 1.0f / ((1-b1-b2)/depths[0] + b1/depths[1] + b2/depths[2]);
+                const auto& pixel = image[y*16+x];
+                if (std::abs(pixel[1]-expected) >= .001f) {
+                    throw std::runtime_error("perspective depth: expected " + std::to_string(expected) +
+                                             ", received " + std::to_string(pixel[1]));
+                }
+                const int cascade = expected <= 100 ? 0 : (expected <= 300 ? 1 : 2);
+                Check(pixel[2] == cascade, "perspective receivers select the correct cascade");
+                Check(pixel[3] == 0, "inverted-W control incorrectly selects the nearest cascade everywhere");
+            }
+        }
+    }
+    std::cout << "Perspective rasterization: 1024 pixels select correct cascades; inverted-W control stays in cascade zero\n";
 }
 
 static void ReceiverPlaneComparisons(Fixture& fixture) {
@@ -400,7 +461,9 @@ int main(int argc, char** argv) {
         Check(q.smsr == 1 && q.smsrMaxSteps == 64 && q.smsrEpsilon == SHADOW_MAP_DEFAULT_SMSR_EPSILON, "config clamps");
         Fixture fixture(std::string(kPrefix) + Read(argv[1]) + kEntry);
         VisibilityCases(fixture);
+        PerspectiveCascadeSelection(fixture);
         ReceiverPlaneComparisons(fixture);
+        AnalyticOccluderDepth(fixture);
         Silhouettes(fixture, argv[2]);
         return 0;
     } catch (const std::exception& error) {
