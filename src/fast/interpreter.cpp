@@ -4352,6 +4352,10 @@ void Interpreter::RenderShadowMap() {
         return;
     }
 
+    // Captures may change several times while culled or while a static depth copy is reused. Allocation
+    // addresses alone cannot tell the backend whether its last uploaded room geometry is still current.
+    mRapi->ShadowMapSetWorldGeneration(mShadowWorldCacheGeneration);
+
     // SOH [Enhancement] World box around everything the ACTOR layer will draw, handed to the backend for the
     // receiver shader.
     //

@@ -222,6 +222,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
                                uint64_t contentKey) override;
+    void ShadowMapSetWorldGeneration(uint64_t generation) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
                               size_t drawCount) override;
     bool SupportsShadowMapAlphaCasters() override;
@@ -320,10 +321,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     float mShadowRasterizerCascadeClamp[SHADOW_MAP_MAX_SLICES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
-    // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
-    // the next cascade nor for the next frame. The interpreter guarantees the pointer identity is
-    // meaningful: a layer whose contents change gets a fresh push into a cleared vector, and the world
-    // cache is only ever swapped wholesale when it is genuinely rebuilt.
+    // The world generation invalidates upload records even when a rebuilt cache reuses an allocation.
+    // Pointer/count matching then remains safe within that generation and across its unchanged frames.
+    uint64_t mShadowWorldUploadGeneration = UINT64_MAX;
     const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     // SOH [Enhancement] Background shader prewarm. The threads compile into the on-disk cache and touch

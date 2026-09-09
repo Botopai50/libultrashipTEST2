@@ -3091,10 +3091,8 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // keeps the same two allocations frame to frame while its contents change completely -- a pointer
         // match across passes would wrongly skip the upload and render last frame's characters forever.
         //
-        // The WORLD layer is deliberately NOT reset: it is a cache that is only ever replaced by swapping in
-        // the separate capture vector, so its data pointer necessarily changes whenever its contents do.
-        // Keeping the record alive across passes is the whole point -- an unchanged room mesh then costs one
-        // bind and one draw per cascade, with no upload at all.
+        // The WORLD layer survives unchanged passes. ShadowMapSetWorldGeneration invalidates its records
+        // on a rebuild, including when skipped uploads let the same allocation return with new contents.
         mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] =
             nullptr;
         mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] = 0;
@@ -3201,6 +3199,18 @@ void GfxRenderingAPIDX11::ShadowMapInvalidateOpenSlice() {
     if (mShadowCurrentSlice >= 0 && mShadowCurrentSlice < SHADOW_MAP_MAX_SLICES) {
         mShadowSliceValid[mShadowCurrentSlice] = false;
     }
+}
+
+void GfxRenderingAPIDX11::ShadowMapSetWorldGeneration(uint64_t generation) {
+    if (mShadowWorldUploadGeneration == generation) {
+        return;
+    }
+    mShadowWorldUploadGeneration = generation;
+    const int index = SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN;
+    mShadowLastCasterPtr[index] = nullptr;
+    mShadowLastCasterCount[index] = 0;
+    mShadowAlphaLastPtr[index] = nullptr;
+    mShadowAlphaLastCount[index] = 0;
 }
 
 void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,

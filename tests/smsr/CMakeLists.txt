@@ -64,6 +64,13 @@ target_include_directories(smsr_prism_driver PRIVATE "${LUS}/include" "${CMAKE_C
 target_link_libraries(smsr_prism_driver PRIVATE prism)
 
 enable_testing()
+extract_between("${backend_source}" "void GfxRenderingAPIDX11::ShadowMapSetWorldGeneration(" "bool GfxRenderingAPIDX11::SupportsShadowMapAlphaCasters(" upload_opaque)
+extract_between("${backend_source}" "int GfxRenderingAPIDX11::ShadowAlphaSlotIndex(" "void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(" upload_alpha)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/shadow_upload.inc" "${upload_opaque}\n${upload_alpha}")
+add_executable(smsr_upload_tests upload_tests.cpp)
+target_include_directories(smsr_upload_tests PRIVATE "${LUS}/include" "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(smsr_upload_tests PRIVATE d3d11)
+add_test(NAME smsr_upload_freshness COMMAND smsr_upload_tests)
 add_test(NAME smsr_warp COMMAND smsr_tests "${CMAKE_CURRENT_BINARY_DIR}/smsr-production.hlsl"
          "${CMAKE_CURRENT_BINARY_DIR}/smsr-comparison.ppm")
 set_tests_properties(smsr_warp PROPERTIES TIMEOUT 60)

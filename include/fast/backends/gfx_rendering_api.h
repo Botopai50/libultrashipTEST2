@@ -262,6 +262,11 @@ class GfxRenderingAPI {
     // selects what is drawn from it, never what is uploaded. That split is the point: a caller can hand over
     // one big list once and then, per cascade, draw only the parts of it that cascade can actually see,
     // without giving up the upload caching that keeps a static room mesh resident on the GPU.
+    // Identify the cached room geometry independently of its allocation address. A double-buffered
+    // capture can reuse an address after multiple changes without any intervening GPU upload.
+    virtual void ShadowMapSetWorldGeneration(uint64_t generation) {
+    }
+
     virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0, size_t firstVertex = 0,
                                       size_t drawCount = 0) {
     }
