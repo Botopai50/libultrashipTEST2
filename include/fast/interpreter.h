@@ -638,6 +638,13 @@ class Interpreter {
         }
     }
 
+    // Called before a rendered frame, independently of the game-tick quality/configuration snapshot.
+    void SetShadowMapLightDirection(const float direction[3]) {
+        for (int i = 0; i < 3; ++i) {
+            mShadowMapLightDir[i] = direction[i];
+        }
+    }
+
     const ShadowMapQuality& ShadowQuality() const {
         return mShadowMapQuality;
     }
@@ -1208,10 +1215,6 @@ class Interpreter {
     // be reused while the camera moves -- see the containment test in RenderShadowMap.
     float mShadowMapCascadeCenter[SHADOW_MAP_MAX_LEVELS][3] = {};
     bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_LEVELS] = {};
-    // Light direction the cascades are currently built around, held across frames for the same reason the
-    // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
-    // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.
-    float mShadowMapLightDirHeld[3] = {};
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
