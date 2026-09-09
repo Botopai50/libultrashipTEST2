@@ -50,7 +50,7 @@ cbuffer TestCB : register(b0) {
     float4 testDC, testDon, testP, testUV, testPlane, shadow_smsr, testConfig;
 };
 static const float4 shadow_range = float4(0,0,0,0);
-float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool actor, float2 pixel) {
+float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool actor, float2 pixel, float2 gradient) {
     return 0.375; // distinguish the existing filtered path from binary SMSR
 }
 )";
@@ -59,6 +59,10 @@ float4 TestVS(uint id : SV_VertexID) : SV_POSITION {
     return float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.0, 1.0);
 }
 float4 TestPS(float4 position : SV_POSITION) : SV_TARGET {
+    if (testConfig.x == 7.0) {
+        float4 receiver = ShadowReceiverDepths(testUV.xy, testUV.z, 1.0 / testConfig.y, testPlane.xy);
+        return step(receiver, testDC);
+    }
     if (testConfig.x == 0.0) return float4(vSMSR(testDC, testDon, testP.xy), 0.0, 0.0, 1.0);
     if (testConfig.x == 1.0) return float4(SmsrNormalize(testDC.xy, testDC.zw, testP.x), 0.0, 1.0);
     if (testConfig.x == 5.0) return float4(SmsrDepthPlane(testP.xyz, float3(1,0,0),
@@ -224,6 +228,33 @@ static void VisibilityCases(Fixture& fixture) {
     std::cout << "12 visibility cases, equality, ONDS orientation and depth-plane projection passed\n";
 }
 
+static void ReceiverPlaneComparisons(Fixture& fixture) {
+    Params params;
+    params.config = { 7, 32, 0, 0 };
+    for (const auto& gradient : { std::array<float, 2>{ .8f, -.6f }, { -.7f, .9f } }) {
+        params.plane = { gradient[0], gradient[1], 1, 0 };
+        for (int phase = 0; phase < 32; ++phase) {
+            const float u = (16.0f + float(phase) / 32.0f) / 32.0f;
+            const float v = (15.0f + float(31-phase) / 32.0f) / 32.0f;
+            const auto depth = [&](float x, float y) { return .5f + gradient[0]*(x-.5f) + gradient[1]*(y-.5f); };
+            params.uv = { u, v, depth(u,v), 0 };
+            const float x = (std::floor(u*32-.5f)+.5f)/32;
+            const float y = (std::floor(v*32-.5f)+.5f)/32;
+            params.dc = { depth(x,y+1.0f/32), depth(x+1.0f/32,y+1.0f/32), depth(x+1.0f/32,y), depth(x,y) };
+            int legacyShadowed = 0;
+            for (float stored : params.dc) legacyShadowed += params.uv[2] > stored;
+            Check(legacyShadowed > 0, "control reproduces false occlusion on tilted receiver");
+            for (float& stored : params.dc) stored += 2.0f/65535.0f;
+            const auto lit = fixture.Draw(params)[0];
+            for (float value : lit) Check(value == 1, "all four taps compare on the receiver plane");
+            for (float& stored : params.dc) stored -= .1f;
+            const auto shadowed = fixture.Draw(params)[0];
+            for (float value : shadowed) Check(value == 0, "real occluder is preserved");
+        }
+    }
+    std::cout << "Receiver-plane quad comparisons: 64 phases without false occlusion; real occluders preserved\n";
+}
+
 static void Silhouettes(Fixture& fixture, const char* outputPath) {
     constexpr int mapSize = 32, scale = 8, renderSize = mapSize * scale;
     std::vector<float> depths(mapSize * mapSize * 5, .8f);
@@ -369,6 +400,7 @@ int main(int argc, char** argv) {
         Check(q.smsr == 1 && q.smsrMaxSteps == 64 && q.smsrEpsilon == SHADOW_MAP_DEFAULT_SMSR_EPSILON, "config clamps");
         Fixture fixture(std::string(kPrefix) + Read(argv[1]) + kEntry);
         VisibilityCases(fixture);
+        ReceiverPlaneComparisons(fixture);
         Silhouettes(fixture, argv[2]);
         return 0;
     } catch (const std::exception& error) {

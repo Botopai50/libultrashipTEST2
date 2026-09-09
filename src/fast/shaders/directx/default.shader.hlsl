@@ -270,7 +270,17 @@ float ShadowJitterNoise(float2 pixel) {
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
-float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor) {
+// RECEIVER-PLANE-BEGIN
+float4 ShadowReceiverDepths(float2 uv, float z, float texelUv, float2 gradient) {
+    float2 centre = (floor(uv / texelUv - 0.5) + 0.5) * texelUv;
+    float base = z + dot(gradient, centre - uv);
+    float2 dz = gradient * texelUv;
+    // Gather order: (0,1), (1,1), (1,0), (0,0).
+    return base + float4(dz.y, dz.x + dz.y, dz.x, 0.0);
+}
+// RECEIVER-PLANE-END
+
+float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor, float2 depthGradient) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
@@ -313,15 +323,17 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     // SOH [Enhancement] Technique 2 (see fast/shadow_map.h) consumes the SAME four depths and reconstructs
     // where the boundary crosses the quad, rather than blending the four comparisons. Branching on a
     // uniform, so a draw takes one path or the other and neither pays for the one it skipped.
+    float4 receiver = ShadowReceiverDepths(uv, z, texelUv, depthGradient);
+    // One D16 step covers rounding of the stored depth without moving the receiver in world space.
+    float4 separation = stored - receiver + (1.0 / 65535.0);
     if (shadow_edge.x > 0.5) {
-        return ShadowAnalyticCoverage(stored, z, subTexel, shadow_edge.y);
+        return ShadowAnalyticCoverage(separation, 0.0, subTexel, shadow_edge.y);
     }
 
     // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
-    // texel does not occlude -- for all four at once. One reference depth for the whole quad: the offset
-    // that keeps a surface from shadowing itself is applied by the rasterizer during the depth pass, not
-    // here (see SHADOW_MAP_SLOPE_BIAS).
-    float4 lit = step(z, stored);
+    // texel does not occlude -- for all four at once, using each tap's own receiver depth. Rasterizer
+    // bias remains a precision margin; it no longer has to compensate for the filter's footprint.
+    float4 lit = step(0.0, separation);
 
     // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
     // dot it is one instruction instead of three dependent ones. Comparing first and filtering after is the
@@ -345,9 +357,10 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
 // Disabled is a uniform branch straight to the single quad, so a draw with jitter off is byte for byte the
 // cost it was. [loop] and not [unroll] for the reason documented on the layer loop below: this file is
 // compiled by FXC inside the frame a material first draws, and an unrolled sixteen-tap body is that hitch.
-float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool isActor, float2 pixel) {
+float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool isActor, float2 pixel,
+                          float2 depthGradient) {
     if (shadow_edge.z < 0.5) {
-        return SampleShadowPCF4(uv, z, slice, texelUv, isActor);
+        return SampleShadowPCF4(uv, z, slice, texelUv, isActor, depthGradient);
     }
 
     uint taps = (uint)max(shadow_edge.w, 1.0);
@@ -365,7 +378,8 @@ float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool 
         float2 unit = float2(cos(theta), sin(theta));
         // Complex multiply: rotate the spiral's own direction by this pixel's angle.
         float2 dir = float2((unit.x * rot.x) - (unit.y * rot.y), (unit.x * rot.y) + (unit.y * rot.x));
-        sum += SampleShadowPCF4(uv + (dir * (r * radius)), z, slice, texelUv, isActor);
+        float2 offset = dir * (r * radius);
+        sum += SampleShadowPCF4(uv + offset, z + dot(depthGradient, offset), slice, texelUv, isActor, depthGradient);
     }
     return sum / (float)taps;
 }
@@ -406,7 +420,7 @@ struct ShadowProjection {
     float z; // ndc depth of the receiver
     float texelUv;
     float slice;  // texture-array slice, this layer's offset included
-    float3 depthPlane; // dz/du, dz/dv, valid receiver plane (SMSR only)
+    float3 depthPlane; // dz/du, dz/dv, valid geometric receiver plane
     float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
 };
 
@@ -611,10 +625,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
     ShadowProjection o;
-    o.depthPlane = float3(0.0, 0.0, 0.0);
-    if (shadow_smsr.x > 0.5) {
-        o.depthPlane = SmsrDepthPlane(normal, viewProj._11_21_31, viewProj._12_22_32, viewProj._13_23_33);
-    }
+    o.depthPlane = SmsrDepthPlane(normal, viewProj._11_21_31, viewProj._12_22_32, viewProj._13_23_33);
     o.uv = uv;
     o.z = ndc.z;
     o.texelUv = texelUv;
@@ -644,7 +655,7 @@ float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
         if (shadow_smsr.x > 0.5) {
             lit = SampleShadowSMSR(p, isActor);
         } else {
-            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel);
+            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel, p.depthPlane.xy);
         }
     }
     return lit;
@@ -858,11 +869,8 @@ float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, flo
     // the acne corrections with it. A layout is a way of PLACING the map; it has no business changing
     // which techniques exist.
     ShadowProjection p;
-    p.depthPlane = float3(0.0, 0.0, 0.0);
-    if (shadow_smsr.x > 0.5) {
-        p.depthPlane = SmsrDepthPlane(normal, shadow_clip_x.xyz / extent,
-                                      shadow_clip_y.xyz / extent, shadow_clip_z.xyz / (5.0 * extent));
-    }
+    p.depthPlane = SmsrDepthPlane(normal, shadow_clip_x.xyz / extent,
+                                 shadow_clip_y.xyz / extent, shadow_clip_z.xyz / (5.0 * extent));
     p.uv = uv;
     p.z = depth;
     p.texelUv = texelUv;
@@ -1410,7 +1418,7 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         float3 shadowN = (shadowNLen > 1e-4) ? (input.normal / shadowNLen) : normalize(shadowGeoN);
         // The geometric receiver plane is calculated before any divergent level/edge search.
         // Smooth vertex normals do not describe the depth change across a triangle.
-        if (shadow_smsr.x > 0.5 && dot(shadowGeoN, shadowGeoN) > 1e-20) {
+        if (dot(shadowGeoN, shadowGeoN) > 1e-20) {
             float3 planeN = normalize(shadowGeoN);
             shadowN = dot(planeN, shadowN) < 0.0 ? -planeN : planeN;
         }
