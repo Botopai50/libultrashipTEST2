@@ -788,6 +788,60 @@ typedef struct ShadowMapAcne {
     float slopeMax;        // ceiling on that scale
 } ShadowMapAcne;
 
+// --- Technique 6: interpolated stored depth, where the quad agrees -------------------------------
+//
+// What it is for: the TEETH on a surface that lies nearly along the light. Not the staircase along a
+// silhouette -- a different defect, with a different cause, that no amount of filtering removes.
+//
+// The stored depth is constant inside a texel; the receiver's depth is not. So the line where one crosses
+// the other can only turn at texel boundaries, and it turns by however much the receiver's depth moved
+// across that texel. On a surface facing the light that is a fraction of a texel and invisible. On one
+// lying nearly ALONG the light -- a castle wall under a sun near the zenith, which is 79.7 degrees in the
+// capture this was measured on -- the receiver's depth sweeps a texel's worth of range in a few pixels and
+// the crossing line becomes a comb, one tooth per texel.
+//
+// The teeth grow with magnification, because the tooth IS one texel step. Measured on that capture as the
+// peak-to-peak residual of the shadow's boundary after its slope is removed:
+//
+//     screen pixels per texel      18        36        73
+//     comparing per texel        5.9 px   13.1 px   23.5 px
+//     + four-tap filtering       5.6 px   10.4 px   20.6 px     <- blurs the teeth, does not remove them
+//     + interpolated depth       2.2 px    2.6 px    4.5 px
+//
+// Those three rows were measured against a kernel that compares the whole quad against ONE receiver depth.
+// This branch's kernel does not: ShadowReceiverDepths gives each of the four texels its own point on the
+// receiver plane, and a comparison depth that tilts across the quad makes the receiver's slope visible in
+// the staircase instead of averaging it away. The teeth are taller there -- 15 px on the same wall -- so
+// the numbers above understate what this build shows and the row that matters is still the last one: the
+// residual stops tracking magnification once the stored depth is interpolated. The table is being redone
+// in that regime; the mechanism and the guard below do not change with it.
+//
+// The middle row is why more filtering is not the answer: the comb survives it, because every tap lands in
+// the same wrongly-quantised place. Interpolating the stored depth turns the staircase back into the line
+// it was sampling, and the residual stops growing with magnification.
+//
+// That is the opposite of what a shadow kernel must do at a SILHOUETTE. There the four texels belong to
+// different surfaces, a depth interpolated between them is a depth nothing occupies, and every object
+// would get a grey halo. So it is applied only where the four texels AGREE, and the threshold below is
+// where that stops: past it the kernel goes back to comparing first and filtering after. On the
+// silhouette-rich parts of the same capture the result stays as close to the discrete truth as plain
+// filtering does -- mean deviation 0.0080 against the filter's 0.0071 -- which is the side that had to fail
+// and did not.
+//
+// It costs no extra fetch. The four depths are already read for the bilinear kernel; this is one dot
+// product, a min, a max and a lerp on values already in registers.
+#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 0
+
+// How close the four texels must be to count as one surface, in normalised depth.
+//
+// 0.0012 is about eighty D16 quanta. It has to sit above the step a smooth surface takes across a texel
+// (measured on the capture: a median of 2 quanta, 3 at the 90th percentile in the near cascade) and well
+// below a real silhouette (110 quanta at the 99th percentile in the middle cascade). Eighty is inside that
+// gap with room on both sides, which is what makes the threshold uncritical rather than tuned.
+#define SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT 0.0012f
+#define SHADOW_MAP_MIN_SMOOTH_AGREEMENT 0.0001f
+#define SHADOW_MAP_MAX_SMOOTH_AGREEMENT 0.0100f
+
 // --- The struct the application pushes -------------------------------------------------------------
 //
 // One struct rather than twenty arguments, because these travel together through five layers (menu ->
@@ -826,6 +880,10 @@ typedef struct ShadowMapQuality {
     float clipmapBase;      // half-extent of level 0, world units
     int clipmapResolution;  // per-level square resolution, independent of the cascade ladder's
 
+    // Technique 6 -- interpolated stored depth where the quad agrees
+    int smoothDepth;        // 0/1
+    float smoothAgreement;  // normalised depth spread below which the quad counts as one surface
+
     // Edge hardening
     int edgeHarden;       // 0/1
     float edgeHardness;   // 0 = unchanged, 1 = a hard threshold
@@ -859,6 +917,8 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
     q.clipmapBase = SHADOW_MAP_DEFAULT_CLIPMAP_BASE;
     q.clipmapResolution = SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION;
+    q.smoothDepth = SHADOW_MAP_DEFAULT_SMOOTH_DEPTH;
+    q.smoothAgreement = SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT;
     q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
     q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
@@ -898,6 +958,9 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
         SHADOW_MAP_CLAMP_(q->clipmapBase, SHADOW_MAP_MIN_CLIPMAP_BASE, SHADOW_MAP_MAX_CLIPMAP_BASE);
     q->clipmapResolution =
         SHADOW_MAP_CLAMP_(q->clipmapResolution, SHADOW_MAP_MIN_RESOLUTION, SHADOW_MAP_MAX_RESOLUTION);
+    q->smoothDepth = q->smoothDepth ? 1 : 0;
+    q->smoothAgreement =
+        SHADOW_MAP_CLAMP_(q->smoothAgreement, SHADOW_MAP_MIN_SMOOTH_AGREEMENT, SHADOW_MAP_MAX_SMOOTH_AGREEMENT);
     q->edgeHarden = q->edgeHarden ? 1 : 0;
     q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
     q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);

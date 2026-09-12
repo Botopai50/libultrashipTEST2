@@ -97,6 +97,10 @@ struct PerShadowCB {
     float shadow_clip_z[4];
     float shadow_clip_p[4];
     float shadow_smsr[4]; // x enabled, y max traversal steps, z depth epsilon, w reserved
+    // SOH [Enhancement] Technique 6 (see shadow_map.h): compare against the interpolated stored depth where
+    // the quad agrees, which is what removes the comb of teeth on a surface lying along the light.
+    //   x on, y agreement threshold in normalised depth, z/w unused
+    float shadow_smooth[4];
 };
 
 struct PerDrawCB {

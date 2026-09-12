@@ -3518,6 +3518,12 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         mPerShadowCbData.shadow_harden[1] = q.edgeHardness;
         mPerShadowCbData.shadow_harden[2] = q.edgeThreshold;
         mPerShadowCbData.shadow_harden[3] = 0.0f; // dead slot; carried bleed reduction
+        // Technique 6. Zeroed when off, so the receiver's branch is uniform and a frame without it pays
+        // nothing -- the same arrangement every other technique here uses.
+        mPerShadowCbData.shadow_smooth[0] = q.smoothDepth ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_smooth[1] = q.smoothAgreement;
+        mPerShadowCbData.shadow_smooth[2] = 0.0f;
+        mPerShadowCbData.shadow_smooth[3] = 0.0f;
 
         // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h).
         for (int i = 0; i < 3; i++) {

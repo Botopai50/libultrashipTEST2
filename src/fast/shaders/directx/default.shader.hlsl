@@ -193,6 +193,7 @@ cbuffer PerShadowCB : register(b3) {
     float4 shadow_clip_z;
     float4 shadow_clip_p;
     float4 shadow_smsr; // enabled, max steps, normalized depth epsilon, reserved
+    float4 shadow_smooth; // x on, y agreement threshold (normalised depth)
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -332,7 +333,50 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     // penumbra -- and that ordering is unchanged: `lit` is already the comparison result.
     float2 inv = 1.0 - subTexel;
     float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
-    return dot(lit, weights);
+    float filtered = dot(lit, weights);
+
+    // SOH [Enhancement] Technique 6 (see fast/shadow_map.h): compare against the INTERPOLATED stored depth
+    // where the four texels agree.
+    //
+    // The line above is the right answer at a silhouette and the wrong one along a surface that lies nearly
+    // parallel to the light. There the stored depth is flat inside a texel while the receiver's sweeps
+    // through a texel's worth of range in a few pixels, so the crossing can only turn at texel boundaries
+    // and the shadow's edge comes out as a comb -- one tooth per texel, measured at fifteen pixels tall on
+    // a capture of the castle wall. Comparing against the interpolated depth turns that staircase back into
+    // the line it was sampling.
+    //
+    // Fifteen is the figure for THIS kernel, the one with a per-texel receiver plane (ShadowReceiverDepths
+    // above). A kernel that compares the whole quad against one `z` produces a shorter tooth -- 5.9 px at
+    // 18 px/texel up to 23.5 px at 73 -- because a flat comparison depth cannot also tilt across the quad.
+    // The per-texel plane is what makes the receiver's own slope visible in the staircase, so it is the
+    // regime the fifteen was measured in and the regime this correction is written for.
+    //
+    // This is the PCF path only. With SMSR enabled ShadowSample takes SampleShadowSMSR instead and never
+    // reaches here; SMSR reconstructs the silhouette from visibility and has its own answer for the comb.
+    //
+    // Only where the quad agrees, and that guard is not a refinement -- it is the whole reason this is safe.
+    // At a silhouette the four texels are four different surfaces, and a depth interpolated between them is
+    // a depth nothing occupies: every object would get a grey halo. The weight falls to zero before the
+    // spread reaches anything a real silhouette produces.
+    //
+    // Uniform branch, and no extra fetch: `stored` is already in registers for the kernel above.
+    //
+    // The receiver side needs no interpolation of its own. `receiver` is an affine function of position
+    // sampled at the four texel centres, so dot(receiver, weights) is that plane evaluated at `uv`, which is
+    // `z` by construction -- comparing the interpolated stored depth against `z` keeps the receiver plane
+    // exactly as the line above uses it. The bias has to come along, though: ShadowReceiverVisibility
+    // compares against `receiver - 1/65535`, and dropping that here would make the two paths disagree by one
+    // quantum on flat ground and reintroduce acne wherever the weight is high.
+    if (shadow_smooth.x > 0.5) {
+        float lo = min(min(stored.x, stored.y), min(stored.z, stored.w));
+        float hi = max(max(stored.x, stored.y), max(stored.z, stored.w));
+        // An empty texel in the quad is not a surface to interpolate towards -- it is the far plane, and
+        // averaging it in would pull the boundary off the real occluder beside it.
+        float interpolated = (hi >= 1.0) ? 1.0 : step(z - (1.0 / 65535.0), dot(stored, weights));
+        float agree = saturate((shadow_smooth.y - (hi - lo)) / max(shadow_smooth.y * 0.5, 1e-6));
+        return lerp(filtered, interpolated, agree);
+    }
+    return filtered;
 }
 
 // SOH [Enhancement] Stochastic jitter (technique 3 -- see fast/shadow_map.h).
