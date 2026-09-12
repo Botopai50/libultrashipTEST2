@@ -4553,8 +4553,43 @@ void Interpreter::RenderShadowMap() {
     for (int i = 0; i < 3; i++) {
         lz[i] /= lzLen;
     }
-    // Use the application's current rendered-frame light. Holding small angular changes here turns
-    // continuous solar motion into pauses and jumps, amplified by tall scenery even with a static camera.
+    // Hold the sun still between steps, when the application asks for it.
+    //
+    // Following it every frame -- which is what happens at 0, and what happened before this existed --
+    // means continuous solar motion re-quantising every edge against the texel grid, and not at the same
+    // instant along an edge's length, which is the ripple that travels along it with nobody moving. The
+    // measurement and the exact trade are in shadow_map.h under "Holding the sun still": standing still
+    // for N frames costs a jump of N texels, in every cascade equally, because a rotation of dTheta moves
+    // a point at distance R by R*dTheta while the texel is 2R/resolution.
+    //
+    // The threshold is therefore in TEXELS OF JUMP, not degrees: it is the quantity the player can see,
+    // and it is resolution-independent by construction.
+    const float holdTexels = mShadowMapQuality.sunHoldTexels;
+    if (holdTexels > 0.0f && mShadowMapResolution > 0) {
+        if (!mShadowSunHeldValid) {
+            for (int i = 0; i < 3; i++) {
+                mShadowSunHeld[i] = lz[i];
+            }
+            mShadowSunHeldValid = true;
+        } else {
+            const float cosine = (mShadowSunHeld[0] * lz[0]) + (mShadowSunHeld[1] * lz[1]) +
+                                 (mShadowSunHeld[2] * lz[2]);
+            // Both are unit vectors, so the chord is the honest small-angle measure and needs no acos:
+            // |a-b| = 2*sin(theta/2), which is theta to well under a percent at the angles in play here.
+            const float chord = std::sqrt(std::max(0.0f, 2.0f - 2.0f * cosine));
+            const float limit = (2.0f * holdTexels) / (float)mShadowMapResolution;
+            if (chord > limit) {
+                for (int i = 0; i < 3; i++) {
+                    mShadowSunHeld[i] = lz[i];
+                }
+            }
+        }
+        for (int i = 0; i < 3; i++) {
+            lz[i] = mShadowSunHeld[i];
+        }
+    } else {
+        mShadowSunHeldValid = false;
+    }
     ShadowLightFrameUpdate(&mShadowLightFrame, lz);
     const float* lx = mShadowLightFrame.x;
     const float* ly = mShadowLightFrame.y;

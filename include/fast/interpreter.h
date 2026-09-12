@@ -1218,6 +1218,11 @@ class Interpreter {
     float mShadowMapCascadeCenter[SHADOW_MAP_MAX_LEVELS][3] = {};
     bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_LEVELS] = {};
     ShadowLightFrame mShadowLightFrame = {};
+    // The sun direction actually used, which lags the game's when holding is on. See the ladder in
+    // shadow_map.h under "Holding the sun still": the game's sun crosses a texel about once per frame for
+    // tall scenery, and this is what lets the whole edge step together instead of rippling along itself.
+    float mShadowSunHeld[3] = {};
+    bool mShadowSunHeldValid = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 
