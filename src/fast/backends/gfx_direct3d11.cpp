@@ -3584,7 +3584,21 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             CAPTURE_FIELD(shadow_clip_z);
             CAPTURE_FIELD(shadow_clip_p);
             CAPTURE_FIELD(shadow_smsr);
+            CAPTURE_FIELD(shadow_smooth);
 #undef CAPTURE_FIELD
+            // Every field the kernel reads has to be here, and this list is hand-maintained, so it drifts
+            // silently: shadow_smooth was added to the constant buffer and not to this list, and the first
+            // capture taken afterwards could not say whether the technique had been on. A reproduction built
+            // from a capture that omits an input is not a reproduction of anything. This assert is the only
+            // thing that makes the omission loud instead of silent -- one entry per float4 in PerShadowCB,
+            // minus the matrix array, which goes out as slice_matrices below.
+            //
+            // Nineteen float4s, of which the three shadow_actor_* are deliberately not captured: this capture
+            // is the WORLD layer and they describe the actor one. Everything else the world path reads is
+            // above. Adding a field to the buffer breaks this line, which is the point.
+            static_assert(sizeof(PerShadowCB) ==
+                              sizeof(float[SHADOW_MAP_MAX_CASCADES][16]) + 19 * sizeof(float[4]),
+                          "PerShadowCB gained a field: add a CAPTURE_FIELD for it above, then update this.");
             metadata["slice_valid"] = nlohmann::json::array();
             metadata["slice_matrices"] = nlohmann::json::array();
             for (int slice = 0; slice < count; ++slice) {
