@@ -8,15 +8,19 @@
 
 // SDS1: little-endian u32 magic, width, height, slice count; then each row is
 // u32 run count followed by (u16 depth, u32 length) pairs. No lossy conversion.
+//
+// firstSlice exists because the two caster layers can share one array: the actor slices sit right after
+// the world ones in that arrangement, so writing them means starting partway in rather than at zero.
 inline void WriteShadowDepthCapture(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
-                                    UINT slices, std::ostream& out) {
+                                    UINT slices, std::ostream& out, UINT firstSlice = 0) {
     if (!device || !context || !texture)
         throw std::runtime_error("No shadow texture");
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
     if ((desc.Format != DXGI_FORMAT_R16_TYPELESS && desc.Format != DXGI_FORMAT_D16_UNORM &&
          desc.Format != DXGI_FORMAT_R16_UNORM) ||
-        desc.SampleDesc.Count != 1 || slices == 0 || slices > desc.ArraySize || desc.Width > 8192 || desc.Height > 8192)
+        desc.SampleDesc.Count != 1 || slices == 0 || firstSlice >= desc.ArraySize ||
+        slices > desc.ArraySize - firstSlice || desc.Width > 8192 || desc.Height > 8192)
         throw std::runtime_error("Unsupported shadow capture dimensions or format");
     const UINT sourceMips = desc.MipLevels;
     desc.MipLevels = desc.ArraySize = 1;
@@ -40,8 +44,8 @@ inline void WriteShadowDepthCapture(ID3D11Device* device, ID3D11DeviceContext* c
     write(uint32_t(desc.Height));
     write(uint32_t(slices));
     for (UINT slice = 0; slice < slices; ++slice) {
-        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture, D3D11CalcSubresource(0, slice, sourceMips),
-                                       nullptr);
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture,
+                                       D3D11CalcSubresource(0, firstSlice + slice, sourceMips), nullptr);
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
             throw std::runtime_error("Cannot read shadow depth");

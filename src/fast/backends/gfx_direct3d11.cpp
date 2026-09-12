@@ -3560,7 +3560,38 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowMapTexture.Get(), count, depth);
             depth.close();
             if (!depth) throw std::runtime_error("Cannot finish depth file");
+
+            // SOH [Enhancement] The ACTOR layer, which until now was never captured at all.
+            //
+            // Three things cast shadows here -- scenery, characters, and point lights -- and this capture
+            // covered one of them. That is not a small gap when the capture is the only way to look at a
+            // reported artefact offline: a defect in a character's shadow could be studied for a long time
+            // in a file that provably does not contain it, and was.
+            //
+            // The actor slices live in mShadowMapTexture right after the world ones while the two layers
+            // share a resolution, and in mShadowActorTexture when they do not (see the note beside those
+            // members). Both cases are written, and the metadata says which arrangement produced the file
+            // so a reader never has to guess where the actor half is.
+            const int actorCount = SHADOW_MAP_ACTOR_CASCADES_FOR(count);
+            bool actorsWritten = false;
+            if (actorCount > 0) {
+                std::ofstream actors(dir / "actors.sds", std::ios::binary);
+                if (mShadowActorTexture != nullptr) {
+                    WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowActorTexture.Get(), actorCount,
+                                            actors);
+                } else {
+                    WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowMapTexture.Get(), actorCount,
+                                            actors, count);
+                }
+                actors.close();
+                if (!actors) throw std::runtime_error("Cannot finish actor depth file");
+                actorsWritten = true;
+            }
+
             nlohmann::json metadata;
+            metadata["actor_layer"] = actorsWritten ? "actors.sds" : nullptr;
+            metadata["actor_slices"] = actorCount;
+            metadata["actor_own_texture"] = mShadowActorTexture != nullptr;
             const auto gameContext = nlohmann::json::parse(
                 captureCVars->GetString(SHADOW_MAP_CAPTURE_CONTEXT_CVAR, "{}"), nullptr, false);
             if (gameContext.is_object()) metadata["game_context"] = gameContext;
@@ -3585,6 +3616,11 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             CAPTURE_FIELD(shadow_clip_p);
             CAPTURE_FIELD(shadow_smsr);
             CAPTURE_FIELD(shadow_smooth);
+            // Captured now that the actor layer itself is. They were left out as "the other layer's", which
+            // was only defensible while that layer was absent from the file entirely.
+            CAPTURE_FIELD(shadow_actor_min);
+            CAPTURE_FIELD(shadow_actor_max);
+            CAPTURE_FIELD(shadow_actor_texel_uv);
 #undef CAPTURE_FIELD
             // Every field the kernel reads has to be here, and this list is hand-maintained, so it drifts
             // silently: shadow_smooth was added to the constant buffer and not to this list, and the first
@@ -3593,9 +3629,8 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
             // thing that makes the omission loud instead of silent -- one entry per float4 in PerShadowCB,
             // minus the matrix array, which goes out as slice_matrices below.
             //
-            // Nineteen float4s, of which the three shadow_actor_* are deliberately not captured: this capture
-            // is the WORLD layer and they describe the actor one. Everything else the world path reads is
-            // above. Adding a field to the buffer breaks this line, which is the point.
+            // Nineteen float4s, every one of them written above. Adding a field to the buffer breaks this
+            // line, which is the point: the list is hand-maintained and drifted once already.
             static_assert(sizeof(PerShadowCB) ==
                               sizeof(float[SHADOW_MAP_MAX_CASCADES][16]) + 19 * sizeof(float[4]),
                           "PerShadowCB gained a field: add a CAPTURE_FIELD for it above, then update this.");
