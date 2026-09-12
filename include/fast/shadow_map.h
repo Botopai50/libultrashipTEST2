@@ -800,33 +800,34 @@ typedef struct ShadowMapAcne {
 // capture this was measured on -- the receiver's depth sweeps a texel's worth of range in a few pixels and
 // the crossing line becomes a comb, one tooth per texel.
 //
-// The teeth grow with magnification, because the tooth IS one texel step. Measured on that capture as the
-// peak-to-peak residual of the shadow's boundary after its slope is removed:
+// The teeth grow with magnification, because the tooth IS one texel step. Measured as the peak-to-peak
+// residual of the shadow's boundary after its slope is removed, on the capture's facade geometry (a stored
+// surface stepping 117 quanta across a 2x2 quad, a receiver crossing it at a grazing angle) and against
+// THIS kernel, the one where ShadowReceiverDepths gives every texel its own point on the receiver plane:
 //
 //     screen pixels per texel      18        36        73
-//     comparing per texel        5.9 px   13.1 px   23.5 px
-//     + four-tap filtering       5.6 px   10.4 px   20.6 px     <- blurs the teeth, does not remove them
-//     + interpolated depth       2.2 px    2.6 px    4.5 px
-//
-// Those three rows were measured against a kernel that compares the whole quad against ONE receiver depth.
-// This branch's kernel does not: ShadowReceiverDepths gives each of the four texels its own point on the
-// receiver plane, and a comparison depth that tilts across the quad makes the receiver's slope visible in
-// the staircase instead of averaging it away. The teeth are taller there -- 15 px on the same wall -- so
-// the numbers above understate what this build shows and the row that matters is still the last one: the
-// residual stops tracking magnification once the stored depth is interpolated. The table is being redone
-// in that regime; the mechanism and the guard below do not change with it.
+//     comparing per texel       45.6 px   92.9 px  190.2 px
+//     + four-tap filtering      29.2 px   58.5 px  118.7 px    <- blurs the teeth, does not remove them
+//     + interpolated depth       1.4 px    2.0 px    3.3 px
 //
 // The middle row is why more filtering is not the answer: the comb survives it, because every tap lands in
 // the same wrongly-quantised place. Interpolating the stored depth turns the staircase back into the line
-// it was sampling, and the residual stops growing with magnification.
+// it was sampling, and the residual stops tracking magnification -- it is what the last row says.
+//
+// Two earlier numbers here were wrong and are worth naming rather than quietly replacing. The first table
+// (5.9 / 13.1 / 23.5 px) measured a SILHOUETTE, occluder against empty map, which is precisely the case
+// this technique refuses to touch; it never measured the crossing. The "15 px" that replaced it came from
+// the right kernel but was read off a picture rather than fitted. The numbers above are the crossing, in
+// this kernel, fitted.
 //
 // That is the opposite of what a shadow kernel must do at a SILHOUETTE. There the four texels belong to
 // different surfaces, a depth interpolated between them is a depth nothing occupies, and every object
 // would get a grey halo. So it is applied only where the four texels AGREE, and the threshold below is
 // where that stops: past it the kernel goes back to comparing first and filtering after. On the
-// silhouette-rich parts of the same capture the result stays as close to the discrete truth as plain
-// filtering does -- mean deviation 0.0080 against the filter's 0.0071 -- which is the side that had to fail
-// and did not.
+// silhouette-rich ground of the same capture that side does not merely hold, it improves -- mean deviation
+// from the discrete truth 0.0052 against the plain filter's 0.0060, and 0.1432 against 0.2539 at the 99th
+// percentile -- because most real silhouettes on that ground are occluder against EMPTY map, and the empty
+// guard below catches those before the threshold is consulted at all.
 //
 // It costs no extra fetch. The four depths are already read for the bilinear kernel; this is one dot
 // product, a min, a max and a lerp on values already in registers.
@@ -834,11 +835,18 @@ typedef struct ShadowMapAcne {
 
 // How close the four texels must be to count as one surface, in normalised depth.
 //
-// 0.0012 is about eighty D16 quanta. It has to sit above the step a smooth surface takes across a texel
-// (measured on the capture: a median of 2 quanta, 3 at the 90th percentile in the near cascade) and well
-// below a real silhouette (110 quanta at the 99th percentile in the middle cascade). Eighty is inside that
-// gap with room on both sides, which is what makes the threshold uncritical rather than tuned.
-#define SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT 0.0012f
+// 0.0046 is about three hundred D16 quanta. It has to sit above the step the TARGET surface takes across a
+// quad and below a real silhouette, and the first of those is what the previous value (0.0012, eighty
+// quanta) got wrong: eighty was measured on flat ground, where a quad spans a median of 3 quanta. The
+// grazing wall this technique exists for spans 117 -- the whole reason it has teeth is that its stored
+// depth moves fast per texel -- so the threshold sat BELOW its target and the weight was zero exactly where
+// the effect was needed. Measured: at eighty the boundary residual is 29.2 / 58.5 / 118.7 px, identical to
+// the plain filter to the digit, because the technique never engaged.
+//
+// Three hundred is between 117 and a real silhouette's 927 (99th percentile on the same capture's ground),
+// which is what makes it uncritical rather than tuned: 200 and 500 give the same answer to a tenth of a
+// pixel, and the ground's deviation from the discrete truth falls monotonically across that whole span.
+#define SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT 0.0046f
 #define SHADOW_MAP_MIN_SMOOTH_AGREEMENT 0.0001f
 #define SHADOW_MAP_MAX_SMOOTH_AGREEMENT 0.0100f
 
