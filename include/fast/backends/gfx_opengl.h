@@ -52,6 +52,9 @@ struct ShaderProgram {
     GLint toon_highlight_intensity_location;
     GLint toon_shadow_intensity_location;
     GLint toon_debug_location;
+    GLint toon_local_enabled_location;
+    GLint toon_local_dir_location;
+    GLint toon_local_color_location;
 
     // SOH [Enhancement] What was last sent to THIS program's uniforms, so a value that has not moved is not
     // sent again. Kept per program rather than globally because that is where GL keeps uniforms: switching
@@ -79,6 +82,7 @@ struct ShaderProgram {
     float lastToonHighlightIntensity;
     float lastToonShadowIntensity;
     float lastToonDebug;
+    ToonLocalLights lastToonLocalLights;
 };
 
 struct FramebufferOGL {

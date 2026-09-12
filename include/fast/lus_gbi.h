@@ -67,6 +67,7 @@ constexpr int8_t OTR_G_READFB = OPCODE(0x3e);
 constexpr int8_t OTR_G_REGBLENDEDTEX = OPCODE(0x3f);
 constexpr int8_t OTR_G_SETINTENSITY = OPCODE(0x40);
 constexpr int8_t OTR_G_SETTOON = OPCODE(0x41);    // SOH [Enhancement] toon lighting
+constexpr int8_t OTR_G_SETTOONLOCAL = OPCODE(0x4c);
 constexpr int8_t OTR_G_SETTOONKEY = OPCODE(0x4a); // SOH [Enhancement] toon lighting key light
 constexpr int8_t OTR_G_SETTOONSHADOW = OPCODE(0x4b); // SOH [Enhancement] actor shadow per-object marker
 constexpr int8_t OTR_G_SETSTENCIL = OPCODE(0x46); // SOH [Enhancement] world light casting

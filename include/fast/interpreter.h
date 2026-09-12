@@ -7,11 +7,13 @@
 #include <list>
 #include <cstddef>
 #include <vector>
+#include <utility>
 #include <stack>
 #include <string>
 
 #include "fast/lus_gbi.h"
 #include "fast/types.h"
+#include "fast/shadow_light_frame.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
 
@@ -311,6 +313,7 @@ struct RSP {
     // SOH [Enhancement] Toon lighting: a per-object key light supplied by the game (gSPToonKey),
     // world-space direction + color. When valid it overrides the renderer's own light averaging so
     // the game can drive a Wind Waker-style sun/torch key with smooth day-night animation.
+    ToonLocalLights toon_local_lights{};
     bool toon_key_valid;
     float toon_key_dir[3];
     float toon_key_color[3];
@@ -523,28 +526,40 @@ class Interpreter {
         // moment after the switch, which is a wait the player can watch rather than one that stops the
         // picture. Nothing downstream needs to know: this is the same state as the mode being off.
         mShadowMapEnabled = enabled && (mRapi == nullptr || !mRapi->ShaderPrewarmInProgress());
-        const int clampedCascades = cascadeCount < 1                         ? 1
-                                    : cascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
-                                                                             : cascadeCount;
+        // The clipmap counts LEVELS here, not cascades, and it may have more of them. Its count comes from
+        // its own setting rather than the cascade slider, so the two layouts keep separate numbers and
+        // switching between them does not carry one's choice into the other.
+        const bool clipmapLayout = mShadowMapQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP;
+        const int requestedLevels = clipmapLayout ? mShadowMapQuality.clipmapLevels : cascadeCount;
+        const int levelBound = clipmapLayout ? SHADOW_MAP_MAX_CLIPMAP_LEVELS : SHADOW_MAP_MAX_CASCADES;
+        const int clampedCascades = requestedLevels < 1            ? 1
+                                    : requestedLevels > levelBound ? levelBound
+                                                                   : requestedLevels;
         // Drop every held matrix when the cascade layout changes: cascade N is now fitted to a different
         // span than the matrix saved under it, so freezing to that matrix would project the wrong band.
         // Clearing makes the next frame refit and redraw regardless of whose turn it was -- one frame of
         // full cost, paid on a transition. (The disable path unparks below, for the same reason.)
         if (clampedCascades != mShadowMapCascadeCount) {
-            for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+            for (int i = 0; i < SHADOW_MAP_MAX_LEVELS; i++) {
                 mShadowMapHeldValid[i] = false;
             }
         }
         mShadowMapCascadeCount = clampedCascades;
-        mShadowMapResolution = resolution;
+        // The clipmap sizes its levels itself. Sharing the ladder's resolution starves one layout or
+        // bankrupts the other -- a clipmap wants many small levels, a ladder few large ones -- and every
+        // texel figure downstream reads this, so overriding here is enough for the whole system.
+        mShadowMapResolution = clipmapLayout ? mShadowMapQuality.clipmapResolution : resolution;
         // Never finer than the world layer (see shadow_map.h); the backend clamps it again, but keeping the
         // two in order here means the value the interpreter reasons with is the one that will be used.
         mShadowMapActorResolution = actorResolution > resolution ? resolution : actorResolution;
         if (splits != nullptr) {
             for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
-                mShadowMapSplits[i] = splits[i];
+                mShadowMapSplitsRequested[i] = splits[i];
             }
         }
+        // The ladder may replace what was just stored (see ApplyShadowLadder). Run from both setters, so
+        // the application may push quality and params in either order and get the same ladder either way.
+        ApplyShadowLadder();
         if (lightDir != nullptr) {
             for (int i = 0; i < 3; i++) {
                 mShadowMapLightDir[i] = lightDir[i];
@@ -560,6 +575,7 @@ class Interpreter {
         mShadowMapMinCasterSize = minCasterSize;
         mShadowMapDebug = debugMode;
         if (!enabled) {
+            mShadowLightFrame = {};
             // Drop both buffers so turning the mode off cannot leave a stale frame of casters that would
             // reappear the moment it is turned back on.
             for (int l = 0; l < SHADOW_MAP_LAYERS; l++) {
@@ -573,7 +589,7 @@ class Interpreter {
             mShadowWorldCacheGeneration++; // the cache changed, so the slices built from it are stale
             // Unpark the cascades. Holding one across a disable would park it wherever the camera stood at
             // the moment the mode went off, and the next enable could be a different scene entirely.
-            for (int c = 0; c < SHADOW_MAP_MAX_CASCADES; c++) {
+            for (int c = 0; c < SHADOW_MAP_MAX_LEVELS; c++) {
                 mShadowMapCascadeCenterValid[c] = false;
                 // The update-rate freeze parks the same cascade a second way, by matrix, and it has to be
                 // let go here too -- a held matrix outliving a disable would freeze the next enable to
@@ -594,6 +610,47 @@ class Interpreter {
             mShadowWorldCapture = true;
         }
     }
+
+    // SOH [Enhancement] Edge-quality policy (see fast/shadow_map.h). Pushed once per frame alongside
+    // SetShadowMapParams, in either order.
+    //
+    // Most of this is the shader's business and travels straight through to the backend. Two parts are
+    // not: the split ladder is fitted here on the CPU, and a change to it moves every cascade -- so a held
+    // matrix from before the change would project the wrong band and has to be dropped, exactly as a
+    // cascade-count change drops them.
+    void SetShadowMapQuality(const ShadowMapQuality& quality) {
+        const int previousLadder = mShadowMapQuality.ladderMode;
+        const float previousLambda = mShadowMapQuality.ladderLambda;
+        const float previousNear = mShadowMapQuality.ladderNear;
+
+        mShadowMapQuality = quality;
+        ShadowMapQualityClamp(&mShadowMapQuality);
+
+        if (mShadowMapQuality.ladderMode != previousLadder || mShadowMapQuality.ladderLambda != previousLambda ||
+            mShadowMapQuality.ladderNear != previousNear) {
+            for (int c = 0; c < SHADOW_MAP_MAX_LEVELS; c++) {
+                mShadowMapHeldValid[c] = false;
+                // The park centre is fitted to the old band too, so it is as stale as the matrix is.
+                mShadowMapCascadeCenterValid[c] = false;
+            }
+        }
+        ApplyShadowLadder();
+        if (mRapi != nullptr) {
+            mRapi->SetShadowMapQuality(mShadowMapQuality);
+        }
+    }
+
+    // Called before a rendered frame, independently of the game-tick quality/configuration snapshot.
+    void SetShadowMapLightDirection(const float direction[3]) {
+        for (int i = 0; i < 3; ++i) {
+            mShadowMapLightDir[i] = direction[i];
+        }
+    }
+
+    const ShadowMapQuality& ShadowQuality() const {
+        return mShadowMapQuality;
+    }
+
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
@@ -873,17 +930,35 @@ class Interpreter {
         // near cascade covers almost none of them.
         float min[3];
         float max[3];
+        // SOH [Enhancement] Signature of this range's vertices, taken once per frame in
+        // ResolveShadowAlphaTextures. The cascade reuse key used to hash these bytes itself, which meant
+        // hashing them again for every cascade that reached the range -- and for the WORLD cache, which is
+        // the cached room mesh, hashing bytes that had not changed since the cache was built. The opaque
+        // spans beside this one (ShadowCasterChunk) already worked this way; the cutout ranges did not.
+        uint64_t hash;
     };
     struct ShadowAlphaCasters {
         std::vector<float> verts; // 5 floats per vertex: world xyz + uv
         std::vector<ShadowAlphaRange> ranges;
+        // Whether every range's `hash` describes the vertices currently in `verts`.
+        //
+        // False means the signatures must be retaken before a reuse key is built from them. It matters most
+        // for the WORLD cache, which is swapped in when the room changes and then stands still for thousands
+        // of frames: without this it would be re-signed every frame to produce the same number. The
+        // per-frame lists get no benefit and lose nothing -- their contents are new each frame, so the flag
+        // is false when they arrive either way.
+        bool hashesValid = false;
         void clear() {
             verts.clear();
             ranges.clear();
+            hashesValid = false;
         }
         void swap(ShadowAlphaCasters& o) {
             verts.swap(o.verts);
             ranges.swap(o.ranges);
+            // Swapped, not cleared: a range carries its own signature, so validity travels with the data it
+            // describes rather than with the variable holding it.
+            std::swap(hashesValid, o.hashesValid);
         }
         size_t VertexCount() const {
             return verts.size() / 5;
@@ -898,6 +973,9 @@ class Interpreter {
     float mShadowObjectMax[3] = {};
     bool mShadowObjectHasVerts = false;
     size_t mShadowAlphaObjectMark = 0; // where the current object started in the actor cutout list
+    // The same, for the actor OPAQUE list. It exists so that list can be written into directly and rolled
+    // back, the way the cutout one already is, instead of being staged in mShadowVerts and copied.
+    size_t mShadowOpaqueObjectMark = 0;
     // Whether the backend can actually draw cutout casters. False keeps them on the opaque list, where they
     // cast their quad -- which is what this whole path exists to avoid, but is still a shadow.
     bool mShadowAlphaSupported = false;
@@ -924,7 +1002,11 @@ class Interpreter {
     // narrower key answers. Now built from only the spans and cutout ranges whose boxes reach into THIS
     // cascade, so a tree swaying next to the player stops rebuilding the two distant cascades it is nowhere
     // near. Returns SHADOW_MAP_EMPTY_CONTENT_KEY when nothing reaches the cascade at all.
-    uint64_t ShadowMapCascadeContentKey(int layer, const float* lightViewProj) const;
+    // SOH [Enhancement] Static caster cache: which half of a world slice's casters the key describes. The
+    // cached room mesh is static; the scenery actors, which move, are dynamic. Only the world layer has a
+    // meaningful split -- the actor layer is characters, and all of them move.
+    enum { SHADOW_KEY_ALL = 0, SHADOW_KEY_STATIC = 1, SHADOW_KEY_DYNAMIC = 2 };
+    uint64_t ShadowMapCascadeContentKey(int layer, const float* lightViewProj, int half = SHADOW_KEY_ALL) const;
     // Tile geometry and texture coordinates for the caster capture, which runs before the combiner setup
     // that normally derives them (see the definitions for why they are duplicated rather than shared).
     void ShadowCasterTexSize(int tile, float* outWidth, float* outHeight);
@@ -1077,14 +1159,43 @@ class Interpreter {
     // from where the light used to be, which is worse than a stale shadow: it is a wrong one. So a skipped
     // cascade is frozen whole -- the previous frame's matrix is written back over the fitted one, and the
     // reuse machinery then sees an unchanged matrix and skips the draw on its own.
-    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0,
-                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
-                                                              SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2 };
-    float mShadowMapHeldMatrices[SHADOW_MAP_MAX_CASCADES * 16] = {};
-    bool mShadowMapHeldValid[SHADOW_MAP_MAX_CASCADES] = {};
+    // Per level, not per cascade: the clipmap has more of them. Entries past the cascade ladder's three
+    // default to 1 rather than 0 -- the rate is used as a modulus, so a zero here would divide by zero on
+    // the first clipmap frame.
+    int mShadowMapCascadeDivisor[SHADOW_MAP_MAX_LEVELS] = {
+        SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_0, SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_1,
+        SHADOW_MAP_DEFAULT_CASCADE_DIVISOR_2, 1, 1, 1, 1, 1, 1, 1
+    };
+    float mShadowMapHeldMatrices[SHADOW_MAP_MAX_LEVELS * 16] = {};
+    bool mShadowMapHeldValid[SHADOW_MAP_MAX_LEVELS] = {};
     uint32_t mShadowMapFrameCounter = 0;
     int mShadowMapResolution = SHADOW_MAP_DEFAULT_RESOLUTION;
     int mShadowMapActorResolution = SHADOW_MAP_DEFAULT_ACTOR_RESOLUTION;
+    // SOH [Enhancement] What the application asked for, before the ladder. Kept apart from the effective
+    // splits below so switching the ladder off restores the sliders rather than whatever the ladder last
+    // computed -- the manual values must survive a round trip through an automatic mode.
+    float mShadowMapSplitsRequested[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0,
+                                                                 SHADOW_MAP_DEFAULT_SPLIT_1,
+                                                                 SHADOW_MAP_DEFAULT_SPLIT_2 };
+    ShadowMapQuality mShadowMapQuality = ShadowMapQualityDefaults();
+
+    // SOH [Enhancement] Fill the effective splits from the requested ones and the ladder policy. In manual
+    // mode this is a copy; in practical mode the requested LAST split still sets the range and the ones
+    // before it are regenerated, so the reach of the system is the player's and only the distribution
+    // inside it is computed.
+    void ApplyShadowLadder() {
+        for (int i = 0; i < SHADOW_MAP_MAX_CASCADES; i++) {
+            mShadowMapSplits[i] = mShadowMapSplitsRequested[i];
+        }
+        // This ladder owns three entries even while the active clipmap has more levels.
+        const int count = mShadowMapCascadeCount < 1 ? 1
+                          : mShadowMapCascadeCount > SHADOW_MAP_MAX_CASCADES ? SHADOW_MAP_MAX_CASCADES
+                                                                           : mShadowMapCascadeCount;
+        ShadowMapLadderSplits(mShadowMapQuality.ladderMode, mShadowMapQuality.ladderLambda,
+                              mShadowMapQuality.ladderNear, mShadowMapSplitsRequested[count - 1], count,
+                              mShadowMapSplits);
+    }
+
     float mShadowMapSplits[SHADOW_MAP_MAX_CASCADES] = { SHADOW_MAP_DEFAULT_SPLIT_0, SHADOW_MAP_DEFAULT_SPLIT_1,
                                                         SHADOW_MAP_DEFAULT_SPLIT_2 };
     float mShadowMapLightDir[3] = { 0.0f, -1.0f, 0.0f }; // world-space direction the light travels
@@ -1100,16 +1211,18 @@ class Interpreter {
     // the radius -- so letting it follow the wobble resizes the grid and the texel snapping stops working,
     // which shows up as shadow edges crawling in steps as the camera moves. Held with hysteresis instead:
     // it only grows to cover a larger fit, or shrinks once the fit is clearly smaller. 0 = not yet fitted.
-    float mShadowMapCascadeRadius[SHADOW_MAP_MAX_CASCADES] = {};
+    float mShadowMapCascadeRadius[SHADOW_MAP_MAX_LEVELS] = {};
     // Where each cascade is currently parked, and whether anything is parked there yet. Held across frames
     // for as long as the cascade still contains the sphere the frame fits, which is what allows a slice to
     // be reused while the camera moves -- see the containment test in RenderShadowMap.
-    float mShadowMapCascadeCenter[SHADOW_MAP_MAX_CASCADES][3] = {};
-    bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_CASCADES] = {};
-    // Light direction the cascades are currently built around, held across frames for the same reason the
-    // radius is: the texel snapping that stops shadow edges shimmering is done along the light's axes, so
-    // those axes have to hold still. The game's light turns continuously with the time of day. 0 = not set.
-    float mShadowMapLightDirHeld[3] = {};
+    float mShadowMapCascadeCenter[SHADOW_MAP_MAX_LEVELS][3] = {};
+    bool mShadowMapCascadeCenterValid[SHADOW_MAP_MAX_LEVELS] = {};
+    ShadowLightFrame mShadowLightFrame = {};
+    // The sun direction actually used, which lags the game's when holding is on. See the ladder in
+    // shadow_map.h under "Holding the sun still": the game's sun crosses a texel about once per frame for
+    // tall scenery, and this is what lets the whole edge step together instead of rippling along itself.
+    float mShadowSunHeld[3] = {};
+    bool mShadowSunHeldValid = false;
     GfxWindowBackend* mWapi = nullptr;
     GfxRenderingAPI* mRapi = nullptr;
 

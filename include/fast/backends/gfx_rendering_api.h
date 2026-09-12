@@ -9,6 +9,7 @@
 #include "fast/shadow_map.h"
 
 namespace Fast {
+static_assert(TOON_LOCAL_LIGHT_MAX == 4, "Update the HLSL, GLSL and Metal array bounds together");
 struct ShaderProgram;
 
 struct GfxClipParameters {
@@ -156,6 +157,10 @@ class GfxRenderingAPI {
 
     // SOH [Enhancement] Toon lighting: the interpreter pushes the per-object dominant light here
     // before each batch; backends read the mToon* members in their per-draw uniform paths.
+    virtual void SetToonLocalLights(const ToonLocalLights& lights) {
+        mToonLocalLights = lights;
+    }
+
     virtual void SetToonLighting(const float dir[3], const float color[3], const float ambient[3]) {
         for (int i = 0; i < 3; i++) {
             mToonLightDir[i] = dir[i];
@@ -218,7 +223,7 @@ class GfxRenderingAPI {
     // Allocate (or resize) the cascade depth array. Safe to call every frame: implementations
     // reallocate only when the count or resolution actually changes. Returns false if the resources
     // could not be created, in which case the caller must treat shadow maps as unavailable this frame.
-    // cascadeCount is clamped to [1, SHADOW_MAP_MAX_CASCADES], both resolutions to the
+    // cascadeCount is bounded by the active layout (cascades or clipmap levels), both resolutions to the
     // SHADOW_MAP_*_RESOLUTION bounds.
     //
     // actorResolution sizes the actor layer independently of the world layer (see shadow_map.h). Passing the
@@ -257,6 +262,11 @@ class GfxRenderingAPI {
     // selects what is drawn from it, never what is uploaded. That split is the point: a caller can hand over
     // one big list once and then, per cascade, draw only the parts of it that cascade can actually see,
     // without giving up the upload caching that keeps a static room mesh resident on the GPU.
+    // Identify the cached room geometry independently of its allocation address. A double-buffered
+    // capture can reuse an address after multiple changes without any intervening GPU upload.
+    virtual void ShadowMapSetWorldGeneration(uint64_t generation) {
+    }
+
     virtual void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot = 0, size_t firstVertex = 0,
                                       size_t drawCount = 0) {
     }
@@ -272,13 +282,13 @@ class GfxRenderingAPI {
         return false;
     }
 
-    virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+    virtual void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) {
     }
 
     // Draw one material's slice of the uploaded alpha casters, clipping against that texture's alpha so the
     // depth map records the leaf rather than the quad holding it. `textureId` is a texture the backend
     // already holds from the main pass.
-    virtual void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
+    virtual void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount, int slot) {
     }
 
     // Close the depth pass and restore the render target the frame was drawing to. After this the
@@ -355,6 +365,91 @@ class GfxRenderingAPI {
         mShadowMaxViewDepth = maxViewDepth;
     }
 
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). Opens a WORLD-layer slice knowing that
+    // its casters split in two: a static half that is cached and a dynamic half that is not.
+    //
+    // Answers what the caller must now draw -- SHADOW_MAP_SLICE_REUSED, _FULL or _DYNAMIC. A _DYNAMIC
+    // answer means the static half was copied in from the cache and only the movers are left to draw, which
+    // is the whole point: one swaying tree stops costing the room mesh again.
+    //
+    // Falls back to the ordinary path when the cache is off or unavailable, in which case it answers
+    // _REUSED or _FULL and behaves exactly as ShadowMapBeginCascade does.
+    virtual int ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16],
+                                           uint64_t staticKey, uint64_t dynamicKey) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, staticKey ^ dynamicKey)
+                   ? SHADOW_MAP_SLICE_FULL
+                   : SHADOW_MAP_SLICE_REUSED;
+    }
+
+    // SOH [Enhancement] Between the two halves of a split slice: everything drawn from here on is dynamic
+    // and must not reach the static copy. A no-op where the cache is not in use.
+    virtual void ShadowMapEndStaticCasters() {
+    }
+
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). Everything the receiver needs to place a
+    // pixel in the clipmap WITHOUT a per-level matrix: the light's three axes, the camera's coordinate
+    // along each of them, and the ladder's shape.
+    //
+    // Sent as axes rather than as matrices because the levels differ only by a power of two and a snapped
+    // centre, both of which the shader can compute. That is what keeps this legal at ps_4_0, where a
+    // dynamically indexed constant-buffer array is not.
+    //
+    // levels == 0 means "not this frame", and the receiver takes the cascade path.
+    virtual void SetShadowMapClipmap(const float lightX[3], const float lightY[3], const float lightZ[3],
+                                     const float cameraInLight[3], float baseHalfExtent, int levels,
+                                     int resolution) {
+        for (int i = 0; i < 3; i++) {
+            mShadowClipmapX[i] = lightX != nullptr ? lightX[i] : 0.0f;
+            mShadowClipmapY[i] = lightY != nullptr ? lightY[i] : 0.0f;
+            mShadowClipmapZ[i] = lightZ != nullptr ? lightZ[i] : 0.0f;
+            mShadowClipmapCamera[i] = cameraInLight != nullptr ? cameraInLight[i] : 0.0f;
+        }
+        mShadowClipmapBase = baseHalfExtent;
+        mShadowClipmapLevels = levels;
+        mShadowClipmapResolution = resolution;
+    }
+
+    // SOH [Enhancement] Edge-quality policy for the shadow map (see fast/shadow_map.h). One struct rather
+    // than a setter per knob, because these travel together and adding one should not mean touching every
+    // layer's signature.
+    //
+    // Clamped on arrival rather than trusted: the application owns the tuning, but the framework owns what
+    // it will actually honour, and a value out of range must not be able to reach a shader.
+    //
+    // Virtual and defaulted to storing only, like everything else here: a backend that implements none of
+    // these techniques still answers the setter and simply never reads the result.
+    virtual void SetShadowMapQuality(const ShadowMapQuality& quality) {
+        mShadowQuality = quality;
+        ShadowMapQualityClamp(&mShadowQuality);
+    }
+
+    // SOH [Enhancement] What the cascades actually came out as this frame: the far distance of each band
+    // and the world size of one of its texels. Both are computed deep in the fit -- the texel from the
+    // projection matrix itself -- and neither is knowable from the settings alone once the automatic
+    // ladder is choosing the splits.
+    //
+    // Readable so the application can SHOW them. A ladder the player cannot inspect is a ladder they have
+    // to guess at, and the numbers here are the only honest answer to "what did automatic decide".
+    int ShadowMapCascadeReport(float* splitsOut, float* texelWorldOut, int maxCascades) const {
+        const int n = mShadowCascadesActive < maxCascades ? mShadowCascadesActive : maxCascades;
+        for (int i = 0; i < n; i++) {
+            if (splitsOut != nullptr) {
+                splitsOut[i] = mShadowSplits[i];
+            }
+            if (texelWorldOut != nullptr) {
+                texelWorldOut[i] = mShadowTexelWorld[i];
+            }
+        }
+        return n;
+    }
+
+    // Readable so the interpreter can act on the parts of this policy that are decided OUTSIDE the shader
+    // -- the split ladder is fitted on the CPU, and the filterable-map mode changes what the depth pass
+    // has to store.
+    const ShadowMapQuality& ShadowMapQualityPolicy() const {
+        return mShadowQuality;
+    }
+
     virtual void SetShadowMapActorBounds(const float boundsMin[3], const float boundsMax[3]) {
         for (int i = 0; i < 3; i++) {
             mShadowActorBoundsMin[i] = boundsMin[i];
@@ -377,12 +472,24 @@ class GfxRenderingAPI {
     float mToonHighlightIntensity = TOON_SHADING_DEFAULT_HIGHLIGHT;
     float mToonShadowIntensity = TOON_SHADING_DEFAULT_SHADOW;
     float mToonDebug = 0.0f;
+    ToonLocalLights mToonLocalLights{};
     int mStencilMode = 0; // SOH [Enhancement] world light casting / actor shadows (see StencilMode)
     // SOH [Enhancement] Cascaded shadow maps: the frame's cascade transforms and tuning, pushed by
     // SetShadowMapParams. mShadowCascadesActive == 0 means "no shadow map this frame", which is the
     // state every backend that does not implement the depth pass stays in forever.
     float mShadowViewProj[SHADOW_MAP_MAX_CASCADES * 16] = {};
     float mShadowSplits[SHADOW_MAP_MAX_CASCADES] = {};
+    // World size of one texel in each cascade, recovered from its own projection. Filled by the
+    // backend beside the shader constants; see ShadowMapCascadeReport.
+    float mShadowTexelWorld[SHADOW_MAP_MAX_CASCADES] = {};
+    // SOH [Enhancement] Clipmap frame; see SetShadowMapClipmap. Zero levels is the cascade path.
+    float mShadowClipmapX[3] = {};
+    float mShadowClipmapY[3] = {};
+    float mShadowClipmapZ[3] = {};
+    float mShadowClipmapCamera[3] = {};
+    float mShadowClipmapBase = 0.0f;
+    int mShadowClipmapLevels = 0;
+    int mShadowClipmapResolution = 0;
     int mShadowCascadesActive = 0;
     float mShadowBlendFraction = SHADOW_MAP_DEFAULT_BLEND_FRACTION;
     float mShadowStrength = SHADOW_MAP_DEFAULT_STRENGTH;
@@ -395,6 +502,9 @@ class GfxRenderingAPI {
     float mShadowActorBoundsMin[3] = { 1e30f, 1e30f, 1e30f };
     float mShadowActorBoundsMax[3] = { -1e30f, -1e30f, -1e30f };
     int mShadowViewSlice = 0;
+    // SOH [Enhancement] Edge-quality policy, defaulted to every technique off so a backend or an
+    // application that never calls the setter behaves exactly as it did before any of this existed.
+    ShadowMapQuality mShadowQuality = ShadowMapQualityDefaults();
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;
     int8_t mCurrentZmodeDecal = 0;

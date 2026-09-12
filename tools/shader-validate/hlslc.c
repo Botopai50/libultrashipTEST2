@@ -55,11 +55,17 @@ int main(int argc, char** argv) {
     fseek(f, 0, SEEK_END);
     n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    buf = (char*)malloc(n);
+    /* One byte over, NUL-terminated. D3DCompile is given an explicit length and should not need it, but
+     * Wine's d3dcompiler reads past that length on some inputs and aborts the process out of its own
+     * allocator -- "free(): invalid pointer", with nothing on stdout. Terminating the buffer costs a byte
+     * and removes the question. It matters more than it looks: an abort here used to be indistinguishable
+     * from a clean compile, because the harness read "no output" as "no complaints". */
+    buf = (char*)malloc((size_t)n + 1);
     if (!buf || fread(buf, 1, n, f) != (size_t)n) {
         printf("cannot read %s\n", argv[1]);
         return 2;
     }
+    buf[n] = '\0';
     fclose(f);
 
     mod = LoadLibraryA("d3dcompiler_47.dll");
@@ -78,5 +84,14 @@ int main(int argc, char** argv) {
         printf("%s\n", (char*)err->v->GetBufferPointer(err));
     }
     printf("[%s %s] %s\n", argv[2], argv[3], SUCCEEDED(hr) ? "OK" : "FAILED");
+    /* Flushed explicitly, and the blobs released, before this returns. The verdict is the only thing the
+     * harness has to go on, so it must reach the pipe even if the runtime tears down badly afterwards. */
+    fflush(stdout);
+    if (code) {
+        ((HRESULT(WINAPI*)(ID3DBlob*))code->v->Release)(code);
+    }
+    if (err) {
+        ((HRESULT(WINAPI*)(ID3DBlob*))err->v->Release)(err);
+    }
     return SUCCEEDED(hr) ? 0 : 1;
 }

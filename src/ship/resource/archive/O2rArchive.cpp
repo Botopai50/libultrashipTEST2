@@ -25,7 +25,13 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
         return nullptr;
     }
 
-    auto zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
+    zip_int64_t zipEntryIndex;
+    const auto indexed = mEntryIndex.find(filePath);
+    if (indexed != mEntryIndex.end()) {
+        zipEntryIndex = indexed->second;
+    } else {
+        zipEntryIndex = zip_name_locate(mZipArchive, filePath.c_str(), 0);
+    }
     if (zipEntryIndex < 0) {
         SPDLOG_TRACE("Failed to find file {} in zip archive  {}.", filePath, GetPath());
         return nullptr;
@@ -86,7 +92,32 @@ bool O2rArchive::Open() {
         IndexFile(zipEntryName);
     }
 
+    RebuildEntryIndex();
+
     return true;
+}
+
+// The index the loads actually need. Kept apart from the loop above because that one also feeds the VFS,
+// which rewrites some names on the way in (see Archive::IndexFile); this one has to hold the names exactly
+// as the archive spells them, since that is what the entry index is keyed on.
+void O2rArchive::RebuildEntryIndex() {
+    mEntryIndex.clear();
+    if (mZipArchive == nullptr) {
+        return;
+    }
+
+    const auto zipNumEntries = zip_get_num_entries(mZipArchive, 0);
+    mEntryIndex.reserve((size_t)(zipNumEntries > 0 ? zipNumEntries : 0));
+    for (zip_int64_t i = 0; i < zipNumEntries; i++) {
+        const char* zipEntryName = zip_get_name(mZipArchive, i, 0);
+        if (zipEntryName == nullptr || zipEntryName[0] == '\0') {
+            continue;
+        }
+        if (zipEntryName[strlen(zipEntryName) - 1] == '/') {
+            continue; // a directory entry, which is never loaded as a file
+        }
+        mEntryIndex.emplace(zipEntryName, i);
+    }
 }
 
 bool O2rArchive::Close() {
@@ -101,6 +132,7 @@ bool O2rArchive::Close() {
     }
 
     mZipArchive = nullptr;
+    mEntryIndex.clear();
     return true;
 }
 
@@ -138,9 +170,14 @@ bool O2rArchive::WriteFile(const std::string& filePath, const std::vector<uint8_
     // Reopen the zip file so that it may continued to be used by libultraship
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
     if (mZipArchive == nullptr) {
+        mEntryIndex.clear();
         SPDLOG_ERROR("Failed to reopen zip file after writing.");
         return false;
     }
+
+    // The reopen renumbered everything, so the cached indices describe the previous archive. Stale entries
+    // here would not fail a load -- they would load the WRONG FILE, silently.
+    RebuildEntryIndex();
 
     IndexFile(filePath);
 

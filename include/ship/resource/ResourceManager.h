@@ -131,6 +131,48 @@ class ResourceManager {
     std::shared_ptr<IResource> GetCachedResource(std::variant<ResourceLoadError, std::shared_ptr<IResource>> cacheLine);
 
   private:
+    // Called after signature normalization and a cache miss by both public loading APIs.
+    std::shared_future<std::shared_ptr<IResource>>
+    QueueResourceLoad(const ResourceIdentifier& identifier, bool loadExact, BS::priority_t priority,
+                      std::shared_ptr<ResourceInitData> initData);
+
+    // A load that has been queued but has not finished yet, so a second request for the same thing can wait
+    // on the first instead of repeating it.
+    //
+    // Without this the duplicate work still happened in full -- read, decompress, parse, allocate -- and was
+    // thrown away at the end: LoadResourceProcess rechecks the cache after building the resource and drops
+    // whatever it just made if another thread got there first. The result was always correct; it was the
+    // work that was wasted, and on a room load with several workers pulling the same shared assets that is
+    // the same file decompressed several times over.
+    //
+    // Keyed with loadExact alongside the identifier because the two are a different question: the exact
+    // load skips alt-asset redirection, so sharing one future between them would hand a caller the resource
+    // it specifically asked not to get.
+    struct InFlightKey {
+        ResourceIdentifier Identifier;
+        bool LoadExact;
+        bool operator==(const InFlightKey& rhs) const {
+            return LoadExact == rhs.LoadExact && Identifier == rhs.Identifier;
+        }
+    };
+    struct InFlightKeyHash {
+        size_t operator()(const InFlightKey& key) const {
+            return ResourceIdentifierHash{}(key.Identifier) ^ (key.LoadExact ? 0x9e3779b97f4a7c15ULL : 0ULL);
+        }
+    };
+    // Removes the entry when the load finishes, however it finishes -- a normal return or an exception.
+    // A nested type of ResourceManager rather than a local struct inside the worker lambda: a local class
+    // declared inside a lambda reaching for the enclosing class's private members is exactly the kind of
+    // access question compilers disagree about, and there is nothing to gain by asking it.
+    struct InFlightGuard {
+        ResourceManager* Manager;
+        InFlightKey Key;
+        ~InFlightGuard();
+    };
+
+    std::mutex mInFlightMutex;
+    std::unordered_map<InFlightKey, std::shared_future<std::shared_ptr<IResource>>, InFlightKeyHash> mInFlight;
+
     std::unordered_map<ResourceIdentifier, std::variant<ResourceLoadError, std::shared_ptr<IResource>>,
                        ResourceIdentifierHash>
         mResourceCache;

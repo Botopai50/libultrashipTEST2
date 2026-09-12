@@ -1,6 +1,8 @@
 #ifndef FAST_SHADOW_MAP_H
 #define FAST_SHADOW_MAP_H
 
+#include <math.h> // powf, for the split ladder below
+
 // Shared limits and default parameters for the cascaded shadow-map effect.
 //
 // The effect renders the frame's shadow casters depth-only from the key light's point of view into a
@@ -60,11 +62,33 @@
 // RECEIVE the world layer's shadows at every distance -- this shortens the casting, not the shading.
 #define SHADOW_MAP_ACTOR_CASCADES 2
 
+// Levels a clipmap may have. Declared here rather than beside the rest of its contract because
+// the slice arithmetic below needs it; the reasoning is with SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS.
+#define SHADOW_MAP_MAX_CLIPMAP_LEVELS 10
+
+// Levels either layout may ask for, and therefore the size of everything held per level: the fitted
+// matrices, the parking state, the update divisors. The clipmap is the one that wants more.
+#define SHADOW_MAP_MAX_LEVELS \
+    (SHADOW_MAP_MAX_CASCADES > SHADOW_MAP_MAX_CLIPMAP_LEVELS ? SHADOW_MAP_MAX_CASCADES \
+                                                             : SHADOW_MAP_MAX_CLIPMAP_LEVELS)
+
 // Slices are laid out world-layer-first: world cascade C is slice C, actor cascade C is slice
 // cascadeCount + C. The actor half is the shorter one, so the total is not a simple product.
 #define SHADOW_MAP_ACTOR_CASCADES_FOR(count) ((count) < SHADOW_MAP_ACTOR_CASCADES ? (count) : SHADOW_MAP_ACTOR_CASCADES)
 #define SHADOW_MAP_SLICES_FOR(count) ((count) + SHADOW_MAP_ACTOR_CASCADES_FOR(count))
-#define SHADOW_MAP_MAX_SLICES SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)
+
+// The TEXTURE array has to hold whichever layout asks for more slices, and the clipmap asks for more: six
+// levels against three cascades (see SHADOW_MAP_MAX_CLIPMAP_LEVELS, further down).
+//
+// Only the texture grows. The constant buffer's matrix array stays at SHADOW_MAP_MAX_CASCADES, because the
+// clipmap has no per-level matrix to put in it -- every level shares one basis and differs by a power of
+// two, so its projection is arithmetic in the shader. That is the difference between this being a change to
+// an allocation and a change to every shader that samples a shadow.
+#define SHADOW_MAP_MAX_SLICES                                                    \
+    (SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES) >                            \
+             SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CLIPMAP_LEVELS)                \
+         ? SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CASCADES)                        \
+         : SHADOW_MAP_SLICES_FOR(SHADOW_MAP_MAX_CLIPMAP_LEVELS))
 
 // SOH [Enhancement] Content key meaning "nothing will be drawn into this slice at all".
 //
@@ -139,9 +163,17 @@
 #define SHADOW_MAP_CASTER_SLOT_MAIN 0    // the room mesh in the world layer; characters in the actor layer
 #define SHADOW_MAP_CASTER_SLOT_SCENERY 1 // scenery actors, world layer only, rebuilt every frame
 
-// Per-cascade square resolution bounds. 4096 is the largest the near cascade is ever asked for, and
-// anything under 256 produces texels so large that the bias needed to hide the acne swallows the
-// shadow itself.
+// Per-cascade square resolution bounds. Anything under 256 produces texels so large that the bias needed
+// to hide the acne swallows the shadow itself.
+//
+// 4096 is the ceiling, and it is a measured one rather than a hardware limit -- feature level 10.0
+// guarantees 8192, and 8192 was offered briefly and taken back out for being unusable in practice. A D16
+// slice quadruples with each step: 8 MB at 2048, 32 at 4096, 128 at 8192. Three cascades at 8192 is 640 MB
+// with the actor layer, and eight clipmap levels at 8192 is over a gigabyte.
+//
+// The clipmap's answer to wanting sharper shadows is MORE LEVELS at a moderate resolution, not fewer at an
+// extreme one: levels cost linearly and a level does not have to be large to be sharp. That is the knob
+// this ceiling is pointing at.
 #define SHADOW_MAP_MIN_RESOLUTION 256
 #define SHADOW_MAP_MAX_RESOLUTION 4096
 #define SHADOW_MAP_DEFAULT_RESOLUTION 4096
@@ -183,7 +215,7 @@
 // maps across this band and blends with smoothstep, which is what keeps the resolution change from
 // showing up as a hard line sweeping across the ground as the camera moves ("cascade popping").
 // Expressed as a fraction so the band scales with each cascade's size.
-#define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.1f
+#define SHADOW_MAP_DEFAULT_BLEND_FRACTION 0.2f
 
 // Slope-scaled bias, handed to the rasterizer: a multiple of the polygon's own depth gradient across a
 // texel. Being relative to the gradient is exactly right -- it is nearly nothing on a surface facing the
@@ -205,6 +237,10 @@
 // been 4.0 and 2.0 in earlier revisions, when a stack of other bias terms sat on top of it; with those gone
 // this may well need to move. It is a starting point, not a tuned value.
 #define SHADOW_MAP_SLOPE_BIAS 1.0f
+
+// D16 stores quantized depths. The slope term vanishes on light-facing surfaces, so retain two
+// representable depth steps for rasterization/interpolation error even when the slope is zero.
+#define SHADOW_MAP_DEPTH_BIAS_UNITS 2
 
 // Front-face culling was implemented here and removed. It ends self-shadowing acne at its source rather
 // than biasing it out of sight -- store only the BACK of each caster and the surface the light strikes is
@@ -315,30 +351,8 @@
 // How far the key light may swing before the cascades are rebuilt around the new direction, as the cosine
 // of the angle. 0.999999 is about a twelfth of a degree.
 //
-// The cascade centre is snapped to whole texels along the LIGHT's own axes, which is what stops shadow edges
-// shimmering as the camera moves. That only works if those axes hold still: the game's environment light
-// turns continuously with the time of day, and a basis that turns with it is a grid that turns with it, so
-// the snapping would be measuring against a ruler that keeps rotating.
-//
-// So the direction is held, and released in one step when it has drifted past this threshold. The cost is
-// that the whole grid re-aligns at once when that happens -- and this number decides whether that step is a
-// detail or the loudest thing on screen.
-//
-// It was 0.9994, about two degrees, and two degrees is enormous. What moves is the shadow's TIP, by roughly
-// the caster's height over sin squared of the sun's elevation, times the angle: at the default elevation
-// floor that is 5.7 world units for Link, 19 for a wall, and 57 for a castle tower -- Link's whole height,
-// arriving in a single frame, once every eighty frames. The jump scales with the caster, which is exactly
-// why it reads as "everything except the actors": a character's shadow is short and its own movement covers
-// the step, while the architecture's shadow is long and visibly jolts.
-//
-// A twelfth of a degree puts those at 0.23, 0.78 and 2.34 units, under one texel of the cascade the
-// architecture is usually in, and it fires every three frames instead of every eighty. That reads as motion
-// rather than as a jolt.
-//
-// Firing more often costs cascade rebuilds, and measurement says that cost is already spent: profiling this
-// scene showed all five slices redrawn on 60 of 60 frames during play, so the cascades were never being held
-// still by this anyway. It was buying grid stability alone, and buying far more than the shimmer was worth.
-#define SHADOW_MAP_LIGHT_DIR_HYSTERESIS_COS 0.999999f
+// Light directions are supplied at rendered-frame precision. Do not quantize or hold them here:
+// angular steps are amplified by tall scenery, even when the camera is stationary.
 
 // Strength of the shadow where it is fully occluded (0 = invisible, 1 = black).
 #define SHADOW_MAP_DEFAULT_STRENGTH 0.5f
@@ -409,6 +423,631 @@
 // 6, 8 and 9 were retired with the machinery they measured; the numbering of the rest is deliberately
 // unchanged, so 5 still means what it meant. The shader's PSMain carries the reading order -- which view to
 // check first, and what each answer rules out. Keep this bound in step with the arms implemented there.
+// One-shot capture requests are consumed by the DirectX backend; not saved settings.
+#define SHADOW_MAP_CAPTURE_REQUEST_CVAR "gFast.ShadowCapture.Request"
+#define SHADOW_MAP_CAPTURE_CONTEXT_CVAR "gFast.ShadowCapture.Context"
+#define SHADOW_MAP_CAPTURE_STATUS_CVAR "gFast.ShadowCapture.Status"
+
 #define SHADOW_MAP_MAX_DEBUG_VIEW 7
+
+
+// ===================================================================================================
+// SOH [Enhancement] Edge quality: the five techniques that attack a stair-stepped shadow edge.
+//
+// Everything above this line describes WHERE a shadow is. Everything below describes what its EDGE looks
+// like once it is in the right place, which is a separate question and was the one left unanswered: the
+// receiver samples a single bilinear quad, so the penumbra is exactly one texel wide and the boundary can
+// only move in whole-texel steps. At the default ladder that step is 0.09, 0.74 and 3.6 world units in the
+// three bands -- one to two screen pixels through most of the useful range, which is read as a staircase.
+//
+// Four independent techniques, each switchable on its own and each with its own tuning, because they attack
+// the same artefact at different points in the pipeline and stack rather than compete:
+//
+//   Analytic edge  -- receiver.  Recovers the sub-texel position of the boundary inside the quad already
+//                                fetched. No extra taps.
+//   Jitter         -- receiver.  Rotates tap offsets per pixel, trading the step for dither.
+//   Filterable map -- map.       Stores a filterable quantity (ESM/VSM/MSM) and blurs the map itself, so
+//                                the receiver stays one fetch and softness stops costing taps.
+//   Ladder         -- fit.       Redistributes cascade range so the texel size is uniform instead of
+//                                350/2500/6000's 40x spread.
+//
+// The policy split is the same as everything above: the framework owns the technique, the application owns
+// the tuning and pushes it in as one struct. No app-specific CVar keys live here, only the defaults and the
+// bounds the framework will honour.
+// ===================================================================================================
+
+// --- Technique 2: analytic edge reconstruction -----------------------------------------------------
+//
+// The receiver already fetches the 2x2 quad of stored depths around the sample point and compares each.
+// Bilinear-weighting those four binary results gives a boundary that is continuous but only one texel
+// wide, and whose iso-contour follows the texel grid's own diagonals -- which is the staircase.
+//
+// Estimate the contour from the four binary comparisons and widen its coverage ramp.
+// Do not interpolate raw depth magnitudes: adjacent texels can belong to unrelated
+// surfaces, and that would move the contour with their separation. This approximation
+// does not recover an exact geometric silhouette from four depth samples.
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE 1
+
+// Width of the approximate coverage ramp in texels. Larger values soften the edge
+// without adding texture reads.
+#define SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH 2.0f
+#define SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH 4.0f
+
+// --- Technique 3: stochastic jitter ----------------------------------------------------------------
+//
+// Rotate the tap pattern by a per-pixel angle instead of holding it on the grid. The step does not get
+// smaller, but it stops being the SAME step for neighbouring pixels, so the eye reads dither rather than a
+// staircase. Costs one hash and a rotation; the tap count is what it is.
+//
+// The honest caveat, stated here because it decides whether this is worth switching on: this renderer has
+// FXAA and no temporal accumulation. Dither with nothing to average it over is grain, and grain in motion
+// is its own artefact. It is offered because on a still image at a moderate tap count it is clearly better
+// than the staircase, and because whether the trade is acceptable is a matter of taste that a constant
+// cannot settle.
+#define SHADOW_MAP_DEFAULT_JITTER 1
+
+// Taps in the rotated pattern. Each is a full bilinear quad fetch, so this is the one knob here that costs
+// real bandwidth, and it is also what decides whether the dither reads as softness or as noise.
+#define SHADOW_MAP_DEFAULT_JITTER_TAPS 8
+#define SHADOW_MAP_MAX_JITTER_TAPS 16
+
+// Radius of the rotated pattern, in texels of the cascade being sampled.
+#define SHADOW_MAP_DEFAULT_JITTER_RADIUS 2.0f
+#define SHADOW_MAP_MAX_JITTER_RADIUS 8.0f
+
+// --- Static caster cache ------------------------------------------------------------------------
+//
+// A slice's casters divide into two kinds that behave nothing alike. The room mesh is a cache: uploaded
+// once and rebuilt only when the scene itself changes. The scenery ACTORS are per frame -- a gate slides,
+// a tree sways -- and cannot be cached on geometry, because the geometry is the same and the matrix is not.
+//
+// Today a slice holds both and is redrawn as a unit. So one swaying tree costs the whole room mesh again,
+// in every slice the tree reaches, every frame it moves. That is the case this exists for. It is not a
+// corner case: chunking the scenery list was already added to stop a single tree invalidating all three
+// world cascades, which says how often it happens.
+//
+// THE SPLIT. Keep a second copy of each world slice holding the STATIC casters alone. Each frame, copy that
+// into the live slice and draw only what moved on top. The copy replaces both the clear and the room mesh's
+// rasterisation.
+//
+//   4096  a slice costs about 420 us to redraw; the copy is about 62 us
+//   1024  the copy is about 4 us, which is nothing
+//
+// WHAT IT COSTS is a second array the size of the world layer's:
+//
+//   cascades at 4096   +96 MB      cascades at 2048   +24 MB
+//   clipmap at 1024    +12 MB      clipmap at 2048    +48 MB
+//
+// Which is why it is off by default and why it belongs beside the clipmap: the layout that wants many
+// small levels is exactly the one where a second copy is cheap. At 4096 cascades this is a real 96 MB, and
+// worth it only in a scene with scenery that actually moves.
+//
+// WHAT IT DOES NOT HELP. A settled scene already redraws nothing -- the parking and the content keys see to
+// that -- so this changes nothing there. It buys back the cost of movement, not the cost of standing still.
+#define SHADOW_MAP_DEFAULT_STATIC_CACHE 0
+
+// What ShadowMapBeginCascadeSplit answers, and therefore what the caller must draw.
+#define SHADOW_MAP_SLICE_REUSED 0  // nothing at all: the live slice already holds this image
+#define SHADOW_MAP_SLICE_FULL 1    // draw the static casters, then the dynamic ones
+#define SHADOW_MAP_SLICE_DYNAMIC 2 // the static half was copied in; draw only what moved
+
+// --- Shadow clipmap ------------------------------------------------------------------------------
+//
+// A second way of laying the map out, chosen instead of the cascade ladder. The idea is the directional
+// half of Unreal's Virtual Shadow Maps, minus the part that does not port.
+//
+// WHAT A CLIPMAP IS. Rather than N slabs fitted to N slices of the view frustum, it is N nested squares
+// CENTRED ON THE CAMERA, each exactly twice the world extent of the one inside it. Level 0 is small and
+// fine; each level out doubles its extent and therefore doubles its texel. Which level a pixel reads is a
+// function of how far it is from the centre, not of which band of view depth it fell in.
+//
+// WHY IT IS BETTER HERE, and it is not a small difference:
+//
+//   The texel ratio between neighbours is exactly 2. The hand-fitted ladder's is 3 to 8 -- measured at
+//   0.09, 0.74 and 3.6 world units -- and that jump is what a cross-fade has to hide. A factor of two is
+//   most of the way to invisible before any blending is applied.
+//
+//   The boundaries are circles around the camera, so they travel WITH the player instead of sweeping
+//   across the world as the camera moves. A seam that moves with you is one you stop noticing.
+//
+//   Levels can be far smaller. Density is uniform, so a level does not need 4096 to be sharp where it
+//   matters: six levels at 1024 is 6.3 megatexels against three at 4096's 50. Eight times less memory and
+//   eight times less fill, better distributed.
+//
+// WHAT IS NOT PORTED, and why. Unreal's version is virtual in the memory sense: a page table, a physical
+// page pool, and per-page allocation driven by which pages the visible pixels actually touch. That needs
+// compute shaders, indirect draw, atomics and a depth prepass, and it is practical there because Nanite
+// can re-rasterise geometry cheaply. This renderer has none of those -- the receiver is compiled by FXC
+// inside the frame, and the geometry is N64 display lists resubmitted per level. The LAYOUT is the part
+// that ports, and the layout is where the image quality lives.
+//
+// THE SHADER HAS NO ARRAY, which is what makes this affordable at ps_4_0 rather than merely desirable.
+// Every level shares one light basis and differs only by a power of two, so the level, its extent, its
+// texel and its snapped centre are all ARITHMETIC -- there is no per-level matrix to index, no comparison
+// chain over splits, and no dynamically indexed constant-buffer array (which ps_4_0 does not allow, and
+// which tools/shader-validate cannot warn about because Wine's compiler accepts it). The clipmap receiver
+// is smaller than the cascade one despite covering twice as many levels.
+#define SHADOW_MAP_LAYOUT_CASCADE 0 // the fitted ladder. What everything above describes.
+#define SHADOW_MAP_LAYOUT_CLIPMAP 1
+#define SHADOW_MAP_LAYOUT_MAX 1
+#define SHADOW_MAP_DEFAULT_LAYOUT SHADOW_MAP_LAYOUT_CASCADE
+
+// Levels in the clipmap, and the knob to reach for when the range is short.
+//
+// Levels cost LINEARLY and buy range EXPONENTIALLY, which is the whole shape of this ladder and is the
+// opposite of how the cascade count behaves. One more level doubles the reach for the price of one more
+// slice -- and a clipmap slice is small, because uniform density means no level has to be large to be
+// sharp. Measured across the plausible settings:
+//
+//   levels  base   res    reach    texel L0   memory
+//        6   190  4096     6080       0.093    192 MB
+//        8   120  2048    15360       0.117     64 MB
+//       10   100  2048    51200       0.098     80 MB
+//
+// So more levels at a lower per-level resolution beats fewer at a high one on every axis that matters.
+// Ten is the bound because the depth pass still costs per slice and every level past the horizon is a
+// slice drawn for nothing.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS 8
+
+// Half the world extent of level 0, in world units. The whole ladder follows: level i is this times 2^i,
+// and the outermost reaches base * 2^(levels-1).
+//
+// 120 with eight levels reaches about 15000 -- two and a half times the cascade ladder -- while level 0 is
+// 240 units across, which at 2048 is 0.117 world units per texel underfoot.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_BASE 120.0f
+#define SHADOW_MAP_MIN_CLIPMAP_BASE 20.0f
+#define SHADOW_MAP_MAX_CLIPMAP_BASE 2000.0f
+
+// Per-level square resolution for the clipmap, and its OWN setting rather than the cascade ladder's.
+//
+// It was a dead constant at first -- declared, and the clipmap left sharing Graphics.ShadowMap.Resolution
+// with the cascades. That coupling is wrong in both directions: a clipmap wants many small levels and a
+// cascade ladder wants few large ones, so a resolution that suits one starves or bankrupts the other. Six
+// levels at the cascade default of 4096 is 192 MB, which is most of why raising the level count looked
+// unaffordable when it is in fact the cheapest knob here.
+//
+// 4096, and 2048 was measured to be a regression rather than a saving. Against the cascade ladder at its
+// own 4096, in world units per texel at a given distance from the camera:
+//
+//     dist   ladder   clip@2048   clip@4096
+//      150    0.090       0.234       0.117
+//      400    0.740       0.469       0.234
+//      900    0.740       0.938       0.469
+//     2000    0.740       3.750       1.875
+//     4000    3.600       7.500       3.750
+//
+// At 2048 the clipmap loses at nearly every distance -- five times worse at 2000 units. At 4096 it wins or
+// ties almost everywhere. A layout meant to replace the ladder must not be coarser than it.
+//
+// The reason it needs the higher number is structural and worth stating, because no setting fixes it: a
+// clipmap level is a SQUARE CENTRED ON THE CAMERA and a cascade is a slab FITTED TO THE VIEW FRUSTUM. The
+// camera looks one way, so the square spends most of its area on ground nobody is looking at. That is the
+// price of boundaries that travel with the player and of a texel ratio of exactly two; the density has to
+// be bought back with resolution.
+//
+// Eight levels at 4096 is 256 MB for the world layer. The actor layer's two levels cover only the innermost
+// squares -- a few hundred units -- so 4096 there is extravagant, and Resolução (Personagens) is a separate
+// setting for exactly this reason: dropping it to 1024 takes 60 MB off the total.
+#define SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION 4096
+
+// --- Edge hardening ------------------------------------------------------------------------------
+//
+// Everything above widens or smooths the boundary. This is the control in the other direction: find the
+// boundary and compress it, for a harder, more defined outline.
+//
+// The "finding" is free and needs no extra fetches, because coverage already carries it. A value at 0 or 1
+// is interior -- fully shadowed or fully lit -- and only the boundary produces anything in between. So the
+// remap below acts ONLY on the edge by construction: interiors map to themselves whatever the setting, and
+// the width of the ramp is the whole of what changes.
+//
+// Applied AFTER the raw coverage is taken for diagnostics, which is what debug view 5 has always promised
+// -- it shows "the filter's raw coverage, before the hardening remap". There was one before the rollback
+// and the view outlived it; this puts the value the view describes back under it. So a boundary that is
+// faceted in view 5 and faceted on screen is faceted in the comparison, and one that is smooth in view 5
+// and hard on screen is this.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDEN 0
+
+// How far the ramp is compressed towards a step. 0 leaves coverage exactly as it arrived; 1 is a hard
+// threshold with no transition at all.
+//
+// A hard threshold is not automatically what is wanted: the penumbra carries the cascade's texel size, so
+// removing it removes the only cue that distance is being sampled more coarsely, and the boundary starts
+// showing the texel grid it was hiding. Somewhere short of 1 is usually where this lands.
+#define SHADOW_MAP_DEFAULT_EDGE_HARDNESS 0.5f
+
+// Where in the coverage range the boundary is taken to be. 0.5 is the geometric answer -- half the kernel
+// occluded is the edge.
+//
+// Moving it GROWS or SHRINKS the shadow: below 0.5 a lightly-occluded pixel counts as shadowed and the
+// shadow spreads; above it the shadow pulls in. Worth having next to the hardness, because compressing a
+// ramp around a shifted centre is how an outline is thickened or thinned rather than merely sharpened.
+#define SHADOW_MAP_DEFAULT_EDGE_THRESHOLD 0.5f
+
+// --- Technique 4: cascade split ladder -------------------------------------------------------------
+//
+// Where the cascade boundaries fall, which decides the texel size in each band and therefore how big the
+// staircase step is before any filtering touches it.
+//
+// The hand-drawn ladder (350 / 2500 / 6000) spends the near cascade on a band so short that its texel is
+// 0.09 world units -- finer than anything can be seen at that distance -- and then hands the middle band a
+// texel eight times coarser and the far band forty times coarser. Uniforming that spread is free: it is
+// three numbers, no shader and no new memory, and it shrinks the step exactly where the step is visible.
+#define SHADOW_MAP_LADDER_MANUAL 0    // whatever the application's split sliders say. The existing behaviour.
+#define SHADOW_MAP_LADDER_PRACTICAL 1 // blend of uniform and logarithmic, by lambda below.
+#define SHADOW_MAP_LADDER_MAX 1
+#define SHADOW_MAP_DEFAULT_LADDER_MODE SHADOW_MAP_LADDER_MANUAL
+
+// Blend between a uniform ladder (0) and a logarithmic one (1), the standard "practical split scheme".
+//
+// Logarithmic is what makes the texel size uniform across bands, which is the point; pure logarithmic
+// however puts the first split extremely close to the camera, and a cascade that covers almost nothing
+// wastes a whole slice. The blend is the usual compromise and 0.75 is where it is normally landed.
+#define SHADOW_MAP_DEFAULT_LADDER_LAMBDA 0.85f
+
+// The near distance the ladder is generated from. Not the camera's actual near plane, which is small
+// enough to drag the first split down to nothing; this is the distance at which shadows start being worth
+// resolving finely.
+#define SHADOW_MAP_DEFAULT_LADDER_NEAR 40.0f
+
+// Generate the split ladder for `count` cascades out to `farDistance`, into splits[0..count-1].
+//
+// The practical split scheme: split i is a blend of the uniform ladder (near + (far-near) * i/N, which
+// keeps each band the same DEPTH) and the logarithmic one (near * (far/near)^(i/N), which keeps each band
+// the same RATIO and therefore each texel the same size). Lambda picks between them.
+//
+// Lives in the header rather than in the interpreter because the menu wants to show the numbers it is about
+// to produce, and a preview that reimplements the formula is a preview that can disagree with it.
+//
+// A no-op when mode is MANUAL: the caller's splits are left exactly as they arrived.
+static inline void ShadowMapLadderSplits(int mode, float lambda, float nearDistance, float farDistance, int count,
+                                         float* splits) {
+    int i;
+    if (splits == 0 || count < 1 || mode != SHADOW_MAP_LADDER_PRACTICAL) {
+        return;
+    }
+    if (nearDistance < 1.0f) {
+        nearDistance = 1.0f;
+    }
+    if (farDistance <= nearDistance) {
+        farDistance = nearDistance + 1.0f;
+    }
+    for (i = 0; i < count; i++) {
+        const float fraction = (float)(i + 1) / (float)count;
+        const float uniform = nearDistance + ((farDistance - nearDistance) * fraction);
+        const float logarithmic = nearDistance * powf(farDistance / nearDistance, fraction);
+        splits[i] = (lambda * logarithmic) + ((1.0f - lambda) * uniform);
+    }
+    // The last split IS the range (see SHADOW_MAP_DEFAULT_SPLIT_2), so it must land exactly on it rather
+    // than on whatever the blend rounds to -- the caster capture reads this number.
+    splits[count - 1] = farDistance;
+}
+
+// --- Shadow acne -----------------------------------------------------------------------------------
+//
+// A surface shadowing itself. The depth pass records a surface at one depth; the receiver asks about the
+// same surface and gets an answer a fraction off, and half the texels come back "occluded". At a grazing
+// view angle the striping projects into long rays converging at the horizon, which is why it reads as a
+// starburst on the ground rather than as stripes.
+//
+// The system's standing defence is the rasterizer's slope-scaled bias (SHADOW_MAP_SLOPE_BIAS), applied
+// while the depth map is written, and for the ordinary receiver it is enough: that receiver's world
+// position is the interpolated vertex position, which is the exact surface the depth pass rasterised.
+//
+// These exist for where it is not enough -- a cascade whose texel has grown very large, a surface almost
+// edge-on to the light, a scene the ladder is stretched across. They are off by default because the system
+// does not normally need them.
+//
+// Each is a different place to intervene, and they compose:
+//
+//   Normal offset -- move the sample point off the surface along its own normal, before projecting. The
+//                    only one that is correct in principle rather than a fudge: the error being corrected
+//                    is a displacement in world space, and this is a displacement in world space. Costs
+//                    nothing at the contact point, because the offset is along the surface, not along the
+//                    light -- so it does not detach a shadow from its caster the way a depth bias does.
+//
+//   Light offset  -- move the sample point toward the light. Simple, and the classic cause of "peter
+//                    panning": push far enough to clear the acne and a shadow visibly parts from the foot
+//                    of the thing casting it.
+//
+//   Depth bias    -- subtract from the receiver's depth after projecting. Cheapest, and the least
+//                    discriminating: it acts the same on a surface facing the light, where there was
+//                    never any acne to remove, as on one edge-on to it.
+//
+//   Slope scaling -- multiply whichever of the above are on by how edge-on the surface is to the light.
+//                    Acne is a grazing-angle problem, so scaling by the angle spends the correction where
+//                    it is needed and nearly nothing where it is not.
+
+// Whether the corrections run at all.
+//
+// ON, and these values are a player's, taken from a tuned config rather than reasoned to. The rasterizer's
+// own slope bias is the standing defence and is usually enough; where it was not, the combination below --
+// a small normal offset, slope-scaled, and nothing else -- was what cleared it in practice.
+#define SHADOW_MAP_DEFAULT_ACNE_ENABLED 1
+
+// Normal offset, in multiples of the sampled cascade's texel. Expressed in texels rather than world units
+// because the error it corrects is itself a texel-sized quantity -- a fixed world offset would be far too
+// large in the near cascade and far too small in the far one.
+#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET 1
+#define SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS 0.6f
+#define SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS 8.0f
+
+// Scale the corrections by how edge-on the surface is to the light, as 1 - N.L clamped by the ceiling
+// below. On by default because it is what keeps the corrections from acting where there is no acne.
+//
+// The ceiling matters: 1/(N.L) runs to infinity as a surface turns edge-on, and an unbounded offset there
+// throws the sample point far enough to sample a different part of the scene entirely.
+#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED 1
+#define SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX 3.5f
+#define SHADOW_MAP_MAX_ACNE_SLOPE_MAX 10.0f
+
+typedef struct ShadowMapAcne {
+    int enabled;           // 0/1 -- master switch for every correction below
+    int normalOffset;      // 0/1
+    float normalTexels;    // multiples of the sampled cascade's texel
+    int slopeScaled;       // 0/1 -- scale the offset above by how edge-on the surface is
+    float slopeMax;        // ceiling on that scale
+} ShadowMapAcne;
+
+// --- Technique 6: interpolated stored depth, where the quad agrees -------------------------------
+//
+// What it is for: the TEETH on a surface that lies nearly along the light. Not the staircase along a
+// silhouette -- a different defect, with a different cause, that no amount of filtering removes.
+//
+// The stored depth is constant inside a texel; the receiver's depth is not. So the line where one crosses
+// the other can only turn at texel boundaries, and it turns by however much the receiver's depth moved
+// across that texel. On a surface facing the light that is a fraction of a texel and invisible. On one
+// lying nearly ALONG the light -- a castle wall under a sun near the zenith, which is 79.7 degrees in the
+// capture this was measured on -- the receiver's depth sweeps a texel's worth of range in a few pixels and
+// the crossing line becomes a comb, one tooth per texel.
+//
+// The teeth grow with magnification, because the tooth IS one texel step. Measured as the peak-to-peak
+// residual of the shadow's boundary after its slope is removed, on the capture's facade geometry (a stored
+// surface stepping 117 quanta across a 2x2 quad, a receiver crossing it at a grazing angle) and against
+// THIS kernel, the one where ShadowReceiverDepths gives every texel its own point on the receiver plane:
+//
+//     screen pixels per texel      18        36        73
+//     comparing per texel       45.6 px   92.9 px  190.2 px
+//     + four-tap filtering      29.2 px   58.5 px  118.7 px    <- blurs the teeth, does not remove them
+//     + interpolated depth       1.4 px    2.0 px    3.3 px
+//
+// The middle row is why more filtering is not the answer: the comb survives it, because every tap lands in
+// the same wrongly-quantised place. Interpolating the stored depth turns the staircase back into the line
+// it was sampling, and the residual stops tracking magnification -- it is what the last row says.
+//
+// Two earlier numbers here were wrong and are worth naming rather than quietly replacing. The first table
+// (5.9 / 13.1 / 23.5 px) measured a SILHOUETTE, occluder against empty map, which is precisely the case
+// this technique refuses to touch; it never measured the crossing. The "15 px" that replaced it came from
+// the right kernel but was read off a picture rather than fitted. The numbers above are the crossing, in
+// this kernel, fitted.
+//
+// That is the opposite of what a shadow kernel must do at a SILHOUETTE. There the four texels belong to
+// different surfaces, a depth interpolated between them is a depth nothing occupies, and every object
+// would get a grey halo. So it is applied only where the four texels AGREE, and the threshold below is
+// where that stops: past it the kernel goes back to comparing first and filtering after. On the
+// silhouette-rich ground of the same capture that side does not merely hold, it improves -- mean deviation
+// from the discrete truth 0.0052 against the plain filter's 0.0060, and 0.1432 against 0.2539 at the 99th
+// percentile -- because most real silhouettes on that ground are occluder against EMPTY map, and the empty
+// guard below catches those before the threshold is consulted at all.
+//
+// It applies over SMSR as well, and there it is not redundant: SMSR answers the silhouette, this answers
+// the crossing, and the agreement test decides which one speaks. See ShadowSmoothOverSMSR in the shader --
+// SMSR alone still leaves 17.5 px of teeth on the facade and still grows with magnification.
+//
+// On the filtered path it costs no extra fetch: the four depths are already read for the bilinear kernel,
+// and this is one dot product, a min, a max and a lerp on values already in registers. Over SMSR it costs
+// one Gather, and only when both are on.
+//
+// Default OFF, and it was ON for one build. That build was played and reported worse: teeth present with
+// the switch on, mostly gone with it off. The measurements above are not wrong, they were incomplete --
+// every one of them scored WHERE the boundary lands and none scored whether it lands softly. This
+// technique replaced the kernel's coverage with a step, so it removed the quantisation teeth and handed
+// back sampling teeth, and a metric that only looks at position cannot see the difference.
+//
+// So: off until the coverage is right (see ShadowSmoothCoverage in the shader, which is the fix), and the
+// bar for turning it back on is a report from the game, not another number.
+#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 0
+
+// How close the four texels must be to count as one surface, in normalised depth.
+//
+// 0.0046 is about three hundred D16 quanta. It has to sit above the step the TARGET surface takes across a
+// quad and below a real silhouette, and the first of those is what the previous value (0.0012, eighty
+// quanta) got wrong: eighty was measured on flat ground, where a quad spans a median of 3 quanta. The
+// grazing wall this technique exists for spans 117 -- the whole reason it has teeth is that its stored
+// depth moves fast per texel -- so the threshold sat BELOW its target and the weight was zero exactly where
+// the effect was needed. Measured: at eighty the boundary residual is 29.2 / 58.5 / 118.7 px, identical to
+// the plain filter to the digit, because the technique never engaged.
+//
+// Three hundred is between 117 and a real silhouette's 927 (99th percentile on the same capture's ground),
+// which is what makes it uncritical rather than tuned: 200 and 500 give the same answer to a tenth of a
+// pixel, and the ground's deviation from the discrete truth falls monotonically across that whole span.
+#define SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT 0.0046f
+// The floor is 0.0030, not 0.0001, because PARTIAL engagement is the failure mode and the old floor sat
+// in the middle of it.
+//
+// A capture from a played build came back with this at 0.0020 -- 131 quanta -- against a wall whose quads
+// span 117 to 149. The weight is then neither 0 nor 1 but somewhere between, and it changes from quad to
+// quad, because the spread it is computed from is a per-quad quantity. Blending two different answers with
+// a weight that steps every texel writes the texel grid straight into the penumbra. Measured as the energy
+// at texel frequency inside the transition band: 0.269 at that setting, against 0.004 with the threshold
+// clear of the wall. The player's word for it was teeth, more discreet than before but there.
+//
+// 0.0030 is 196 quanta, above every grazing surface measured on either capture (117, 149) and well below a
+// real silhouette (927 at the 99th percentile). Clamping rather than only changing the default is
+// deliberate: the bad value is already saved in someone's config, and a default does not reach them.
+#define SHADOW_MAP_MIN_SMOOTH_AGREEMENT 0.0030f
+#define SHADOW_MAP_MAX_SMOOTH_AGREEMENT 0.0100f
+
+// --- Holding the sun still -------------------------------------------------------------------------
+//
+// What it is for: the RIPPLE that travels along a shadow's edge with nobody moving. Not a snapping bug --
+// the cascade centre is snapped to whole texels and the radius is held, and both work. The sun is simply
+// fast.
+//
+// Measured from a capture the game wrote: dayTime advanced 10 units in one frame, which over a 65536-unit
+// day is 0.0549 degrees per frame, a full day in 109 seconds at 60 fps. A rotation of dTheta moves the
+// shadow of a caster h units up by h*dTheta, so:
+//
+//     caster height        50      100      300      600 units
+//     shadow moves       0.048    0.096    0.288    0.575 units per frame
+//     in cascade-0 texels 0.08     0.15     0.46     0.92
+//
+// A castle tower is the last column. Its shadow's edge crosses a texel boundary about once per frame, and
+// not at the same moment all along its length -- so the crossing runs along the edge, which is exactly
+// what a travelling ripple is.
+//
+// Holding the direction makes the whole edge step together instead, but it is a straight trade and the
+// arithmetic is exact: a rotation of dTheta moves a point at distance R by R*dTheta, and the cascade's
+// texel is 2R/resolution, so the movement is dTheta*resolution/2 texels REGARDLESS of which cascade. To
+// stand still for N frames you accept a jump of N texels. There is no setting that gets both.
+//
+//     hold until     1        2        4        8       16 texels of jump
+//     still for    1.0      2.0      4.1      8.1     16.3 frames
+//
+// So this is a control and not a fix, and the default is the behaviour that was already there. It is here
+// because the trade was decided once without anyone seeing both sides in motion, and that is the player's
+// call, not a measurement's.
+#define SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS 0.0f
+#define SHADOW_MAP_MAX_SUN_HOLD_TEXELS 32.0f
+
+// --- The struct the application pushes -------------------------------------------------------------
+//
+// One struct rather than twenty arguments, because these travel together through five layers (menu ->
+// per-frame snapshot -> interpreter -> rendering API -> constant buffer) and adding a knob should not mean
+// editing five signatures. Plain C layout: this header is included from both sides of the C boundary.
+//
+// Zero-initialising this gives every technique OFF and every tuning at zero, which is not the same as the
+// defaults -- call ShadowMapQualityDefaults() rather than relying on {}.
+#define SHADOW_MAP_DEFAULT_SMSR 0
+#define SHADOW_MAP_DEFAULT_SMSR_STEPS 16
+#define SHADOW_MAP_MAX_SMSR_STEPS 64
+#define SHADOW_MAP_DEFAULT_SMSR_EPSILON 0.00002f
+#define SHADOW_MAP_MAX_SMSR_EPSILON 0.001f
+
+typedef struct ShadowMapQuality {
+    int smsr;             // binary silhouette revectorization, bypasses all shadow filtering
+    int smsrMaxSteps;      // maximum texels traversed in each direction
+    float smsrEpsilon;     // near-equality tolerance in normalized shadow depth
+    // Technique 1 -- filterable maps
+
+    // Technique 2 -- analytic edge
+    int analyticEdge;         // 0/1
+    float analyticEdgeWidth;  // texels
+
+    // Technique 3 -- stochastic jitter
+    int jitter;          // 0/1
+    int jitterTaps;      // 1..SHADOW_MAP_MAX_JITTER_TAPS
+    float jitterRadius;  // texels
+
+    // Layout -- the cascade ladder, or the clipmap
+    int layout;           // SHADOW_MAP_LAYOUT_*
+    int staticCache;      // 0/1 -- keep a static-only copy of each world slice and blit it
+
+
+    int clipmapLevels;      // clipmap only
+    float clipmapBase;      // half-extent of level 0, world units
+    int clipmapResolution;  // per-level square resolution, independent of the cascade ladder's
+
+    // Technique 6 -- interpolated stored depth where the quad agrees
+    int smoothDepth;        // 0/1
+    float smoothAgreement;  // normalised depth spread below which the quad counts as one surface
+
+    // Hold the sun still between steps. 0 = follow it every frame (see SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS)
+    float sunHoldTexels;
+
+    // Edge hardening
+    int edgeHarden;       // 0/1
+    float edgeHardness;   // 0 = unchanged, 1 = a hard threshold
+    float edgeThreshold;  // where the boundary sits in the coverage range
+
+    // Technique 4 -- split ladder
+    int ladderMode;      // SHADOW_MAP_LADDER_*
+    float ladderLambda;  // 0 = uniform, 1 = logarithmic
+    float ladderNear;    // world units
+
+
+    // Shadow acne. Travels with the rest rather than in its own setter: it is pushed once per frame from
+    // the same place and adding a second path through five layers would buy nothing.
+    ShadowMapAcne acne;
+} ShadowMapQuality;
+
+// The defaults above, as a value. Written as a function rather than an initialiser macro so both sides of
+// the C boundary get the same one and it cannot drift.
+static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
+    ShadowMapQuality q;
+    q.smsr = SHADOW_MAP_DEFAULT_SMSR;
+    q.smsrMaxSteps = SHADOW_MAP_DEFAULT_SMSR_STEPS;
+    q.smsrEpsilon = SHADOW_MAP_DEFAULT_SMSR_EPSILON;
+    q.analyticEdge = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE;
+    q.analyticEdgeWidth = SHADOW_MAP_DEFAULT_ANALYTIC_EDGE_WIDTH;
+    q.jitter = SHADOW_MAP_DEFAULT_JITTER;
+    q.jitterTaps = SHADOW_MAP_DEFAULT_JITTER_TAPS;
+    q.jitterRadius = SHADOW_MAP_DEFAULT_JITTER_RADIUS;
+    q.layout = SHADOW_MAP_DEFAULT_LAYOUT;
+    q.staticCache = SHADOW_MAP_DEFAULT_STATIC_CACHE;
+    q.clipmapLevels = SHADOW_MAP_DEFAULT_CLIPMAP_LEVELS;
+    q.clipmapBase = SHADOW_MAP_DEFAULT_CLIPMAP_BASE;
+    q.clipmapResolution = SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION;
+    q.smoothDepth = SHADOW_MAP_DEFAULT_SMOOTH_DEPTH;
+    q.smoothAgreement = SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT;
+    q.sunHoldTexels = SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS;
+    q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
+    q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
+    q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
+    q.ladderMode = SHADOW_MAP_DEFAULT_LADDER_MODE;
+    q.ladderLambda = SHADOW_MAP_DEFAULT_LADDER_LAMBDA;
+    q.ladderNear = SHADOW_MAP_DEFAULT_LADDER_NEAR;
+    q.acne.enabled = SHADOW_MAP_DEFAULT_ACNE_ENABLED;
+    q.acne.normalOffset = SHADOW_MAP_DEFAULT_ACNE_NORMAL_OFFSET;
+    q.acne.normalTexels = SHADOW_MAP_DEFAULT_ACNE_NORMAL_TEXELS;
+    q.acne.slopeScaled = SHADOW_MAP_DEFAULT_ACNE_SLOPE_SCALED;
+    q.acne.slopeMax = SHADOW_MAP_DEFAULT_ACNE_SLOPE_MAX;
+    return q;
+}
+
+// Clamp every field into the range the framework will honour. Called by the framework on arrival rather
+// than trusted from the application, and safe to call on the application side too.
+static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
+    if (q == 0) {
+        return;
+    }
+#define SHADOW_MAP_CLAMP_(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+    q->smsr = q->smsr ? 1 : 0;
+    q->smsrMaxSteps = SHADOW_MAP_CLAMP_(q->smsrMaxSteps, 1, SHADOW_MAP_MAX_SMSR_STEPS);
+    // Reject NaN as well as out-of-range values from configuration files.
+    if (!(q->smsrEpsilon >= 0.0f && q->smsrEpsilon <= SHADOW_MAP_MAX_SMSR_EPSILON)) {
+        q->smsrEpsilon = SHADOW_MAP_DEFAULT_SMSR_EPSILON;
+    }
+    q->analyticEdge = q->analyticEdge ? 1 : 0;
+    q->analyticEdgeWidth = SHADOW_MAP_CLAMP_(q->analyticEdgeWidth, 0.25f, SHADOW_MAP_MAX_ANALYTIC_EDGE_WIDTH);
+    q->jitter = q->jitter ? 1 : 0;
+    q->jitterTaps = SHADOW_MAP_CLAMP_(q->jitterTaps, 1, SHADOW_MAP_MAX_JITTER_TAPS);
+    q->jitterRadius = SHADOW_MAP_CLAMP_(q->jitterRadius, 0.0f, SHADOW_MAP_MAX_JITTER_RADIUS);
+    q->layout = SHADOW_MAP_CLAMP_(q->layout, 0, SHADOW_MAP_LAYOUT_MAX);
+    q->staticCache = q->staticCache ? 1 : 0;
+    q->clipmapLevels = SHADOW_MAP_CLAMP_(q->clipmapLevels, 1, SHADOW_MAP_MAX_CLIPMAP_LEVELS);
+    q->clipmapBase =
+        SHADOW_MAP_CLAMP_(q->clipmapBase, SHADOW_MAP_MIN_CLIPMAP_BASE, SHADOW_MAP_MAX_CLIPMAP_BASE);
+    q->clipmapResolution =
+        SHADOW_MAP_CLAMP_(q->clipmapResolution, SHADOW_MAP_MIN_RESOLUTION, SHADOW_MAP_MAX_RESOLUTION);
+    q->smoothDepth = q->smoothDepth ? 1 : 0;
+    q->smoothAgreement =
+        SHADOW_MAP_CLAMP_(q->smoothAgreement, SHADOW_MAP_MIN_SMOOTH_AGREEMENT, SHADOW_MAP_MAX_SMOOTH_AGREEMENT);
+    // NaN as well as range: this one comes straight from a config file and multiplies an angle.
+    if (!(q->sunHoldTexels >= 0.0f && q->sunHoldTexels <= SHADOW_MAP_MAX_SUN_HOLD_TEXELS)) {
+        q->sunHoldTexels = SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS;
+    }
+    q->edgeHarden = q->edgeHarden ? 1 : 0;
+    q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
+    q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);
+    q->ladderMode = SHADOW_MAP_CLAMP_(q->ladderMode, 0, SHADOW_MAP_LADDER_MAX);
+    q->ladderLambda = SHADOW_MAP_CLAMP_(q->ladderLambda, 0.0f, 1.0f);
+    q->ladderNear = SHADOW_MAP_CLAMP_(q->ladderNear, 1.0f, 1000.0f);
+    q->acne.enabled = q->acne.enabled ? 1 : 0;
+    q->acne.normalOffset = q->acne.normalOffset ? 1 : 0;
+    q->acne.normalTexels = SHADOW_MAP_CLAMP_(q->acne.normalTexels, 0.0f, SHADOW_MAP_MAX_ACNE_NORMAL_TEXELS);
+    q->acne.slopeScaled = q->acne.slopeScaled ? 1 : 0;
+    q->acne.slopeMax = SHADOW_MAP_CLAMP_(q->acne.slopeMax, 1.0f, SHADOW_MAP_MAX_ACNE_SLOPE_MAX);
+#undef SHADOW_MAP_CLAMP_
+}
 
 #endif // FAST_SHADOW_MAP_H

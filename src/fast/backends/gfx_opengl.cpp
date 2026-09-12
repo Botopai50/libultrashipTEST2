@@ -160,6 +160,12 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
             glUniform1f(prg->toon_debug_location, mToonDebug);
             prg->lastToonDebug = mToonDebug;
         }
+        if (first || memcmp(&mToonLocalLights, &prg->lastToonLocalLights, sizeof(ToonLocalLights)) != 0) {
+            glUniform1f(prg->toon_local_enabled_location, mToonLocalLights.enabled);
+            glUniform4fv(prg->toon_local_dir_location, TOON_LOCAL_LIGHT_MAX, &mToonLocalLights.direction[0][0]);
+            glUniform4fv(prg->toon_local_color_location, TOON_LOCAL_LIGHT_MAX, &mToonLocalLights.color[0][0]);
+            prg->lastToonLocalLights = mToonLocalLights;
+        }
         prg->toonUniformsSent = true;
     }
 }
@@ -616,6 +622,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->toon_highlight_intensity_location = glGetUniformLocation(shader_program, "toon_highlight_intensity");
     prg->toon_shadow_intensity_location = glGetUniformLocation(shader_program, "toon_shadow_intensity");
     prg->toon_debug_location = glGetUniformLocation(shader_program, "toon_debug");
+    prg->toon_local_enabled_location = glGetUniformLocation(shader_program, "toon_local_enabled");
+    prg->toon_local_dir_location = glGetUniformLocation(shader_program, "toon_local_dir[0]");
+    prg->toon_local_color_location = glGetUniformLocation(shader_program, "toon_local_color[0]");
 
     LoadShader(prg);
 

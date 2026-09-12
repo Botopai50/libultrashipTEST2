@@ -23,6 +23,10 @@ struct DrawUniforms {
     float toonHighlightIntensity;
     float toonShadowIntensity;
     float toonDebug;
+    float toonLocalEnabled;
+    // Scalar arrays match the C++ simd::float1 arrays without float4 alignment padding.
+    float toonLocalDir[4][4];
+    float toonLocalColor[4][4];
 };
 
 struct Vertex {
@@ -289,12 +293,25 @@ fragment float4 fragmentShader(
         float3 toonLit = float3(drawUniforms.toonAmbient) +
                          float3(drawUniforms.toonLightColor) * drawUniforms.toonHighlightIntensity;
         float3 toonShadow = mix(toonLit, float3(drawUniforms.toonAmbient), drawUniforms.toonShadowIntensity);
+        float3 localContribution = float3(0.0);
+        if (drawUniforms.toonLocalEnabled > 0.5) {
+            for (int i = 0; i < 4; ++i) {
+                float3 localDir(drawUniforms.toonLocalDir[i][0], drawUniforms.toonLocalDir[i][1],
+                                drawUniforms.toonLocalDir[i][2]);
+                float3 localColor(drawUniforms.toonLocalColor[i][0], drawUniforms.toonLocalColor[i][1],
+                                  drawUniforms.toonLocalColor[i][2]);
+                float localNL = dot(toonN, localDir) * 0.5 + 0.5;
+                float localRamp = smoothstep(drawUniforms.toonRampCenter - drawUniforms.toonRampSoftness,
+                                             drawUniforms.toonRampCenter + drawUniforms.toonRampSoftness, localNL);
+                localContribution += localColor * drawUniforms.toonHighlightIntensity * localRamp;
+            }
+        }
         if (drawUniforms.toonDebug > 0.5) {
             // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
             // discarded — makes it obvious which draws are receiving toon lighting.
             texel.xyz = float3(toonRamp);
         } else {
-            texel.xyz = clamp(texel.xyz * mix(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            texel.xyz = clamp(texel.xyz * (mix(toonShadow, toonLit, toonRamp) + localContribution), 0.0, 1.0);
         }
     @end
 

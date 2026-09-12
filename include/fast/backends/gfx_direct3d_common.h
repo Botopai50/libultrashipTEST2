@@ -45,8 +45,13 @@ struct PerToonCB {
     float toon_highlight_intensity;
     float toon_shadow_intensity;
     float toon_debug;
-    float _toon_pad[2];
+    float toon_local_enabled;
+    float _toon_pad;
+    float toon_local_dir[TOON_LOCAL_LIGHT_MAX][4];
+    float toon_local_color[TOON_LOCAL_LIGHT_MAX][4];
 };
+static_assert(sizeof(PerToonCB) == 192, "PerToonCB must match the HLSL register layout");
+static_assert(offsetof(PerToonCB, toon_local_dir) == 64, "Local directions start at HLSL register c4");
 
 // SOH [Enhancement] Cascaded shadow maps (register b3). Layout must match the PerShadowCB cbuffer in
 // default.shader.hlsl field for field. Everything is float4-shaped because HLSL gives each element of a
@@ -67,6 +72,35 @@ struct PerShadowCB {
     // One texel of the ACTOR layer in UV terms, per cascade. Separate from shadow_texel_uv because that
     // layer can be sized on its own (see shadow_map.h); equal to it when the two resolutions match.
     float shadow_actor_texel_uv[4];
+    // SOH [Enhancement] Edge quality (see shadow_map.h). Packing matches the shader's comment exactly:
+    //   shadow_edge:   x analytic on/off, y ramp width (texels), z jitter on/off, w jitter taps
+    //   shadow_jitter: x jitter radius (texels); y, z, w dead (rotation and filterable modes, removed)
+    float shadow_edge[4];
+    float shadow_jitter[4];
+    // SOH [Enhancement] Shadow acne (see shadow_map.h). Magnitudes arrive already zeroed when their switch
+    // is off, so the shaders multiply rather than branch.
+    //   acne0: x enabled, y normal offset (texels); z, w dead (light offset and depth bias, removed)
+    //   acne1: x slope-scaled, y slope ceiling, z apply in the ordinary receiver, w unused
+    float shadow_acne0[4];
+    float shadow_acne1[4];
+    // SOH [Enhancement] Edge hardening (see shadow_map.h). x on, y hardness, z threshold, w unused.
+    float shadow_harden[4];
+    // SOH [Enhancement] Clipmap layout (see shadow_map.h). The light's axes with the camera's coordinate
+    // along each in w, then the ladder: base half-extent, level count, resolution. No per-level matrix --
+    // levels differ by a power of two and a snapped centre, both computed in the shader.
+    //   clip_x: light X axis, w = camera along it
+    //   clip_y: light Y axis, w = camera along it
+    //   clip_z: light Z axis, w = camera along it
+    //   clip_p: x base half-extent, y level count (0 = cascade path), z resolution, w unused
+    float shadow_clip_x[4];
+    float shadow_clip_y[4];
+    float shadow_clip_z[4];
+    float shadow_clip_p[4];
+    float shadow_smsr[4]; // x enabled, y max traversal steps, z depth epsilon, w reserved
+    // SOH [Enhancement] Technique 6 (see shadow_map.h): compare against the interpolated stored depth where
+    // the quad agrees, which is what removes the comb of teeth on a surface lying along the light.
+    //   x on, y agreement threshold in normalised depth, z/w unused
+    float shadow_smooth[4];
 };
 
 struct PerDrawCB {
@@ -192,12 +226,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) override;
     bool ShadowMapBeginCascade(int layer, int cascadeIndex, const float lightViewProj[16],
                                uint64_t contentKey) override;
+    void ShadowMapSetWorldGeneration(uint64_t generation) override;
     void ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
                               size_t drawCount) override;
     bool SupportsShadowMapAlphaCasters() override;
-    void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) override;
-    void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) override;
+    int ShadowAlphaSlotIndex(int slot) const;
+    void ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) override;
+    void ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount, int slot) override;
     void ShadowMapEndPass() override;
+    int ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16], uint64_t staticKey,
+                                   uint64_t dynamicKey) override;
+    void ShadowMapEndStaticCasters() override;
     void SetShadowMapParams(const float* viewProj, const float* splitDistances, int cascadeCount, float blendFraction,
                             float strength, float debugMode) override;
 
@@ -231,6 +270,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     ID3D11RasterizerState* ShadowRasterizerForCascade(int slice, int resolution, const float lightViewProj[16]);
     void ShadowMapInvalidateOpenSlice();
     void ShadowMapBindForReading();
+    // SOH [Enhancement] Static caster cache (technique from the Unity-style cached shadow maps).
+    bool CreateShadowStaticTargets(int cascadeCount, int resolution);
+    void ShadowStaticRelease();
+    void ShadowStaticBlit(int slice);
 
     // SOH [Enhancement] Cascaded shadow maps. The array is one D16 texture with a depth-stencil view per
     // slice (written one cascade at a time) and a single shader resource view over all slices (read by
@@ -282,10 +325,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     float mShadowRasterizerCascadeClamp[SHADOW_MAP_MAX_SLICES] = {};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mShadowDepthStencilState;
     size_t mShadowCasterVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {}; // capacity of each buffer, in vertices
-    // What each caster buffer currently holds, so a list that has not changed is neither re-uploaded for
-    // the next cascade nor for the next frame. The interpreter guarantees the pointer identity is
-    // meaningful: a layer whose contents change gets a fresh push into a cleared vector, and the world
-    // cache is only ever swapped wholesale when it is genuinely rebuilt.
+    // The world generation invalidates upload records even when a rebuilt cache reuses an allocation.
+    // Pointer/count matching then remains safe within that generation and across its unchanged frames.
+    uint64_t mShadowWorldUploadGeneration = UINT64_MAX;
     const float* mShadowLastCasterPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     size_t mShadowLastCasterCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
     // SOH [Enhancement] Background shader prewarm. The threads compile into the on-disk cache and touch
@@ -318,10 +360,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11PixelShader> mShadowAlphaPs;
     Microsoft::WRL::ComPtr<ID3D11InputLayout> mShadowAlphaLayout;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mShadowAlphaSampler;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowAlphaVb;
-    size_t mShadowAlphaVbVertices = 0;
-    const float* mShadowAlphaLastPtr = nullptr;
-    size_t mShadowAlphaLastCount = 0;
+    // One buffer and one record per (layer, slot), exactly as the opaque casters have. A single shared
+    // buffer is what made the reuse test useless here: the draw loop alternates the cached room mesh's
+    // cutouts and the per-frame scenery cutouts on every cascade, so consecutive calls never matched and
+    // the whole list was re-uploaded on each one. Separate slots is the same fix the opaque path already
+    // carries, and for the same reason.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mShadowAlphaVb[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS];
+    size_t mShadowAlphaVbVertices[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    const float* mShadowAlphaLastPtr[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    size_t mShadowAlphaLastCount[SHADOW_MAP_LAYERS * SHADOW_MAP_CASTER_SLOTS] = {};
+    // Which slot's vertex buffer is on the context, so a run of ranges from one list binds it once.
+    int mShadowAlphaBoundIndex = -1;
     bool mShadowAlphaPipelineReady = false; // every alpha object built successfully
     bool mShadowAlphaBound = false;         // the alpha pipeline is the one currently set on the context
     int mShadowCascadeCount = 0;        // 0 until the cascade array exists
@@ -331,6 +380,33 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // array rather than no shadows.
     int mShadowActorResolution = 0;
     bool mShadowActorSplit = false;
+
+
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). A second copy of the WORLD layer's
+    // slices holding only the casters that do not move, so a frame where scenery moved can blit that in and
+    // redraw the movers alone instead of the room mesh as well.
+    //
+    // World layer only. The actor layer is characters, whose content changes every frame by definition --
+    // there is no static half of it to cache.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mShadowStaticTexture;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mShadowStaticDsv[SHADOW_MAP_MAX_SLICES];
+    // What each static slice was drawn from, and with. Both have to match for the copy to be legitimate:
+    // the same casters projected through a different matrix is a different image.
+    uint64_t mShadowStaticKey[SHADOW_MAP_MAX_SLICES] = {};
+    float mShadowStaticMatrix[SHADOW_MAP_MAX_SLICES][16] = {};
+    bool mShadowStaticValid[SHADOW_MAP_MAX_SLICES] = {};
+    // The slice a split pass is filling, while its static half is being drawn. -1 once the caller has said
+    // the static casters are done, after which the writes are dynamic and must not reach the cache.
+    int mShadowStaticOpenSlice = -1;
+    // Set around the shared slice-opening body so it targets the STATIC copy, and so it leaves the live
+    // slice's contents alone when the static half is about to be blitted over it. Both are cleared again
+    // immediately; nothing outside the split path ever sees them set.
+    int mShadowStaticTargetSlice = -1;
+    bool mShadowSkipSliceClear = false;
+    bool mShadowStaticReady = false;
+    int mShadowStaticResolution = 0;
+    int mShadowStaticSlices = 0;
+
     bool mShadowPipelineReady = false;
     bool mShadowPipelineFailed = false; // creation already failed once; do not retry every frame
     bool mShadowPassActive = false;     // between BeginCascade and EndPass
@@ -407,7 +483,17 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
 
+    // The rasterizer state currently BOUND. Kept as its own handle because the shadow pass rebinds it when
+    // it hands the context back (see ShadowMapEndPass); it now aliases one of the two cached states below.
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
+    // SOH [Enhancement] Rasterizer states, created lazily and cached, exactly as the depth-stencil states
+    // right below already were. Indexed by zmodeDecal, which is the only thing that varies per draw; the
+    // slope-scaled depth bias also depends on the z-fighting mode and the render target's height, so both
+    // are recorded and the pair is dropped when either moves. Decal geometry flips this many times a frame
+    // and every flip used to run CreateRasterizerState, allocating a driver object each time.
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerStates[2];
+    int mRasterizerStatesZFightingMode = -1;
+    int32_t mRasterizerStatesHeight = -1;
     // SOH [Enhancement] Depth-stencil states, created lazily and cached for the device's lifetime (the
     // stencil features flip the mode many times per frame, and each flip used to re-run
     // CreateDepthStencilState). Key: depthTest | depthMask<<1 | zmodeDecal<<2 | stencilMode<<3 — same
@@ -441,6 +527,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerToonCB mPerToonCbData{};
     bool mPerToonCbValid = false; // false until something has actually been uploaded to compare against
     PerShadowCB mPerShadowCbData; // SOH [Enhancement] cascaded shadow maps
+    // SOH [Enhancement] Frames since the backend started, used only to advance the jitter pattern's
+    // rotation when temporal jitter is on. Incremented where the shadow constants are written, which
+    // happens exactly once per frame.
+    uint32_t mShadowQualityFrame = 0;
     bool mShadowCbDirty = true;   // re-upload the cascade CB only when the frame's values changed
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;

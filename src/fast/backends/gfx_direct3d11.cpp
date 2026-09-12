@@ -1,6 +1,8 @@
 #ifdef ENABLE_DX11
 
 #include <cstdio>
+#include <chrono>
+#include "fast/backends/shadow_capture.h"
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -1334,40 +1336,64 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
 
-        mRasterizerState.Reset();
-
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
-
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
-
-        switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
+        // SOH [Enhancement] Cached, the same way the depth-stencil states directly above already are, and
+        // for the same reason their comment gives: decal geometry flips this flag many times a frame, and
+        // every flip ran CreateRasterizerState -- a driver object allocated, bound, and dropped, per flip,
+        // for one of two descriptions that never change while the mode and the target hold still.
+        //
+        // Only two states exist, one per value of zmodeDecal, so the cache is an array of two rather than a
+        // keyed table. The bias in them is not constant, though: it is derived from the z-fighting mode and
+        // the render target's height, so both are recorded and the PAIR is dropped whenever either moves.
+        // That is what keeps this exactly equivalent to rebuilding on every flip -- at any flip the state
+        // bound is still one built from the current mode and the current height.
+        const int zFightingMode =
+            Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        if (zFightingMode != mRasterizerStatesZFightingMode || mRenderTargetHeight != mRasterizerStatesHeight) {
+            mRasterizerStates[0].Reset();
+            mRasterizerStates[1].Reset();
+            mRasterizerStatesZFightingMode = zFightingMode;
+            mRasterizerStatesHeight = mRenderTargetHeight;
         }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
 
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
+        const int rsSlot = mCurrentZmodeDecal ? 1 : 0;
+        if (mRasterizerStates[rsSlot] == nullptr) {
+            D3D11_RASTERIZER_DESC rasterizer_desc;
+            ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+
+            rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+            rasterizer_desc.CullMode = D3D11_CULL_NONE;
+            rasterizer_desc.FrontCounterClockwise = true;
+            rasterizer_desc.DepthBias = 0;
+            // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+            // fighting
+            const int n64modeFactor = 120;
+            const int noVanishFactor = 100;
+            float SSDB = -2;
+
+            switch (zFightingMode) {
+                case 1: // scaled z-fighting (N64 mode like)
+                    SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+                    break;
+                case 2: // no vanishing paths
+                    SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+                    break;
+                case 0: // disabled
+                default:
+                    SSDB = -2;
+            }
+            rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
+            rasterizer_desc.DepthBiasClamp = 0.0f;
+            rasterizer_desc.DepthClipEnable = false;
+            rasterizer_desc.ScissorEnable = true;
+            rasterizer_desc.MultisampleEnable = false;
+            rasterizer_desc.AntialiasedLineEnable = false;
+
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerStates[rsSlot].GetAddressOf()));
+        }
+
+        // Still tracked separately, because the shadow pass rebinds whatever was last bound when it hands
+        // the context back (see ShadowMapEndPass).
+        mRasterizerState = mRasterizerStates[rsSlot];
         mContext->RSSetState(mRasterizerState.Get());
     }
 
@@ -1442,6 +1468,9 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         toon.toon_highlight_intensity = mToonHighlightIntensity;
         toon.toon_shadow_intensity = mToonShadowIntensity;
         toon.toon_debug = mToonDebug;
+        toon.toon_local_enabled = mToonLocalLights.enabled;
+        memcpy(toon.toon_local_dir, mToonLocalLights.direction, sizeof(toon.toon_local_dir));
+        memcpy(toon.toon_local_color, mToonLocalLights.color, sizeof(toon.toon_local_color));
 
         if (!mPerToonCbValid || memcmp(&toon, &mPerToonCbData, sizeof(PerToonCB)) != 0) {
             D3D11_MAPPED_SUBRESOURCE toon_ms;
@@ -1857,8 +1886,8 @@ void GfxRenderingAPIDX11::DrawShadowMapView() {
     // The array holds the world layer's cascades first and then the actor layer's, and the actor layer is
     // the shorter one -- so the count is not a product. Asking for a slice past the end would sample
     // whatever the clamp lands on and show a picture that is not there.
-    const int worldSlices = mShadowCascadesActive;
-    const int actorSlices = SHADOW_MAP_ACTOR_CASCADES_FOR(mShadowCascadesActive);
+    const int worldSlices = mShadowCascadeCount;
+    const int actorSlices = SHADOW_MAP_ACTOR_CASCADES_FOR(worldSlices);
     const int totalSlices = worldSlices + actorSlices;
     const int index = slice - 1; // the setting is 1-based so that 0 can mean off
     if (index >= totalSlices) {
@@ -1891,7 +1920,8 @@ void GfxRenderingAPIDX11::DrawShadowMapView() {
     float sliceIndex = (float)index;
     if (isActorHalf && mShadowActorSrv != nullptr) {
         srv = mShadowActorSrv.Get();
-        sliceIndex = (float)(index - worldSlices);
+        // Actor SRVs use the same logical slice indices as the world array.
+        sliceIndex = (float)index;
     }
 
     // The stretch. A cascade's depths crowd near its near plane, so the raw range is nearly flat on screen
@@ -2471,11 +2501,9 @@ bool GfxRenderingAPIDX11::CreateShadowMapPipeline() {
     // it should do. The far side is safe too: a caster clamped to the far value never wins a comparison it
     // should lose, so nothing gains a shadow it should not have.
     rast_desc.DepthClipEnable = FALSE;
-    // No constant bias here. It is applied in the shader instead, in world units divided by each
-    // cascade's own depth range -- the rasterizer's units are depth increments, which mean a different
-    // physical distance in every cascade. The slope term stays: being relative to the polygon's own
-    // gradient is exactly right, and it is the same relative amount whatever the range.
-    rast_desc.DepthBias = 0;
+    // The receiver compares unquantized depth with D16. Reserve a small quantization margin even
+    // where the slope vanishes, or a stationary surface alternates between lit and self-shadowed.
+    rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
     rast_desc.SlopeScaledDepthBias = SHADOW_MAP_SLOPE_BIAS;
     if (FAILED(mDevice->CreateRasterizerState(&rast_desc, mShadowRasterizerState.GetAddressOf()))) {
         SPDLOG_ERROR("Shadow map: could not create the depth rasterizer state.");
@@ -2726,11 +2754,163 @@ bool GfxRenderingAPIDX11::CreateShadowMapTargets(int cascadeCount, int resolutio
     return true;
 }
 
+void GfxRenderingAPIDX11::ShadowStaticRelease() {
+    for (int i = 0; i < SHADOW_MAP_MAX_SLICES; i++) {
+        mShadowStaticDsv[i].Reset();
+        mShadowStaticValid[i] = false;
+        mShadowStaticKey[i] = 0;
+    }
+    mShadowStaticTexture.Reset();
+    mShadowStaticReady = false;
+    mShadowStaticResolution = 0;
+    mShadowStaticSlices = 0;
+    mShadowStaticOpenSlice = -1;
+}
+
+// SOH [Enhancement] Static caster cache (see fast/shadow_map.h). A second array holding the WORLD layer's
+// slices with only the casters that do not move in them.
+//
+// World layer only, and the array is only as long as that layer: the actor layer is characters, whose
+// content changes every frame by definition, so there is no static half of it to keep.
+bool GfxRenderingAPIDX11::CreateShadowStaticTargets(int cascadeCount, int resolution) {
+    if (mShadowStaticTexture != nullptr && cascadeCount == mShadowStaticSlices &&
+        resolution == mShadowStaticResolution) {
+        return true;
+    }
+    ShadowStaticRelease();
+    if (cascadeCount <= 0 || resolution <= 0 || mShadowMapTexture == nullptr) {
+        return false;
+    }
+
+    // Deliberately the same desc as the live array, because the copy below requires it: D3D11 will only
+    // copy between resources of identical type, format and dimensions.
+    D3D11_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = (UINT)resolution;
+    desc.Height = (UINT)resolution;
+    desc.MipLevels = 1;
+    desc.ArraySize = (UINT)cascadeCount;
+    desc.Format = DXGI_FORMAT_R16_TYPELESS;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    // A depth target because the static half is rasterised straight into it; never read as a texture, only
+    // copied out of, so it needs no shader resource view.
+    desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(mDevice->CreateTexture2D(&desc, nullptr, mShadowStaticTexture.GetAddressOf()))) {
+        SPDLOG_WARN("Shadow map: could not create the {}x{} x{} static caster cache; the split is off.",
+                    resolution, resolution, cascadeCount);
+        ShadowStaticRelease();
+        return false;
+    }
+    for (int i = 0; i < cascadeCount; i++) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv;
+        ZeroMemory(&dsv, sizeof(dsv));
+        dsv.Format = DXGI_FORMAT_D16_UNORM;
+        dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv.Texture2DArray.MipSlice = 0;
+        dsv.Texture2DArray.FirstArraySlice = (UINT)i;
+        dsv.Texture2DArray.ArraySize = 1;
+        if (FAILED(mDevice->CreateDepthStencilView(mShadowStaticTexture.Get(), &dsv,
+                                                   mShadowStaticDsv[i].GetAddressOf()))) {
+            SPDLOG_WARN("Shadow map: could not create the static cache's view for slice {}.", i);
+            ShadowStaticRelease();
+            return false;
+        }
+    }
+    mShadowStaticResolution = resolution;
+    mShadowStaticSlices = cascadeCount;
+    mShadowStaticReady = true;
+    SPDLOG_INFO("Shadow map: static caster cache ready at {}x{} across {} slices.", resolution, resolution,
+                cascadeCount);
+    return true;
+}
+
+// Copy the static half of `slice` into the live slice. Neither may be bound as a target while it happens,
+// which is why the target is dropped and put back around it.
+//
+// No source box: D3D11 will not copy a sub-region of a depth-stencil resource, and a whole slice is what is
+// wanted anyway.
+void GfxRenderingAPIDX11::ShadowStaticBlit(int slice) {
+    mContext->OMSetRenderTargets(0, nullptr, nullptr);
+    mContext->CopySubresourceRegion(mShadowMapTexture.Get(), (UINT)slice, 0, 0, 0, mShadowStaticTexture.Get(),
+                                    (UINT)slice, nullptr);
+    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
+}
+
+int GfxRenderingAPIDX11::ShadowMapBeginCascadeSplit(int layer, int cascadeIndex, const float lightViewProj[16],
+                                                   uint64_t staticKey, uint64_t dynamicKey) {
+    // The two keys identify the slice together, and the live reuse test is unchanged by the split: a slice
+    // still holds what its whole caster set drew. Mixed rather than xored so a static change cannot be
+    // cancelled out by a dynamic one landing on the same bits.
+    const uint64_t combined = (staticKey * 0x100000001B3ull) ^ dynamicKey;
+
+    // The actor layer has no static half, and a cache that failed to build is simply not there.
+    if (layer != SHADOW_MAP_LAYER_WORLD || !mShadowStaticReady || mShadowStaticTexture == nullptr ||
+        !mShadowQuality.staticCache) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined) ? SHADOW_MAP_SLICE_FULL
+                                                                                  : SHADOW_MAP_SLICE_REUSED;
+    }
+    if (cascadeIndex < 0 || cascadeIndex >= mShadowCascadeCount) {
+        return SHADOW_MAP_SLICE_REUSED;
+    }
+    const int slice = layer * mShadowCascadeCount + cascadeIndex;
+    if (slice >= mShadowStaticSlices || mShadowStaticDsv[slice] == nullptr) {
+        return ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined) ? SHADOW_MAP_SLICE_FULL
+                                                                                  : SHADOW_MAP_SLICE_REUSED;
+    }
+
+    // Is the cached half still the right image? The same casters through a different matrix is a different
+    // image, so both have to match.
+    const bool staticUsable = mShadowStaticValid[slice] && mShadowStaticKey[slice] == staticKey &&
+                              memcmp(mShadowStaticMatrix[slice], lightViewProj, 16 * sizeof(float)) == 0;
+
+    if (staticUsable) {
+        // The clear is what the blit replaces, so it is suppressed and the copy lands on a slice nobody
+        // has written to yet this frame.
+        mShadowSkipSliceClear = true;
+        const bool opened = ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined);
+        mShadowSkipSliceClear = false;
+        if (!opened) {
+            return SHADOW_MAP_SLICE_REUSED; // the live slice already held this exact image
+        }
+        ShadowStaticBlit(slice);
+        return SHADOW_MAP_SLICE_DYNAMIC;
+    }
+
+    // The cached half has to be rebuilt, so the same opening body is aimed at the static copy instead. The
+    // caller draws the static casters, then says so, and ShadowMapEndStaticCasters blits and switches over.
+    mShadowStaticTargetSlice = slice;
+    const bool opened = ShadowMapBeginCascade(layer, cascadeIndex, lightViewProj, combined);
+    mShadowStaticTargetSlice = -1;
+    if (!opened) {
+        return SHADOW_MAP_SLICE_REUSED;
+    }
+    mShadowStaticOpenSlice = slice;
+    mShadowStaticKey[slice] = staticKey;
+    memcpy(mShadowStaticMatrix[slice], lightViewProj, 16 * sizeof(float));
+    // Claimed only once the draws have gone in; see ShadowMapEndStaticCasters.
+    mShadowStaticValid[slice] = false;
+    return SHADOW_MAP_SLICE_FULL;
+}
+
+void GfxRenderingAPIDX11::ShadowMapEndStaticCasters() {
+    if (mShadowStaticOpenSlice < 0) {
+        return;
+    }
+    const int slice = mShadowStaticOpenSlice;
+    mShadowStaticOpenSlice = -1;
+    // The static half is complete and may now be trusted for later frames.
+    mShadowStaticValid[slice] = true;
+    ShadowStaticBlit(slice);
+}
+
 bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, int actorResolution) {
+    const int levelBound = mShadowQuality.layout == SHADOW_MAP_LAYOUT_CLIPMAP
+                               ? SHADOW_MAP_MAX_CLIPMAP_LEVELS : SHADOW_MAP_MAX_CASCADES;
     if (cascadeCount < 1) {
         cascadeCount = 1;
-    } else if (cascadeCount > SHADOW_MAP_MAX_CASCADES) {
-        cascadeCount = SHADOW_MAP_MAX_CASCADES;
+    } else if (cascadeCount > levelBound) {
+        cascadeCount = levelBound;
     }
     if (resolution < SHADOW_MAP_MIN_RESOLUTION) {
         resolution = SHADOW_MAP_MIN_RESOLUTION;
@@ -2748,7 +2928,19 @@ bool GfxRenderingAPIDX11::ShadowMapConfigure(int cascadeCount, int resolution, i
     if (!CreateShadowMapPipeline()) {
         return false;
     }
-    return CreateShadowMapTargets(cascadeCount, resolution, actorResolution);
+    if (!CreateShadowMapTargets(cascadeCount, resolution, actorResolution)) {
+        return false;
+    }
+
+    // SOH [Enhancement] Static caster cache (see fast/shadow_map.h). Optional in every sense: a failure
+    // here leaves the cache unavailable and the split path falls back to redrawing whole slices, which is
+    // what happens today.
+    if (mShadowQuality.staticCache) {
+        CreateShadowStaticTargets(cascadeCount, resolution);
+    } else {
+        ShadowStaticRelease();
+    }
+    return true;
 }
 
 // SOH [Enhancement] Cascaded shadow maps: this cascade's rasterizer state, differing from the shared one
@@ -2800,13 +2992,16 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
     // value is SHADOW_MAP_MAX_SLOPE_BIAS_WORLD in this cascade's own depth units: the projection scales the
     // light's unit x axis by 1/radius, so sx IS 1/radius, and a cascade's depth range is five radii by
     // construction.
-    float depthBiasClamp = 0.0f;
+    const float depthUnit = 1.0f / 65535.0f;
+    const float minimumClamp = SHADOW_MAP_DEPTH_BIAS_UNITS * depthUnit;
+    float depthBiasClamp = minimumClamp;
     const float sx = std::sqrt((lightViewProj[0] * lightViewProj[0]) + (lightViewProj[4] * lightViewProj[4]) +
                                (lightViewProj[8] * lightViewProj[8]));
     if (sx > 1e-9f) {
         depthBiasClamp = SHADOW_MAP_MAX_SLOPE_BIAS_WORLD * sx / 5.0f;
-        // Quantised for the same reason the slope is: a value drifting by a hair must not rebuild the state.
-        depthBiasClamp = std::floor((depthBiasClamp * 4096.0f) + 0.5f) / 4096.0f;
+        // Quantize to the texture's precision, not 1/4096. The old rounding could reach zero on
+        // large levels, which D3D interprets as UNLIMITED bias and causes abrupt shadow displacement.
+        depthBiasClamp = std::max(minimumClamp, std::floor(depthBiasClamp / depthUnit) * depthUnit);
     }
 
     // Both facings recorded. Front-face culling was tried here and removed: it does remove self-shadowing
@@ -2821,7 +3016,7 @@ ID3D11RasterizerState* GfxRenderingAPIDX11::ShadowRasterizerForCascade(int slice
         rast_desc.FillMode = D3D11_FILL_SOLID;
         rast_desc.CullMode = D3D11_CULL_NONE;
         rast_desc.DepthClipEnable = FALSE;
-        rast_desc.DepthBias = 0;
+        rast_desc.DepthBias = SHADOW_MAP_DEPTH_BIAS_UNITS;
         rast_desc.SlopeScaledDepthBias = slope;
         rast_desc.DepthBiasClamp = depthBiasClamp;
         ComPtr<ID3D11RasterizerState> built;
@@ -2899,10 +3094,8 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         // keeps the same two allocations frame to frame while its contents change completely -- a pointer
         // match across passes would wrongly skip the upload and render last frame's characters forever.
         //
-        // The WORLD layer is deliberately NOT reset: it is a cache that is only ever replaced by swapping in
-        // the separate capture vector, so its data pointer necessarily changes whenever its contents do.
-        // Keeping the record alive across passes is the whole point -- an unchanged room mesh then costs one
-        // bind and one draw per cascade, with no upload at all.
+        // The WORLD layer survives unchanged passes. ShadowMapSetWorldGeneration invalidates its records
+        // on a rebuild, including when skipped uploads let the same allocation return with new contents.
         mShadowLastCasterPtr[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] =
             nullptr;
         mShadowLastCasterCount[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] = 0;
@@ -2912,11 +3105,15 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
         mShadowLastCasterPtr[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] =
             nullptr;
         mShadowLastCasterCount[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] = 0;
-        // The alpha list gets no such exemption: it shares one buffer between the two layers, so whatever it
-        // holds is overwritten within the pass anyway, and the actor half is double-buffered exactly like the
-        // opaque one. Forget it wholesale rather than reason about which half is safe.
-        mShadowAlphaLastPtr = nullptr;
-        mShadowAlphaLastCount = 0;
+        // The cutout lists now follow exactly the same rule, because they now have exactly the same shape:
+        // one buffer per slot. The two that are rebuilt every frame forget their records; the cached room
+        // mesh's cutouts keep theirs, so an unchanged room uploads them once and then never again.
+        mShadowAlphaLastPtr[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] =
+            nullptr;
+        mShadowAlphaLastCount[SHADOW_MAP_LAYER_ACTORS * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN] = 0;
+        mShadowAlphaLastPtr[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] =
+            nullptr;
+        mShadowAlphaLastCount[SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_SCENERY] = 0;
         mShadowPassActive = true;
         ShadowTimerBegin();
     }
@@ -2954,9 +3151,18 @@ bool GfxRenderingAPIDX11::ShadowMapBeginCascade(int layer, int cascadeIndex, con
     // Everything below re-establishes the OPAQUE pipeline, so any alpha binding from the previous cascade is
     // gone by the time this returns.
     mShadowAlphaBound = false;
+    mShadowAlphaBoundIndex = -1;
 
-    mContext->OMSetRenderTargets(0, nullptr, mShadowMapDsv[slice].Get());
-    mContext->ClearDepthStencilView(mShadowMapDsv[slice].Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    // SOH [Enhancement] Static caster cache: the split path aims this same body at the static copy while
+    // its half is drawn, and suppresses the clear on the frame where that copy is about to be blitted in.
+    // Both flags are off for every other caller, so the ordinary path is unchanged.
+    ID3D11DepthStencilView* sliceTarget = (mShadowStaticTargetSlice == slice && mShadowStaticDsv[slice] != nullptr)
+                                              ? mShadowStaticDsv[slice].Get()
+                                              : mShadowMapDsv[slice].Get();
+    mContext->OMSetRenderTargets(0, nullptr, sliceTarget);
+    if (!mShadowSkipSliceClear) {
+        mContext->ClearDepthStencilView(sliceTarget, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    }
 
     D3D11_VIEWPORT viewport;
     viewport.TopLeftX = 0.0f;
@@ -2998,6 +3204,18 @@ void GfxRenderingAPIDX11::ShadowMapInvalidateOpenSlice() {
     }
 }
 
+void GfxRenderingAPIDX11::ShadowMapSetWorldGeneration(uint64_t generation) {
+    if (mShadowWorldUploadGeneration == generation) {
+        return;
+    }
+    mShadowWorldUploadGeneration = generation;
+    const int index = SHADOW_MAP_LAYER_WORLD * SHADOW_MAP_CASTER_SLOTS + SHADOW_MAP_CASTER_SLOT_MAIN;
+    mShadowLastCasterPtr[index] = nullptr;
+    mShadowLastCasterCount[index] = 0;
+    mShadowAlphaLastPtr[index] = nullptr;
+    mShadowAlphaLastCount[index] = 0;
+}
+
 void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t vertexCount, int slot, size_t firstVertex,
                                                size_t drawCount) {
     if (!mShadowPassActive || worldXyz == nullptr || vertexCount < 3) {
@@ -3018,6 +3236,26 @@ void GfxRenderingAPIDX11::ShadowMapDrawCasters(const float* worldXyz, size_t ver
     drawCount -= drawCount % 3;
     if (drawCount < 3) {
         return;
+    }
+
+    // The cutout path binds its own pipeline and leaves it bound, on the reasoning that the next
+    // ShadowMapBeginCascade puts the opaque one back. That held only while no opaque draw ever followed a
+    // cutout draw INSIDE one slice -- an ordering rule that lived in a comment and nowhere else, and that
+    // the static caster cache broke the moment it moved the cached half's cutouts above the scenery.
+    //
+    // What that cost: scenery rasterised through the cutout pipeline, a vertex shader expecting five floats
+    // per vertex fed three, and a pixel shader clipping against whatever texture was still bound. The depth
+    // written was noise, and the shadow came out stippled.
+    //
+    // So the opaque path restores what it needs instead of trusting the order. One branch per draw, taken
+    // only when a cutout batch actually preceded this one.
+    if (mShadowAlphaBound) {
+        mContext->IASetInputLayout(mShadowDepthLayout.Get());
+        mContext->VSSetShader(mShadowDepthVs.Get(), nullptr, 0);
+        mContext->VSSetConstantBuffers(0, 1, mShadowDepthCb.GetAddressOf());
+        mContext->PSSetShader(nullptr, nullptr, 0); // depth-only: no pixel shader at all
+        mShadowAlphaBound = false;
+        mShadowAlphaBoundIndex = -1;
     }
 
     const int layerIndex = (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
@@ -3089,19 +3327,30 @@ bool GfxRenderingAPIDX11::SupportsShadowMapAlphaCasters() {
     return mShadowAlphaPipelineReady;
 }
 
-void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount) {
+// (layer, slot) -> the index both caster paths key their buffers and reuse records on. The layer is the one
+// the open cascade named, exactly as ShadowMapDrawCasters reads it.
+int GfxRenderingAPIDX11::ShadowAlphaSlotIndex(int slot) const {
+    const int layerIndex =
+        (mShadowCurrentLayer >= 0 && mShadowCurrentLayer < SHADOW_MAP_LAYERS) ? mShadowCurrentLayer : 0;
+    const int slotIndex = (slot >= 0 && slot < SHADOW_MAP_CASTER_SLOTS) ? slot : 0;
+    return layerIndex * SHADOW_MAP_CASTER_SLOTS + slotIndex;
+}
+
+void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t vertexCount, int slot) {
     if (!mShadowPassActive || !mShadowAlphaPipelineReady || xyzUv == nullptr || vertexCount < 3) {
         return;
     }
+    const int index = ShadowAlphaSlotIndex(slot);
     // Same reuse rule as the opaque list: identical pointer and count means the buffer already holds this
     // geometry, whether that is from the previous cascade or (for the cached world layer) the previous
-    // frame. Only the world layer's record survives a pass; see ShadowMapBeginCascade.
-    if (mShadowAlphaLastPtr == xyzUv && mShadowAlphaLastCount == vertexCount && mShadowAlphaVb != nullptr) {
+    // frame. Only the world layer's MAIN record survives a pass; see ShadowMapBeginCascade.
+    if (mShadowAlphaLastPtr[index] == xyzUv && mShadowAlphaLastCount[index] == vertexCount &&
+        mShadowAlphaVb[index] != nullptr) {
         return;
     }
 
-    if (mShadowAlphaVb == nullptr || mShadowAlphaVbVertices < vertexCount) {
-        size_t capacity = mShadowAlphaVbVertices ? mShadowAlphaVbVertices : 32u * 1024u;
+    if (mShadowAlphaVb[index] == nullptr || mShadowAlphaVbVertices[index] < vertexCount) {
+        size_t capacity = mShadowAlphaVbVertices[index] ? mShadowAlphaVbVertices[index] : 32u * 1024u;
         while (capacity < vertexCount) {
             capacity *= 2;
         }
@@ -3117,29 +3366,34 @@ void GfxRenderingAPIDX11::ShadowMapUploadAlphaCasters(const float* xyzUv, size_t
             ShadowMapInvalidateOpenSlice();
             return;
         }
-        mShadowAlphaVb = grown;
-        mShadowAlphaVbVertices = capacity;
-        mShadowAlphaLastPtr = nullptr;
-        mShadowAlphaLastCount = 0;
+        mShadowAlphaVb[index] = grown;
+        mShadowAlphaVbVertices[index] = capacity;
+        mShadowAlphaLastPtr[index] = nullptr;
+        mShadowAlphaLastCount[index] = 0;
+        if (mShadowAlphaBoundIndex == index) {
+            mShadowAlphaBoundIndex = -1; // the buffer on the context is the old one
+        }
     }
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(ms));
-    if (FAILED(mContext->Map(mShadowAlphaVb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+    if (FAILED(mContext->Map(mShadowAlphaVb[index].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         ShadowMapInvalidateOpenSlice();
         return;
     }
     memcpy(ms.pData, xyzUv, vertexCount * 5 * sizeof(float));
-    mContext->Unmap(mShadowAlphaVb.Get(), 0);
-    mShadowAlphaLastPtr = xyzUv;
-    mShadowAlphaLastCount = vertexCount;
+    mContext->Unmap(mShadowAlphaVb[index].Get(), 0);
+    mShadowAlphaLastPtr[index] = xyzUv;
+    mShadowAlphaLastCount[index] = vertexCount;
 }
 
-void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount) {
-    if (!mShadowPassActive || !mShadowAlphaPipelineReady || mShadowAlphaVb == nullptr || vertexCount < 3) {
+void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t firstVertex, size_t vertexCount,
+                                                 int slot) {
+    const int index = ShadowAlphaSlotIndex(slot);
+    if (!mShadowPassActive || !mShadowAlphaPipelineReady || mShadowAlphaVb[index] == nullptr || vertexCount < 3) {
         return;
     }
-    if (firstVertex + vertexCount > mShadowAlphaLastCount) {
+    if (firstVertex + vertexCount > mShadowAlphaLastCount[index]) {
         ShadowMapInvalidateOpenSlice();
         return; // range does not lie inside what was uploaded
     }
@@ -3155,10 +3409,7 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
     // Switch the pipeline once and leave it: consecutive ranges differ only by texture and draw offset.
     // ShadowMapBeginCascade puts the opaque pipeline back for the next cascade.
     if (!mShadowAlphaBound) {
-        UINT stride = 5 * sizeof(float);
-        UINT offset = 0;
         mContext->IASetInputLayout(mShadowAlphaLayout.Get());
-        mContext->IASetVertexBuffers(0, 1, mShadowAlphaVb.GetAddressOf(), &stride, &offset);
         mContext->VSSetShader(mShadowAlphaVs.Get(), nullptr, 0);
         mContext->PSSetShader(mShadowAlphaPs.Get(), nullptr, 0);
         mContext->PSSetSamplers(0, 1, mShadowAlphaSampler.GetAddressOf());
@@ -3170,6 +3421,15 @@ void GfxRenderingAPIDX11::ShadowMapDrawAlphaRange(uint32_t textureId, size_t fir
         // while the main pass re-bound every sampler on every draw and so could not be misled by a stale
         // record; it is needed now that the pass skips the ones it believes are already bound.
         mLastSamplerStates[0] = nullptr;
+        mShadowAlphaBoundIndex = -1; // the pipeline was just (re)established; no vertex buffer with it yet
+    }
+    // The vertex buffer is bound per slot rather than with the pipeline, so a run of ranges out of one list
+    // costs one bind however many draws it takes, and switching lists costs a bind and not an upload.
+    if (mShadowAlphaBoundIndex != index) {
+        const UINT stride = 5 * sizeof(float);
+        const UINT offset = 0;
+        mContext->IASetVertexBuffers(0, 1, mShadowAlphaVb[index].GetAddressOf(), &stride, &offset);
+        mShadowAlphaBoundIndex = index;
     }
     mContext->PSSetShaderResources(0, 1, mTextures[textureId].resource_view.GetAddressOf());
     mContext->Draw((UINT)vertexCount, (UINT)firstVertex);
@@ -3208,11 +3468,192 @@ void GfxRenderingAPIDX11::SetShadowMapParams(const float* viewProj, const float*
         if (sx > 1e-9f && mShadowResolution > 0) {
             const float texelWorld = 2.0f / (sx * (float)mShadowResolution);
             mPerShadowCbData.shadow_texel_world[c] = texelWorld;
+            // Kept where the application can read it too (see ShadowMapCascadeReport): once the automatic
+            // ladder is choosing the splits, this is the only place the real texel size exists.
+            mShadowTexelWorld[c] = texelWorld;
             mPerShadowCbData.shadow_texel_uv[c] = 1.0f / (float)mShadowResolution;
             mPerShadowCbData.shadow_actor_texel_uv[c] =
                 1.0f / (float)(mShadowActorSplit ? mShadowActorResolution : mShadowResolution);
         }
     }
+
+    // SOH [Enhancement] Edge quality (see fast/shadow_map.h). Written after the loop because ZeroMemory
+    // above cleared it, and these are frame-global rather than per cascade.
+    {
+        const ShadowMapQuality& q = mShadowQuality;
+        mPerShadowCbData.shadow_smsr[0] = q.smsr ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_smsr[1] = (float)q.smsrMaxSteps;
+        mPerShadowCbData.shadow_smsr[2] = q.smsrEpsilon;
+        mPerShadowCbData.shadow_edge[0] = q.analyticEdge ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_edge[1] = q.analyticEdgeWidth;
+        // Jitter with a zero radius would fetch the same quad N times and average it to itself -- N times
+        // the bandwidth for the picture it already had. Reported as off rather than honoured literally.
+        const bool jitterOn = q.jitter != 0 && q.jitterRadius > 0.0f && q.jitterTaps > 1;
+        mPerShadowCbData.shadow_edge[2] = jitterOn ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_edge[3] = (float)q.jitterTaps;
+        mPerShadowCbData.shadow_jitter[0] = q.jitterRadius;
+        // y, z and w are dead slots: they carried the per-frame tap rotation and the filterable modes,
+        // both removed. Left zeroed rather than repacked, so this removal does not also shift the cbuffer
+        // layout -- that is its own change, with its own layout check.
+        mPerShadowCbData.shadow_jitter[1] = 0.0f;
+        mPerShadowCbData.shadow_jitter[2] = 0.0f;
+        mPerShadowCbData.shadow_jitter[3] = 0.0f;
+
+        // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). Each magnitude is zeroed when its own
+        // switch is off, so the shader multiplies by it rather than branching on a second flag.
+        const ShadowMapAcne& acne = q.acne;
+        mPerShadowCbData.shadow_acne0[0] = acne.enabled ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne0[1] = acne.normalOffset ? acne.normalTexels : 0.0f;
+        // z and w are dead slots: the light-offset and depth-bias methods are gone. Normal offset and
+        // slope scaling do the same job, and these two were off.
+        mPerShadowCbData.shadow_acne0[2] = 0.0f;
+        mPerShadowCbData.shadow_acne0[3] = 0.0f;
+        mPerShadowCbData.shadow_acne1[0] = acne.slopeScaled ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne1[1] = acne.slopeMax;
+        mPerShadowCbData.shadow_acne1[2] = acne.enabled ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_acne1[3] = 0.0f;
+
+        // SOH [Enhancement] Edge hardening (see fast/shadow_map.h).
+        mPerShadowCbData.shadow_harden[0] = q.edgeHarden ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_harden[1] = q.edgeHardness;
+        mPerShadowCbData.shadow_harden[2] = q.edgeThreshold;
+        mPerShadowCbData.shadow_harden[3] = 0.0f; // dead slot; carried bleed reduction
+        // Technique 6. Zeroed when off, so the receiver's branch is uniform and a frame without it pays
+        // nothing -- the same arrangement every other technique here uses.
+        mPerShadowCbData.shadow_smooth[0] = q.smoothDepth ? 1.0f : 0.0f;
+        mPerShadowCbData.shadow_smooth[1] = q.smoothAgreement;
+        mPerShadowCbData.shadow_smooth[2] = 0.0f;
+        mPerShadowCbData.shadow_smooth[3] = 0.0f;
+
+        // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h).
+        for (int i = 0; i < 3; i++) {
+            mPerShadowCbData.shadow_clip_x[i] = mShadowClipmapX[i];
+            mPerShadowCbData.shadow_clip_y[i] = mShadowClipmapY[i];
+            mPerShadowCbData.shadow_clip_z[i] = mShadowClipmapZ[i];
+        }
+        // The camera's coordinate along each axis rides in that axis's w, which is where the shader wants
+        // it: every use of an axis is immediately followed by subtracting the camera along it.
+        mPerShadowCbData.shadow_clip_x[3] = mShadowClipmapCamera[0];
+        mPerShadowCbData.shadow_clip_y[3] = mShadowClipmapCamera[1];
+        mPerShadowCbData.shadow_clip_z[3] = mShadowClipmapCamera[2];
+        mPerShadowCbData.shadow_clip_p[0] = mShadowClipmapBase;
+        mPerShadowCbData.shadow_clip_p[1] = (float)mShadowClipmapLevels;
+        mPerShadowCbData.shadow_clip_p[2] = (float)mShadowClipmapResolution;
+        mPerShadowCbData.shadow_clip_p[3] = 0.0f;
+
+        mShadowQualityFrame++;
+    }
+
+    // SHADOW-CAPTURE-BEGIN
+    auto captureCVars = Ship::Context::GetInstance()->GetConsoleVariables();
+    if (captureCVars->GetInteger(SHADOW_MAP_CAPTURE_REQUEST_CVAR, 0) != 0) {
+        captureCVars->SetInteger(SHADOW_MAP_CAPTURE_REQUEST_CVAR, 0);
+        try {
+            if (count <= 0 || mShadowMapTexture == nullptr)
+                throw std::runtime_error("Shadow map is not active");
+            const auto stamp = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const std::filesystem::path dir = Ship::Context::GetPathRelativeToAppDirectory(
+                "shadow-captures/" + std::to_string(stamp));
+            std::filesystem::create_directories(dir);
+            std::ofstream depth(dir / "world.sds", std::ios::binary);
+            WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowMapTexture.Get(), count, depth);
+            depth.close();
+            if (!depth) throw std::runtime_error("Cannot finish depth file");
+
+            // SOH [Enhancement] The ACTOR layer, which until now was never captured at all.
+            //
+            // Three things cast shadows here -- scenery, characters, and point lights -- and this capture
+            // covered one of them. That is not a small gap when the capture is the only way to look at a
+            // reported artefact offline: a defect in a character's shadow could be studied for a long time
+            // in a file that provably does not contain it, and was.
+            //
+            // The actor slices live in mShadowMapTexture right after the world ones while the two layers
+            // share a resolution, and in mShadowActorTexture when they do not (see the note beside those
+            // members). Both cases are written, and the metadata says which arrangement produced the file
+            // so a reader never has to guess where the actor half is.
+            const int actorCount = SHADOW_MAP_ACTOR_CASCADES_FOR(count);
+            bool actorsWritten = false;
+            if (actorCount > 0) {
+                std::ofstream actors(dir / "actors.sds", std::ios::binary);
+                if (mShadowActorTexture != nullptr) {
+                    WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowActorTexture.Get(), actorCount,
+                                            actors);
+                } else {
+                    WriteShadowDepthCapture(mDevice.Get(), mContext.Get(), mShadowMapTexture.Get(), actorCount,
+                                            actors, count);
+                }
+                actors.close();
+                if (!actors) throw std::runtime_error("Cannot finish actor depth file");
+                actorsWritten = true;
+            }
+
+            nlohmann::json metadata;
+            metadata["actor_layer"] = actorsWritten ? "actors.sds" : nullptr;
+            metadata["actor_slices"] = actorCount;
+            metadata["actor_own_texture"] = mShadowActorTexture != nullptr;
+            const auto gameContext = nlohmann::json::parse(
+                captureCVars->GetString(SHADOW_MAP_CAPTURE_CONTEXT_CVAR, "{}"), nullptr, false);
+            if (gameContext.is_object()) metadata["game_context"] = gameContext;
+            metadata["format"] = "SDS1";
+            metadata["layer"] = "world";
+            metadata["complete"] = true;
+#define CAPTURE_FIELD(field) metadata[#field] = mPerShadowCbData.field
+            CAPTURE_FIELD(shadow_view_proj);
+            CAPTURE_FIELD(shadow_splits);
+            CAPTURE_FIELD(shadow_texel_world);
+            CAPTURE_FIELD(shadow_texel_uv);
+            CAPTURE_FIELD(shadow_params);
+            CAPTURE_FIELD(shadow_range);
+            CAPTURE_FIELD(shadow_edge);
+            CAPTURE_FIELD(shadow_jitter);
+            CAPTURE_FIELD(shadow_acne0);
+            CAPTURE_FIELD(shadow_acne1);
+            CAPTURE_FIELD(shadow_harden);
+            CAPTURE_FIELD(shadow_clip_x);
+            CAPTURE_FIELD(shadow_clip_y);
+            CAPTURE_FIELD(shadow_clip_z);
+            CAPTURE_FIELD(shadow_clip_p);
+            CAPTURE_FIELD(shadow_smsr);
+            CAPTURE_FIELD(shadow_smooth);
+            // Captured now that the actor layer itself is. They were left out as "the other layer's", which
+            // was only defensible while that layer was absent from the file entirely.
+            CAPTURE_FIELD(shadow_actor_min);
+            CAPTURE_FIELD(shadow_actor_max);
+            CAPTURE_FIELD(shadow_actor_texel_uv);
+#undef CAPTURE_FIELD
+            // Every field the kernel reads has to be here, and this list is hand-maintained, so it drifts
+            // silently: shadow_smooth was added to the constant buffer and not to this list, and the first
+            // capture taken afterwards could not say whether the technique had been on. A reproduction built
+            // from a capture that omits an input is not a reproduction of anything. This assert is the only
+            // thing that makes the omission loud instead of silent -- one entry per float4 in PerShadowCB,
+            // minus the matrix array, which goes out as slice_matrices below.
+            //
+            // Nineteen float4s, every one of them written above. Adding a field to the buffer breaks this
+            // line, which is the point: the list is hand-maintained and drifted once already.
+            static_assert(sizeof(PerShadowCB) ==
+                              sizeof(float[SHADOW_MAP_MAX_CASCADES][16]) + 19 * sizeof(float[4]),
+                          "PerShadowCB gained a field: add a CAPTURE_FIELD for it above, then update this.");
+            metadata["slice_valid"] = nlohmann::json::array();
+            metadata["slice_matrices"] = nlohmann::json::array();
+            for (int slice = 0; slice < count; ++slice) {
+                metadata["slice_valid"].push_back(mShadowSliceValid[slice]);
+                metadata["slice_matrices"].push_back(mShadowSliceMatrix[slice]);
+            }
+            std::ofstream info(dir / "capture.json");
+            info << metadata.dump(2);
+            info.close();
+            if (!info) throw std::runtime_error("Cannot finish capture metadata");
+            captureCVars->SetString(SHADOW_MAP_CAPTURE_STATUS_CVAR, dir.string().c_str());
+            SPDLOG_INFO("Shadow capture saved: {}", dir.string());
+        } catch (const std::exception& error) {
+            const std::string message = std::string("Capture failed: ") + error.what();
+            captureCVars->SetString(SHADOW_MAP_CAPTURE_STATUS_CVAR, message.c_str());
+            SPDLOG_ERROR("{}", message);
+        }
+    }
+
+    // SHADOW-CAPTURE-END
     mShadowCbDirty = true;
 }
 
@@ -3378,6 +3819,7 @@ void GfxRenderingAPIDX11::ShadowMapEndPass() {
     mShadowPassActive = false;
     ShadowTimerEnd();
     mShadowAlphaBound = false;
+    mShadowAlphaBoundIndex = -1;
     mShadowCurrentSlice = -1;
 
     // Put back the frame's render target and viewport.

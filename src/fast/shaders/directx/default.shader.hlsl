@@ -90,7 +90,10 @@ cbuffer PerToonCB : register(b2) {
     float toon_highlight_intensity;
     float toon_shadow_intensity;
     float toon_debug;
-    float2 _toon_pad;
+    float toon_local_enabled;
+    float _toon_pad;
+    float4 toon_local_dir[4];
+    float4 toon_local_color[4];
 }
 @end
 
@@ -117,6 +120,7 @@ SamplerState g_shadowSampler : register(s6);
 // subtly wrong instead.
 Texture2DArray<float> g_shadowMapActors : register(t7);
 SamplerState g_shadowActorSampler : register(s7);
+
 
 // Everything is float4-shaped on purpose: HLSL gives each element of a `float arr[n]` its own 16-byte
 // register, so a scalar array would waste three quarters of its space and make the C++ layout easy to get
@@ -157,6 +161,39 @@ cbuffer PerShadowCB : register(b3) {
     // One texel of the ACTOR layer in UV terms, per cascade. Equal to shadow_texel_uv while the two layers
     // share a resolution; separate once that layer is sized on its own (see fast/shadow_map.h).
     float4 shadow_actor_texel_uv;
+    // SOH [Enhancement] Edge quality (see fast/shadow_map.h). Three registers holding the switches and
+    // tuning for the techniques that shape the shadow's EDGE, as opposed to deciding where it falls.
+    // Packed rather than named one per register because a cbuffer gives every scalar its own 16 bytes.
+    //   edge:   x = analytic edge on/off, y = its ramp width in texels,
+    //           z = jitter on/off,        w = jitter tap count
+    //   jitter: x = jitter radius in texels. y, z and w are dead slots -- they carried the per-frame tap
+    //           rotation and the filterable modes, all removed. Kept zeroed rather than repacked so the
+    //           removal did not also shift this layout; folding them out is its own change.
+    float4 shadow_edge;
+    float4 shadow_jitter;
+    // SOH [Enhancement] Shadow acne (see fast/shadow_map.h). The magnitudes arrive already zeroed when
+    // their switch is off, so the shader multiplies rather than branches.
+    //   acne0: x = corrections enabled, y = normal offset in texels. z and w are dead slots -- they
+    //          carried the light-offset and depth-bias methods, both removed.
+    //   acne1: x = scale by how edge-on the surface is, y = the ceiling on that scale,
+    //          z = apply in the ordinary receiver too, w = unused
+    float4 shadow_acne0;
+    float4 shadow_acne1;
+    // SOH [Enhancement] Edge hardening (see fast/shadow_map.h). x = on, y = hardness (0 unchanged, 1 a hard
+    // threshold), z = where the boundary sits in the coverage range, w = dead slot (light-bleed reduction,
+    // removed with the filterable modes).
+    float4 shadow_harden;
+    // SOH [Enhancement] Clipmap layout (see fast/shadow_map.h). The light's three axes, each carrying the
+    // camera's coordinate along it in w, then the ladder's shape. No per-level matrix: levels differ by a
+    // power of two and a snapped centre, and both are arithmetic. That is also what keeps this legal at
+    // ps_4_0, where a dynamically indexed constant-buffer array is not.
+    //   clip_p: x base half-extent, y level count (0 = take the cascade path), z resolution, w unused
+    float4 shadow_clip_x;
+    float4 shadow_clip_y;
+    float4 shadow_clip_z;
+    float4 shadow_clip_p;
+    float4 shadow_smsr; // enabled, max steps, normalized depth epsilon, reserved
+    float4 shadow_smooth; // x on, y agreement threshold (normalised depth)
 }
 
 // One depth fetch, compared by hand. The sampler filters point-wise on purpose: averaging stored depths
@@ -188,7 +225,94 @@ cbuffer PerShadowCB : register(b3) {
 // straddles four texels. Against a point sampler those four taps usually land inside the SAME texel,
 // return the same value, and average to exactly one hard sample -- no filtering at all, which is what made
 // edges stair-step.
-float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor) {
+// SOH [Enhancement] Analytic edge reconstruction (technique 2 -- see fast/shadow_map.h).
+//
+// Estimate the contour from binary visibility, then widen its coverage ramp.
+// Stored depths at adjacent texels may belong to unrelated surfaces. Interpolating
+// their magnitudes invents a connecting surface and pulls the contour toward the
+// receiver's tiny bias margin. Compare first, as in PCF: equal visibility must
+// produce the same edge even when the occluder/receiver separation changes.
+// This is a coverage approximation, not exact geometric silhouette recovery.
+float ShadowAnalyticCoverage(float4 stored, float z, float2 subTexel, float width) {
+    // Gather's component order: w is (0,0), z is (1,0), x is (0,1), y is (1,1).
+    float4 g = step(z, stored) - 0.5;
+    float row0 = lerp(g.w, g.z, subTexel.x); // v = 0
+    float row1 = lerp(g.x, g.y, subTexel.x); // v = 1
+    float value = lerp(row0, row1, subTexel.y);
+    // Gradient in TEXEL units, which is what makes the distance below a texel count.
+    float du = lerp(g.z - g.w, g.y - g.x, subTexel.y);
+    float dv = row1 - row0;
+    float gradient = length(float2(du, dv));
+    // A flat quad has no boundary in it and no gradient to divide by. Falling back to the hard comparison
+    // is right: there is genuinely nothing to antialias, and every neighbouring quad that DOES hold the
+    // boundary is producing the ramp.
+    if (gradient < 1e-7) {
+        return step(0.0, value);
+    }
+    // Signed distance to the contour, in texels, then a linear ramp of `width` texels centred on it.
+    return saturate(0.5 + ((value / gradient) / max(width, 1e-4)));
+}
+
+// SOH [Enhancement] Interleaved gradient noise (technique 3 -- see fast/shadow_map.h).
+//
+// One hash of the pixel coordinate, returning 0..1. Chosen over a texture lookup because it costs no
+// bandwidth and no bind, and over a plain hash because its output is spatially well distributed at the
+// scale of a few pixels -- which is exactly the scale a rotated tap pattern is trying to decorrelate over.
+float ShadowJitterNoise(float2 pixel) {
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
+// RECEIVER-PLANE-BEGIN
+float4 ShadowReceiverDepths(float2 uv, float z, float texelUv, float2 gradient) {
+    float2 centre = (floor(uv / texelUv - 0.5) + 0.5) * texelUv;
+    float base = z + dot(gradient, centre - uv);
+    float2 dz = gradient * texelUv;
+    // Gather order: (0,1), (1,1), (1,0), (0,0).
+    return base + float4(dz.y, dz.x + dz.y, dz.x, 0.0);
+}
+float4 ShadowReceiverVisibility(float4 stored, float4 receiver) {
+    // A cleared D16 texel (also the sampler border) contains no caster. A grazing
+    // receiver plane can extrapolate beyond depth 1 at a neighbouring tap; that
+    // must not turn the far-plane clear value into an occluding surface.
+    return max(step(receiver - (1.0 / 65535.0), stored), step(1.0, stored));
+}
+// RECEIVER-PLANE-END
+
+// SOH [Enhancement] Coverage of the crossing, instead of a step. See fast/shadow_map.h, technique 6.
+//
+// This is the correction to a build that shipped and was played and came back worse. Comparing against the
+// interpolated stored depth removed the QUANTISATION teeth and returned a plain `step`, which is a binary
+// decision per pixel -- so it handed back SAMPLING teeth in their place. Every metric used at the time
+// scored where the boundary lands and none scored whether it lands softly, which is why the trade was
+// invisible until someone looked at the game.
+//
+// `f` is the signed distance from the receiver to the interpolated stored surface, and its gradient is
+// known in closed form: the stored side is bilinear in the four texels, so its derivative per texel comes
+// straight from them, and the receiver side is the plane we already carry. f / |grad f| is therefore the
+// distance to the boundary IN TEXELS, and 0.5 + that, clamped, is the fraction of a texel-wide footprint
+// on the lit side.
+//
+// A texel, not a pixel, and not a tuned number: a texel is the size of the uncertainty. It is the
+// quantisation step and it is the order of the residual SMSR leaves. On a wall lying along the light one
+// texel covers dozens of screen pixels, so the edge softens exactly where the error is large, and stays
+// hard where the texel is small -- with no parameter to pick.
+//
+// Closed form rather than ddx/ddy deliberately. The screen-space derivative is the textbook way to do
+// this, but the SMSR caller below sits inside `if (p.inside > 0.5)`, which is not uniform, and a
+// derivative taken in non-uniform control flow is undefined -- it would read whatever the neighbouring
+// lanes happen to hold at a cascade boundary or a screen edge.
+float ShadowSmoothCoverage(float4 stored, float2 subTexel, float z, float texelUv, float2 depthGradient) {
+    // Gather order: x = (0,1), y = (1,1), z = (1,0), w = (0,0).
+    float4 weights = float4((1.0 - subTexel.x) * subTexel.y, subTexel.x * subTexel.y,
+                            subTexel.x * (1.0 - subTexel.y), (1.0 - subTexel.x) * (1.0 - subTexel.y));
+    float2 storedGrad = float2((1.0 - subTexel.y) * (stored.z - stored.w) + subTexel.y * (stored.y - stored.x),
+                               (1.0 - subTexel.x) * (stored.x - stored.w) + subTexel.x * (stored.y - stored.z));
+    float2 grad = storedGrad - depthGradient * texelUv;
+    float f = dot(stored, weights) - (z - (1.0 / 65535.0));
+    return saturate(0.5 + f / max(length(grad), 1e-9));
+}
+
+float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor, float2 depthGradient) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
     float2 baseTexel = floor(texelPos);
@@ -228,11 +352,14 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     }
 @end
 
-    // step(a, b) is b >= a, so this is "the receiver is at or in front of the stored depth" -- 1 where the
-    // texel does not occlude -- for all four at once. One reference depth for the whole quad: the offset
-    // that keeps a surface from shadowing itself is applied by the rasterizer during the depth pass, not
-    // here (see SHADOW_MAP_SLOPE_BIAS).
-    float4 lit = step(z, stored);
+    // SOH [Enhancement] Technique 2 (see fast/shadow_map.h) consumes the SAME four depths and reconstructs
+    // where the boundary crosses the quad, rather than blending the four comparisons. Branching on a
+    // uniform, so a draw takes one path or the other and neither pays for the one it skipped.
+    float4 receiver = ShadowReceiverDepths(uv, z, texelUv, depthGradient);
+    float4 lit = ShadowReceiverVisibility(stored, receiver);
+    if (shadow_edge.x > 0.5) {
+        return ShadowAnalyticCoverage(lit, 0.5, subTexel, shadow_edge.y);
+    }
 
     // Bilinear weights, written out. lerp(lerp(w, z, sx), lerp(x, y, sx), sy) is exactly this sum, and as a
     // dot it is one instruction instead of three dependent ones. Comparing first and filtering after is the
@@ -240,8 +367,93 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
     // penumbra -- and that ordering is unchanged: `lit` is already the comparison result.
     float2 inv = 1.0 - subTexel;
     float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
-    return dot(lit, weights);
+    float filtered = dot(lit, weights);
+
+    // SOH [Enhancement] Technique 6 (see fast/shadow_map.h): compare against the INTERPOLATED stored depth
+    // where the four texels agree.
+    //
+    // The line above is the right answer at a silhouette and the wrong one along a surface that lies nearly
+    // parallel to the light. There the stored depth is flat inside a texel while the receiver's sweeps
+    // through a texel's worth of range in a few pixels, so the crossing can only turn at texel boundaries
+    // and the shadow's edge comes out as a comb -- one tooth per texel, measured at fifteen pixels tall on
+    // a capture of the castle wall. Comparing against the interpolated depth turns that staircase back into
+    // the line it was sampling.
+    //
+    // Fifteen is the figure for THIS kernel, the one with a per-texel receiver plane (ShadowReceiverDepths
+    // above). A kernel that compares the whole quad against one `z` produces a shorter tooth -- 5.9 px at
+    // 18 px/texel up to 23.5 px at 73 -- because a flat comparison depth cannot also tilt across the quad.
+    // The per-texel plane is what makes the receiver's own slope visible in the staircase, so it is the
+    // regime the fifteen was measured in and the regime this correction is written for.
+    //
+    // This is the PCF path only. With SMSR enabled ShadowSample takes SampleShadowSMSR instead and never
+    // reaches here; SMSR reconstructs the silhouette from visibility and has its own answer for the comb.
+    //
+    // Only where the quad agrees, and that guard is not a refinement -- it is the whole reason this is safe.
+    // At a silhouette the four texels are four different surfaces, and a depth interpolated between them is
+    // a depth nothing occupies: every object would get a grey halo. The weight falls to zero before the
+    // spread reaches anything a real silhouette produces.
+    //
+    // Uniform branch, and no extra fetch: `stored` is already in registers for the kernel above.
+    //
+    // The receiver side needs no interpolation of its own. `receiver` is an affine function of position
+    // sampled at the four texel centres, so dot(receiver, weights) is that plane evaluated at `uv`, which is
+    // `z` by construction -- comparing the interpolated stored depth against `z` keeps the receiver plane
+    // exactly as the line above uses it. The bias has to come along, though: ShadowReceiverVisibility
+    // compares against `receiver - 1/65535`, and dropping that here would make the two paths disagree by one
+    // quantum on flat ground and reintroduce acne wherever the weight is high.
+    if (shadow_smooth.x > 0.5) {
+        float lo = min(min(stored.x, stored.y), min(stored.z, stored.w));
+        float hi = max(max(stored.x, stored.y), max(stored.z, stored.w));
+        // An empty texel in the quad is not a surface to interpolate towards -- it is the far plane, and
+        // averaging it in would pull the boundary off the real occluder beside it.
+        float interpolated =
+            (hi >= 1.0) ? 1.0 : ShadowSmoothCoverage(stored, subTexel, z, texelUv, depthGradient);
+        float agree = saturate((shadow_smooth.y - (hi - lo)) / max(shadow_smooth.y * 0.5, 1e-6));
+        return lerp(filtered, interpolated, agree);
+    }
+    return filtered;
 }
+
+// SOH [Enhancement] Stochastic jitter (technique 3 -- see fast/shadow_map.h).
+//
+// Spread the taps over a disk and rotate that disk by a per-pixel angle. The step between texels does not
+// shrink, but neighbouring pixels no longer step at the same place, so the boundary reads as dither rather
+// than as a staircase.
+//
+// A Vogel (golden-angle) spiral rather than a grid: it has no preferred axis, so there is no direction
+// along which the pattern itself can print -- which is the failure mode of a rotated square kernel, and is
+// what turned an earlier widened filter into visible wedges.
+//
+// Disabled is a uniform branch straight to the single quad, so a draw with jitter off is byte for byte the
+// cost it was. [loop] and not [unroll] for the reason documented on the layer loop below: this file is
+// compiled by FXC inside the frame a material first draws, and an unrolled sixteen-tap body is that hitch.
+float SampleShadowJittered(float2 uv, float z, float slice, float texelUv, bool isActor, float2 pixel,
+                          float2 depthGradient) {
+    if (shadow_edge.z < 0.5) {
+        return SampleShadowPCF4(uv, z, slice, texelUv, isActor, depthGradient);
+    }
+
+    uint taps = (uint)max(shadow_edge.w, 1.0);
+    float angle = ShadowJitterNoise(pixel) * 6.28318530718;
+    float2 rot = float2(cos(angle), sin(angle));
+    float radius = shadow_jitter.x * texelUv;
+
+    float sum = 0.0;
+    [loop]
+    for (uint i = 0; i < taps; i++) {
+        // sqrt of the index fraction distributes the taps by AREA, so the disk is evenly covered rather
+        // than crowded at the centre. 2.3999632 is the golden angle in radians.
+        float r = sqrt(((float)i + 0.5) / (float)taps);
+        float theta = (float)i * 2.3999632;
+        float2 unit = float2(cos(theta), sin(theta));
+        // Complex multiply: rotate the spiral's own direction by this pixel's angle.
+        float2 dir = float2((unit.x * rot.x) - (unit.y * rot.y), (unit.x * rot.y) + (unit.y * rot.x));
+        float2 offset = dir * (r * radius);
+        sum += SampleShadowPCF4(uv + offset, z + dot(depthGradient, offset), slice, texelUv, isActor, depthGradient);
+    }
+    return sum / (float)taps;
+}
+
 
 // Project into one cascade and return how lit that cascade says this point is (1 = lit, 0 = occluded).
 // Outside the cascade's footprint there is nothing to occlude, so the answer is "lit" -- which is also
@@ -278,8 +490,252 @@ struct ShadowProjection {
     float z; // ndc depth of the receiver
     float texelUv;
     float slice;  // texture-array slice, this layer's offset included
+    float3 depthPlane; // dz/du, dz/dv, valid geometric receiver plane
     float inside; // 1 where the cascade covers this point, 0 where there is nothing to sample
 };
+
+// SMSR-BEGIN
+// Single-pass SMSR, Macedo & Apolinario (GI 2016), supplementary section 2, cases 1-12.
+// https://marciocerqueira.github.io/docs/publications/2016-GI-Supp.pdf
+// Original implementation of the published equations. Every visibility result is binary.
+
+float3 SmsrDepthPlane(float3 normal, float3 axisX, float3 axisY, float3 axisZ) {
+    // Transform a receiver plane into orthographic light space. Unlike screen derivatives
+    // inside a divergent edge search, this remains valid for every traversed texel.
+    float3 n = float3(dot(normal, axisX) / max(dot(axisX, axisX), 1e-30),
+                      dot(normal, axisY) / max(dot(axisY, axisY), 1e-30),
+                      dot(normal, axisZ) / max(dot(axisZ, axisZ), 1e-30));
+    if (abs(n.z) <= 1e-4 * length(n) || length(n) < 1e-20) {
+        return float3(0.0, 0.0, 0.0); // grazing/degenerate: keep the ordinary hard test
+    }
+    return float3(float2(-2.0 * n.x, 2.0 * n.y) / n.z, 1.0); // UV Y is down
+}
+
+bool SmsrInBounds(int2 coord, int size) {
+    return all(coord >= 0) && all(coord < size);
+}
+
+float SmsrDepth(int2 coord, float slice, bool isActor) {
+    float depth = 1.0;
+    if (isActor) {
+        depth = g_shadowMapActors.Load(int4(coord, (int)slice, 0));
+    } else {
+        depth = g_shadowMap.Load(int4(coord, (int)slice, 0));
+    }
+    return depth;
+}
+
+float SmsrLitAt(ShadowProjection projection, int2 coord, int size, bool isActor) {
+    if (!SmsrInBounds(coord, size)) {
+        return 1.0;
+    }
+    float zl = SmsrDepth(coord, projection.slice, isActor);
+    if (zl >= 1.0) {
+        return 1.0; // clear depth is empty, even if the extrapolated receiver exceeds 1
+    }
+    float2 uv = (float2(coord) + 0.5) * projection.texelUv;
+    float zc = projection.z + dot(projection.depthPlane.xy, uv - projection.uv);
+    // Only a near-equality is corrected. A distinct occluder must not become a receiver.
+    if (abs(zc - zl) <= shadow_smsr.z) {
+        zc = min(zc, zl);
+    }
+    return zc <= zl ? 1.0 : 0.0;
+}
+
+float2 SmsrDiscontinuity(ShadowProjection projection, int2 coord, int size, bool isActor, float s) {
+    float left = abs(SmsrLitAt(projection, coord + int2(-1, 0), size, isActor) - s);
+    float right = abs(SmsrLitAt(projection, coord + int2(1, 0), size, isActor) - s);
+    float top = abs(SmsrLitAt(projection, coord + int2(0, -1), size, isActor) - s);
+    float bottom = abs(SmsrLitAt(projection, coord + int2(0, 1), size, isActor) - s);
+    return float2(2.0 * left + right, top + 2.0 * bottom) * 0.25;
+}
+
+// x = oriented distance, y = endpoint/beginning was actually found.
+// A search limit or map boundary is unknown, never a fabricated edge endpoint.
+float2 SmsrTrace(ShadowProjection projection, int2 origin, int2 direction, int size,
+                 bool isActor, float initialDirection, bool alongX) {
+    int limit = clamp((int)shadow_smsr.y, 1, 64);
+    [loop]
+    for (int distance = 1; distance <= limit; ++distance) {
+        int2 coord = origin + direction * distance;
+        if (!SmsrInBounds(coord, size)) {
+            return float2(-(float)distance, 0.0);
+        }
+        float s = SmsrLitAt(projection, coord, size, isActor);
+        if (s < 0.5) {
+            return float2((float)distance, 1.0); // end: illumination changed
+        }
+        // Only the two neighbours perpendicular to the traversal can change the
+        // relevant discontinuity component. Avoid fetching the other two at each step.
+        int2 across = alongX ? int2(0, 1) : int2(1, 0);
+        float minus = 1.0 - SmsrLitAt(projection, coord - across, size, isActor);
+        float plus = 1.0 - SmsrLitAt(projection, coord + across, size, isActor);
+        float dc = alongX ? (minus + 2.0 * plus) * 0.25 : (2.0 * minus + plus) * 0.25;
+        if (dc != initialDirection) {
+            return float2(-(float)distance, 1.0); // beginning: direction changed
+        }
+    }
+    return float2(-(float)(limit + 1), 0.0);
+}
+
+// x = normalized position, y = -1 dual negative / 0 positive-negative / 1 dual positive.
+float2 SmsrNormalize(float2 negative, float2 positive, float p) {
+    if (negative.y < 0.5 || positive.y < 0.5) {
+        return float2(0.0, -1.0); // truncated edge: conservative hard-shadow fallback
+    }
+    float alpha1 = negative.x;
+    float alpha2 = positive.x;
+    float kind = (alpha1 > 0.0 ? 1.0 : 0.0) + (alpha2 > 0.0 ? 1.0 : 0.0) - 1.0;
+    float L = max(abs(alpha1) + abs(alpha2) - 1.0, 1.0);
+    float po = alpha1 > alpha2 ? 1.0 - p : p;
+    float don = (1.0 - max(alpha1, alpha2) / L) + po / L;
+    return float2(saturate(don), kind);
+}
+
+// dc.rg = compressed discontinuities; dc.ba = dominant horizontal/vertical directions.
+// don.rg = normalized positions along X/Y; don.ba = their respective edge classes.
+float vSMSR(float4 dc, float4 don, float2 p) {
+    if (all(dc.xy == 0.0)) {
+        return 1.0;
+    }
+    if (don.z < 0.0 || don.w < 0.0) {
+        return 1.0; // Case 1: dual negative
+    }
+    if (don.z > 0.0 || don.w > 0.0) {
+        return 0.0; // Case 2: dual positive closes the edge
+    }
+    if (dc.x == 0.75 || dc.y == 0.75) {
+        return 0.0; // Case 3: opposite discontinuities close the gap
+    }
+    // Cases 9/10 (bottom/top) and 11/12 (left/right), with strict comparisons.
+    float vertical = ((dc.y == 0.5 ? 1.0 - p.y : p.y) < don.x) ? 0.0 : 1.0;
+    float horizontal = ((dc.x == 0.5 ? p.x : 1.0 - p.x) < don.y) ? 0.0 : 1.0;
+    if (dc.x == 0.0) {
+        return vertical; // Cases 9, 10
+    }
+    if (dc.y == 0.0) {
+        return horizontal; // Cases 11, 12
+    }
+    if (dc.z > 0.5 && dc.w > 0.5) {
+        return min(horizontal, vertical); // Case 8: intersecting edges
+    }
+    if (dc.z > 0.5) {
+        return horizontal; // Case 4: horizontal discontinuity dominates at a corner
+    }
+    if (dc.w > 0.5) {
+        return vertical; // Case 5: vertical discontinuity dominates at a corner
+    }
+    // Cases 6/7: a one-texel corner, no dominant direction.
+    float py = dc.y == 0.5 ? p.y : 1.0 - p.y;
+    return 1.0 - don.x < py ? 0.0 : 1.0;
+}
+
+float SampleShadowSMSR(ShadowProjection projection, bool isActor) {
+    int size = (int)round(1.0 / projection.texelUv);
+    int2 origin = int2(floor(projection.uv * size));
+    if (!SmsrInBounds(origin, size)) {
+        return 1.0;
+    }
+    float s = SmsrLitAt(projection, origin, size, isActor);
+    if (s < 0.5 || projection.depthPlane.z < 0.5) {
+        return s; // Only entering (lit-side) discontinuities are revectorized.
+    }
+    float2 dc = SmsrDiscontinuity(projection, origin, size, isActor, s);
+    if (all(dc == 0.0)) {
+        return s;
+    }
+    bool corner = dc.x > 0.0 && dc.y > 0.0;
+    float2 dominant = float2(dc.x > 0.0 ? 1.0 : 0.0, dc.y > 0.0 ? 1.0 : 0.0);
+    if (corner) {
+        // Look away from each shadow neighbour: continuing discontinuities on the
+        // lit neighbours distinguish a long edge from a one-texel corner/intersection.
+        int2 awayY = int2(0, dc.y == 0.25 ? 1 : -1);
+        int2 awayX = int2(dc.x == 0.5 ? 1 : -1, 0);
+        float2 nextY = SmsrDiscontinuity(projection, origin + awayY, size, isActor, 1.0);
+        float2 nextX = SmsrDiscontinuity(projection, origin + awayX, size, isActor, 1.0);
+        dominant.x = SmsrInBounds(origin + awayY, size) && nextY.x == dc.x ? 1.0 : 0.0;
+        dominant.y = SmsrInBounds(origin + awayX, size) && nextX.y == dc.y ? 1.0 : 0.0;
+    }
+    float2 p = frac(projection.uv * size);
+    float4 don = float4(0.0, 0.0, 0.0, 0.0);
+    if (dominant.y > 0.5 || (corner && all(dominant == 0.0))) {
+        float2 a = SmsrTrace(projection, origin, int2(-1, 0), size, isActor, dc.y, true);
+        float2 b = SmsrTrace(projection, origin, int2(1, 0), size, isActor, dc.y, true);
+        float2 edge = SmsrNormalize(a, b, p.x);
+        don.x = edge.x;
+        don.z = edge.y;
+    }
+    if (dominant.x > 0.5) {
+        float2 a = SmsrTrace(projection, origin, int2(0, -1), size, isActor, dc.x, false);
+        float2 b = SmsrTrace(projection, origin, int2(0, 1), size, isActor, dc.x, false);
+        float2 edge = SmsrNormalize(a, b, p.y);
+        don.y = edge.x;
+        don.w = edge.y;
+    }
+    return s * vSMSR(float4(dc, dominant), don, p);
+}
+// SMSR-END
+
+// SOH [Enhancement] Technique 6 over SMSR (see fast/shadow_map.h).
+//
+// SMSR and technique 6 are not two answers to one question. SMSR reconstructs a SILHOUETTE, where the four
+// texels of a quad are four different surfaces. Technique 6 fixes a CROSSING, where they are the same
+// surface and the step is the map's own quantisation. Each one abstains where the other works, and the
+// agreement test already tells the two cases apart -- so it picks which one answers, instead of one
+// replacing the other.
+//
+// Measured on the capture, against the sub-texel truth. On the facade's crossing the boundary's residual
+// goes 17.5 px -> 1.4 px at 18 screen pixels per texel, and SMSR alone still grows with magnification
+// (35.2 px at 36) while this does not (2.0). On the silhouette-rich ground it is not a trade: mean
+// deviation 0.0070 -> 0.0059, and SMSR's one-sided darkening excess 0.68% -> 0.44%, with the 99th
+// percentile still exactly zero.
+//
+// It costs one Gather on top of SMSR's own traversal, and only when both are on.
+float ShadowSmoothOverSMSR(ShadowProjection projection, bool isActor, float smsrLit) {
+    float texelUv = projection.texelUv;
+    float2 texelPos = projection.uv / texelUv - 0.5;
+    float2 baseTexel = floor(texelPos);
+    float2 subTexel = texelPos - baseTexel;
+    float2 uv00 = (baseTexel + 0.5) * texelUv;
+
+@if(o_shadow_gather)
+    float4 stored =
+        isActor ? g_shadowMapActors.Gather(g_shadowActorSampler, float3(uv00 + texelUv * 0.5, projection.slice))
+                : g_shadowMap.Gather(g_shadowSampler, float3(uv00 + texelUv * 0.5, projection.slice));
+@else
+    float4 stored;
+    if (isActor) {
+        stored.w = g_shadowMapActors.SampleLevel(g_shadowActorSampler, float3(uv00, projection.slice), 0);
+        stored.z = g_shadowMapActors.SampleLevel(g_shadowActorSampler,
+                                                 float3(uv00 + float2(texelUv, 0.0), projection.slice), 0);
+        stored.x = g_shadowMapActors.SampleLevel(g_shadowActorSampler,
+                                                 float3(uv00 + float2(0.0, texelUv), projection.slice), 0);
+        stored.y = g_shadowMapActors.SampleLevel(g_shadowActorSampler,
+                                                 float3(uv00 + float2(texelUv, texelUv), projection.slice), 0);
+    } else {
+        stored.w = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00, projection.slice), 0);
+        stored.z = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, 0.0), projection.slice), 0);
+        stored.x = g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(0.0, texelUv), projection.slice), 0);
+        stored.y =
+            g_shadowMap.SampleLevel(g_shadowSampler, float3(uv00 + float2(texelUv, texelUv), projection.slice), 0);
+    }
+@end
+
+    float lo = min(min(stored.x, stored.y), min(stored.z, stored.w));
+    float hi = max(max(stored.x, stored.y), max(stored.z, stored.w));
+    // An empty texel in the quad means a silhouette however small the spread reads, and a silhouette is
+    // SMSR's case, not this one. Weight zero, no blend, no second opinion.
+    if (hi >= 1.0) {
+        return smsrLit;
+    }
+    // Coverage, never a step. SMSR's own answer is binary and exactly right at its own boundary; blending
+    // a SECOND binary answer into it with a weight that changes per quad is what put texel-frequency
+    // structure into the penumbra -- measured at 0.269 against 0.004 for this form, on the same wall.
+    float interpolated = ShadowSmoothCoverage(stored, subTexel, projection.z, projection.texelUv,
+                                              projection.depthPlane.xy);
+    float agree = saturate((shadow_smooth.y - (hi - lo)) / max(shadow_smooth.y * 0.5, 1e-6));
+    return lerp(smsrLit, interpolated, agree);
+}
 
 // The direction the light travels, which every cascade shares.
 //
@@ -294,7 +750,7 @@ float3 ShadowLightAxis() {
 
 // Everything about a lookup except the fetches. No derivatives here, which is what makes this safe to call
 // from inside a branch -- and the partner projection is now built only where it is actually read.
-ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase) {
+ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint cascade, float sliceBase, float3 normal) {
     float4 clip = mul(float4(p, 1.0), viewProj);
 
     float safeW = abs(clip.w) > 1e-6 ? clip.w : 1e-6;
@@ -303,6 +759,7 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
 
     ShadowProjection o;
+    o.depthPlane = SmsrDepthPlane(normal, viewProj._11_21_31, viewProj._12_22_32, viewProj._13_23_33);
     o.uv = uv;
     o.z = ndc.z;
     o.texelUv = texelUv;
@@ -325,10 +782,19 @@ ShadowProjection ShadowProject(float3 p, float4x4 viewProj, float texelUv, uint 
 // upwards inherited the inversion: mode 2 painted the whole world outside the near cascade yellow, and any
 // mode reading the shadow term itself (mode 5 reads the raw coverage) would have been reading a value this
 // line had already replaced. A diagnostic that alters what it measures is worse than none.
-float ShadowSample(ShadowProjection p, bool isActor) {
+float ShadowSample(ShadowProjection p, bool isActor, float2 pixel) {
     float lit = abs(shadow_range.y - 1.0) < 0.5 ? 0.0 : 1.0;
     if (p.inside > 0.5) {
-        lit = SampleShadowPCF4(p.uv, p.z, p.slice, p.texelUv, isActor);
+        [branch]
+        if (shadow_smsr.x > 0.5) {
+            lit = SampleShadowSMSR(p, isActor);
+            [branch]
+            if (shadow_smooth.x > 0.5) {
+                lit = ShadowSmoothOverSMSR(p, isActor, lit);
+            }
+        } else {
+            lit = SampleShadowJittered(p.uv, p.z, p.slice, p.texelUv, isActor, pixel, p.depthPlane.xy);
+        }
     }
     return lit;
 }
@@ -372,7 +838,7 @@ float ShadowActorTexelUvAt(uint cascade) {
     return v;
 }
 
-ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
+ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase, float3 normal) {
     float4x4 viewProj = shadow_view_proj[0];
     float texelUv = shadow_texel_uv.x;
     if (cascade == 1) {
@@ -382,7 +848,7 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
         viewProj = shadow_view_proj[2];
         texelUv = shadow_texel_uv.z;
     }
-    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase);
+    return ShadowProject(p, viewProj, texelUv, cascade, sliceBase, normal);
 }
 
 // First cascade whose far split still covers this depth; the last one catches everything beyond. Zero when
@@ -392,6 +858,7 @@ ShadowProjection ShadowProjectAt(float3 p, uint cascade, float sliceBase) {
 // repeating the ladder -- a debug view that reimplements the thing it is inspecting can agree with the
 // picture and disagree with the code, which is the one failure mode an instrument may not have. Literal
 // indices only, same constraint as ShadowSplitAt.
+// SHADOW-VIEW-DEPTH-BEGIN
 uint ShadowCascadeIndex(float viewDepth) {
     uint count = (uint)shadow_params.x;
     uint cascade = 0;
@@ -409,6 +876,158 @@ uint ShadowCascadeIndex(float viewDepth) {
     return cascade;
 }
 
+// SHADOW-VIEW-DEPTH-END
+
+// SOH [Enhancement] The cascade's world-to-depth scale, for turning a bias in world units into one in the
+// cascade's own normalised depth. The projection is orthographic and row-vector, so the light axis column's
+// LENGTH is exactly that factor. Literal indices only, same constraint as ShadowSplitAt.
+float ShadowDepthScaleAt(uint cascade) {
+    float3 axis = shadow_view_proj[2]._13_23_33;
+    if (cascade == 0) {
+        axis = shadow_view_proj[0]._13_23_33;
+    } else if (cascade == 1) {
+        axis = shadow_view_proj[1]._13_23_33;
+    }
+    return length(axis);
+}
+
+// How much the corrections are scaled by this surface's angle to the light (see fast/shadow_map.h).
+//
+// Acne is a grazing-angle problem: a surface facing the light has none of it, and one edge-on to the light
+// has depth running away across a texel. 1/(N.L) is that relationship, and the ceiling is not optional --
+// it runs to infinity as the surface turns edge-on, and an unbounded offset there lands the sample in a
+// different part of the scene entirely.
+float ShadowAcneSlope(float3 normal) {
+    if (shadow_acne1.x < 0.5) {
+        return 1.0;
+    }
+    float ndl = saturate(dot(normal, -ShadowLightAxis()));
+    return min(1.0 / max(ndl, 1.0e-3), shadow_acne1.y);
+}
+
+// Move the sample point off the surface before it is projected.
+//
+// The offset is ALONG THE SURFACE rather than along the light, which is what keeps a shadow attached to the
+// foot of its caster. Moving along the light instead was offered as a separate method and removed: it fixes
+// the same acne and detaches the shadow doing it.
+float3 ShadowAcneMovePoint(float3 world, float3 normal, float texelWorld, float slope) {
+    if (shadow_acne0.x < 0.5) {
+        return world;
+    }
+    return world + (normal * (texelWorld * shadow_acne0.y * slope));
+}
+
+
+// SOH [Enhancement] Compress the boundary for a harder outline (see fast/shadow_map.h).
+//
+// The edge identifies itself: coverage is 0 or 1 across every interior, and only the boundary lands in
+// between. So remapping the range acts on the boundary alone -- interiors map to themselves whatever the
+// setting -- and no search, no derivative and no extra fetch is needed to find it.
+//
+// smoothstep rather than a linear ramp so the compressed edge keeps a continuous derivative; a linear one
+// leaves a visible corner where it meets the interiors, which on a shadow reads as a second, fainter edge
+// just inside the first.
+float ShadowHardenEdge(float coverage) {
+    if (shadow_harden.x < 0.5 || shadow_smsr.x > 0.5) {
+        return coverage;
+    }
+    // Hardness 1 leaves no width at all, which smoothstep cannot express -- its two edges would be equal.
+    // Held just apart, so full hardness is a step one float wide rather than a divide by zero.
+    float width = max((1.0 - shadow_harden.y) * 0.5, 1.0e-5);
+    float threshold = shadow_harden.z;
+    return smoothstep(threshold - width, threshold + width, coverage);
+}
+
+// SOH [Enhancement] Clipmap lookup (see fast/shadow_map.h).
+//
+// Nested squares centred on the camera, each twice the extent of the one inside it. The level is a function
+// of how far the point is from the centre, so there is no split ladder, no comparison chain and no matrix
+// array -- every quantity below is computed from the level index.
+//
+// Returns both caster layers, the same pair ShadowLitLayers returns, so the two layouts are
+// interchangeable at the call site.
+float2 ShadowLitClipmap(float3 worldPos, float layerStride, bool wantActors, float2 pixel, float3 normal) {
+    float2 lit = float2(1.0, 1.0);
+    float levels = shadow_clip_p.y;
+    if (levels < 0.5 || shadow_params.x < 0.5) {
+        return lit;
+    }
+
+    // The point in the light's frame. The axes carry the camera's coordinate in w, so the offset from the
+    // clipmap's centre falls out of the same dot products.
+    float3 lp = float3(dot(worldPos, shadow_clip_x.xyz), dot(worldPos, shadow_clip_y.xyz),
+                       dot(worldPos, shadow_clip_z.xyz));
+    float2 offset = lp.xy - float2(shadow_clip_x.w, shadow_clip_y.w);
+
+    // Which level contains it: the smallest whose half-extent covers the larger of the two offsets. The
+    // Chebyshev distance rather than the Euclidean one, because the levels are squares.
+    float base = max(shadow_clip_p.x, 1e-4);
+    float reach = max(max(abs(offset.x), abs(offset.y)), base);
+    float level = clamp(ceil(log2(reach / base)), 0.0, levels - 1.0);
+
+    float extent = base * exp2(level);
+    float resolution = max(shadow_clip_p.z, 1.0);
+    float texel = (extent * 2.0) / resolution;
+
+    // SOH [Enhancement] Acne corrections, the same four the cascade path applies (see fast/shadow_map.h).
+    // Chosen from THIS level's texel, which is why they come after the level and not before it: the offset
+    // is sized in texels, and a clipmap's texel doubles per level.
+    //
+    // The level is picked from the UNOFFSET position deliberately. Offsetting first would let a point near a
+    // boundary be nudged into the neighbouring level, and the level it is nudged into would have a different
+    // texel -- which is the same circularity the cascade path avoids by fitting before it biases.
+    if (shadow_acne1.z > 0.5) {
+        float acneSlope = ShadowAcneSlope(normal);
+        float3 moved = ShadowAcneMovePoint(worldPos, normal, texel, acneSlope);
+        lp = float3(dot(moved, shadow_clip_x.xyz), dot(moved, shadow_clip_y.xyz), dot(moved, shadow_clip_z.xyz));
+    }
+    // The centre is snapped to THIS level's texel, which is what stops the edges shimmering as the camera
+    // moves -- and, because a camera that has not crossed a texel produces the same centre, is also what
+    // lets the slice be reused with no parking code at all.
+    float2 centre = floor(float2(shadow_clip_x.w, shadow_clip_y.w) / texel) * texel;
+
+    // Normalised device coordinates for this level, then texture space -- and the Y FLIP is not optional.
+    // NDC is +up and a texture is +down, which is why ShadowProject writes -ndc.y * 0.5 + 0.5 on the cascade
+    // path. Leaving it out here mirrored the map vertically: the shadows then slid the wrong way in Y as
+    // the camera moved, which reads as the whole scene's shadows travelling with the camera.
+    float2 ndc = (lp.xy - centre) / extent;
+    float2 uv = float2((ndc.x * 0.5) + 0.5, (-ndc.y * 0.5) + 0.5);
+    if (any(uv < 0.0) || any(uv > 1.0)) {
+        return lit; // outside this level's square nothing is known to occlude
+    }
+
+    // The depth arrangement the fit builds: the eye pulled back three radii, the range running five.
+    float depth = ((lp.z - shadow_clip_z.w) + (extent * 3.0)) / (extent * 5.0);
+    if (depth < 0.0 || depth > 1.0) {
+        return lit;
+    }
+
+    float texelUv = 1.0 / resolution;
+
+    // Everything downstream of the projection is shared with the cascade layout, and shared by going
+    // through the same call rather than by repeating it: ShadowSample is what carries the jitter kernel.
+    // Reaching past it to SampleShadowPCF4 -- which this did at first -- silently dropped it, and dropped
+    // the acne corrections with it. A layout is a way of PLACING the map; it has no business changing
+    // which techniques exist.
+    ShadowProjection p;
+    p.depthPlane = SmsrDepthPlane(normal, shadow_clip_x.xyz / extent,
+                                 shadow_clip_y.xyz / extent, shadow_clip_z.xyz / (5.0 * extent));
+    p.uv = uv;
+    p.z = depth;
+    p.texelUv = texelUv;
+    p.slice = level;
+    p.inside = 1.0; // the footprint test is the uv/depth bounds above, already applied
+
+    lit.x = ShadowSample(p, false, pixel);
+    // The actor layer is shorter than the world layer here too, and lives at the same stride.
+    if (wantActors && level < (float)@{o_shadow_actor_cascades}) {
+        p.slice = level + layerStride;
+        p.texelUv = ShadowActorTexelUvAt(0);
+        lit.y = ShadowSample(p, true, pixel);
+    }
+    return lit;
+}
+
 // Pick a cascade by view distance and cross-fade into the next one over the last slice of the range.
 // Without the fade the resolution change shows up as a hard line sweeping across the ground as the camera
 // moves -- "cascade popping". smoothstep rather than a linear ramp so the seam has no visible corner.
@@ -423,7 +1042,8 @@ uint ShadowCascadeIndex(float viewDepth) {
 // `wantActors` is the receiver kind, constant across a draw call, and it gates only the fetches -- never the
 // projection, which has to run for the world layer regardless. So a character pays nothing for the actor
 // half it skips, exactly as before, while scenery stops paying twice for the half they share.
-float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors) {
+float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool wantActors,
+                       float2 pixel, float3 normal) {
     // Single return, pre-initialized to "fully lit" -- which is also the answer when no cascades were
     // rendered this frame (count == 0), and for the actor layer whenever this receiver does not take it.
     float2 lit = float2(1.0, 1.0);
@@ -437,14 +1057,33 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
         // long way, and cutting at the split would take real shadows with it (a low sun throws them well
         // past the band that cast them).
         if (viewDepth <= shadow_range.x) {
-            ShadowProjection primary = ShadowProjectAt(worldPos, cascade, 0.0);
+            // SOH [Enhancement] Acne corrections (see fast/shadow_map.h). Gated on their own switch here:
+            // the ordinary receiver reads the exact surface the depth pass rasterised, so it does not
+            // normally need them -- unlike the screen-space mask, which reconstructs its position.
+            //
+            // PER CASCADE, which is the whole of this block's shape. The offset is sized in TEXELS, and the
+            // cross-fade partner is a coarser cascade whose texel is several times larger -- so a single
+            // offset computed for the primary and reused for the partner leaves the partner corrected for a
+            // cascade it is not. It then self-shadows, and since the band blends towards it, the seam
+            // darkens across the fade and snaps clean the moment the cascade index flips. That was visible
+            // as the cascade boundary going dark, and only ever with the cross-fade on, because without it
+            // the partner is never sampled.
+            //
+            // The slope is a property of the SURFACE, not of the cascade, so it is computed once.
+            bool acneOn = shadow_acne1.z > 0.5;
+            float acneSlope = acneOn ? ShadowAcneSlope(normal) : 0.0;
+            float3 samplePos = worldPos;
+            if (acneOn) {
+                samplePos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(cascade), acneSlope);
+            }
+            ShadowProjection primary = ShadowProjectAt(samplePos, cascade, 0.0, normal);
 
             // Cross-fade band at the far edge of this cascade, where the next one also covers the point.
             // Sampling both and blending is what hides the resolution change; a hard switch draws a visible
             // line that sweeps across the ground as the camera moves.
             bool blend = false;
             float t = 0.0;
-            if (cascade + 1 < count) {
+            if (cascade + 1 < count && shadow_smsr.x < 0.5) {
                 // Not named `far`/`near`: those are legacy Windows macros, and this source is compiled by name
                 // at runtime where a stray definition would be baffling to debug.
                 float farEdge = ShadowSplitAt(cascade);
@@ -460,7 +1099,13 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
             ShadowProjection partner = primary;
             if (blend) {
                 uint pc = min(cascade + 1, count - 1);
-                partner = ShadowProjectAt(worldPos, pc, 0.0);
+                // Its own offset, from the PARTNER's texel. See the note above: sharing the primary's is
+                // what darkened the seam.
+                float3 partnerPos = worldPos;
+                if (acneOn) {
+                    partnerPos = ShadowAcneMovePoint(worldPos, normal, ShadowTexelWorldAt(pc), acneSlope);
+                }
+                partner = ShadowProjectAt(partnerPos, pc, 0.0, normal);
             }
 
             // Can the actor layer possibly shadow this point at all?
@@ -542,6 +1187,17 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                 // Asked of the cascade index rather than of the projection, so the skip lands before the struct
                 // copy below rather than after it.
                 if (isActor && (isPartner ? min(cascade + 1, count - 1) : cascade) >= @{o_shadow_actor_cascades}) {
+                    // Past the actor layer's last cascade there is no slice to read, and the answer is the
+                    // one an empty slice gives: lit.
+                    //
+                    // FADED to it rather than skipped, which is the whole of this change. Skipping left
+                    // lit.y holding the primary cascade's answer right up to the split and then dropping it
+                    // in one step -- so a character's shadow on the ground did not soften across the
+                    // boundary, it stopped dead at a line. Blending towards "lit" over the same band the
+                    // world layer uses makes the layer run out the way every other transition here does.
+                    if (isPartner && blend) {
+                        lit.y = lerp(lit.y, 1.0, t);
+                    }
                     continue;
                 }
                 if (isPartner && !blend) {
@@ -562,7 +1218,7 @@ float2 ShadowLitLayers(float3 worldPos, float viewDepth, float layerStride, bool
                     // may have its own. Equal to the world layer's whenever the two are the same size.
                     p.texelUv = ShadowActorTexelUvAt(isPartner ? min(cascade + 1, count - 1) : cascade);
                 }
-                float s = ShadowSample(p, isActor);
+                float s = ShadowSample(p, isActor, pixel);
                 if (isActor) {
                     lit.y = isPartner ? lerp(lit.y, s, t) : s;
                 } else {
@@ -833,17 +1489,31 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
     // SOH [Enhancement] Toon lighting: re-light the (white-shaded) albedo with the single dominant
     // light through a soft half-Lambert ramp.
     @if(o_toon)
+        float3 toonAlbedo = texel.rgb;
+        float3 toonLocalContribution = float3(0.0, 0.0, 0.0);
         float3 toonN = normalize(input.normal);
         float toonNL = dot(toonN, normalize(toon_light_dir)) * 0.5 + 0.5;
         float toonRamp = smoothstep(toon_ramp_center - toon_ramp_softness, toon_ramp_center + toon_ramp_softness, toonNL);
         float3 toonLit = toon_ambient + toon_light_color * toon_highlight_intensity;
         float3 toonShadow = lerp(toonLit, toon_ambient, toon_shadow_intensity);
+        float3 toonDirectContribution = toon_light_color * toon_highlight_intensity *
+            lerp(1.0 - toon_shadow_intensity, 1.0, toonRamp);
+        if (toon_local_enabled > 0.5) {
+            [unroll] for (int i = 0; i < 4; ++i) {
+                float localNL = dot(toonN, toon_local_dir[i].xyz) * 0.5 + 0.5;
+                float localRamp = smoothstep(toon_ramp_center - toon_ramp_softness,
+                                             toon_ramp_center + toon_ramp_softness, localNL);
+                toonLocalContribution += toon_local_color[i].xyz * toon_highlight_intensity * localRamp;
+            }
+        }
         if (toon_debug > 0.5) {
             // Diagnostic view: flat white on the lit side of the ramp, flat black in shadow, albedo
             // discarded — makes it obvious which draws are receiving toon lighting.
             texel.rgb = float3(toonRamp, toonRamp, toonRamp);
         } else {
-            texel.rgb = clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
+            texel.rgb = toon_local_enabled > 0.5
+                ? toonAlbedo * (toon_ambient + toonDirectContribution + toonLocalContribution)
+                : clamp(texel.rgb * lerp(toonShadow, toonLit, toonRamp), 0.0, 1.0);
         }
     @end
 
@@ -864,11 +1534,37 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // Both computed unconditionally and then selected. ddx/ddy are gradient instructions and may not
         // sit inside varying control flow, so they cannot be moved inside the diagnostic branch that reads
         // them; the cost is two derivatives and a normalize.
-        float3 shadowGeoN = cross(ddx(input.worldPos.xyz), ddy(input.worldPos.xyz));
+        //
+        // The operand order is not arbitrary, and having it backwards is what made the acne correction
+        // CAUSE acne. SV_Position.y increases DOWNWARD in Direct3D, so the screen-space basis (ddx, ddy)
+        // is left-handed with respect to the world and cross(ddx, ddy) points INTO the surface. On a floor
+        // it came out as (0,-1,0) -- debug view 3 draws that purple, while a real vertex normal in the same
+        // scene draws green, which is how it was found.
+        //
+        // Two things followed from the flip, and both were visible. The offset is
+        // `world + normal * texels * slope`, so a downward normal pushed the sample point INTO the floor and
+        // the receiver compared as occluded across a whole plaza. And it inverted the slope control: with
+        // the normal facing away from the light, ndl saturates to zero, the slope pins at its ceiling, and
+        // RAISING that ceiling made the wrong-way offset bigger -- the setting meant to fix acne shaded the
+        // whole room instead.
+        //
+        // Only geometry with no vertex normal of its own reaches this, which here is the room mesh and most
+        // scenery -- so it was the ground and the walls that were wrong while characters were right.
+        //
+        // Swapped rather than negated: one expression to read instead of an expression and a sign. This file
+        // is compiled by the Direct3D 11 backend alone (Metal and OpenGL have their own shader trees, and
+        // the shadow map exists on neither), so no other convention is affected by this order.
+        float3 shadowGeoN = cross(ddy(input.worldPos.xyz), ddx(input.worldPos.xyz));
         float shadowNLen = length(input.normal);
         float3 shadowN = (shadowNLen > 1e-4) ? (input.normal / shadowNLen) : normalize(shadowGeoN);
-        // input.position.w is the clip-space w the rasterizer interpolated, which for a perspective
-        // projection is view depth -- exactly what picks a cascade, with no extra uniform needed.
+        // The geometric receiver plane is calculated before any divergent level/edge search.
+        // Smooth vertex normals do not describe the depth change across a triangle.
+        if (dot(shadowGeoN, shadowGeoN) > 1e-20) {
+            float3 planeN = normalize(shadowGeoN);
+            shadowN = dot(planeN, shadowN) < 0.0 ? -planeN : planeN;
+        }
+        // Direct3D pixel SV_Position.w preserves perspective-interpolated clip W.
+        // See the WARP perspective-cascade regression; do not invert it as gl_FragCoord.w.
         // The world caster layer is sampled by everything. The actor layer is sampled only by scenery, so a
         // character is shadowed by the world but never by another character (or by itself) -- the
         // interaction rules the design lays out. Layer L, cascade C is slice L*cascadeCount + C.
@@ -876,8 +1572,16 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // another character or by itself. That choice is constant across a draw call and is passed in, so
         // the character case genuinely skips the second set of taps rather than computing and discarding
         // them -- while the projection the two layers share is built once either way.
-        float2 shadowLayers =
-            ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x, input.worldPos.w > 0.5);
+        // SOH [Enhancement] Two layouts, one call site. The clipmap reports its level count as zero when it
+        // is not the active one, so this is a uniform branch and a draw pays for only the path it takes.
+        float2 shadowLayers;
+        if (shadow_clip_p.y > 0.5) {
+            shadowLayers = ShadowLitClipmap(input.worldPos.xyz, shadow_clip_p.y, input.worldPos.w > 0.5,
+                                            screenSpace.xy, shadowN);
+        } else {
+            shadowLayers = ShadowLitLayers(input.worldPos.xyz, input.position.w, shadow_params.x,
+                                           input.worldPos.w > 0.5, screenSpace.xy, shadowN);
+        }
         float shadowLit = min(shadowLayers.x, shadowLayers.y);
         // What the comparison produced is COVERAGE -- what fraction of the bilinear quad is occluded -- and
         // it is now shaded with directly. Nothing rewrites it between here and the multiply at the bottom.
@@ -892,6 +1596,10 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
         // literally the same number, which is worth stating: if the two disagree in SHAPE, something below
         // this line is lying.
         float shadowCoverage = shadowLit;
+        // SOH [Enhancement] Hardened AFTER the raw value is taken above, which is what debug view 5 has
+        // always claimed to show -- the coverage before the hardening remap. The two are the same number
+        // again only when this is off.
+        shadowLit = ShadowHardenEdge(shadowLit);
         // Debug 2: paint the two caster layers apart instead of shading with them. GREEN where the world
         // layer occludes, RED where the actor layer does. A shadow that vanishes is either coming from a
         // layer that stopped capturing or not being sampled at all, and those look identical once the two
@@ -951,14 +1659,51 @@ float4 PSMain(PSInput input, float4 screenSpace : SV_Position) : SV_TARGET {
             // view and the shaded picture carry the same number -- see the reading order above.
             texel.rgb = float3(shadowCoverage, shadowCoverage, shadowCoverage);
         } else if (shadowDebugMode == 7) {
-            // Which cascade this pixel sampled: red, green, blue from nearest to furthest. Cross-fade bands
-            // read as the primary cascade's colour, since that is the one the picture is keyed to.
+            // Which cascade this pixel sampled: red, green, blue from nearest to furthest -- and, across a
+            // cross-fade band, the two colours MIXED by the same factor the shadow term is mixed by.
+            //
+            // It used to paint the band in the primary cascade's flat colour, which made a seam impossible
+            // to diagnose from here: a band that is fading and a band that is not look identical, so a hard
+            // cascade edge on screen could be the blend failing or something else entirely. Now the
+            // gradient IS the blend. A sharp colour boundary means no fade is happening; a smooth ramp
+            // means the fade runs and a seam has some other cause.
             uint shadowDebugCascade = ShadowCascadeIndex(input.position.w);
-            texel.rgb = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
-                               shadowDebugCascade == 2 ? 1.0 : 0.0);
+            float3 shadowDebugColour = float3(shadowDebugCascade == 0 ? 1.0 : 0.0, shadowDebugCascade == 1 ? 1.0 : 0.0,
+                                              shadowDebugCascade == 2 ? 1.0 : 0.0);
+            uint shadowDebugCount = (uint)shadow_params.x;
+            if (shadowDebugCascade + 1 < shadowDebugCount) {
+                float shadowDebugFar = ShadowSplitAt(shadowDebugCascade);
+                float shadowDebugNear = (shadowDebugCascade == 0) ? 0.0 : ShadowSplitAt(shadowDebugCascade - 1);
+                float shadowDebugStart =
+                    shadowDebugFar - ((shadowDebugFar - shadowDebugNear) * shadow_params.y);
+                if (input.position.w > shadowDebugStart) {
+                    uint shadowDebugNext = min(shadowDebugCascade + 1, shadowDebugCount - 1);
+                    float3 shadowDebugNextColour =
+                        float3(shadowDebugNext == 0 ? 1.0 : 0.0, shadowDebugNext == 1 ? 1.0 : 0.0,
+                               shadowDebugNext == 2 ? 1.0 : 0.0);
+                    shadowDebugColour = lerp(shadowDebugColour, shadowDebugNextColour,
+                                             smoothstep(shadowDebugStart, shadowDebugFar, input.position.w));
+                }
+            }
+            texel.rgb = shadowDebugColour;
         } else {
-            texel.rgb *= lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            float directionalVisibility = lerp(1.0 - shadow_params.w, 1.0, shadowLit);
+            @if(o_toon)
+                if (toon_local_enabled > 0.5 && toon_debug < 0.5) {
+                    // A solar occluder removes only the directional contribution.
+                    texel.rgb = toonAlbedo * (toon_ambient + toonDirectContribution * directionalVisibility +
+                                              toonLocalContribution);
+                } else {
+                    texel.rgb *= directionalVisibility;
+                }
+            @else
+                texel.rgb *= directionalVisibility;
+            @end
         }
+    @end
+
+    @if(o_toon)
+        if (toon_local_enabled > 0.5) texel.rgb = clamp(texel.rgb, 0.0, 1.0);
     @end
 
     @if(o_fog)
