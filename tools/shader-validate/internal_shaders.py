@@ -24,7 +24,10 @@ import sys
 SHADERS = {
     "kShadowDepthShaderSource": [("VSMain", "vs_4_0")],
     "kShadowAlphaDepthShaderSource": [("VSMain", "vs_4_0"), ("PSMain", "ps_4_0")],
-    "kShadowMomentShaderSource": [("VSMain", "vs_4_0"), ("PSResolve", "ps_4_0"), ("PSBlur", "ps_4_0")],
+    # kShadowMomentShaderSource was here until 041f8fb1 took the filterable modes (ESM/VSM/MSM) out. The
+    # string went with them and this entry did not, so every run since has ended in "could not extract" --
+    # a validator that fails for a shader nobody compiles teaches you to ignore its last line, which is the
+    # line that says whether the 28 real variants passed.
 }
 
 
