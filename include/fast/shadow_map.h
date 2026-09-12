@@ -829,9 +829,19 @@ typedef struct ShadowMapAcne {
 // percentile -- because most real silhouettes on that ground are occluder against EMPTY map, and the empty
 // guard below catches those before the threshold is consulted at all.
 //
-// It costs no extra fetch. The four depths are already read for the bilinear kernel; this is one dot
-// product, a min, a max and a lerp on values already in registers.
-#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 0
+// It applies over SMSR as well, and there it is not redundant: SMSR answers the silhouette, this answers
+// the crossing, and the agreement test decides which one speaks. See ShadowSmoothOverSMSR in the shader --
+// SMSR alone still leaves 17.5 px of teeth on the facade and still grows with magnification.
+//
+// On the filtered path it costs no extra fetch: the four depths are already read for the bilinear kernel,
+// and this is one dot product, a min, a max and a lerp on values already in registers. Over SMSR it costs
+// one Gather, and only when both are on.
+//
+// Default ON, which is a change to how a default build looks. Every measurement above says it is strictly
+// better -- the crossing by an order of magnitude, the silhouette by a little, neither worse -- and a
+// correction that ships switched off is a correction that does not ship. The switch stays for anyone who
+// wants the old behaviour back.
+#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 1
 
 // How close the four texels must be to count as one surface, in normalised depth.
 //
