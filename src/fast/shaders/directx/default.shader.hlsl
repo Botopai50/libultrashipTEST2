@@ -278,6 +278,40 @@ float4 ShadowReceiverVisibility(float4 stored, float4 receiver) {
 }
 // RECEIVER-PLANE-END
 
+// SOH [Enhancement] Coverage of the crossing, instead of a step. See fast/shadow_map.h, technique 6.
+//
+// This is the correction to a build that shipped and was played and came back worse. Comparing against the
+// interpolated stored depth removed the QUANTISATION teeth and returned a plain `step`, which is a binary
+// decision per pixel -- so it handed back SAMPLING teeth in their place. Every metric used at the time
+// scored where the boundary lands and none scored whether it lands softly, which is why the trade was
+// invisible until someone looked at the game.
+//
+// `f` is the signed distance from the receiver to the interpolated stored surface, and its gradient is
+// known in closed form: the stored side is bilinear in the four texels, so its derivative per texel comes
+// straight from them, and the receiver side is the plane we already carry. f / |grad f| is therefore the
+// distance to the boundary IN TEXELS, and 0.5 + that, clamped, is the fraction of a texel-wide footprint
+// on the lit side.
+//
+// A texel, not a pixel, and not a tuned number: a texel is the size of the uncertainty. It is the
+// quantisation step and it is the order of the residual SMSR leaves. On a wall lying along the light one
+// texel covers dozens of screen pixels, so the edge softens exactly where the error is large, and stays
+// hard where the texel is small -- with no parameter to pick.
+//
+// Closed form rather than ddx/ddy deliberately. The screen-space derivative is the textbook way to do
+// this, but the SMSR caller below sits inside `if (p.inside > 0.5)`, which is not uniform, and a
+// derivative taken in non-uniform control flow is undefined -- it would read whatever the neighbouring
+// lanes happen to hold at a cascade boundary or a screen edge.
+float ShadowSmoothCoverage(float4 stored, float2 subTexel, float z, float texelUv, float2 depthGradient) {
+    // Gather order: x = (0,1), y = (1,1), z = (1,0), w = (0,0).
+    float4 weights = float4((1.0 - subTexel.x) * subTexel.y, subTexel.x * subTexel.y,
+                            subTexel.x * (1.0 - subTexel.y), (1.0 - subTexel.x) * (1.0 - subTexel.y));
+    float2 storedGrad = float2((1.0 - subTexel.y) * (stored.z - stored.w) + subTexel.y * (stored.y - stored.x),
+                               (1.0 - subTexel.x) * (stored.x - stored.w) + subTexel.x * (stored.y - stored.z));
+    float2 grad = storedGrad - depthGradient * texelUv;
+    float f = dot(stored, weights) - (z - (1.0 / 65535.0));
+    return saturate(0.5 + f / max(length(grad), 1e-9));
+}
+
 float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isActor, float2 depthGradient) {
     // Position in texel space, offset so flooring lands on the lower-left of the surrounding quad.
     float2 texelPos = uv / texelUv - 0.5;
@@ -372,7 +406,8 @@ float SampleShadowPCF4(float2 uv, float z, float slice, float texelUv, bool isAc
         float hi = max(max(stored.x, stored.y), max(stored.z, stored.w));
         // An empty texel in the quad is not a surface to interpolate towards -- it is the far plane, and
         // averaging it in would pull the boundary off the real occluder beside it.
-        float interpolated = (hi >= 1.0) ? 1.0 : step(z - (1.0 / 65535.0), dot(stored, weights));
+        float interpolated =
+            (hi >= 1.0) ? 1.0 : ShadowSmoothCoverage(stored, subTexel, z, texelUv, depthGradient);
         float agree = saturate((shadow_smooth.y - (hi - lo)) / max(shadow_smooth.y * 0.5, 1e-6));
         return lerp(filtered, interpolated, agree);
     }
@@ -693,9 +728,11 @@ float ShadowSmoothOverSMSR(ShadowProjection projection, bool isActor, float smsr
     if (hi >= 1.0) {
         return smsrLit;
     }
-    float2 inv = 1.0 - subTexel;
-    float4 weights = float4(inv.x * subTexel.y, subTexel.x * subTexel.y, subTexel.x * inv.y, inv.x * inv.y);
-    float interpolated = step(projection.z - (1.0 / 65535.0), dot(stored, weights));
+    // Coverage, never a step. SMSR's own answer is binary and exactly right at its own boundary; blending
+    // a SECOND binary answer into it with a weight that changes per quad is what put texel-frequency
+    // structure into the penumbra -- measured at 0.269 against 0.004 for this form, on the same wall.
+    float interpolated = ShadowSmoothCoverage(stored, subTexel, projection.z, projection.texelUv,
+                                              projection.depthPlane.xy);
     float agree = saturate((shadow_smooth.y - (hi - lo)) / max(shadow_smooth.y * 0.5, 1e-6));
     return lerp(smsrLit, interpolated, agree);
 }

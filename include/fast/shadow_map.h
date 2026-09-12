@@ -837,11 +837,15 @@ typedef struct ShadowMapAcne {
 // and this is one dot product, a min, a max and a lerp on values already in registers. Over SMSR it costs
 // one Gather, and only when both are on.
 //
-// Default ON, which is a change to how a default build looks. Every measurement above says it is strictly
-// better -- the crossing by an order of magnitude, the silhouette by a little, neither worse -- and a
-// correction that ships switched off is a correction that does not ship. The switch stays for anyone who
-// wants the old behaviour back.
-#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 1
+// Default OFF, and it was ON for one build. That build was played and reported worse: teeth present with
+// the switch on, mostly gone with it off. The measurements above are not wrong, they were incomplete --
+// every one of them scored WHERE the boundary lands and none scored whether it lands softly. This
+// technique replaced the kernel's coverage with a step, so it removed the quantisation teeth and handed
+// back sampling teeth, and a metric that only looks at position cannot see the difference.
+//
+// So: off until the coverage is right (see ShadowSmoothCoverage in the shader, which is the fix), and the
+// bar for turning it back on is a report from the game, not another number.
+#define SHADOW_MAP_DEFAULT_SMOOTH_DEPTH 0
 
 // How close the four texels must be to count as one surface, in normalised depth.
 //
@@ -857,8 +861,53 @@ typedef struct ShadowMapAcne {
 // which is what makes it uncritical rather than tuned: 200 and 500 give the same answer to a tenth of a
 // pixel, and the ground's deviation from the discrete truth falls monotonically across that whole span.
 #define SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT 0.0046f
-#define SHADOW_MAP_MIN_SMOOTH_AGREEMENT 0.0001f
+// The floor is 0.0030, not 0.0001, because PARTIAL engagement is the failure mode and the old floor sat
+// in the middle of it.
+//
+// A capture from a played build came back with this at 0.0020 -- 131 quanta -- against a wall whose quads
+// span 117 to 149. The weight is then neither 0 nor 1 but somewhere between, and it changes from quad to
+// quad, because the spread it is computed from is a per-quad quantity. Blending two different answers with
+// a weight that steps every texel writes the texel grid straight into the penumbra. Measured as the energy
+// at texel frequency inside the transition band: 0.269 at that setting, against 0.004 with the threshold
+// clear of the wall. The player's word for it was teeth, more discreet than before but there.
+//
+// 0.0030 is 196 quanta, above every grazing surface measured on either capture (117, 149) and well below a
+// real silhouette (927 at the 99th percentile). Clamping rather than only changing the default is
+// deliberate: the bad value is already saved in someone's config, and a default does not reach them.
+#define SHADOW_MAP_MIN_SMOOTH_AGREEMENT 0.0030f
 #define SHADOW_MAP_MAX_SMOOTH_AGREEMENT 0.0100f
+
+// --- Holding the sun still -------------------------------------------------------------------------
+//
+// What it is for: the RIPPLE that travels along a shadow's edge with nobody moving. Not a snapping bug --
+// the cascade centre is snapped to whole texels and the radius is held, and both work. The sun is simply
+// fast.
+//
+// Measured from a capture the game wrote: dayTime advanced 10 units in one frame, which over a 65536-unit
+// day is 0.0549 degrees per frame, a full day in 109 seconds at 60 fps. A rotation of dTheta moves the
+// shadow of a caster h units up by h*dTheta, so:
+//
+//     caster height        50      100      300      600 units
+//     shadow moves       0.048    0.096    0.288    0.575 units per frame
+//     in cascade-0 texels 0.08     0.15     0.46     0.92
+//
+// A castle tower is the last column. Its shadow's edge crosses a texel boundary about once per frame, and
+// not at the same moment all along its length -- so the crossing runs along the edge, which is exactly
+// what a travelling ripple is.
+//
+// Holding the direction makes the whole edge step together instead, but it is a straight trade and the
+// arithmetic is exact: a rotation of dTheta moves a point at distance R by R*dTheta, and the cascade's
+// texel is 2R/resolution, so the movement is dTheta*resolution/2 texels REGARDLESS of which cascade. To
+// stand still for N frames you accept a jump of N texels. There is no setting that gets both.
+//
+//     hold until     1        2        4        8       16 texels of jump
+//     still for    1.0      2.0      4.1      8.1     16.3 frames
+//
+// So this is a control and not a fix, and the default is the behaviour that was already there. It is here
+// because the trade was decided once without anyone seeing both sides in motion, and that is the player's
+// call, not a measurement's.
+#define SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS 0.0f
+#define SHADOW_MAP_MAX_SUN_HOLD_TEXELS 32.0f
 
 // --- The struct the application pushes -------------------------------------------------------------
 //
@@ -902,6 +951,9 @@ typedef struct ShadowMapQuality {
     int smoothDepth;        // 0/1
     float smoothAgreement;  // normalised depth spread below which the quad counts as one surface
 
+    // Hold the sun still between steps. 0 = follow it every frame (see SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS)
+    float sunHoldTexels;
+
     // Edge hardening
     int edgeHarden;       // 0/1
     float edgeHardness;   // 0 = unchanged, 1 = a hard threshold
@@ -937,6 +989,7 @@ static inline ShadowMapQuality ShadowMapQualityDefaults(void) {
     q.clipmapResolution = SHADOW_MAP_DEFAULT_CLIPMAP_RESOLUTION;
     q.smoothDepth = SHADOW_MAP_DEFAULT_SMOOTH_DEPTH;
     q.smoothAgreement = SHADOW_MAP_DEFAULT_SMOOTH_AGREEMENT;
+    q.sunHoldTexels = SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS;
     q.edgeHarden = SHADOW_MAP_DEFAULT_EDGE_HARDEN;
     q.edgeHardness = SHADOW_MAP_DEFAULT_EDGE_HARDNESS;
     q.edgeThreshold = SHADOW_MAP_DEFAULT_EDGE_THRESHOLD;
@@ -979,6 +1032,10 @@ static inline void ShadowMapQualityClamp(ShadowMapQuality* q) {
     q->smoothDepth = q->smoothDepth ? 1 : 0;
     q->smoothAgreement =
         SHADOW_MAP_CLAMP_(q->smoothAgreement, SHADOW_MAP_MIN_SMOOTH_AGREEMENT, SHADOW_MAP_MAX_SMOOTH_AGREEMENT);
+    // NaN as well as range: this one comes straight from a config file and multiplies an angle.
+    if (!(q->sunHoldTexels >= 0.0f && q->sunHoldTexels <= SHADOW_MAP_MAX_SUN_HOLD_TEXELS)) {
+        q->sunHoldTexels = SHADOW_MAP_DEFAULT_SUN_HOLD_TEXELS;
+    }
     q->edgeHarden = q->edgeHarden ? 1 : 0;
     q->edgeHardness = SHADOW_MAP_CLAMP_(q->edgeHardness, 0.0f, 1.0f);
     q->edgeThreshold = SHADOW_MAP_CLAMP_(q->edgeThreshold, 0.05f, 0.95f);
